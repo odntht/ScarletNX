@@ -222,6 +222,8 @@ the rest goes in the folder of its kind. A relative `$XDG_*_HOME` is ignored, as
 | --- | --- |
 | `~/.config/scarletnx/games/` (`$XDG_CONFIG_HOME`) | `Game.ini` |
 | `~/.local/state/scarletnx/games/` (`$XDG_STATE_HOME`) | `Game.log`, `threads.txt` |
+| `~/.local/state/scarletnx/` | the menu's Share log, `scarletnx.log` |
+| `~/.local/state/scarletnx/gui/` | the menu's `recent.txt` and `last-run.log`, for every copy (the checkout's too) |
 | `~/.cache/scarletnx/` (`$XDG_CACHE_HOME`) | `work/`, `games/shader_cache/` |
 
 What an older version left in the data folder moves to these on first use, a line in the output or the game's log for

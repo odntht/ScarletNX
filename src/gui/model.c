@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 #include "model.h"
+#include "common.h"
 #include "font.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,6 +135,9 @@ const char* gui_setting_description(const GuiMenu* menu) {
         case GUI_LOG:
 #ifdef __ANDROID__
             return "Saves the last run's output and game log to /sdcard/ScarletNX/scarletnx.log, then shares it";
+#elif defined(SNX_XDG)
+            return "Saves the last run's output and game log to scarletnx.log in the working folder (an installed "
+                   "copy's: its state folder), path copied";
 #else
             return "Saves the last run's output and game log to scarletnx.log in the working folder, path copied";
 #endif

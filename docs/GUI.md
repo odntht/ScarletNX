@@ -42,8 +42,10 @@ build of a detached checkout outside CI says `detached`, and both read `unknown`
   drag and drop `prod.keys` (or paste its path with Ctrl+V); a blinking
   **[ Drop prod.keys here ]** waits in the middle of the screen (the theme's
   `[prompt]`). It installs the file to `~/.switch/prod.keys`, or
-  `%USERPROFILE%\.switch\prod.keys` on Windows,
-  creating the folder if needed. Existing keys trigger the bright-red warning
+  `%USERPROFILE%\.switch\prod.keys` on Windows; an installed copy on Linux puts it in its
+  data folder instead (`~/.local/share/scarletnx/prod.keys`), which the driver reads before
+  `~/.switch`, and names the keys of `~/.switch` it would use until then. It creates the
+  folder if needed. Existing keys trigger the bright-red warning
   **Keys already setup. This will overwrite the previous ones**. A successful
   drop replaces them and returns to the menu; ESC cancels without changing them.
 - **[ON/OFF] Fullscreen** toggles the Switch game's startup setting, not the
@@ -67,9 +69,10 @@ build of a detached checkout outside CI says `detached`, and both read `unknown`
   The focus moves between them and the items in one ring, and the line under the menu
   shows the focused game's path. Choosing one runs it again with the driver it was
   loaded with and the options the menu has now; a game whose file is gone leaves the
-  list instead. The list is kept in `recent.txt` in the user's data folder
-  (`$XDG_DATA_HOME/scarletnx/gui/`, by default `~/.local/share/scarletnx/gui/`, or
-  `%APPDATA%\scarletnx\gui\` on Windows), a line per
+  list instead. The list is kept in `recent.txt`, beside `last-run.log`, in the user's state
+  folder on Linux (`$XDG_STATE_HOME/scarletnx/gui/`, by default `~/.local/state/scarletnx/gui/`,
+  where an older version's move from `~/.local/share/scarletnx/gui/`), or in
+  `%APPDATA%\scarletnx\gui\` on Windows, a line per
   game: `switch`, `linux` or `3ds`, `file` or `games` (a program from games/, run as it is),
   the path and the name, separated by tabs.
 

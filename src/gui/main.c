@@ -114,7 +114,7 @@ static const char* const load_labels[] = {"-> Select via drag and drop", "-> Sel
 #define SAY_ABORT      "Press [ESC] to abort and return to menu"
 #define SAY_NO_GAMES   "No executables found in games/."
 #define SAY_COUNT      "executable(s)"
-#define SAY_LOG_FAILED "The log could not be saved in the working folder."
+#define SAY_LOG_FAILED "The log could not be saved: check the folder's permissions."
 #endif
 static SDL_Color rgb(GuiRgb c) {
     SDL_Color out;
@@ -222,6 +222,49 @@ static void rule(App* app, int row, GuiRgb c) {
     r.h = (float)app->scale;
     SDL_SetRenderDrawColor(app->renderer, c.r, c.g, c.b, 255);
     SDL_RenderFillRect(app->renderer, &r);
+}
+/* ~/.switch/prod.keys (%USERPROFILE%\.switch on Windows), where hactool and other tools keep them */
+static char* home_keys_path(void) {
+#ifdef _WIN32
+    const char* home = getenv("USERPROFILE");
+    if (!home || !home[0]) home = getenv("HOME");
+#else
+    const char* home = getenv("HOME");
+#endif
+    if (!home || !home[0]) return NULL;
+    char* directory = snx_path_join(home, ".switch");
+    char* path = directory ? snx_path_join(directory, "prod.keys") : NULL;
+    free(directory);
+    return path;
+}
+#ifdef SNX_XDG
+/* the menu of an installed build, whose folder is the user's data folder (snx_data_dir) */
+static bool installed(const App* app) {
+    char* user = snx_user_data_dir();
+    bool same = user && app->data_dir && !strcmp(user, app->data_dir);
+    free(user);
+    return same;
+}
+#endif
+/* where the keys are installed: an installed build's data folder, which the driver reads first, so nothing is written
+   in the home folder itself (XDG); else ~/.switch */
+static char* device_keys_path(const App* app) {
+#ifdef SNX_XDG
+    if (installed(app)) return snx_path_join(app->data_dir, "prod.keys");
+#else
+    (void)app;
+#endif
+    return home_keys_path();
+}
+/* the prod.keys the driver reads: those installed here, else for an installed build the ones in ~/.switch */
+static char* keys_in_use(const App* app) {
+    if (app->keys_path && snx_is_file(app->keys_path)) return snx_strdup(app->keys_path);
+#ifdef SNX_XDG
+    char* home = installed(app) ? home_keys_path() : NULL;
+    if (home && snx_is_file(home)) return home;
+    free(home);
+#endif
+    return NULL;
 }
 /* the footer from row: the usage, then the working folder, which games/ and themes/ are found in. The theme's bar style
    puts them on a band of ink over rows rows, its plain one in soft and ink; a rule above when it says so */
@@ -799,8 +842,15 @@ static void render(App* app) {
             text(app, 1, 2, SAY_KEYS_HOW, soft);
             text(app, 1, 3, app->keys_path ? app->keys_path : "Home directory unavailable.", ink);
         }
-        if (app->keys_path && snx_is_file(app->keys_path))
+        char* in_use = keys_in_use(app);
+        if (in_use && app->keys_path && !strcmp(in_use, app->keys_path))
             text(app, 1, 4, "Keys already setup. This will overwrite the previous ones", failure);
+        else if (in_use) {
+            char line[1100];
+            snprintf(line, sizeof(line), "Keys in use: %s. Keys dropped here are read before them", in_use);
+            text(app, 1, 4, line, soft);
+        }
+        free(in_use);
         text(app, 1, 6, app->message, focus);
         entry(app, 1, 8, "Back [ESC]", false, app->browser.selected == 0);
         prompt(app, GUI_PROMPT_KEYS, 1, SDL_max(app->rows / 2, 10), SAY_KEYS_WAIT, focus);
@@ -1103,19 +1153,6 @@ static void open_recent(App* app, int index) {
     launch(app, snx_strdup(game.path), game.prepared);
     if (app->menu.running) app->menu.recent_focus = 1; /* back from the run, on the game that is now first */
 }
-static char* device_keys_path(void) {
-#ifdef _WIN32
-    const char* home = getenv("USERPROFILE");
-    if (!home || !home[0]) home = getenv("HOME");
-#else
-    const char* home = getenv("HOME");
-#endif
-    if (!home || !home[0]) return NULL;
-    char* directory = snx_path_join(home, ".switch");
-    char* path = directory ? snx_path_join(directory, "prod.keys") : NULL;
-    free(directory);
-    return path;
-}
 static void install_keys(App* app, const char* source) {
     const char* name = source;
     if (source)
@@ -1196,15 +1233,16 @@ static char* log_tail(const char* path, size_t max) {
     free(data);
     return text;
 }
-/* the game log written last, games/<game>.log */
+/* the game log written last, games/<game>.log: beside the games, or an installed build's in its state folder */
 static char* newest_log(const App* app) {
     int count = 0, i;
-    char** names = SDL_GlobDirectory(app->games_dir, "*.log", 0, &count);
+    char* folder = snx_user_path(app->games_dir, SNX_USER_STATE);
+    char** names = SDL_GlobDirectory(folder, "*.log", 0, &count);
     char* newest = NULL;
     SDL_Time time = 0;
     for (i = 0; names && i < count; ++i) {
         SDL_PathInfo info;
-        char* path = snx_path_join(app->games_dir, names[i]);
+        char* path = snx_path_join(folder, names[i]);
         if (SDL_GetPathInfo(path, &info) && (!newest || info.modify_time > time)) {
             free(newest);
             newest = path;
@@ -1213,18 +1251,29 @@ static char* newest_log(const App* app) {
             free(path);
     }
     SDL_free(names);
+    free(folder);
     return newest;
 }
 /* the message on the screen, the last run's output and the newest game log, as scarletnx.log: on Android in
-   /sdcard/ScarletNX and handed to the share sheet as that file, elsewhere in the working folder with its path copied */
+   /sdcard/ScarletNX and handed to the share sheet as that file, elsewhere in the working folder with its path copied.
+   An installed build saves it in its state folder (XDG), as the working folder is the home folder when the menu is
+   started from the desktop */
 static void share_log(App* app) {
-    char *game, *run, *played, *text, *saved;
+    char *game, *run, *played, *text, *saved, *state = NULL;
     const char* folder;
 #ifdef SDL_PLATFORM_ANDROID
     android_folder(app);
     folder = gui_android_folder();
 #else
     folder = app->cwd;
+#endif
+#ifdef SNX_XDG
+    if (installed(app)) state = snx_user_dir(SNX_USER_STATE);
+    if (state && snx_mkdirs(state)) {
+        free(state);
+        state = NULL;
+    }
+    if (state) folder = state;
 #endif
     game = newest_log(app);
     run = log_tail(app->run_log, 1 << 20);
@@ -1248,6 +1297,7 @@ static void share_log(App* app) {
     free(played);
     free(run);
     free(game);
+    free(state);
 }
 static void list_games(App* app) {
 #ifdef SDL_PLATFORM_ANDROID
@@ -1648,7 +1698,7 @@ static bool initialize(App* app) {
     app->games_dir = snx_path_join(app->data_dir, "games");
     app->themes_dirs[0] = snx_path_join(app->data_dir, "themes");
     if (app->drivers) app->themes_dirs[1] = snx_path_join(app->drivers, "themes");
-    app->keys_path = device_keys_path();
+    app->keys_path = device_keys_path(app);
     gui_console_init(&app->console, 78, 17);
     if (!app->font || !app->process || !app->drivers) {
         SDL_SetError("Cannot initialize GUI resources");
@@ -1683,6 +1733,33 @@ static void cleanup(App* app) {
     SDL_DestroyWindow(app->window);
     SDL_Quit();
 }
+#ifdef SNX_XDG
+/* recent.txt and last-run.log: in the state folder's gui/ (~/.local/state/scarletnx/gui/), where an older build's move
+   from the data folder's. Elsewhere SDL_GetPrefPath's folder (under %APPDATA% on Windows) */
+static char* state_folder(void) {
+    static const char* const names[] = {"recent.txt", "last-run.log"};
+    char *state = snx_user_dir(SNX_USER_STATE), *data = snx_user_data_dir();
+    char *folder = state ? snx_path_join(state, "gui") : NULL, *old = data ? snx_path_join(data, "gui") : NULL;
+    size_t i;
+    for (i = 0; folder && old && i < sizeof(names) / sizeof(*names); ++i) {
+        char *from = snx_path_join(old, names[i]), *to = snx_path_join(folder, names[i]);
+        int moved = snx_move_old(from, to, 1);
+        if (moved == SNX_MOVE_DONE) fprintf(stderr, "scarletnx-gui: moved %s to %s\n", from, to);
+        if (moved == SNX_MOVE_LEFT) fprintf(stderr, "scarletnx-gui: could not move %s to %s\n", from, to);
+        free(from);
+        free(to);
+    }
+    if (old) remove(old); /* when nothing else is left in it */
+    if (folder && snx_mkdirs(folder)) {
+        free(folder);
+        folder = NULL;
+    }
+    free(old);
+    free(data);
+    free(state);
+    return folder;
+}
+#endif
 #ifndef SNX_GUI_NO_MAIN
 int main(int argc, char** argv) {
     (void)argc;
@@ -1695,12 +1772,19 @@ int main(int argc, char** argv) {
         cleanup(&app);
         return 1;
     }
-    /* the user's data folder (~/.local/share/scarletnx/gui/ on Linux, under %APPDATA% on Windows); main() opens
-       it, not initialize(), so the tests keep their own */
-    prefs = SDL_GetPrefPath("scarletnx", "gui");
+    /* the menu's own files; main() opens them, not initialize(), so the tests keep their own */
+#ifdef SNX_XDG
+    prefs = state_folder();
+#else
+    {
+        char* sdl = SDL_GetPrefPath("scarletnx", "gui");
+        prefs = sdl ? snx_strdup(sdl) : NULL;
+        SDL_free(sdl);
+    }
+#endif
     if (prefs) recent_open(&app, snx_path_join(prefs, "recent.txt"));
     if (prefs) app.run_log = snx_path_join(prefs, "last-run.log");
-    SDL_free(prefs);
+    free(prefs);
     splash_start(&app);
     while (!app.menu.quit) {
         SDL_Event e;

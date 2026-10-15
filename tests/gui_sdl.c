@@ -206,6 +206,8 @@ int main(int argc, char** argv) {
     assert(!strcmp(app.data_dir, "/nonexistent/snx-gui-test/scarletnx"));
     assert(!strcmp(app.games_dir, "/nonexistent/snx-gui-test/scarletnx/games"));
     assert(!strcmp(app.themes_dirs[0], "/nonexistent/snx-gui-test/scarletnx/themes"));
+    /* and the keys go in it, where the driver reads them first, not in ~/.switch */
+    assert(!strcmp(app.keys_path, "/nonexistent/snx-gui-test/scarletnx/prod.keys"));
 #endif
     /* the window says which build it is: commit, compiler, platform */
     assert(!strcmp(SDL_GetWindowTitle(app.window), snx_build_info()) && !strncmp(snx_build_info(), "ScarletNX ", 10));
@@ -344,6 +346,35 @@ int main(int argc, char** argv) {
     assert(app.menu.view == GUI_LOAD_NONE && snx_is_file(app.keys_path));
     free(switch_dir);
     free(source_keys);
+#ifdef SNX_XDG
+    /* keys another tool left in ~/.switch, which the driver reads after the data folder's, are the installed build's
+       keys in use until some are installed here */
+    {
+        char *home = snx_path_join(temporary, "home"), *saved_home = getenv("HOME") ? SDL_strdup(getenv("HOME")) : NULL;
+        char *dir = snx_path_join(home, ".switch"), *found = snx_path_join(dir, "prod.keys"), *in_use;
+        assert(!snx_mkdirs(dir) && !snx_write_file(found, "home keys", 9));
+        SDL_setenv_unsafe("HOME", home, 1);
+        in_use = keys_in_use(&app);
+        assert(in_use && !strcmp(in_use, app.keys_path)); /* those installed above come first */
+        free(in_use);
+        assert(!snx_remove_tree(app.keys_path));
+        in_use = keys_in_use(&app);
+        assert(in_use && !strcmp(in_use, found));
+        free(in_use);
+        key(&app, SDLK_RETURN);
+        assert(app.menu.view == GUI_LOAD_KEYS);
+        render(&app);
+        key(&app, SDLK_ESCAPE);
+        if (saved_home)
+            SDL_setenv_unsafe("HOME", saved_home, 1);
+        else
+            SDL_unsetenv_unsafe("HOME");
+        SDL_free(saved_home);
+        free(found);
+        free(dir);
+        free(home);
+    }
+#endif
     key(&app, SDLK_RIGHT);
     assert(app.menu.selected == GUI_FULLSCREEN);
     key(&app, SDLK_SPACE);
@@ -1320,13 +1351,65 @@ int main(int argc, char** argv) {
         app.cwd = SDL_strdup(temporary);
         snprintf(app.message, sizeof(app.message), "before the log");
         app.menu.selected = GUI_LOG;
+#ifdef SNX_XDG
+        /* an installed build's in its state folder, as the working folder is the home folder from the desktop */
+        char *state = snx_path_join(temporary, "state"), *logged = snx_path_join(state, "scarletnx/scarletnx.log");
+        char* installed_dir = app.data_dir;
+        SDL_setenv_unsafe("XDG_STATE_HOME", state, 1);
+        key(&app, SDLK_RETURN);
+        assert(strstr(app.message, logged) && !snx_path_exists(saved));
+        text = (char*)snx_read_file(logged, &size);
+        assert(text && strstr(text, "Message: before the log"));
+        free(text);
+        free(logged);
+        free(state);
+        /* any other build's (a checkout, a portable copy) in the working folder */
+        app.data_dir = snx_strdup(temporary);
+        snprintf(app.message, sizeof(app.message), "before the log");
+#endif
         key(&app, SDLK_RETURN);
         assert(!strncmp(app.message, "Log saved to ", 13) && strstr(app.message, "scarletnx.log"));
         text = (char*)snx_read_file(saved, &size);
         assert(text && strstr(text, "Message: before the log") && strstr(text, "== the last run: "));
         free(text);
         free(saved);
+#ifdef SNX_XDG
+        free(app.data_dir);
+        app.data_dir = installed_dir;
+#endif
     }
+#ifdef SNX_XDG
+    /* the menu's recent.txt and last-run.log in the state folder's gui/, moved there from the data folder's */
+    {
+        char *data = snx_path_join(temporary, "data"), *state = snx_path_join(temporary, "state");
+        char *old = snx_path_join(data, "scarletnx/gui"), *recent = snx_path_join(old, "recent.txt");
+        char *run = snx_path_join(old, "last-run.log"), *folder, *expected = snx_path_join(state, "scarletnx/gui"),
+             *moved;
+        assert(!snx_mkdirs(old) && !snx_write_file(recent, "recent", 6) && !snx_write_file(run, "run", 3));
+        SDL_setenv_unsafe("XDG_DATA_HOME", data, 1);
+        folder = state_folder();
+        assert(folder && !strcmp(folder, expected) && !snx_path_exists(old));
+        moved = snx_path_join(folder, "recent.txt");
+        assert(snx_file_size(moved) == 6);
+        free(moved);
+        moved = snx_path_join(folder, "last-run.log");
+        assert(snx_file_size(moved) == 3);
+        free(moved);
+        free(folder);
+        /* and an empty state folder is made for the first run */
+        assert(!snx_remove_tree(state));
+        folder = state_folder();
+        assert(folder && snx_is_dir(folder));
+        free(folder);
+        SDL_setenv_unsafe("XDG_DATA_HOME", "/nonexistent/snx-gui-test", 1);
+        free(expected);
+        free(run);
+        free(recent);
+        free(old);
+        free(state);
+        free(data);
+    }
+#endif
     /* the system's picker, as the Android menu opens it for a file to load or for the keys: a document with no path
        stays on the screen, and so does none, saying so, for the screen's messages to be read; a path loads */
     app.picked = SDL_RegisterEvents(1);
