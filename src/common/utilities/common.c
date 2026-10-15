@@ -613,29 +613,100 @@ SnxU64 snx_free_space(const char* path) {
 /* The per-user folder of an installed build, which has no checkout: $XDG_DATA_HOME/scarletnx or
    ~/.local/share/scarletnx, ~/Library/Application Support/scarletnx on macOS, %APPDATA%\scarletnx on Windows. These are
    the folders SDL_GetPrefPath("scarletnx", ...) gives the GUI. NULL when the environment names no home */
-char* snx_user_data_dir(void) {
-    const char* base;
-#ifdef _WIN32
-    base = getenv("APPDATA");
-    return base && base[0] ? snx_path_join(base, "scarletnx") : NULL;
-#else
+#ifndef _WIN32
+/* $var/scarletnx, else ~/fallback/scarletnx: the XDG spec ignores a relative path */
+static char* home_folder(const char* var, const char* fallback) {
+    const char* base = var ? getenv(var) : NULL;
     char *parent, *path;
-    base = getenv("XDG_DATA_HOME");
-#ifndef __APPLE__
-    /* the XDG spec ignores a relative XDG_DATA_HOME */
     if (base && base[0] == '/') return snx_path_join(base, "scarletnx");
-#endif
     base = getenv("HOME");
     if (!base || !base[0]) return NULL;
-#ifdef __APPLE__
-    parent = snx_path_join(base, "Library/Application Support");
-#else
-    parent = snx_path_join(base, ".local/share");
-#endif
-    path = parent ? snx_path_join(parent, "scarletnx") : NULL;
+    parent = snx_path_join(base, fallback);
+    path = snx_path_join(parent, "scarletnx");
     free(parent);
     return path;
+}
 #endif
+char* snx_user_data_dir(void) {
+#ifdef _WIN32
+    const char* base = getenv("APPDATA");
+    return base && base[0] ? snx_path_join(base, "scarletnx") : NULL;
+#elif defined(__APPLE__)
+    return home_folder(NULL, "Library/Application Support");
+#else
+    return home_folder("XDG_DATA_HOME", ".local/share");
+#endif
+}
+char* snx_user_dir(int kind) {
+#ifdef SNX_XDG
+    if (kind == SNX_USER_CONFIG) return home_folder("XDG_CONFIG_HOME", ".config");
+    if (kind == SNX_USER_STATE) return home_folder("XDG_STATE_HOME", ".local/state");
+    if (kind == SNX_USER_CACHE) return home_folder("XDG_CACHE_HOME", ".cache");
+#else
+    (void)kind;
+#endif
+    return snx_user_data_dir();
+}
+char* snx_user_path(const char* path, int kind) {
+    char *data = snx_user_data_dir(), *root = snx_user_dir(kind), *full = NULL, *base = NULL, *moved = NULL;
+    const char* rest;
+    /* both resolved: a data folder reached through a link is still the data folder */
+    if (data && root && strcmp(data, root)) {
+        full = snx_absolute(path);
+        base = snx_absolute(data);
+    }
+    if (full && base && snx_path_within(full, base)) {
+        rest = full + strlen(base);
+        while (separator(*rest)) ++rest;
+        moved = *rest ? snx_path_join(root, rest) : snx_strdup(root);
+    }
+    free(data);
+    free(root);
+    free(full);
+    free(base);
+    return moved ? moved : snx_strdup(path);
+}
+int snx_move_old(const char* from, const char* to, int copy) {
+    char *folder, *staged;
+    int moved;
+    if (!strcmp(from, to) || !snx_path_exists(from) || snx_path_exists(to)) return SNX_MOVE_NONE;
+    folder = snx_dirname(to);
+    moved = !snx_mkdirs(folder) && !snx_replace(from, to);
+    free(folder);
+    if (moved) return SNX_MOVE_DONE;
+    /* another filesystem (~/.cache often is one): the copy lands beside to under another name, so a stopped copy is
+       never taken for the file */
+    if (!copy || snx_is_link(from) || !snx_is_file(from)) return SNX_MOVE_LEFT;
+    staged = snx_format("%s.moving", to);
+    moved = !snx_copy_file(from, staged) && !snx_replace(staged, to);
+    if (!moved) remove_one(staged, 0);
+    free(staged);
+    if (!moved) return SNX_MOVE_LEFT;
+    remove_one(from, 0);
+    return SNX_MOVE_DONE;
+}
+char* snx_work_dir(const char* data_dir) {
+    char *old = snx_path_join(data_dir, "work"), *work = snx_user_path(old, SNX_USER_CACHE), *from, *to, **names;
+    size_t i, n;
+    int left = 0;
+    if (strcmp(old, work) && snx_is_dir(old) && !snx_list_dir(old, &names, &n)) {
+        for (i = 0; i < n; ++i) {
+            from = snx_path_join(old, names[i]);
+            to = snx_path_join(work, names[i]);
+            if (snx_move_old(from, to, 0) == SNX_MOVE_DONE) printf("Moved %s to %s\n", from, to);
+            left |= snx_path_exists(from);
+            free(from);
+            free(to);
+        }
+        snx_free_strings(names, n);
+        if (left)
+            printf("%s holds extractions an older version made: this one makes them in %s, so they can be deleted\n",
+                   old, work);
+        else
+            remove_one(old, 1);
+    }
+    free(old);
+    return work;
 }
 char* snx_data_dir(const char* checkout, const char* program_dir) {
     const char *appimage = getenv("APPIMAGE"), *appdir = getenv("APPDIR");

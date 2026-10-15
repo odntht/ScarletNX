@@ -43,6 +43,26 @@ int snx_write_file(const char* path, const void* data, size_t size);
 int snx_write_changed(const char* path, const void* data, size_t size);
 char* snx_temp_dir(const char* parent);
 char* snx_user_data_dir(void);
+/* Systems that follow the XDG Base Directory spec, where settings, state and caches have folders of their own */
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
+#define SNX_XDG 1
+#endif
+enum { SNX_USER_DATA, SNX_USER_CONFIG, SNX_USER_STATE, SNX_USER_CACHE };
+/* An installed build's folder for one kind of file: $XDG_CONFIG_HOME/scarletnx (~/.config), $XDG_STATE_HOME/scarletnx
+   (~/.local/state) or $XDG_CACHE_HOME/scarletnx (~/.cache), a relative path ignored. Without SNX_XDG all four are the
+   data folder. NULL when the environment names no home */
+char* snx_user_dir(int kind);
+/* A path in the user's data folder, moved to the same place in the folder of kind: games/X.ini of the data folder is
+   games/X.ini of the config folder. Any other path (a checkout, a portable copy, --outdir) is returned as it is */
+char* snx_user_path(const char* path, int kind);
+enum { SNX_MOVE_NONE, SNX_MOVE_DONE, SNX_MOVE_LEFT };
+/* Moves what an older build left at from to to, never over something already there: SNX_MOVE_NONE when there is
+   nothing to move or to is taken, SNX_MOVE_DONE, SNX_MOVE_LEFT when from stays. Across filesystems, where a rename
+   fails, a file is copied when copy is set; a folder stays */
+int snx_move_old(const char* from, const char* to, int copy);
+/* work/ of a data folder, the drivers' extractions: an installed build's is in its cache folder, and an older build's
+   extractions move there first, a line each on stdout; what cannot move stays, with a line saying so */
+char* snx_work_dir(const char* data_dir);
 /* The folder work/, games/ and the keys are in when a run names none (--repo), and the menu's games/: the checkout a build
    came from; else, when a games/ folder is beside it, the folder of the AppImage or of the program (a portable copy);
    else the user's data folder. NULL when none can be named */
