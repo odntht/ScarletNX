@@ -9,6 +9,8 @@
 #include "hle/kernel/kernel.h"
 #include "memory/mem.h"
 #include "runtime/ini.h"
+#include "utilities/common.h"
+#include "utilities/ini_lines.h"
 #include "runtime/platform/backend.h"
 #include "runtime/platform/log.h"
 #include "runtime/platform/plat.h"
@@ -58,7 +60,7 @@ static int ini_removed(const char* k) {
         if (!strcmp(k, INI_REMOVED[i])) return 1;
     return 0;
 }
-/* everything we read, so the rewrite keeps unknown keys. A line is at most INI_LINE bytes */
+/* everything we read, so the rewrite keeps unknown keys. A value is under INI_LINE bytes */
 #define INI_MAXK 128
 #define INI_LINE 2048
 static char g_ini_k[INI_MAXK][64], g_ini_v[INI_MAXK][INI_LINE];
@@ -266,41 +268,24 @@ static int file_hash(const char* p, u64* h) {
 }
 /* the file's keys into the store, applied: 0, -1 when it can't be read (errno says why) */
 static int ini_load(const char* path) {
-    FILE* f = fopen(path, "r");
-    if (!f) return -1;
-    char ln[INI_LINE];
-    int first = 1;
-    while (fgets(ln, sizeof ln, f)) {
-        char* k = ln;
-        if (!strchr(ln, '\n') && !feof(f)) { /* longer than a line can be: dropped, not cut */
-            int c;
-            while ((c = fgetc(f)) != EOF && c != '\n') {}
-            WARN_LIMIT(
-                1, "settings: a line of %s is longer than %d bytes: it is not read, and the rewritten file drops it\n",
-                path, INI_LINE - 2);
+    size_t size;
+    char* text = (char*)snx_read_file(path, &size);
+    SnxIni ini;
+    char *k, *v;
+    if (!text) return -1;
+    snx_ini_start(&ini, text); /* sections only arrange the file: a key means the same in any */
+    while (snx_ini_next(&ini, &k, &v)) {
+        if (strlen(v) >= INI_LINE) { /* longer than the store keeps: dropped, not cut */
+            WARN_LIMIT(1,
+                       "settings: %s's %s is longer than %d bytes: it is not read, and the rewritten file drops it\n",
+                       path, k, INI_LINE - 1);
             continue;
-        }
-        if (first && !strncmp(k, "\xEF\xBB\xBF", 3)) k += 3; /* the UTF-8 mark Windows editors may start with */
-        first = 0;
-        while (*k == ' ' || *k == '\t') k++;
-        char* eq = strchr(k, '=');
-        if (!eq || *k == ';' || *k == '#' || *k == '[') continue;
-        *eq = 0;
-        char* v = eq + 1;
-        char* nl = strpbrk(v, "\r\n");
-        if (nl) *nl = 0;
-        char* ke = k + strlen(k);
-        while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) *--ke = 0;
-        while (*v == ' ' || *v == '\t') v++;
-        {
-            char* ve = v + strlen(v);
-            while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t')) *--ve = 0;
         }
         if (ini_removed(k)) continue;
         ini_store(k, v);
         if (!ini_overridden(k)) ini_apply(k, v);
     }
-    fclose(f);
+    free(text);
     return 0;
 }
 /* the startup-only keys, wrapped to the header's box */

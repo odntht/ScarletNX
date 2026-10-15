@@ -317,6 +317,10 @@ add_executable(snx-test-ini ini.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
 snx_test_target(snx-test-ini 11)
 target_compile_options(snx-test-ini PRIVATE -UNDEBUG) # its checks are asserts
 add_test(NAME ini COMMAND snx-test-ini)
+add_executable(snx-test-ini-lines ini_lines.c "${PROJECT_SOURCE_DIR}/src/common/utilities/ini_lines.c")
+snx_test_target(snx-test-ini-lines 90)
+target_compile_options(snx-test-ini-lines PRIVATE -UNDEBUG) # its checks are asserts
+add_test(NAME ini_lines COMMAND snx-test-ini-lines)
 
 # the controls' atlas and their shaders are generated and checked in: their sources must still make them
 find_package(Python3 QUIET COMPONENTS Interpreter)

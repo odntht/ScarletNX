@@ -2,6 +2,7 @@
    Copyright 2026 the ScarletNX contributors */
 #include "theme.h"
 #include "common.h"
+#include "ini_lines.h"
 #include "gui_themes.h"
 #include <stdlib.h>
 #include <string.h>
@@ -14,13 +15,6 @@ typedef char snx_gui_id_slot[sizeof(((GuiThemes*)0)->ids[0]) == sizeof(((GuiThem
 static const char* const screens[GUI_SCREEN_COUNT] = {"menu", "games", "keys", "compiling", "loading"};
 static const char* const rings[] = {"none", "left", "right", "right-near-text"};
 
-static char* trim(char* s) {
-    size_t n;
-    while (*s == ' ' || *s == '\t') ++s;
-    n = strlen(s);
-    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r')) s[--n] = 0;
-    return s;
-}
 /* "quoted" keeps its spaces */
 static char* unquote(char* s) {
     size_t n = strlen(s);
@@ -216,37 +210,17 @@ static const GuiTheme* layout_base(const char* layout) {
 }
 static int visit(const char* text, size_t size, GuiTheme* theme, const GuiTheme** bases, int base_only,
                  int run_colors) {
-    char section[32];
-    char* line;
-    char* next;
+    SnxIni ini;
+    char* key;
+    char* value;
     char* copy_of = malloc(size + 1);
     if (!copy_of) return 0;
     memcpy(copy_of, text, size);
     copy_of[size] = 0;
-    memset(section, 0, sizeof section);
-    for (line = copy_of; line; line = next) {
-        char* key;
-        char* value;
-        char* equals;
-        char* s;
-        next = strchr(line, '\n');
-        if (next) *next++ = 0;
-        s = trim(line);
-        if (!*s || *s == ';' || *s == '#') continue;
-        if (*s == '[') {
-            char* end = strchr(s, ']');
-            if (end && (size_t)(end - s - 1) < sizeof section) {
-                memcpy(section, s + 1, (size_t)(end - s - 1));
-                section[end - s - 1] = 0;
-            } else
-                section[0] = 0;
-            continue;
-        }
-        equals = strchr(s, '=');
-        if (!equals) continue;
-        *equals = 0;
-        key = trim(s);
-        value = unquote(trim(equals + 1));
+    snx_ini_start(&ini, copy_of);
+    while (snx_ini_next(&ini, &key, &value)) {
+        const char* section = ini.section;
+        value = unquote(value);
         if (base_only) {
             if (!strcmp(section, "theme") && !strcmp(key, "base") && gui_theme_builtin(value))
                 bases[0] = gui_theme_builtin(value);
