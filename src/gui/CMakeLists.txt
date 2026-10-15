@@ -90,6 +90,11 @@ if(BUILD_TESTING)
     target_compile_definitions(snx-test-gui-theme-formats PRIVATE
                                SNX_GUI_THEME_FIXTURES="${PROJECT_SOURCE_DIR}/tests/gui_themes")
     add_test(NAME gui_theme_formats COMMAND snx-test-gui-theme-formats)
+    add_executable(snx-test-gui-theme-write "${PROJECT_SOURCE_DIR}/tests/gui_theme_write.c")
+    target_link_libraries(snx-test-gui-theme-write PRIVATE snx_gui_support scarletnx-common)
+    target_compile_definitions(snx-test-gui-theme-write PRIVATE
+                               SNX_GUI_THEME_FIXTURES="${PROJECT_SOURCE_DIR}/tests/gui_themes")
+    add_test(NAME gui_theme_write COMMAND snx-test-gui-theme-write)
     add_executable(snx-test-gui-process "${PROJECT_SOURCE_DIR}/tests/gui_process.c")
     target_link_libraries(snx-test-gui-process PRIVATE snx_gui_support scarletnx-common)
     add_test(NAME gui_process_tree COMMAND snx-test-gui-process)
@@ -99,7 +104,7 @@ if(BUILD_TESTING)
     target_link_libraries(snx-test-gui-sdl PRIVATE snx_gui_support scarletnx-common SDL3::SDL3 snx_window_icon
                           snx_build_info)
     foreach(test snx-test-gui-model snx-test-gui-cia-browser snx-test-gui-recent snx-test-gui-steps snx-test-gui-theme snx-test-gui-process
-                 snx-test-gui-sdl snx-test-gui-theme-formats)
+                 snx-test-gui-sdl snx-test-gui-theme-formats snx-test-gui-theme-write)
         target_compile_options(${test} PRIVATE -Wall -Wextra -Werror -UNDEBUG)
     endforeach()
     add_test(NAME gui_sdl_events COMMAND snx-test-gui-sdl)
