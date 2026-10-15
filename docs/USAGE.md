@@ -224,7 +224,7 @@ the rest goes in the folder of its kind. A relative `$XDG_*_HOME` is ignored, as
 | `~/.local/state/scarletnx/games/` (`$XDG_STATE_HOME`) | `Game.log`, `threads.txt` |
 | `~/.local/state/scarletnx/` | the menu's Share log, `scarletnx.log` |
 | `~/.local/state/scarletnx/gui/` | the menu's `recent.txt` and `last-run.log`, for every copy (the checkout's too) |
-| `~/.cache/scarletnx/` (`$XDG_CACHE_HOME`) | `work/`, `games/shader_cache/` |
+| `~/.cache/scarletnx/` (`$XDG_CACHE_HOME`) | `work/` (`work/3ds/` for the 3DS driver), `games/shader_cache/` |
 
 What an older version left in the data folder moves to these on first use, a line in the output or the game's log for
 each; across filesystems a file is copied, and `work/` stays where it is with a line saying it can be deleted. The
