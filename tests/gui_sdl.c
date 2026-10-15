@@ -55,6 +55,20 @@ static void swipe(App* app, int col, int row, int to_col, int to_row) {
     event(app, &e);
 }
 static void tap(App* app, int col, int row) { swipe(app, col, row, col, row); }
+/* a key with a modifier held, and text as a keyboard types it */
+static void key_with(App* app, SDL_Keycode code, SDL_Keymod mod) {
+    SDL_Event e = {0};
+    e.type = SDL_EVENT_KEY_DOWN;
+    e.key.key = code;
+    e.key.mod = mod;
+    event(app, &e);
+}
+static void typed(App* app, const char* text) {
+    SDL_Event e = {0};
+    e.type = SDL_EVENT_TEXT_INPUT;
+    e.text.text = text;
+    event(app, &e);
+}
 /* what the system's picker answers, from its own thread */
 static void pick(App* app, const char* uri) {
     SDL_Event e = {0};
@@ -984,6 +998,67 @@ int main(int argc, char** argv) {
         free(custom_ini);
         free(custom);
         free(themes);
+
+        /* The theme editor: its screen in the menu's theme, a preview the menu's own drawing makes in the theme being
+           edited, a typed value, the preview's switch, and Save making it the menu's theme */
+        {
+            int col, prow, cols, rows, r;
+            SDL_Color night = {0x10, 0x20, 0x30, 255};
+            char* saved = snx_format("%s/themes/mytheme/theme.ini", temporary);
+            mouse(&app, 2, menu_row(&app, GUI_THEME_EDIT), true);
+            assert(app.editing && !strcmp(app.editor.id, "mytheme") && !strcmp(app.editor.theme.id, "default"));
+            render(&app);
+            colored_text_at(&app, 1, 0, "THEME EDITOR  /  mytheme", normal);
+            preview_box(&app, &col, &prow, &cols, &rows);
+            /* page = #102030, typed: the preview's page takes it, the editor's own stays the menu's */
+            for (r = 0; !gui_editor_key_of(r) || strcmp(gui_editor_key_of(r)->key, "page"); ++r) {}
+            app.editor.row = r;
+            key(&app, SDLK_RETURN);
+            assert(app.editor.typing && SDL_TextInputActive(app.window));
+            for (int i = 0; i < 7; ++i) key(&app, SDLK_BACKSPACE);
+            typed(&app, "#102030");
+            key(&app, SDLK_RETURN);
+            assert(!app.editor.typing && !SDL_TextInputActive(app.window) && app.editor.dirty);
+            assert(!strcmp(app.editor.text, "#102030"));
+            render(&app);
+            assert(same_colour(
+                pixel(&app, (col + cols * 76.0f / 80) * 8 * app.scale, (prow + rows * 12.5f / 25) * 16 * app.scale),
+                night));
+            assert(same_colour(pixel(&app, 4, (app.rows - 4) * 16.0f * app.scale + 8), black));
+            /* Tab, or a tap on the preview: a run in the theme, then the menu again */
+            key(&app, SDLK_TAB);
+            assert(app.editor.preview == GUI_SCREEN_COMPILING);
+            render(&app);
+            mouse(&app, col + 2, prow + 2, true);
+            assert(app.editor.preview == GUI_SCREEN_MENU);
+            /* a space typed arrives as text: the key itself, Select elsewhere, does not take a text value */
+            app.editor.row = 1; /* [theme] name */
+            key(&app, SDLK_RETURN);
+            typed(&app, "x");
+            key(&app, SDLK_SPACE);
+            assert(app.editor.typing);
+            key(&app, SDLK_ESCAPE);
+            assert(!app.editor.typing && strcmp(app.editor.theme.name, "Defaultx"));
+            /* a click focuses a row, a click on the focused one changes it */
+            mouse(&app, 2, 4 + 2 - app.editor.top, true);
+            assert(app.editor.row == 2 && !app.editor.typing);
+            /* ESC over changes asks first; Ctrl+S saves in themes/mytheme, and the menu's theme is it */
+            key(&app, SDLK_ESCAPE);
+            assert(app.editing && app.editor.leaving);
+            key_with(&app, SDLK_S, SDL_KMOD_LCTRL);
+            assert(snx_is_file(saved) && !app.editor.dirty && !strcmp(app.theme.id, "mytheme"));
+            assert(same_colour(rgb(app.theme.page), night));
+            key(&app, SDLK_ESCAPE); /* nothing left unsaved: it leaves at once */
+            assert(!app.editing);
+            render(&app);
+            colored_text_on(&app, 1, menu_row(&app, GUI_THEME), "- Theme: Default", normal, night);
+            /* opened on a theme of themes/, it saves there under its own name */
+            mouse(&app, 2, menu_row(&app, GUI_THEME_EDIT), true);
+            assert(app.editing && !strcmp(app.editor.id, "mytheme") && !strcmp(app.editor.file.base, "default"));
+            key(&app, SDLK_ESCAPE);
+            assert(!app.editing);
+            free(saved);
+        }
 
         /* YoRHa loading: a run as steps, typed in, with the ring, the dots and the bar; the run fades in, and out */
         steps_input = snx_path_join(temporary, "option flags steps.nro");

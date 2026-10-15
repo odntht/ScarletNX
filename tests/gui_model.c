@@ -94,6 +94,10 @@ int main(void) {
     gui_menu_key(&menu, GUI_SELECT);
     assert(menu.selected == GUI_THEME && menu.theme_next && !menu.quit);
     menu.theme_next = false; /* the GUI's to clear */
+    gui_menu_key(&menu, GUI_DOWN);
+    gui_menu_key(&menu, GUI_SELECT);
+    assert(menu.selected == GUI_THEME_EDIT && menu.theme_edit && !menu.theme_next && menu.view == GUI_LOAD_NONE);
+    menu.theme_edit = 0; /* the GUI's to clear */
     /* Text size goes round 1x to the largest, then back to fitting the screen */
     gui_menu_key(&menu, GUI_DOWN);
     assert(menu.selected == GUI_TEXT && !menu.text_size);

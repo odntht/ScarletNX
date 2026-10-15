@@ -64,6 +64,15 @@ build of a detached checkout outside CI says `detached`, and both read `unknown`
   Switch options; they are never forwarded as Linux guest arguments or to the 3DS driver.
 - **Theme** switches to the next theme: the built-in Default and YoRHa, then each
   folder of `themes/` (see [Themes](#themes)). It lasts for the session.
+- **Theme editor** opens the theme shown in a screen of its own: a row per key of its
+  `theme.ini` with its value, and beside them the menu or a run (Tab, or a tap on it)
+  drawn in the theme as it is. Up and Down move, Left and Right change a word, a switch
+  or a number, and Enter (a tap on the focused row) changes a word or types the others: a
+  colour as `#RRGGBB`, a text, a number; what the key does not take stays typed, with a note.
+  Save, or Ctrl+S, writes `themes/<folder>/theme.ini` in the data folder, the first row
+  naming the folder, and the menu takes the theme; ESC leaves, asking once over changes.
+  A built-in is saved as a new theme (`mytheme` until renamed); a theme of `themes/` is
+  saved in its own folder, with the keys it had that the GUI does not read.
 - **Text size** steps the menu's letters through Auto (fit the screen) and four sizes.
   Bigger letters scroll the menu.
 - **Share log** saves the last run's output and game log to `scarletnx.log`. On the
@@ -172,8 +181,8 @@ nothing else: each folder of `src/gui/themes/` is one, its `theme.ini` compiled 
 takes YoRHa's colours from the same file at build time. The files are copied beside the GUI
 in the build and installed with it: copy one under a new name to make a theme, or edit one
 to change the built-in. `[theme] base` picks the built-in a file starts from, and a key it
-leaves out, or that cannot be read, keeps the base's value. The theme builder at
-<https://scarletnx.github.io/theme/> writes a theme.ini with a preview drawn as the GUI draws.
+leaves out, or that cannot be read, keeps the base's value. The menu's **Theme editor**
+writes a theme.ini with every key, a preview beside it drawn by the menu's own code.
 
 ```ini
 [theme]
@@ -280,8 +289,9 @@ ErET needs `[theme] layout`, so the built-in files carry one: `debug` and `menu`
 
 - A file of a format the GUI knows reads the same in it and in every later GUI: each key
   keeps its meaning, and each value reads to the same theme. `tests/gui_themes/<N>/` holds
-  files of format N as the theme builder writes them, with the theme each reads to
-  (`<name>.json`, the GUI's fields in the builder's names); `gui_theme_formats` checks them.
+  files of format N as a theme tool wrote them, with the theme each reads to (`<name>.json`,
+  the GUI's fields by key); `gui_theme_formats` checks them, and `gui_theme_write` that each,
+  written again, reads to the same theme.
   They are never changed: a field added to themes later is simply not in an older one's JSON.
 - A new key, or a new word for a key, keeps N: an older GUI leaves what it does not know, and
   the base's value stays. A new key's value in the built-ins must keep an older file looking
@@ -290,9 +300,9 @@ ErET needs `[theme] layout`, so the built-in files carry one: `debug` and `menu`
   older format's files with the older meaning, their fixtures stay, and the new format's go
   in `tests/gui_themes/<N+1>/`.
 - A file of a newer format than the GUI's: the keys it knows still apply, the others are left.
-- The theme builder writes every key and the newest format it knows, so its files never lean
-  on a built-in's values, which may change. It reads an older file as that format reads, and
-  writes it in the current one.
+- The theme editor writes every key and the newest format it knows (`gui_theme_write`), so its
+  files never lean on a built-in's values, which may change. It reads an older file as that
+  format reads, and writes it in the current one.
 
 ## Building and testing
 

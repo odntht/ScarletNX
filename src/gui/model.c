@@ -86,6 +86,8 @@ void gui_menu_key(GuiMenu* menu, GuiKey key) {
                 menu->gdbstub = !menu->gdbstub;
             else if (menu->selected == GUI_THEME)
                 menu->theme_next = 1;
+            else if (menu->selected == GUI_THEME_EDIT)
+                menu->theme_edit = 1;
             else if (menu->selected == GUI_TEXT)
                 menu->text_size = (menu->text_size + 1) % (GUI_TEXT_MAX + 1);
             else if (menu->selected == GUI_LOG)
@@ -130,6 +132,7 @@ const char* gui_setting_description(const GuiMenu* menu) {
                                       : "Program was not compiled with libgccjit";
         case GUI_GDBSTUB: return "Enables gdbstub on port 1234";
         case GUI_THEME: return "Built-in themes, then each themes/<name>/theme.ini";
+        case GUI_THEME_EDIT: return "This theme's keys with a preview, saved as themes/<name>/theme.ini";
         case GUI_TEXT: return "Bigger letters scroll the menu. Auto fits the screen";
         case GUI_LOG:
 #ifdef __ANDROID__

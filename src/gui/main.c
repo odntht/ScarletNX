@@ -6,6 +6,7 @@
 #endif
 #include "common.h"
 #include "browser.h"
+#include "editor.h"
 #include "font.h"
 #include "model.h"
 #include "gui_process.h"
@@ -74,6 +75,12 @@ typedef struct {
     SDL_Texture* splash;      /* the boot's splash, its icon, until splash_until */
     Uint64 splash_until;
     GuiRgb splash_page;
+    bool editing; /* the theme editor's screen instead of the menu's */
+    GuiEditor editor;
+    SDL_Texture* preview;   /* the editor's: the menu or a run drawn in its theme, at 1x */
+    GuiSteps preview_steps; /* the run it shows, over again every GUI_PREVIEW_MS */
+    GuiConsole preview_console;
+    Uint64 preview_since;
 } App;
 static const char* const items[] = {"Load Switch NSP/XCI/NRO",
                                     "Load Linux ARM ELF",
@@ -85,6 +92,7 @@ static const char* const items[] = {"Load Switch NSP/XCI/NRO",
                                     "Enable libgccjit",
                                     "Enable gdbstub",
                                     "Theme",
+                                    "Theme editor",
                                     "Text size",
                                     "Share log",
                                     "Exit"};
@@ -103,6 +111,7 @@ static const char* const load_labels[] = {"-> Select a file", "-> Select file fr
 #define SAY_NO_GAMES   "No games in games/: put a game's .nro, .xci or .nsp there."
 #define SAY_COUNT      "game(s)"
 #define SAY_LOG_FAILED "The log could not be saved: allow the app access to files."
+#define SAY_EDITOR     "Tap a key to change it or type it. Back: go back."
 #else
 static const char* const load_labels[] = {"-> Select via drag and drop", "-> Select file from games/ instead"};
 #define SAY_MENU       "Arrows/mouse: move. Space/Enter/click: select."
@@ -117,6 +126,7 @@ static const char* const load_labels[] = {"-> Select via drag and drop", "-> Sel
 #define SAY_NO_GAMES   "No executables found in games/."
 #define SAY_COUNT      "executable(s)"
 #define SAY_LOG_FAILED "The log could not be saved in the working folder."
+#define SAY_EDITOR     "Up/Down: key. Left/Right: change. Enter: type. Ctrl+S: save. ESC: back."
 #endif
 static SDL_Color rgb(GuiRgb c) {
     SDL_Color out;
@@ -739,13 +749,12 @@ static int splash_shown(App* app) {
     SDL_RenderPresent(app->renderer);
     return 1;
 }
-static void render(App* app) {
+/* the menu's screen or a run's, in app->theme, on the render target as it is */
+static void draw_screen(App* app) {
     SDL_Color ink, soft, focus, paper, active, failure;
     const char* title;
     int head, foot, idle;
     const GuiTheme* theme;
-    layout(app);
-    if (splash_shown(app)) return;
     theme = &app->theme;
     idle = (!app->menu.running && !app->finished) || entering(app);
     head = theme->head != GUI_STYLE_NONE;
@@ -765,7 +774,6 @@ static void render(App* app) {
         render_steps(app);
         render_ask(app);
         overlay(app);
-        SDL_RenderPresent(app->renderer);
         return;
     }
     title = theme->title[idle ? (app->menu.view == GUI_LOAD_GAMES  ? GUI_SCREEN_GAMES
@@ -876,6 +884,229 @@ static void render(App* app) {
     if (foot) footer(app, app->rows - 3, 3, theme->page, theme->ink, theme->soft);
     render_ask(app);
     overlay(app);
+}
+
+/* ---- the theme editor (editor.c): its rows on the left, the menu or a run in its theme on the right ---- */
+#define GUI_PREVIEW_MS 8000
+static const char preview_run[] = "Extracting Cult of the Lamb.nsp\n"
+                                  "Extracted 3 NCAs, the program's 4 modules\n"
+                                  "Recompiling Cult of the Lamb (4 modules)\n"
+                                  "Functions: 48211  instructions: 2915002\n"
+                                  "LLVM: 5 code units and the module descriptor\n"
+                                  "  compiled block 1/6: code_000, 9874 functions (8.1 s)\n"
+                                  "  compiled block 2/6: code_001, 10022 functions (8.4 s)\n"
+                                  "  compiled block 3/6: code_002, 9567 functions (7.9 s)\n";
+/* the preview's cells: the right half, its page 640 x 400 (80 x 25 at 1x) kept 1.6 times as wide as high */
+static void preview_box(const App* app, int* col, int* row, int* cols, int* rows) {
+    *cols = SDL_max(16, app->cols / 2 - 2);
+    *rows = *cols * 5 / 16;
+    *col = app->cols - *cols;
+    *row = 4;
+}
+static void render_preview(App* app) {
+    static App saved; /* the whole app, put back after: drawing the preview borrows it */
+    SDL_FRect box;
+    int col, row, cols, rows;
+    int run = app->editor.preview != GUI_SCREEN_MENU;
+    Uint64 now = now_ms(app);
+    preview_box(app, &col, &row, &cols, &rows);
+    if (!app->preview) {
+        app->preview = SDL_CreateTexture(app->renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, 640, 400);
+        if (!app->preview) return;
+    }
+    if (!app->preview_since || now - app->preview_since >= GUI_PREVIEW_MS) {
+        app->preview_since = SDL_max(now, 1);
+        gui_steps_reset(&app->preview_steps);
+        gui_steps_feed(&app->preview_steps, preview_run, sizeof preview_run - 1, app->preview_since);
+        gui_console_init(&app->preview_console, 78, 17);
+        gui_console_feed(&app->preview_console, preview_run, sizeof preview_run - 1);
+    }
+    saved = *app;
+    app->theme = app->editor.theme;
+    app->scale = 1;
+    app->cols = 80;
+    app->rows = 25;
+    app->menu.view = GUI_LOAD_NONE;
+    app->menu.running = run;
+    app->finished = app->aborting = app->abnormal_exit = app->confirm.shown = false;
+    app->native = app->banner.seen = 0;
+    app->entering_ms = app->leaving_ms = 0;
+    app->fade_ms = run ? app->preview_since : 0; /* a run fades in from black, as after the menu */
+    app->message[0] = 0;
+    app->has_output = run;
+    if (run) {
+        app->steps = app->preview_steps;
+        app->console = app->preview_console;
+        app->file = (char*)"games/Cult of the Lamb.nsp";
+        app->menu.selected = GUI_SWITCH;
+    }
+    app->log_top = run ? 4 : menu_row(app, GUI_EXIT) + 6;
+    SDL_SetRenderTarget(app->renderer, app->preview);
+    SDL_SetRenderViewport(app->renderer, NULL);
+    draw_screen(app);
+    SDL_SetRenderTarget(app->renderer, NULL);
+    *app = saved;
+    set_area(app);
+    box.x = (float)(col * 8 * app->scale);
+    box.y = (float)(row * 16 * app->scale);
+    box.w = (float)(cols * 8 * app->scale);
+    box.h = (float)(rows * 16 * app->scale);
+    SDL_RenderTexture(app->renderer, app->preview, NULL, &box);
+    text(app, col, row + rows, run ? "Preview: a run (Tab: the menu)" : "Preview: the menu (Tab: a run)",
+         rgb(app->theme.soft));
+}
+/* the editor's rows between rows 4 and the last three, as many as fit */
+static int editor_rows(const App* app) { return SDL_max(1, app->rows - 7); }
+static void render_editor(App* app) {
+    GuiEditor* e = &app->editor;
+    const GuiTheme* theme = &app->theme;
+    const GuiThemeKey* focused = gui_editor_key_of(e->row);
+    char label[64], value[96], title[96];
+    int r, col, row, cols, rows, width;
+    SDL_SetRenderDrawColor(app->renderer, theme->page.r, theme->page.g, theme->page.b, 255);
+    SDL_RenderClear(app->renderer);
+    preview_box(app, &col, &row, &cols, &rows);
+    width = col - 2; /* the rows' text, left of the preview */
+    snprintf(title, sizeof title, "THEME EDITOR  /  %s", e->id);
+    if (theme->head == GUI_STYLE_BAR) band(app, 0, 1, theme->ink);
+    text(app, 1, 0, title, rgb(theme->head == GUI_STYLE_BAR ? theme->page : theme->ink));
+    text(app, 1, 1, SAY_EDITOR, rgb(theme->ink));
+    if (e->note[0])
+        text(app, 1, 2, e->note, rgb(e->leaving ? theme->failure : theme->focus));
+    else if (focused)
+        text(app, 1, 2, focused->about, rgb(theme->soft));
+    gui_editor_scroll(e, editor_rows(app));
+    for (r = e->top; r < gui_editor_rows() && r - e->top < editor_rows(app); ++r) {
+        const GuiThemeKey* k = gui_editor_key_of(r);
+        int y = 4 + r - e->top, at = 1 + 25;
+        char line[160];
+        gui_editor_label(r, label, sizeof label);
+        if (r == e->row && e->typing)
+            snprintf(value, sizeof value, "%s_", e->text);
+        else
+            gui_editor_value(e, r, value, sizeof value);
+        snprintf(line, sizeof line, "%s%-24s %s", theme->marker, label, value);
+        {
+            int n = 0; /* what fits left of the preview, a character at a time */
+            char* c;
+            for (c = line; *c && n < width; ++c) n += ((unsigned char)*c & 0xC0) != 0x80;
+            while (((unsigned char)*c & 0xC0) == 0x80) ++c;
+            *c = 0;
+        }
+        entry(app, 1, y, line, false, r == e->row);
+        if (k && k->type == GUI_KEY_COLOUR) {
+            const GuiRgb* c = (const GuiRgb*)((const char*)&e->theme + k->at);
+            float px = (float)app->scale, x0, y0 = (float)y * 16 * px + 2 * px;
+            at += (int)SDL_utf8strlen(theme->marker) + 8;
+            x0 = (float)at * 8 * px;
+            if (at + 2 <= width) { /* framed in soft, so a page-coloured one shows */
+                fill(app, x0, y0, 16 * px, 12 * px, theme->soft, 255);
+                fill(app, x0 + px, y0 + px, 14 * px, 10 * px, *c, 255);
+            }
+        }
+    }
+    snprintf(value, sizeof value, "Saves in %s", app->themes_dirs[0] ? app->themes_dirs[0] : "(no themes folder)");
+    text(app, 1, app->rows - 2, value, rgb(theme->soft));
+    render_preview(app);
+}
+static bool menu_key_of(const SDL_KeyboardEvent* k, GuiKey* key);
+/* the editor on the theme the menu shows: a folder of themes/ keeps its file's extras and its name, a built-in is
+   saved as a new theme */
+static void open_editor(App* app) {
+    GuiThemeFile file;
+    int from_file = 0;
+    size_t i;
+    for (i = 0; i < 2 && !from_file; ++i) {
+        char* folder = app->themes_dirs[i] ? snx_path_join(app->themes_dirs[i], app->theme.id) : NULL;
+        char* path = folder ? snx_path_join(folder, "theme.ini") : NULL;
+        size_t size = 0;
+        unsigned char* text = path ? snx_read_file(path, &size) : NULL;
+        from_file = text && gui_theme_file_read(&file, (const char*)text, size);
+        free(text);
+        free(path);
+        free(folder);
+    }
+    gui_editor_start(&app->editor, &app->theme, from_file ? &file : NULL, from_file ? app->theme.id : "mytheme");
+    if (from_file) gui_theme_file_free(&file);
+    app->editing = true;
+    app->preview_since = 0;
+}
+static void leave_editor(App* app) {
+    gui_editor_stop(&app->editor);
+    app->editing = false;
+    SDL_StopTextInput(app->window);
+}
+/* saved in themes/ of the data folder, and the menu's theme from then on */
+static void save_editor(App* app) {
+    const char* const* dirs = (const char* const*)app->themes_dirs;
+    if (gui_editor_save(&app->editor, app->themes_dirs[0])) return;
+    gui_themes_scan(&app->themes, dirs, 2);
+    gui_theme_load(&app->theme, dirs, 2, app->editor.id);
+}
+static void editor_key(App* app, GuiKey key) {
+    GuiEditorDo what = gui_editor_key(&app->editor, key);
+    if (what == GUI_EDITOR_SAVE) save_editor(app);
+    if (what == GUI_EDITOR_LEAVE) {
+        leave_editor(app);
+        return;
+    }
+    if (app->editor.typing && !SDL_TextInputActive(app->window))
+        SDL_StartTextInput(app->window); /* a phone's keyboard comes up */
+    else if (!app->editor.typing && SDL_TextInputActive(app->window))
+        SDL_StopTextInput(app->window);
+}
+/* keys and typed text: while a value is typed, Space and the letters are its text */
+static void editor_input(App* app, const SDL_Event* e) {
+    GuiKey key;
+    if (e->type == SDL_EVENT_TEXT_INPUT) {
+        gui_editor_type(&app->editor, e->text.text);
+        return;
+    }
+    if (e->key.key == SDLK_S && (e->key.mod & SDL_KMOD_CTRL) && !e->key.repeat) {
+        save_editor(app);
+        return;
+    }
+    if (e->key.key == SDLK_TAB && !e->key.repeat) {
+        app->editor.preview = app->editor.preview == GUI_SCREEN_MENU ? GUI_SCREEN_COMPILING : GUI_SCREEN_MENU;
+        app->preview_since = 0;
+        return;
+    }
+    if (app->editor.typing) {
+        if (e->key.key == SDLK_BACKSPACE) gui_editor_erase(&app->editor);
+        if (e->key.key == SDLK_V && (e->key.mod & SDL_KMOD_CTRL)) {
+            char* clipboard = SDL_GetClipboardText();
+            gui_editor_type(&app->editor, clipboard ? clipboard : "");
+            SDL_free(clipboard);
+        }
+        if (e->key.key == SDLK_SPACE) return;
+    }
+    if (menu_key_of(&e->key, &key)) editor_key(app, key);
+}
+/* a click or a tap on a row focuses it, and on the focused one is Select; on the preview it switches the screen */
+static void editor_pointer(App* app, float x, float y, bool click) {
+    int col, row, cols, rows, r = app->editor.top + (int)y - 4;
+    preview_box(app, &col, &row, &cols, &rows);
+    if (!click) return;
+    if (x >= col && x < col + cols && y >= row && y < row + rows + 1) {
+        app->editor.preview = app->editor.preview == GUI_SCREEN_MENU ? GUI_SCREEN_COMPILING : GUI_SCREEN_MENU;
+        app->preview_since = 0;
+        return;
+    }
+    if (y < 4 || r < 0 || r >= gui_editor_rows() || (int)y - 4 >= editor_rows(app)) return;
+    if (r == app->editor.row && !app->editor.typing)
+        editor_key(app, GUI_SELECT);
+    else if (r != app->editor.row) {
+        if (app->editor.typing) editor_key(app, GUI_CANCEL);
+        app->editor.row = r;
+    }
+}
+static void render(App* app) {
+    layout(app);
+    if (splash_shown(app)) return;
+    if (app->editing)
+        render_editor(app);
+    else
+        draw_screen(app);
     SDL_RenderPresent(app->renderer);
 }
 /* the game's name as its run gave it, from the step that names it, for its recent game */
@@ -1314,6 +1545,10 @@ static void menu_key(App* app, GuiKey key) {
         app->menu.theme_next = 0;
         next_theme(app);
     }
+    if (app->menu.theme_edit) {
+        app->menu.theme_edit = 0;
+        open_editor(app);
+    }
     if (app->menu.share_log) {
         app->menu.share_log = 0;
         share_log(app);
@@ -1369,6 +1604,10 @@ static void pointer(App* app, float window_x, float window_y, bool click, bool t
     if (!SDL_RenderCoordinatesFromWindow(app->renderer, window_x, window_y, &x, &y)) return;
     x /= 8 * app->scale;
     y /= 16 * app->scale;
+    if (app->editing) {
+        editor_pointer(app, x, y, click);
+        return;
+    }
     if (app->confirm.shown) {
         ask_pointer(app, x, y, click);
         return;
@@ -1470,18 +1709,20 @@ static Uint64 finger_id(const SDL_TouchFingerEvent* f) {
 static bool drags(const App* app, float x, float y) {
     float dx = x - app->finger_x, dy = y - app->finger_y;
     return SDL_fabsf(dy) > 0.05f && SDL_fabsf(dy) > 2 * SDL_fabsf(dx) && app->menu.view != GUI_LOAD_GAMES &&
-           !app->menu.running && !app->finished && menu_row_in_full(app, GUI_EXIT) > menu_last_row(app);
+           !app->menu.running && !app->finished &&
+           (app->editing || menu_row_in_full(app, GUI_EXIT) > menu_last_row(app));
 }
 /* the focus follows the finger, up as it goes up, a row each time it passes a row's height, so the highlight is seen
    going */
 static void drag(App* app, float y) {
     float row = 1.0f / (float)SDL_max(1, app->rows);
+    void (*key)(App*, GuiKey) = app->editing ? editor_key : menu_key;
     while (y <= app->finger_mark - row) {
-        menu_key(app, GUI_UP);
+        key(app, GUI_UP);
         app->finger_mark -= row;
     }
     while (y >= app->finger_mark + row) {
-        menu_key(app, GUI_DOWN);
+        key(app, GUI_DOWN);
         app->finger_mark += row;
     }
 }
@@ -1555,6 +1796,10 @@ static void event(App* app, const SDL_Event* e) {
     if (app->splash && (e->type == SDL_EVENT_KEY_DOWN || e->type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
                         e->type == SDL_EVENT_FINGER_DOWN || e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN)) {
         app->splash_until = 0;
+        return;
+    }
+    if (app->editing && (e->type == SDL_EVENT_KEY_DOWN || e->type == SDL_EVENT_TEXT_INPUT)) {
+        editor_input(app, e);
         return;
     }
     if (e->type == SDL_EVENT_DROP_FILE || e->type == SDL_EVENT_DROP_TEXT) {
@@ -1711,6 +1956,8 @@ static void cleanup(App* app) {
     free(app->run_log);
     gui_games_free(&app->games);
     SDL_free(app->cwd);
+    if (app->editing) gui_editor_stop(&app->editor);
+    SDL_DestroyTexture(app->preview);
     SDL_DestroyTexture(app->splash);
     SDL_DestroyTexture(app->font);
     SDL_DestroyRenderer(app->renderer);
