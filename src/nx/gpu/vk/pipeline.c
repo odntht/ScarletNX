@@ -195,7 +195,7 @@ void vk_pipeline_init(void) {
                                      .pPushConstantRanges = &pc};
     if (!VK_OK(vkCreatePipelineLayout(g_vk.dev, &pl, NULL, &g_vk_playout)))
         fatal("vulkan: cannot create shader pipeline layout");
-    snprintf(g_cache_dir, sizeof g_cache_dir, "%sshader_cache", g_exedir);
+    snprintf(g_cache_dir, sizeof g_cache_dir, "%sshader_cache", g_cachedir);
     plat_mkdir(g_cache_dir);
     snprintf(g_pcache_path, sizeof g_pcache_path, "%s/vk_pipelines.bin", g_cache_dir);
     /* the temporary name is the process's own: two games running at once would otherwise write the same file */

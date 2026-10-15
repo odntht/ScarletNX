@@ -108,6 +108,30 @@ static int copy_dlls(const char* run, const char* out) {
     return rc;
 }
 #endif
+/* The game's settings: beside it, or in an installed build's config folder (snx_user_path), where the runtime reads
+   them and where an older build's file moves first. NULL when that folder cannot be made */
+static char* settings_path(const char* out, const char* title, int quiet) {
+    char *folder = snx_user_path(out, SNX_USER_CONFIG), *base, *path = NULL, *old;
+    if (!strcmp(folder, out) || !snx_mkdirs(folder)) {
+        base = snx_path_join(folder, title);
+        path = snx_format("%s.ini", base);
+        free(base);
+    }
+    if (path && strcmp(folder, out)) {
+        base = snx_path_join(out, title);
+        old = snx_format("%s.ini", base);
+        free(base);
+        switch (snx_move_old(old, path, 1)) {
+            case SNX_MOVE_DONE:
+                if (!quiet) printf("Moved %s to %s\n", old, path);
+                break;
+            case SNX_MOVE_LEFT: fprintf(stderr, "scarletnx: could not move %s to %s\n", old, path); break;
+        }
+        free(old);
+    }
+    free(folder);
+    return path;
+}
 static SnxU64* read_hints(const char* base, size_t* count) {
     char *path = snx_format("%s.hints", base), line[256], *s;
     FILE* f = snx_fopen(path, "r");
@@ -373,7 +397,11 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
         snx_error("cannot stage game data in %s", data);
         goto done;
     }
-    ini = snx_format("%s.ini", base);
+    ini = settings_path(out, title, compile.quiet);
+    if (!ini) {
+        snx_error("cannot create the settings folder for %s", title);
+        goto done;
+    }
     if (!snx_is_file(ini)) {
         ini_text = snx_format(
             "; ScarletNX settings for %s\n; Full option help is written on first run.\n[Display]\nlanguage=1\n", title);

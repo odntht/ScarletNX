@@ -31,7 +31,7 @@
 const SnxModule* g_mod;
 GuestFn* g_disp;
 GuestFn snx_interp_entry;
-char g_datadir[1024], g_exename[256], g_exedir[1024];
+char g_datadir[1024], g_exename[256], g_exedir[1024], g_confdir[1024], g_statedir[1024], g_cachedir[1024];
 volatile int g_quit;
 int g_frames;
 /* ============================================================ code module */
@@ -100,6 +100,54 @@ static int load_code(void) {
     }
     g_mod = f();
     return g_mod ? 0 : -1;
+}
+
+/* the folder one kind of the game's files goes in, with its separator: beside the game, or for a game in an installed
+   build's data folder the XDG folder of that kind (utilities/common.h) */
+static void user_folder(char* dir, size_t size, const char* games, int kind) {
+    char* moved = games ? snx_user_path(games, kind) : NULL;
+    int apart = moved && strcmp(moved, games);
+    if (apart && snx_mkdirs(moved)) {
+        WARN("cannot create %s, so the game's files of that kind stay beside it\n", moved);
+        apart = 0;
+    }
+    if (apart)
+        snprintf(dir, size, "%s/", moved);
+    else
+        snprintf(dir, size, "%s", g_exedir);
+    free(moved);
+}
+/* the settings, the log and threads.txt, and the pipeline cache. What an older build left beside the game moves there
+   first, the log before anything is written to it */
+static void user_folders(void) {
+    /* the game's own name before those that start with a dot */
+    static const char* const what[] = {".log", "threads.txt", ".ini", "shader_cache/vk_pipelines.bin"};
+    const char* const dirs[] = {g_statedir, g_statedir, g_confdir, g_cachedir};
+    char from[4][1400], to[4][1400];
+    int moved[4];
+    char* games = snx_absolute(g_exedir[0] ? g_exedir : ".");
+    user_folder(g_confdir, sizeof g_confdir, games, SNX_USER_CONFIG);
+    user_folder(g_statedir, sizeof g_statedir, games, SNX_USER_STATE);
+    user_folder(g_cachedir, sizeof g_cachedir, games, SNX_USER_CACHE);
+    for (int i = 0; i < 4; i++) {
+        const char* game = what[i][0] == '.' ? g_exename : "";
+        moved[i] = SNX_MOVE_NONE;
+        if (!games || !strcmp(dirs[i], g_exedir)) continue;
+        snprintf(from[i], sizeof from[i], "%s/%s%s", games, game, what[i]);
+        snprintf(to[i], sizeof to[i], "%s%s%s", dirs[i], game, what[i]);
+        moved[i] = snx_move_old(from[i], to[i], 1);
+    }
+    if (moved[3] == SNX_MOVE_DONE) {
+        char old[1100];
+        snprintf(old, sizeof old, "%s/shader_cache", games);
+        remove(old); /* when nothing else is left in it */
+    }
+    free(games);
+    for (int i = 0; i < 4; i++)
+        if (moved[i] == SNX_MOVE_DONE)
+            LOG("moved %s to %s\n", from[i], to[i]);
+        else if (moved[i] == SNX_MOVE_LEFT)
+            WARN("could not move %s to %s, where this version keeps it\n", from[i], to[i]);
 }
 
 static void build_dispatch(void) {
@@ -240,6 +288,7 @@ int snx_main(int argc, char** argv) {
     }
     /* loaded before the .ini is opened, which writes one: a mistyped --game leaves no stray settings file */
     if (load_code()) fatal("Could not load the game's recompiled code.");
+    user_folders(); /* before the log's first line */
     if (g_mod->abi != SNX_ABI) fatal("The recompiled code is from another ScarletNX version.");
     /* Fullscreen is opt-in on each launch, regardless of an older INI value. */
     ini_override("fullscreen", g_opt_fullscreen ? "1" : "0");
@@ -257,7 +306,7 @@ int snx_main(int argc, char** argv) {
         }
     }
     char ini[1400];
-    snprintf(ini, sizeof ini, "%s%s.ini", g_exedir, g_exename);
+    snprintf(ini, sizeof ini, "%s%s.ini", g_confdir, g_exename);
     ini_open(ini);
     snprintf(g_datadir, sizeof g_datadir, "%s%s_data/", g_exedir, g_exename);
     hints_init();
@@ -305,7 +354,7 @@ int snx_main(int argc, char** argv) {
         /* dump thread states to threads.txt every 15s, useful when something hangs */
         if (tick % 900 == 0) {
             char p[1200];
-            snprintf(p, sizeof p, "%sthreads.txt", g_exedir);
+            snprintf(p, sizeof p, "%sthreads.txt", g_statedir);
             FILE* f = fopen(p, "w");
             if (f) {
                 fprintf(f, "second %d, frames %d\n", tick / 60, g_frames);

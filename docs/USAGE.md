@@ -111,7 +111,8 @@ Remaining examples: POSIX.
 ./build/scarletnx -r -h
 ```
 
-- **Keys:** encrypted content uses flags → checkout → `~/.switch` (`%USERPROFILE%\.switch` on Windows).
+- **Keys:** encrypted content uses flags → the data folder (the checkout, or an installed copy's, below) → `~/.switch`
+  (`%USERPROFILE%\.switch` on Windows).
   Common NSP tickets supplement title keys. Fully decrypted content needs neither key file.
 - **Extraction:** defaults to `work/<dump stem>`; `--name`/`--out DIR` override. Refuses existing `exefs`;
   builds missing hactool. [Temp cleanup/key filtering](../src/nx/runtime/driver/extract.c).
@@ -130,7 +131,7 @@ Remaining examples: POSIX.
 | `games/Game[.exe]`, `Game_code.so/.dll` | Runtime + AOT module |
 | `games/Game_data/`, `Game.ini` | Data/saves + settings |
 | `games/Game_build/` | Generated code, only with `--keep-ir` |
-| `games/shader_cache/spirv/` | SPIR-V cache |
+| `games/shader_cache/vk_pipelines.bin` | Vulkan pipeline cache |
 
 ## GDB (UNIX only)
 
@@ -213,6 +214,20 @@ keeps a `games/` folder beside the AppImage (or beside the zip's programs), and 
 Windows, of `scarletnx.exe` and the DLLs next to it).
 X11 bypasses Wayland. [Licenses](CREDITS.md).
 
+On Linux an installed copy follows the [XDG Base Directory spec](https://specifications.freedesktop.org/basedir/latest/):
+the data folder keeps `games/` (each game's program, code, `Game_data/` with its saves, `captures/`) and `prod.keys`, and
+the rest goes in the folder of its kind. A relative `$XDG_*_HOME` is ignored, as the spec says.
+
+| Folder | Holds |
+| --- | --- |
+| `~/.config/scarletnx/games/` (`$XDG_CONFIG_HOME`) | `Game.ini` |
+| `~/.local/state/scarletnx/games/` (`$XDG_STATE_HOME`) | `Game.log`, `threads.txt` |
+| `~/.cache/scarletnx/` (`$XDG_CACHE_HOME`) | `work/`, `games/shader_cache/` |
+
+What an older version left in the data folder moves to these on first use, a line in the output or the game's log for
+each; across filesystems a file is copied, and `work/` stays where it is with a line saying it can be deleted. The
+checkout and a portable copy keep everything beside the game, as on Windows.
+
 ## Settings / input
 
 `Game.ini`: help rewritten at startup, most settings hot-reload. `--key=value` overrides one run.
@@ -257,5 +272,6 @@ shown, a stick's middle where the finger lands, a D-pad a finger slides on, a bu
 screen, and *Reset layout*. The game's `.ini` keeps them: `controls`, `controls_scale`, `controls_opacity`,
 `controls_snap`, `controls_rel_center`, `controls_dpad_slide`, `controls_haptics`, and a control's place once it
 was moved (`controls_a=0.930 0.470 100 1`: its middle across the screen, its size in percent, shown).
-Beside the executable: `Game.log`, `threads.txt` (15 s refresh), `captures/` (screenshots).
+Beside the executable: `Game.log`, `threads.txt` (15 s refresh), `captures/` (screenshots); an installed copy on Linux
+keeps the first two in its state folder ([above](#appimage--display)).
 Scripts/disasm/shaders: [DEVELOPMENT](DEVELOPMENT.md).
