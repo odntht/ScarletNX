@@ -117,6 +117,18 @@ bool gui_confirm_key(GuiConfirm* confirm, GuiKey key) {
         default: return false;
     }
 }
+void gui_usage_text(char* out, size_t size, bool available, uint64_t memory_bytes, double cpu_percent, int cores) {
+    double mb = (double)memory_bytes / 1048576, cpu = cpu_percent / (cores > 0 ? cores : 1);
+    if (!available) {
+        snprintf(out, size, "ScarletNX's memory and CPU use: unavailable here");
+        return;
+    }
+    cpu = cpu < 0 ? 0 : cpu > 100 ? 100 : cpu; /* a sample taken over a little more than its interval */
+    if (mb < 1024)
+        snprintf(out, size, "ScarletNX uses %.0f MB of memory and %.0f%% of the CPU", mb, cpu);
+    else
+        snprintf(out, size, "ScarletNX uses %.1f GB of memory and %.0f%% of the CPU", mb / 1024, cpu);
+}
 const char* gui_setting_description(const GuiMenu* menu) {
     switch (menu->selected) {
         case GUI_FULLSCREEN:

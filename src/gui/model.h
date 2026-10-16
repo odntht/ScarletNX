@@ -69,6 +69,9 @@ size_t gui_launch_options(const GuiMenu* menu, bool prepared, const char* repo, 
 /* the game's --touch=N and --controls=N for the menu's choices */
 const char* gui_touch_option(const GuiMenu* menu);
 const char* gui_controls_option(const GuiMenu* menu);
+/* the footer's line of what ScarletNX and its games use, in words a player reads: memory in MB or GB, the CPU as a share
+   of the whole computer (cpu_percent is of one core: cores of them make 100%) */
+void gui_usage_text(char* out, size_t size, bool available, uint64_t memory_bytes, double cpu_percent, int cores);
 /* how many columns a line over columns too many has slid at ms, a column every step_ms: it waits at each end */
 int gui_slide(int over, uint64_t ms, uint32_t step_ms);
 

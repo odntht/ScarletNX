@@ -142,12 +142,12 @@ A missing driver or invalid dropped path leaves the prompt open with a diagnosti
 Drivers use line-buffered stdout so progress remains visible when piped. A third-party
 program that buffers or privately redirects its output still controls when it flushes.
 
-The footer samples combined GUI and descendant resource use every half second:
+The footer says what ScarletNX uses, the menu and everything it started, sampled every half
+second, and below it the folder it works in (`Folder:`):
 
-- RAM is the sum of resident sets (Windows working sets), in MiB. Shared pages may
+- memory, the sum of resident sets (Windows working sets), in MB or GB. Shared pages may
   be counted more than once. It is not the machine's total installed memory.
-- CPU is aggregate utilization. 100% means one fully occupied host CPU, so parallel
-  compilation can exceed 100%.
+- the CPU as a share of the whole computer: 100% is every core busy.
 
 Linux and FreeBSD track a private child session, including the separate process
 groups created by the driver's stage supervisor and descendants that outlive their

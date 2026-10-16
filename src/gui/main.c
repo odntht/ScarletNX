@@ -242,14 +242,11 @@ static void footer(App* app, int row, int rows, GuiRgb page, GuiRgb ink, GuiRgb 
     int bar = app->theme.footer == GUI_STYLE_BAR;
     if (bar) band(app, row, rows, ink);
     if (app->theme.footer_rule) rule(app, row, soft);
-    if (app->usage.available)
-        snprintf(usage, sizeof(usage), "GUI + children: RAM %.1f MiB (sum RSS)  CPU %.1f%% (100%% = 1 core)",
-                 (double)app->usage.memory_bytes / 1048576, app->usage.cpu_percent);
-    else
-        snprintf(usage, sizeof(usage), "GUI + children: resource usage unavailable");
+    gui_usage_text(usage, sizeof(usage), app->usage.available, app->usage.memory_bytes, app->usage.cpu_percent,
+                   SDL_GetNumLogicalCPUCores());
     text(app, 1, row, usage, rgb(bar ? page : soft));
-    text(app, 1, row + 1, "CWD:", rgb(bar ? page : soft));
-    text(app, 6, row + 1, app->cwd ? app->cwd : "(unavailable)", rgb(bar ? page : ink));
+    text(app, 1, row + 1, "Folder:", rgb(bar ? page : soft));
+    text(app, 9, row + 1, app->cwd ? app->cwd : "(unavailable)", rgb(bar ? page : ink));
 }
 /* a selectable line: activated, focused (in the focus colour, or on a band) or plain */
 static void entry(App* app, int x, int y, const char* label, int activated, int focused) {

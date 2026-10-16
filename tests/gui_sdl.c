@@ -973,7 +973,7 @@ int main(int argc, char** argv) {
         colored_text_on(&app, 1, 0, "SCARLETNX  /  MENU", page, ink);
         colored_text_on(&app, 3, menu_row(&app, GUI_THEME), "Theme: YoRHa", page, ink); /* the focused line's band */
         colored_text_on(&app, 3, menu_row(&app, GUI_EXIT), "Exit", ink, page);
-        colored_text_on(&app, 1, app.rows - 2, "CWD:", page, ink);
+        colored_text_on(&app, 1, app.rows - 2, "Folder:", page, ink);
         /* the footer's bar goes on below its last whole row, to the window's edge */
         assert(SDL_SetWindowSize(app.window, 1280, 810));
         SDL_SyncWindow(app.window);
@@ -1128,11 +1128,11 @@ int main(int argc, char** argv) {
         app.theme.prompt = gui_theme_builtin("yorha")->prompt;
         cell = 16.0f * (float)app.scale;
         /* the menu's footer over the ESC line, in the run's colours: YoRHa's bar style, a band of its ink */
-        colored_text_on(&app, 1, app.rows - 3, "GUI + children: ", lp, li);
-        colored_text_on(&app, 1, app.rows - 2, "CWD: ", lp, li);
+        colored_text_on(&app, 1, app.rows - 3, "ScarletNX uses ", lp, li);
+        colored_text_on(&app, 1, app.rows - 2, "Folder: ", lp, li);
         app.theme.footer = GUI_STYLE_PLAIN;
         render(&app);
-        colored_text_on(&app, 1, app.rows - 2, "CWD:", ls, lp);
+        colored_text_on(&app, 1, app.rows - 2, "Folder:", ls, lp);
         app.theme.footer = GUI_STYLE_NONE;
         render(&app);
         colored_text_on(&app, 1, app.rows - 2, "    ", ls, lp);
@@ -1145,7 +1145,7 @@ int main(int argc, char** argv) {
         colored_text_on(&app, app.cols - 6, app.rows - 5, "100%", li, lp); /* above the footer */
         colored_text_on(&app, 1, app.rows - 4, "OPTION FLAGS", li, lp);
         assert(same_colour(pixel(&app, 8.0f * (float)app.scale + 2, cell * (float)(app.rows - 5) + cell / 2), li));
-        colored_text_on(&app, 1, app.rows - 2, "CWD: ", lp, li);
+        colored_text_on(&app, 1, app.rows - 2, "Folder: ", lp, li);
         /* typing: five characters in, the cursor after them; async, each line from when it came. The run is over, so
            a row types whole in typing_ms: 25 characters in 10 ms */
         app.theme.typing_sync = false;
