@@ -15,13 +15,13 @@ if(NOT rest STREQUAL "" OR list STREQUAL "")
 endif()
 # the game's menu's settings with its names and words, as the launcher shows them; a whole number of few values with
 # its numbers
-foreach(row "Display\tdocked\t0\tint\t0\t1\t1 = TV mode" "Display\tfullscreen\t0\tint\t0\t1\t"
+foreach(row "Display\tdocked\t1\tint\t0\t1\t1 = TV mode" "Display\tfullscreen\t0\tint\t0\t1\t"
             "Graphics\tresolution\t1\tfloat\t0.25\t4\t" "Performance\tfps_limit\tgame\ttext\t"
             "On-screen controls\tcontrols\t" "\tShow controls\t0=Off|1=On\n"
             "\tScale\t0=50%|10=60%|20=70%|30=80%|40=90%|50=100%|60=110%|70=120%|80=130%|90=140%|100=150%\n"
             "On-screen controls\ttouch\t2\tint\t0\t2\t" "\tTouch screen\t0=Off|1=Fingers|2=Mouse too\n"
             "On-screen controls/Buttons\tcontrols_a_shown\t\tint\t0\t1\t" "\tA\t0=Hidden|1=Shown\n"
-            "Controllers\tgamepad_buttons\t1\tint\t0\t2\t" "\tA B X Y\t0=By position|1=By label|2=Custom\n"
+            "Controllers\tgamepad_swap_ab\t0\tint\t0\t1\t" "\tSwap A/B\t0=Off|1=On\n"
             "Controllers/Button map\tgamepad_map\t\ttext\t"
             "\tStick dead zone\t0=0%|5=5%|10=10%|" "|90=90%\n" "\tVibration\t0=Off|10=10%|20=20%|"
             "Debug\tlog\t1\tint\t0\t2\t" "\t\t0=0|1=1|2=2\n"

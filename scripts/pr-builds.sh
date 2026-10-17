@@ -6,8 +6,9 @@
 #
 #   scripts/pr-builds.sh REPO PR RUN SHA [--print]
 #
-# NEEDS, when set, is the workflow's toJSON(needs): a job that did not succeed gets a line. --print writes the comment
-# to stdout and posts nothing. gh needs a token that may write on pull requests.
+# NEEDS, when set, is the workflow's toJSON(needs): a job that did not succeed gets a line, but edenprobe, which builds
+# nothing: its line is its result, linked to the run's summary (docs/EDENPROBE.md). --print writes the comment to stdout
+# and posts nothing. gh needs a token that may write on pull requests.
 set -euo pipefail
 
 if [ $# -lt 4 ] || [ $# -gt 5 ] || { [ $# -eq 5 ] && [ "$5" != --print ]; }; then
@@ -21,20 +22,28 @@ if [ -z "$print" ] && [ "$(gh api "repos/$repo/pulls/$pr" --jq .head.sha)" != "$
     echo "$sha is no longer the head of #$pr: its comment stays"
     exit 0
 fi
-# every artifact but the APK's halves, which only the job that packs the APK takes
+# every artifact but the APK's halves (-stage), which only the job that packs the APK takes, and edenprobe's reports,
+# which its line below links through the run
 artifacts=$(gh api "repos/$repo/actions/runs/$run/artifacts?per_page=100")
 links=$(jq -r --arg url "https://github.com/$repo/actions/runs/$run/artifacts" '
-    .artifacts | map(select((.expired | not) and (.name | startswith("android-stage-") | not))) | sort_by(.name)[] |
+    .artifacts | map(select((.expired | not) and (.name | endswith("-stage") or startswith("edenprobe-") | not))) |
+    sort_by(.name)[] |
     "- [\(.name)](\($url)/\(.id)), \(.size_in_bytes / 1048576 | floor) MiB"' <<<"$artifacts")
 until=$(jq -r '[.artifacts[].expires_at] | min // empty | .[:10]' <<<"$artifacts")
 needs=${NEEDS:-}
 [ -n "$needs" ] || needs='{}'
-failed=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key) (\(.value.result))"' <<<"$needs" |
-    paste -sd, - | sed 's/,/, /g')
+failed=$(jq -r 'to_entries[] | select(.key != "edenprobe" and .value.result != "success") |
+    "\(.key) (\(.value.result))"' <<<"$needs" | paste -sd, - | sed 's/,/, /g')
+probe=$(jq -r --arg url "https://github.com/$repo/actions/runs/$run" '.edenprobe // empty |
+    "[\(.outputs.result // "edenprobe")](\($url)): " +
+    if .result == "success" then "every case of the baseline passes"
+    elif .result == "failure" then "failed, see its summary" else .result end' <<<"$needs")
 
 body="$mark
 Builds of ${sha::7}${until:+, kept until $until}:
-${links:-none}${failed:+
+${links:-none}${probe:+
+
+$probe}${failed:+
 
 Not built: $failed}"
 

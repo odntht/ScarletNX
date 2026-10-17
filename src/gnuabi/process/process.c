@@ -6,6 +6,7 @@
 #include "gnuabi/process/process.h"
 #include "gnuabi/network/network.h"
 #include "gnuabi/abi/errno/errno.h"
+#include "common/utilities/common.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -14,6 +15,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <bcrypt.h>
+#else
+#include <unistd.h>
 #endif
 
 int gnu_random_bytes(void* destination, size_t size) {
@@ -66,6 +69,16 @@ int gnu_clock_gettime(int id, int64_t* seconds, int64_t* nanos) {
 #endif
     return 0;
 }
+void gnu_sleep(int64_t seconds, int64_t nanoseconds) {
+#ifdef _WIN32
+    Sleep((DWORD)(seconds * 1000 + nanoseconds / 1000000));
+#else
+    struct timespec t;
+    t.tv_sec = (time_t)seconds;
+    t.tv_nsec = (long)nanoseconds;
+    while (nanosleep(&t, &t)) {}
+#endif
+}
 static int push(GnuProcess* p, uint64_t* sp, const void* data, size_t n) {
     if (n > *sp || *sp - n < UINT64_C(0xef800000)) return -GNU_E2BIG;
     *sp -= n;
@@ -106,7 +119,7 @@ int gnu_process_stack(GnuProcess* p, int argc, const char* const* argv, const ch
                                   4,  p->elf.phentsize,
                                   5,  p->elf.phnum,
                                   6,  GNU_PAGE_SIZE,
-                                  7,  0,
+                                  7,  p->interp.image ? p->interp.bias : 0,
                                   8,  0,
                                   9,  p->elf.entry,
                                   11, 1000,
@@ -144,7 +157,8 @@ int gnu_process_stack(GnuProcess* p, int argc, const char* const* argv, const ch
     free(values);
     if (!result) {
         p->cpu.x[31] = initial;
-        p->cpu.pc = p->elf.entry;
+        /* a dynamic program starts in its dynamic linker, which finds the program through AT_PHDR and AT_ENTRY */
+        p->cpu.pc = p->interp.image ? p->interp.entry : p->elf.entry;
         /* Linux starts all general registers at zero; argc/argv live on the stack. */
         result = gnu_memory_protect(&p->memory, stack_low, UINT64_C(0x800000), p->elf.stack_permissions);
     }
@@ -240,42 +254,132 @@ done:
     free(environment);
     return result;
 }
+static void code_changed(void* context, uint64_t address, uint64_t length) {
+    GnuProcess* p = context;
+    gnu_jit_invalidate(&p->jit, address, length);
+}
+
+int gnu_process_load(GnuProcess* p, const char* path, const unsigned char* image, size_t size, int argc,
+                     const char* const* argv, const char* const* env, char* error, size_t cap) {
+    int r = gnu_memory_init(&p->memory);
+    if (cap) error[0] = 0;
+    if (r) {
+        snprintf(error, cap, "Cannot reserve the guest address space");
+        return r;
+    }
+    p->memory.code_changed = code_changed;
+    p->memory.code_context = p;
+    r = gnu_elf_load_image(&p->elf, &p->memory, image, size, error, cap);
+    if (!r && p->elf.interp[0]) {
+        /* the dynamic linker, from the guest's namespace (the sysroot's /lib/ld-linux-aarch64.so.1) */
+        unsigned char* linker = NULL;
+        size_t linker_size = 0;
+        char guest[4096];
+        if (p->elf.bits == 32) {
+            snprintf(error, cap, "Dynamically linked AArch32 programs are unsupported");
+            return -GNU_ENOEXEC;
+        }
+        r = gnu_vfs_load(&p->vfs, -100, p->elf.interp, &linker, &linker_size, guest, sizeof guest);
+        if (r) {
+            snprintf(error, cap, "Cannot load the dynamic linker %s (%d)", p->elf.interp, r);
+            return r;
+        }
+        r = gnu_elf_load_at(&p->interp, &p->memory, linker, linker_size, GNU_ELF_INTERP_BIAS, 0, error, cap);
+        free(linker);
+    }
+    if (r) return r;
+    if (p->elf.bits == 32) {
+        memset(&p->arm, 0, sizeof p->arm);
+        p->arm.mem = p->memory.base;
+        p->arm.mem_size = p->memory.size;
+        p->arm.cpsr = 0x10u | (p->elf.thumb ? 0x20u : 0u);
+        r = gnu_process_stack32(p, argc, argv, env);
+    } else {
+        /* Linux starts all general registers at zero */
+        memset(&p->cpu, 0, sizeof p->cpu);
+        p->cpu.mem = p->memory.base;
+        p->cpu.rt = &gnu_rtapi;
+        p->cpu.thread = p;
+        gnu_jit_bind(&p->jit, &p->cpu);
+        r = gnu_process_stack(p, argc, argv, env);
+    }
+    if (r) {
+        snprintf(error, cap, "Cannot build the initial stack (%d)", r);
+        return r;
+    }
+    r = gnu_vfs_set_process(&p->vfs, p->pid, path, argc, argv);
+    /* the isolated namespace has no host files: the program is imported as /program */
+    if (!r && !strcmp(path, "/program")) r = gnu_vfs_set_executable(&p->vfs, image, size);
+    if (!r && p->elf.bits == 64 && p->jit.mode == GNU_AOT) {
+        SnxExecRange* ranges = calloc(p->elf.code_count ? p->elf.code_count : 1, sizeof *ranges);
+        if (!ranges) return -GNU_ENOMEM;
+        for (size_t i = 0; i < p->elf.code_count; i++) {
+            ranges[i].address = p->elf.code[i].address;
+            ranges[i].data = p->elf.code[i].data;
+            ranges[i].size = p->elf.code[i].size;
+        }
+        r = gnu_jit_prepare(&p->jit, ranges, p->elf.code_count, p->elf.entry, error, cap);
+        free(ranges);
+    }
+    return r;
+}
+
 int gnu_process_init(GnuProcess* p, const char* path, int argc, const char* const* argv, const char* const* env,
-                     char* error, size_t cap) {
+                     const char* sysroot, char* error, size_t cap) {
+    GnuJit jit = p->jit; /* initialized by the caller */
+    char guest[4096];
+    unsigned char* image = NULL;
+    size_t size = 0;
     if (cap) error[0] = 0;
     memset(p, 0, sizeof *p);
-    p->pid = p->tid = 1000;
-    int r = gnu_memory_init(&p->memory);
-    if (!r) r = gnu_vfs_init(&p->vfs);
-    if (!r) r = gnu_elf_load(&p->elf, &p->memory, path, error, cap);
-    if (!r) {
-        if (p->elf.bits == 32) {
-            p->arm.mem = p->memory.base;
-            p->arm.mem_size = p->memory.size;
-            p->arm.cpsr = 0x10u | (p->elf.thumb ? 0x20u : 0u);
-            r = gnu_process_stack32(p, argc, argv, env);
-        } else {
-            p->cpu.mem = p->memory.base;
-            p->cpu.rt = &gnu_rtapi;
-            p->cpu.thread = p;
-            r = gnu_process_stack(p, argc, argv, env);
-        }
+    p->jit = jit;
+    p->vfork_fd = -1;
+#ifdef _WIN32
+    p->pid = p->tid = (uint32_t)GetCurrentProcessId();
+#else
+    p->pid = p->tid = (uint32_t)getpid();
+#endif
+    int r = gnu_vfs_init(&p->vfs);
+    if (!r && sysroot) r = gnu_vfs_set_root(&p->vfs, sysroot);
+    if (r) {
+        snprintf(error, cap, "Cannot create the guest filesystem (%d)", r);
+        gnu_vfs_destroy(&p->vfs);
+        return r;
     }
-    if (!r) r = gnu_vfs_set_process(&p->vfs, p->pid, "/program", argc, argv);
-    if (!r) r = gnu_vfs_set_executable(&p->vfs, p->elf.image, p->elf.size);
+    image = snx_read_file(path, &size);
+    if (!image) {
+        snprintf(error, cap, "Cannot read '%s'", path);
+        gnu_vfs_destroy(&p->vfs);
+        return -GNU_ENOENT;
+    }
+    if (sysroot) {
+        /* the program's guest path: inside the sysroot without its prefix, the host's path otherwise, as QEMU has it */
+        char* absolute = snx_absolute(path);
+        r = gnu_hostfs_program_path(&p->vfs, absolute ? absolute : path, guest, sizeof guest);
+        free(absolute);
+    } else
+        strcpy(guest, "/program");
+    if (!r) r = gnu_process_load(p, guest, image, size, argc, argv, env, error, cap);
+    free(image);
     if (!r) r = gnu_net_process_init(p);
     if (r) {
         if (cap && !error[0]) snprintf(error, cap, "Guest process initialization failed (%d)", r);
         gnu_process_destroy(p);
+        p->jit = jit;
     }
     return r;
 }
 void gnu_process_destroy(GnuProcess* p) {
     gnu_vfs_destroy(&p->vfs);
     gnu_elf_destroy(&p->elf);
+    gnu_elf_destroy(&p->interp);
     gnu_memory_destroy(&p->memory);
 }
 void gnu_process_exit(GnuProcess* p, int status) {
+#ifdef _WIN32
+    /* a vfork child that never exec'd: its parent goes on, and wait4 finds the status */
+    if (p->vfork_parent) gnu_spawn_win32_child_exit(p, status);
+#endif
     if (p->clear_tid) {
         uint32_t zero = 0;
         (void)gnu_memory_write(&p->memory, p->clear_tid, &zero, 4);

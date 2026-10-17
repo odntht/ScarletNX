@@ -2,6 +2,7 @@
    Copyright 2026 the ScarletNX contributors */
 #include "gnuabi/runtime/arm_exec.h"
 #include "common/cpu/arm/llvm.h"
+#include "common/cpu/arm/exec.h"
 #include "gnuabi/abi/syscalls/syscalls.h"
 #include "gnuabi/abi/errno/errno.h"
 #include <llvm-c/ExecutionEngine.h>
@@ -105,6 +106,7 @@ int gnu_arm_run(GnuProcess* p) {
     memset(&e, 0, sizeof e);
     if (LLVMInitializeNativeTarget() || LLVMInitializeNativeAsmPrinter()) return 4;
     LLVMLinkInMCJIT();
+    snx_arm_exec_symbols(); /* the runtime library's functions blocks call */
     e.ctx = LLVMContextCreate();
     LLVMModuleRef initial = LLVMModuleCreateWithNameInContext("gnuarm", e.ctx);
     struct LLVMMCJITCompilerOptions options;

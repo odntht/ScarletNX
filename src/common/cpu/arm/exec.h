@@ -20,9 +20,18 @@ typedef int (*SnxArmSyscallFn)(void* context, uint32_t imm, uint64_t number, con
 
 typedef struct SnxArmExec SnxArmExec;
 
+/* Names the runtime library's functions blocks call (snx_arm_fp, snx_arm_crypto, snx_arm_undefined,
+   snx_arm_coproc) to LLVM's JIT in this process, which a program that doesn't export its symbols needs. Idempotent;
+   snx_arm_exec_new calls it */
+void snx_arm_exec_symbols(void);
 /* Returns NULL with a bounded error on failure. */
 SnxArmExec* snx_arm_exec_new(char* error, size_t error_size);
 void snx_arm_exec_free(SnxArmExec* exec);
+/* The block at pc (Thumb when thumb is set), compiled now unless it was before, from base + pc (the guest's
+   memory; ranges bound how far it may read). NULL when pc is outside the ranges or the compiler fails. Not thread-safe:
+   callers serialize */
+SnxArmBlock snx_arm_exec_block(SnxArmExec* exec, const SnxArmExecRange* ranges, size_t range_count, uint32_t pc,
+                               int thumb, const unsigned char* base);
 /* Runs from cpu->r[15] until the process exits (cpu->exit set by a trap or the
    syscall handler). code_ranges bound block compilation. Returns cpu->exit. */
 int snx_arm_exec_run(SnxArmExec* exec, SnxArmCPU* cpu, const SnxArmExecRange* ranges, size_t range_count,

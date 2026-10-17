@@ -121,6 +121,60 @@ static void analysis_test(void) {
     snx_codegen_free(&codegen);
 }
 
+/* Function pointers built in code must be compiled even without symbols or unwind information. */
+static void address_taken_test(void) {
+    unsigned char image[80];
+    SnxProgram program;
+    SnxModuleImage module;
+    SnxCodegen codegen;
+    SnxFde range = {0};
+    const SnxFunction* function;
+    size_t i;
+    int with_fde;
+    for (i = 0; i < sizeof(image); i += 4) put32(image, i, 0xD4200000UL);
+    put32(image, 0, 0x10000100UL);  /* ADR x0, +32: callback */
+    put32(image, 4, 0x10000041UL);  /* ADR x1, +8: interior entry at 12 */
+    put32(image, 8, 0xD503201FUL);  /* NOP */
+    put32(image, 12, 0xD65F03C0UL); /* RET */
+    put32(image, 32, 0x90000002UL); /* ADRP x2, current page */
+    put32(image, 36, 0x91010042UL); /* ADD x2, x2, #64: another callback */
+    put32(image, 40, 0xD65F03C0UL);
+    put32(image, 64, 0xD65F03C0UL);
+    for (with_fde = 0; with_fde < 2; ++with_fde) {
+        setup_program(&program, &module, image, sizeof(image));
+        range.start = 0;
+        range.size = 16;
+        module.fde = with_fde ? &range : NULL;
+        module.fde_count = with_fde;
+        check(!snx_nx_codegen_analyze(&codegen, &program, NULL, 0, 1), "analyze address-taken callbacks");
+        check(snx_codegen_function(&codegen, SNX_CODE_BASE + 32) != NULL, "ADR callback discovered");
+        check(snx_codegen_function(&codegen, SNX_CODE_BASE + 64) != NULL, "ADRP/ADD callback discovered");
+        function = snx_codegen_function(&codegen, SNX_CODE_BASE);
+        check(function && has_leader(function, SNX_CODE_BASE + 12), "interior address becomes a leader");
+        check(codegen.function_count == 3, "interior address does not duplicate a function");
+        snx_codegen_free(&codegen);
+    }
+}
+
+/* ADRP and an ADD of its page offset shifted by 12 (ADD Xd, Xn, #imm, LSL #12): the callback a page further on */
+static void address_taken_shifted_test(void) {
+    static unsigned char image[0x1010];
+    SnxProgram program;
+    SnxModuleImage module;
+    SnxCodegen codegen;
+    size_t i;
+    for (i = 0; i < sizeof(image); i += 4) put32(image, i, 0xD4200000UL);
+    put32(image, 0, 0x90000003UL);      /* ADRP x3, current page */
+    put32(image, 4, 0x91400463UL);      /* ADD x3, x3, #1, LSL #12: the next page */
+    put32(image, 8, 0xD65F03C0UL);      /* RET */
+    put32(image, 0x1000, 0xD65F03C0UL); /* the callback */
+    setup_program(&program, &module, image, sizeof(image));
+    module.size = 0x2000;
+    check(!snx_nx_codegen_analyze(&codegen, &program, NULL, 0, 1), "analyze a shifted ADD");
+    check(snx_codegen_function(&codegen, SNX_CODE_BASE + 0x1000) != NULL, "ADRP/ADD LSL #12 callback discovered");
+    snx_codegen_free(&codegen);
+}
+
 static void large_range_test(void) {
     SnxProgram program;
     SnxModuleImage module;
@@ -426,6 +480,8 @@ int main(int argc, char** argv) {
     if (!directory) return 1;
     decoder_test();
     analysis_test();
+    address_taken_test();
+    address_taken_shifted_test();
     large_range_test();
     semantics_test(argv[1], argv[2], directory);
     poll_test(argv[1], argv[2], directory);

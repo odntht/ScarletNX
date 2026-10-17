@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* What each control of a gamepad sends the game, as the console's buttons: by where they sit on the console's
-   controller, by the labels the pad shows, or a map the player made (the .ini's gamepad_map). The runtime's gamepads
+   controller, A and B swapped or not (gamepad_swap_ab), over which a map the player made (the .ini's gamepad_map) sets
+   what it names. The runtime's gamepads
    (src/nx/runtime/platform/backend/gamepad.c) and the button map screens of the launcher and the game's menu
    (pad_screen.h) read it; no SDL here, each of them knows its pad */
 #ifndef SNX_PAD_MAP_H
@@ -43,9 +44,6 @@ enum {
     SNX_PAD_LABEL_SQUARE,
     SNX_PAD_LABEL_TRIANGLE
 };
-/* how gamepad_buttons maps them */
-enum { SNX_PAD_BY_POSITION, SNX_PAD_BY_LABEL, SNX_PAD_CUSTOM };
-
 typedef struct {
     signed char bit[SNX_PAD_CONTROLS]; /* the console's button each control sends, SNX_PAD_NONE for none */
 } SnxPadMap;
@@ -56,9 +54,10 @@ const char* snx_pad_control_key(int control);
 const char* snx_pad_control_name(int control, const int* labels);
 /* a console button's name ("A", "ZL", "Plus"), "None" for SNX_PAD_NONE */
 const char* snx_pad_button_name(int bit);
-/* the map of how: by position, by labels (the pad's four, NULL for an Xbox pad's) or custom (its own over the labels') */
+/* the console's layout: each control the button in its place */
 void snx_pad_map_position(SnxPadMap* map);
-void snx_pad_map_labels(SnxPadMap* map, const int* labels);
+/* A sent where B was and B where A was, whichever controls send them */
+void snx_pad_map_swap_ab(SnxPadMap* map);
 /* every control SNX_PAD_UNSET; the unset ones of map taken from from */
 void snx_pad_map_unset(SnxPadMap* map);
 void snx_pad_map_fill(SnxPadMap* map, const SnxPadMap* from);

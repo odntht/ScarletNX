@@ -49,7 +49,7 @@ const GuiThemeKey gui_theme_keys[] = {
     COLOUR("colors", "soft", soft, "hints, secondary text, rules"),
     COLOUR("colors", "focus", focus, "the focused line, or its band"),
     COLOUR("colors", "active", active, "the item chosen, the run's head"),
-    COLOUR("colors", "failure", failure, "warnings, the ESC line, a failed run"),
+    COLOUR("colors", "failure", failure, "warnings, the ESC line, a failed run, missing keys"),
     COLOUR("colors", "dim", dim, "the boxes' frames, a filled box, the grid and the title's shadow"),
     COLOUR("colors", "warning", warning, "the abort question in the console layout"),
     COLOUR("colors", "added", added, "a diff's added lines, as failure its removed ones; no screen uses it yet"),
@@ -105,9 +105,9 @@ const GuiThemeKey gui_theme_keys[] = {
     NUMBER("transitions", "line_in_ms", line_in_ms, 10000, "slide and fade's length"),
     NUMBER("transitions", "typing_ms", typing_ms, 10000, "a character of the running line, any other line whole"),
     WORD("transitions", "typing", typing_sync, typings, "sync: one line at a time"),
-    NUMBER("transitions", "blink_ms", blink_ms, 10000, "the cursor's and the prompt's blink"),
+    NUMBER("transitions", "blink_ms", blink_ms, 10000, "the cursor's, the prompt's and Setup device keys' blink"),
     NUMBER("transitions", "scroll_ms", scroll_ms, 10000, "a line too long for its row slides a column each"),
-    COLOUR("splash", "page", splash_page, "behind the icon"),
+    COLOUR("splash", "page", splash_page, "behind the drawing"),
     NUMBER("splash", "ms", splash_ms, 10000, "how long; 0: none"),
     NUMBER("splash", "chance", splash_chance, 100, "the boots in 100 that show this theme's, the default's the others"),
     {NULL, NULL, GUI_KEY_TEXT, 0, 0, NULL, 0, NULL}};
@@ -122,7 +122,7 @@ static const char* const sections[][2] = {
     {"run", "A run: the driver's output as it comes, or a loading screen in its own colours."},
     {"prompt", "A line that waits on the user: framed, placed and blinking when its key is true."},
     {"transitions", "Milliseconds, 0 to 10000; 0 turns the thing off."},
-    {"splash", "The boot's: the program's icon on a page."}};
+    {"splash", "The boot's: one of Wimsy's drawings on a page."}};
 
 /* "quoted" keeps its spaces */
 static char* unquote(char* s) {

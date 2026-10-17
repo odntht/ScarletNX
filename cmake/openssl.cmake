@@ -41,8 +41,11 @@ elseif(WIN32)
     else()
         set(snx_openssl_target mingw64)
     endif()
+elseif(IOS)
+    # 64-bit iOS: its compiler, Xcode's Clang, gets the SDK and oldest version from the flags below
+    set(snx_openssl_target ios64-xcrun)
 elseif(CMAKE_CROSSCOMPILING)
-    message(FATAL_ERROR "Cross-building OpenSSL is only set up for Windows and Android (cmake/openssl.cmake)")
+    message(FATAL_ERROR "Cross-building OpenSSL is only set up for Windows, Android and iOS (cmake/openssl.cmake)")
 endif()
 set(snx_openssl_args
     ${snx_openssl_target}
@@ -53,13 +56,26 @@ set(snx_openssl_args
     no-docs
     no-tests
     no-autoload-config)
+# macOS and iOS: the compiler with the architecture, SDK and oldest system version CMake's compiles get
+# (cmake/apple.cmake). They go in CC, not among the arguments: Configure takes a bare word there for its target, and
+# read the arm64 of -arch arm64 as one
+set(snx_openssl_cc "${CMAKE_C_COMPILER}")
+if(SNX_APPLE_FLAGS)
+    list(JOIN SNX_APPLE_FLAGS " " snx_openssl_apple_flags)
+    string(APPEND snx_openssl_cc " ${snx_openssl_apple_flags}")
+endif()
 if(ANDROID)
     list(APPEND snx_openssl_args -D__ANDROID_API__=${ANDROID_PLATFORM_LEVEL})
 else()
-    list(APPEND snx_openssl_args CC=${CMAKE_C_COMPILER} AR=${CMAKE_AR} RANLIB=${CMAKE_RANLIB})
+    list(APPEND snx_openssl_args "CC=${snx_openssl_cc}" AR=${CMAKE_AR} RANLIB=${CMAKE_RANLIB})
 endif()
 if(CMAKE_RC_COMPILER)
     list(APPEND snx_openssl_args RC=${CMAKE_RC_COMPILER})
+endif()
+# iOS marks makecontext unavailable, which OpenSSL's async jobs are made of: nothing here starts one. Its target puts
+# -mios-version-min=7.0.0 after CC's flags, and the arguments' flags come after the target's
+if(IOS)
+    list(APPEND snx_openssl_args no-async -miphoneos-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET})
 endif()
 if(NOT WIN32)
     # position-independent, as FFmpeg is: the libraries go into a shared library too (Android's runtime)
@@ -73,7 +89,7 @@ list(JOIN CMAKE_C_COMPILER_LAUNCHER " " snx_openssl_launcher)
 if(snx_openssl_launcher AND ANDROID)
     set(snx_openssl_make_cc "CC=${snx_openssl_launcher} ${snx_openssl_android_cc}")
 elseif(snx_openssl_launcher)
-    set(snx_openssl_make_cc "CC=${snx_openssl_launcher} ${CMAKE_C_COMPILER}")
+    set(snx_openssl_make_cc "CC=${snx_openssl_launcher} ${snx_openssl_cc}")
 endif()
 
 # Built once for every tree that builds it the same way, when SNX_DEPS_CACHE names a folder (cmake/deps_cache.cmake).

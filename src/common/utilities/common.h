@@ -11,9 +11,10 @@
 typedef uint32_t SnxU32;
 typedef uint64_t SnxU64;
 typedef struct {
-    const char* repo;
+    const char* repo; /* the data folder: games/, work/, the keys */
     const char* build;
     const char* executable;
+    const char* source; /* the checkout the build came from (snx_checkout), to build tools in; NULL without one */
 } SnxPaths;
 
 void* snx_alloc(size_t size);
@@ -53,21 +54,32 @@ char* snx_user_data_dir(void);
 enum { SNX_USER_DATA, SNX_USER_CONFIG, SNX_USER_STATE, SNX_USER_CACHE };
 /* A portable copy's data folder: this folder beside the AppImage or the program */
 #define SNX_PORTABLE_DIR ".scarletnx"
-/* Android's data folder, which the user sees (the app's working folder once it may write there) */
-#define SNX_ANDROID_DIR  "/sdcard/ScarletNX"
-/* An installed build's folder for one kind of file: $XDG_CONFIG_HOME/scarletnx (~/.config), $XDG_STATE_HOME/scarletnx
+/* iOS: the app (dist/apple), which starts no other process and keeps its data in its Documents folder */
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#define SNX_IOS 1
+#endif
+#endif
+/* An older version's data folder on Android, the shared storage's: a game there still runs as one of a data folder */
+#define SNX_ANDROID_DIR "/sdcard/ScarletNX"
+/* The user's folder for one kind of file: $XDG_CONFIG_HOME/scarletnx (~/.config), $XDG_STATE_HOME/scarletnx
    (~/.local/state) or $XDG_CACHE_HOME/scarletnx (~/.cache), a relative path ignored. Without SNX_XDG config/, state/
    and cache/ of the data folder. NULL when the environment names no home */
 char* snx_user_dir(int kind);
 /* 1 for a data folder that keeps each kind of file apart: the user's, a portable copy's (SNX_PORTABLE_DIR), Android's.
-   A checkout's or an --outdir's games keep their files in their folders */
+   Another folder's games (--repo, --outdir) keep their files in their folders */
 int snx_app_dir(const char* folder);
 /* Such a data folder's folder for one kind of file: the user's as snx_user_dir says, another's config/, state/ and
    cache/ in it; the data folder itself for SNX_USER_DATA */
 char* snx_app_kind_dir(const char* app, int kind);
 /* A path in a data folder (snx_app_dir), moved to the same place in its folder of kind: games/X/X.ini of the data
-   folder is games/X/X.ini of the config folder. Any other path (a checkout, an --outdir) is returned as it is */
+   folder is games/X/X.ini of the config folder. Any other path (another --repo, an --outdir) is returned as it is */
 char* snx_user_path(const char* path, int kind);
+/* The folder of kind of the launcher's own files (settings.ini and gamecontrollerdb.txt in config, recent.txt in
+   state) for a program in folder: the data folder's (snx_app_dir) that folder is in, else the user's. The launcher
+   names its data folder, a game its own folder, so a game finds the files of the launcher whose games/ it is in */
+char* snx_menu_dir(const char* folder, int kind);
 /* 1 while what an older build left at old is still there, for the caller to say each run where it is and that this
    build keeps it at now. Nothing is moved: the player does that */
 int snx_left_behind(const char* old, const char* now);
@@ -84,15 +96,33 @@ typedef struct {
     int kind;
 } SnxGameFile;
 extern const SnxGameFile snx_game_files[SNX_GAME_FILES];
-/* work/ of a data folder, the drivers' extractions: an installed build's is in its cache folder. An older build's
+/* work/ of a data folder, the drivers' extractions: the user's is in its cache folder. An older build's
    work/ in the data folder stays, a line on stdout saying so */
 char* snx_work_dir(const char* data_dir);
-/* The folder work/, games/ and the keys are in when a run names none (--repo), and the menu's games/: the checkout a build
-   came from, for a program run from that build's tree (build; NULL: any program); else SNX_PORTABLE_DIR beside the
-   AppImage or the program, when it is there (a portable copy); else the user's data folder. NULL when none can be
-   named */
-char* snx_data_dir(const char* checkout, const char* build, const char* program_dir);
+/* The folder work/, games/ and the keys are in when a run names none (--repo), and the menu's games/: SNX_PORTABLE_DIR
+   beside the AppImage or the program, when it is there (a portable copy); else the user's data folder. NULL when none
+   can be named */
+char* snx_data_dir(const char* program_dir);
+/* The checkout a program run from its build tree (build; NULL: any program) was built from, for what only a checkout
+   has: its sources, and what an older version kept in it. NULL for any other program */
+char* snx_checkout(const char* checkout, const char* build, const char* program_dir);
+/* What an older version kept in the checkout of a build tree's program, its data folder then: games/, work/, the
+   keys and scarletnx-gnuabi's sysroot, linux/. snx_checkout_now names where this one keeps each for the data folder data; snx_checkout_left says so on
+   stderr for each still there. Nothing is moved: the player does that (docs/DEPRECATIONS.md) */
+#define SNX_CHECKOUT_FILES 5
+extern const char* const snx_checkout_files[SNX_CHECKOUT_FILES];
+char* snx_checkout_now(const char* data, int file);
+void snx_checkout_left(const char* checkout, const char* data);
+/* The name of a dump's extraction in work/: its file's name without the extension, kept to letters, digits, UTF-8,
+   spaces, '-' and '_', trailing spaces cut; "Game" when nothing is left */
+char* snx_dump_name(const char* input);
+/* Why folder cannot take what the drivers write there, and with run the games run from it: "is not there", "is not a
+   folder", "cannot be written" or "is on a disk that runs no programs (noexec)"; NULL when it can */
+const char* snx_folder_unfit(const char* folder, int run);
 SnxU64 snx_free_space(const char* path);
+/* 1 when a and b are on one disk (one file system), each a folder or one still to be made under the nearest folder
+   there: what goes into one takes the other's free space */
+int snx_same_disk(const char* a, const char* b);
 SnxU64 snx_file_size(const char* path);
 int snx_make_executable(const char* path);
 unsigned snx_cpu_count(void);

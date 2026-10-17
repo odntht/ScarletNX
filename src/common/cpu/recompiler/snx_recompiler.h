@@ -74,6 +74,11 @@ SNX_RECOMPILER_API void snx_recompiler_set_verbose(struct snx_recompiler* r, int
 /* A folder the generated code's text (LLVM IR as .ll, libgccjit's C dump) is saved in, for inspection; NULL (the
    default) saves nothing. The string is copied */
 SNX_RECOMPILER_API int snx_recompiler_set_keep_ir(struct snx_recompiler* r, const char* folder);
+/* A folder of linked modules (LLVM), made if missing, by a hash of everything a module is made from: the code and its
+   addresses, the entries, the settings, SNX_ABI and the host CPU. A module found there is loaded instead of compiled,
+   and one compiled is saved there; NULL (the default) keeps none. The string is copied. 0, or -1 when the folder
+   can't be made */
+SNX_RECOMPILER_API int snx_recompiler_set_cache(struct snx_recompiler* r, const char* folder);
 
 /* ---- A64 ---- */
 
@@ -114,6 +119,15 @@ SNX_RECOMPILER_API struct snx_recompiled* snx_recompile(struct snx_recompiler* r
 SNX_RECOMPILER_API struct snx_recompiled* snx_recompile_ranges(struct snx_recompiler* r,
                                                                const struct snx_code_range* ranges, size_t range_count,
                                                                const uint64_t* hints, size_t hint_count);
+/* A just-in-time compiler's step: the functions at the hints, then the functions they call, breadth first, until about
+   limit instructions are found; a call target skip(context, address) says is compiled already is left to the dispatch
+   table. Only those functions are compiled, and the module's table covers just them. The ranges are where code may be
+   read (a program's executable segments) */
+SNX_RECOMPILER_API struct snx_recompiled* snx_recompile_from(struct snx_recompiler* r,
+                                                             const struct snx_code_range* ranges, size_t range_count,
+                                                             const uint64_t* hints, size_t hint_count, size_t limit,
+                                                             int (*skip)(void* context, uint64_t address),
+                                                             void* context);
 /* Unloads the host code. Every CPU bound to m must have stopped */
 SNX_RECOMPILER_API void snx_recompiled_free(struct snx_recompiled* m);
 /* The guest address range the module's dispatch table covers (code_lo inclusive, code_hi exclusive) */
@@ -127,6 +141,12 @@ SNX_RECOMPILER_API int snx_recompiled_bind(struct snx_recompiled* m, CPU* cpu);
 /* The host function for guest address pc: the recompiled function (also for a pc inside one, at a leader), or the
    module's interpreter for any other pc. Never NULL */
 SNX_RECOMPILER_API GuestFn snx_recompiled_lookup(const struct snx_recompiled* m, uint64_t pc);
+/* The recompiled function entered at pc (a leader), NULL for any other pc */
+SNX_RECOMPILER_API GuestFn snx_recompiled_function(const struct snx_recompiled* m, uint64_t pc);
+/* What the module's generated code calls for a pc its CPU's dispatch table has no function for, instead of the
+   interpreter: a just-in-time compiler's handler, which compiles the code at that pc and runs it. NULL restores the
+   interpreter */
+SNX_RECOMPILER_API void snx_recompiled_set_fallback(struct snx_recompiled* m, GuestFn fallback);
 /* Calls the guest function at pc (snx_recompiled_lookup) and returns when that host function returns: at the guest
    function's RET, with cpu->pc its return address, or after rt->undef or rt->brk */
 SNX_RECOMPILER_API void snx_recompiled_call(struct snx_recompiled* m, CPU* cpu, uint64_t pc);

@@ -181,12 +181,13 @@ int main(void) {
            !strcmp(def->title[GUI_SCREEN_MENU], yorha->title[GUI_SCREEN_MENU]));
     assert(yorha->head == GUI_STYLE_PLAIN && yorha->focus_bar && yorha->title[GUI_SCREEN_COMPILING][0]);
     /* the boxes: the default's framed, YoRHa's filled with a cursor in the margin; the title in the row of tabs in
-       both, YoRHa's twice as big; the grid, the tips' and the keys' boxes and the foot on a band YoRHa's alone */
+       both, YoRHa's twice as big; the tips on a row of their own under the head in both; the grid, the tips' and the
+       keys' boxes and the foot on a band YoRHa's alone */
     assert(def->panels == GUI_PANELS_OUTLINE && !def->cursor[0] && yorha->panels == GUI_PANELS_FILL &&
            !strcmp(yorha->cursor, "\xe2\x96\xba "));
     assert(def->head_place == GUI_HEAD_TABS && yorha->head_place == GUI_HEAD_TABS);
     assert(def->title_size == 1 && !def->title_shadow && yorha->title_size == 2 && !yorha->title_shadow);
-    assert(!def->grid && yorha->grid && def->tips_place == GUI_TIPS_BOTTOM && yorha->tips_place == GUI_TIPS_BOTTOM);
+    assert(!def->grid && yorha->grid && def->tips_place == GUI_TIPS_TOP && yorha->tips_place == GUI_TIPS_TOP);
     assert(!def->tips_box && !def->footer_box && yorha->tips_box && yorha->footer_box);
     assert(def->footer == GUI_STYLE_PLAIN && yorha->footer == GUI_STYLE_BAR && yorha->head_rule && !def->head_rule);
     assert(!gui_theme_key("body", "layout") && !gui_theme_key("head", "tabs") && !gui_theme_key("frame", "edges"));
@@ -260,10 +261,10 @@ int main(void) {
            rgb_is(theme.page, 0x10, 0x20, 0x30));
     parse(&theme, "[theme]\nbase = yorha\n[body]\ncursor = \"> \"\n");
     assert(theme.panels == GUI_PANELS_FILL && !strcmp(theme.cursor, "> "));
-    parse(&theme, "[theme]\nbase = yorha\n[body]\npanels = outline\n[head]\nplace = below\n[tips]\nplace = top\n"
+    parse(&theme, "[theme]\nbase = yorha\n[body]\npanels = outline\n[head]\nplace = below\n[tips]\nplace = bottom\n"
                   "box = false\n[footer]\nbox = false\nstyle = none\n");
     assert(theme.panels == GUI_PANELS_OUTLINE && theme.head_place == GUI_HEAD_BELOW &&
-           theme.tips_place == GUI_TIPS_TOP);
+           theme.tips_place == GUI_TIPS_BOTTOM);
     assert(!theme.tips_box && !theme.footer_box && theme.footer == GUI_STYLE_NONE);
     parse(&theme, "[body]\npanels = round\n[head]\nplace = left\n[tips]\nplace = side\n");
     assert(theme.panels == def->panels && theme.head_place == def->head_place && theme.tips_place == def->tips_place);

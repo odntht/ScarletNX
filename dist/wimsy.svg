@@ -27,15 +27,11 @@
 
         <dc:creator>
           <cc:Agent>
-            <dc:title>Madeline_Dev</dc:title>
-            <dc:identifier>mailto:madelvidel@gmail.com</dc:identifier>
+            <dc:title>Liz</dc:title>
           </cc:Agent>
         </dc:creator>
-        <dc:date>2025</dc:date>
         <dc:license
-   rdf:resource="https://www.gnu.org/licenses/gpl-3.0.html" />
-        <dc:rights>2025 Eden Emulator Project</dc:rights>
-        <dc:source>https://git.eden-emu.dev</dc:source>
+   rdf:resource="https://spdx.org/licenses/GPL-3.0-or-later.html" />
       </cc:Work>
     </rdf:RDF>
   </metadata>

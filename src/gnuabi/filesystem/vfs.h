@@ -13,8 +13,36 @@ typedef struct GnuVfs {
 int gnu_vfs_init(GnuVfs* vfs);
 void gnu_vfs_destroy(GnuVfs* vfs);
 int gnu_vfs_set_process(GnuVfs* vfs, uint32_t pid, const char* exe, int argc, const char* const* argv);
+void gnu_vfs_set_pid(GnuVfs* vfs, uint32_t pid); /* a forked child's: /proc/<pid> */
 /* The only imported host file is the executable already validated by the ELF loader. */
 int gnu_vfs_set_executable(GnuVfs* vfs, const void* bytes, size_t length);
+/* The host-backed namespace: guest paths name the sysroot's files, then the host's (QEMU's -L), the working folder
+   is the host's, and standard input, output and error are the host's descriptors. Without it (gnu_vfs_init alone)
+   the namespace is isolated: /tmp in memory, and no host file but the program */
+int gnu_vfs_set_root(GnuVfs* vfs, const char* sysroot);
+/* the guest path of a host path: under the sysroot without its prefix, otherwise as it is */
+int gnu_hostfs_program_path(GnuVfs* vfs, const char* host, char* guest, size_t capacity);
+/* execve: the descriptors marked close-on-exec go */
+void gnu_vfs_close_on_exec(GnuVfs* vfs);
+/* pipe2: a host pipe, its read end in fds[0]. flags: O_CLOEXEC, O_NONBLOCK */
+int gnu_vfs_pipe(GnuVfs* vfs, unsigned flags, int fds[2]);
+/* execve's file: the whole of the regular, executable file at path (its symlinks followed), and its guest path */
+int gnu_vfs_load(GnuVfs* vfs, int dirfd, const char* path, unsigned char** bytes, size_t* size, char* guest,
+                 size_t guest_capacity);
+/* the host descriptor guest descriptor fd is backed by (a file, a pipe, standard input), or -1 */
+int gnu_vfs_host_descriptor(GnuVfs* vfs, int fd);
+/* the host path a guest path names (its symlinks followed), for a host process to open */
+int gnu_vfs_host_path(GnuVfs* vfs, const char* guest, char* host, size_t capacity);
+/* the guest's working folder, and setting it (a process started by another copy of the runtime) */
+const char* gnu_vfs_cwd(GnuVfs* vfs);
+int gnu_vfs_set_cwd(GnuVfs* vfs, const char* guest);
+/* host descriptor host as guest descriptor fd (a process started by another copy of the runtime) */
+int gnu_vfs_adopt(GnuVfs* vfs, int fd, int host);
+/* A vfork child's descriptor table is a copy of its parent's: the parent's is kept aside, its files still open,
+   until the child execs or exits, and then it is the process's again */
+struct GnuVfsTable;
+struct GnuVfsTable* gnu_vfs_save_table(GnuVfs* vfs);
+void gnu_vfs_restore_table(GnuVfs* vfs, struct GnuVfsTable* table);
 bool gnu_vfs_syscall(GnuVfs* vfs, GnuMemory* memory, uint64_t number, const uint64_t args[6], int64_t* result);
 int64_t gnu_vfs_pread(GnuVfs* vfs, int fd, void* destination, size_t length, uint64_t offset);
 

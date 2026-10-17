@@ -20,6 +20,7 @@
 #include "common/cpu/recompiler/llvm/ir.h"
 #include "common/cpu/recompiler/llvm/link.h"
 #include <llvm-c/Support.h>
+#include <llvm-c/TargetMachine.h>
 #ifdef SNX_WITH_GCCJIT
 #include "common/cpu/recompiler/gccjit/jit.h"
 #endif
@@ -44,6 +45,9 @@
    snx-rtlib-gen embed); the LLVM backend compiles its bitcode instead (snx_ir_rtlib_object) */
 extern const unsigned char snx_rtlib_object[];
 extern const unsigned long snx_rtlib_object_size;
+/* the runtime library's bitcode the LLVM backend compiles (llvm/ir.c), which names its cached object */
+extern const unsigned char snx_rtlib_bitcode[];
+extern const unsigned long snx_rtlib_bitcode_size;
 
 /* instructions per code unit (an LLVM module, a libgccjit context): whole functions until a unit reaches it, as the
    game workflow splits them (SNX_CHUNK_INSTRUCTIONS) */
@@ -65,6 +69,7 @@ typedef struct {
     const uint64_t* addresses; /* ascending */
     const GuestFn* functions;  /* the function each leader belongs to (its F_, which dispatches on the entry) */
     GuestFn interp;            /* the module's interpreter (rtlib.c's snx_interp), for every other pc */
+    GuestFn* interp_entry;     /* rtlib.c's snx_interp_entry, which the module's lookups fall back to */
 } Descriptor;
 #define DESCRIPTOR_SYMBOL "snx_lib_module"
 typedef const Descriptor* (*DescriptorFn)(void);
@@ -75,6 +80,7 @@ struct snx_recompiler {
     unsigned jobs;
     int verbose;
     char* keep_ir;
+    char* cache; /* folder of linked modules by the hash of what they were made from (LLVM), NULL for none */
     char error[1024];
 };
 
@@ -85,6 +91,7 @@ struct snx_recompiled {
     void* jit_result;  /* libgccjit: gcc_jit_result*, released with the code */
     GuestFn* dispatch; /* (pc - code_lo) >> 2 -> function, NULL for the interpreter */
     GuestFn interp;    /* the module's interpreter entry */
+    GuestFn* fallback; /* the module's snx_interp_entry (snx_recompiled_set_fallback) */
     uint64_t code_lo, code_hi;
     size_t functions, fallbacks;
 };
@@ -146,6 +153,7 @@ struct snx_recompiler* snx_recompiler_new(int flags) {
 }
 
 void snx_recompiler_free(struct snx_recompiler* r) {
+    if (r) free(r->cache);
     if (!r) return;
     free(r->keep_ir);
     free(r);
@@ -176,6 +184,18 @@ int snx_recompiler_set_keep_ir(struct snx_recompiler* r, const char* folder) {
     }
     free(r->keep_ir);
     r->keep_ir = copy;
+    return 0;
+}
+
+int snx_recompiler_set_cache(struct snx_recompiler* r, const char* folder) {
+    free(r->cache);
+    r->cache = NULL;
+    if (!folder) return 0;
+    if (snx_mkdirs(folder)) {
+        fail(r, "cannot create the module cache %s", folder);
+        return -1;
+    }
+    r->cache = snx_strdup(folder);
     return 0;
 }
 
@@ -254,17 +274,24 @@ static SnxCodeImage* images(struct snx_recompiler* r, const struct snx_code_rang
 }
 
 /* chunks of whole functions: units[i] = first function of unit i, units[count] = function_count */
-static size_t* chunks(const SnxCodegen* codegen, size_t* count) {
-    size_t *units, first, last, n, instructions;
+static size_t* chunks(const SnxCodegen* codegen, unsigned jobs, size_t* count) {
+    size_t *units, first, last, n, instructions, total = 0, unit;
     units = (size_t*)calloc(codegen->function_count + 2, sizeof(*units));
     if (!units) return NULL;
+    /* a small program (a just-in-time step) is still split between the jobs, down to units of a few thousand
+       instructions, below which a unit's fixed cost is more than its share of the work */
+    for (first = 0; first < codegen->function_count; ++first) total += codegen->functions[first].count;
+    if (!jobs) jobs = snx_cpu_count();
+    unit = jobs > 1 ? total / jobs + 1 : CHUNK_INSTRUCTIONS;
+    if (unit < 4000) unit = 4000;
+    if (unit > CHUNK_INSTRUCTIONS) unit = CHUNK_INSTRUCTIONS;
     n = 0;
     for (first = 0; first < codegen->function_count; first = last) {
         last = first;
         instructions = 0;
         do {
             instructions += codegen->functions[last++].count;
-        } while (last < codegen->function_count && instructions < CHUNK_INSTRUCTIONS);
+        } while (last < codegen->function_count && instructions < unit);
         units[n++] = first;
     }
     units[n] = codegen->function_count;
@@ -438,7 +465,8 @@ static int load_descriptor(struct snx_recompiler* r, struct snx_recompiled* m, c
         m->dispatch[(a - m->code_lo) >> 2] = d->functions[i];
     }
     m->interp = d->interp;
-    if (!m->interp) {
+    m->fallback = d->interp_entry;
+    if (!m->interp || !m->fallback) {
         fail(r, "the recompiled module has no interpreter");
         return -1;
     }
@@ -655,11 +683,72 @@ static int llvm_descriptor(SnxIr* ir, const SnxCodegen* codegen, char* error, si
     FIELD(addresses, addresses);
     FIELD(functions, functions);
     FIELD(interp, interp);
+    FIELD(interp_entry, entry);
 #undef FIELD
     LLVMBuildRet(ir->b, desc);
     return 0;
 }
 
+/* ---- the module cache ----
+   A linked module is a function of the code it was made from, the addresses it sits at, where it may be entered (the
+   leaders), the backend's settings, the contract with the runtime (SNX_ABI) and the CPU it was made for (the backends
+   and rtlib.c use every extension the host has). Two 64-bit FNV-1a hashes of all that, with different offsets, name
+   it in the cache folder */
+typedef struct {
+    uint64_t a, b;
+} CacheKey;
+static void key_bytes(CacheKey* k, const void* data, size_t size) {
+    const unsigned char* p = (const unsigned char*)data;
+    size_t i;
+    for (i = 0; i < size; ++i) {
+        k->a = (k->a ^ p[i]) * UINT64_C(0x100000001b3);
+        k->b = (k->b ^ p[i]) * UINT64_C(0x100000001b3);
+    }
+}
+static void key_u64(CacheKey* k, uint64_t v) {
+    unsigned char bytes[8];
+    int i;
+    for (i = 0; i < 8; ++i) bytes[i] = (unsigned char)(v >> (i * 8));
+    key_bytes(k, bytes, sizeof(bytes));
+}
+static char* cache_path(struct snx_recompiler* r, SnxCodegen* codegen) {
+    CacheKey k;
+    char *cpu, *features, name[64];
+    size_t i, j;
+    SnxU32 word;
+    k.a = UINT64_C(0xcbf29ce484222325);
+    k.b = UINT64_C(0x84222325cbf29ce4);
+    key_bytes(&k, "snx-module-cache-1", 18);
+    key_u64(&k, SNX_ABI);
+    key_u64(&k, (uint64_t)r->backend);
+    key_u64(&k, (uint64_t)(unsigned char)r->opt);
+    cpu = LLVMGetHostCPUName();
+    features = LLVMGetHostCPUFeatures();
+    key_bytes(&k, cpu, strlen(cpu) + 1);
+    key_bytes(&k, features, strlen(features) + 1);
+    LLVMDisposeMessage(cpu);
+    LLVMDisposeMessage(features);
+    key_u64(&k, codegen->function_count);
+    for (i = 0; i < codegen->function_count; ++i) {
+        const SnxFunction* f = &codegen->functions[i];
+        key_u64(&k, f->start);
+        key_u64(&k, f->count);
+        for (j = 0; j < f->count; ++j) {
+            uint64_t a = snx_function_address(f, j);
+            if (!snx_codegen_word(codegen, a, &word)) word = 0;
+            key_u64(&k, a);
+            key_u64(&k, (uint64_t)word << 1 | f->leaders[j]);
+        }
+    }
+    snprintf(name, sizeof(name), "%016llx%016llx.%s", (unsigned long long)k.a, (unsigned long long)k.b,
+#ifdef _WIN32
+             "dll"
+#else
+             "so"
+#endif
+    );
+    return snx_path_join(r->cache, name);
+}
 /* The runtime library compiled for this CPU (snx_ir_rtlib_object), once per optimization level and process: it takes
    seconds, and nothing else a recompiler sets changes it. Kept until the process ends */
 #ifdef _WIN32
@@ -670,7 +759,31 @@ static pthread_mutex_t rtlib_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned char* rtlib_objects[6];
 static size_t rtlib_sizes[6];
 
-static int rtlib_object(char opt, const unsigned char** data, size_t* size, char* error, size_t error_size) {
+static void save_cached(const char* path, const unsigned char* data, size_t size);
+
+/* the cache's copy of the compiled runtime library: a short-lived process (a just-in-time compiler's, which a
+   program's every execve starts again) would spend most of its first compile on it */
+static char* rtlib_cache_path(const char* cache, char opt) {
+    CacheKey k;
+    char *cpu, *features, name[80];
+    k.a = UINT64_C(0xcbf29ce484222325);
+    k.b = UINT64_C(0x84222325cbf29ce4);
+    key_bytes(&k, "snx-rtlib-cache-1", 17);
+    key_u64(&k, SNX_ABI);
+    key_u64(&k, (uint64_t)(unsigned char)opt);
+    key_bytes(&k, snx_rtlib_bitcode, snx_rtlib_bitcode_size);
+    cpu = LLVMGetHostCPUName();
+    features = LLVMGetHostCPUFeatures();
+    key_bytes(&k, cpu, strlen(cpu) + 1);
+    key_bytes(&k, features, strlen(features) + 1);
+    LLVMDisposeMessage(cpu);
+    LLVMDisposeMessage(features);
+    snprintf(name, sizeof(name), "rtlib-%016llx%016llx.o", (unsigned long long)k.a, (unsigned long long)k.b);
+    return snx_path_join(cache, name);
+}
+
+static int rtlib_object(const char* cache, char opt, const unsigned char** data, size_t* size, char* error,
+                        size_t error_size) {
     static const char levels[] = "0123sz";
     const char* level = opt ? strchr(levels, opt) : NULL;
     size_t i = level ? (size_t)(level - levels) : 2;
@@ -680,7 +793,15 @@ static int rtlib_object(char opt, const unsigned char** data, size_t* size, char
 #else
     pthread_mutex_lock(&rtlib_lock);
 #endif
-    if (!rtlib_objects[i]) rc = snx_ir_rtlib_object(levels[i], &rtlib_objects[i], &rtlib_sizes[i], error, error_size);
+    if (!rtlib_objects[i] && cache) {
+        char* path = rtlib_cache_path(cache, levels[i]);
+        rtlib_objects[i] = snx_read_file(path, &rtlib_sizes[i]);
+        if (!rtlib_objects[i] &&
+            !(rc = snx_ir_rtlib_object(levels[i], &rtlib_objects[i], &rtlib_sizes[i], error, error_size)))
+            save_cached(path, rtlib_objects[i], rtlib_sizes[i]);
+        free(path);
+    } else if (!rtlib_objects[i])
+        rc = snx_ir_rtlib_object(levels[i], &rtlib_objects[i], &rtlib_sizes[i], error, error_size);
     *data = rtlib_objects[i];
     *size = rtlib_sizes[i];
 #ifdef _WIN32
@@ -689,6 +810,38 @@ static int rtlib_object(char opt, const unsigned char** data, size_t* size, char
     pthread_mutex_unlock(&rtlib_lock);
 #endif
     return rc;
+}
+
+/* the cached module at path, loaded; nonzero when there is none or it can't be loaded (then it is made again) */
+static int load_cached(struct snx_recompiler* r, struct snx_recompiled* m, const char* path) {
+    size_t size = 0;
+    unsigned char* data = snx_read_file(path, &size);
+    DescriptorFn describe;
+    int rc = -1;
+    if (!data) return -1;
+    if (!load_image(r, m, data, size)) {
+        describe = (DescriptorFn)(uintptr_t)image_symbol(m, DESCRIPTOR_SYMBOL);
+        rc = describe ? load_descriptor(r, m, describe()) : -1;
+        if (rc) {
+            free(m->dispatch);
+            m->dispatch = NULL;
+            unload_image(m);
+        }
+    }
+    free(data);
+    r->error[0] = 0;
+    return rc;
+}
+/* saved under a temporary name first and then renamed: another process may be loading the same module */
+static void save_cached(const char* path, const unsigned char* data, size_t size) {
+    static unsigned long serial;
+    char* temporary = snx_format("%s.%lu.%lu.tmp", path, (unsigned long)(snx_seconds() * 1000000.0), ++serial);
+    if (!snx_write_file(temporary, data, size) && !snx_replace(temporary, path)) {
+        free(temporary);
+        return;
+    }
+    snx_remove_tree(temporary);
+    free(temporary);
 }
 
 static int recompile_llvm(struct snx_recompiler* r, struct snx_recompiled* m, SnxCodegen* codegen) {
@@ -702,6 +855,7 @@ static int recompile_llvm(struct snx_recompiler* r, struct snx_recompiled* m, Sn
     const char* exports[1];
     char error[1024];
     int rc = -1;
+    char* cached = NULL;
     memset(&q, 0, sizeof(q));
     memset(&linked, 0, sizeof(linked));
     error[0] = 0;
@@ -709,7 +863,14 @@ static int recompile_llvm(struct snx_recompiler* r, struct snx_recompiled* m, Sn
         fail(r, "%s", error);
         return -1;
     }
-    units = chunks(codegen, &count);
+    if (r->cache) {
+        cached = cache_path(r, codegen);
+        if (!load_cached(r, m, cached)) {
+            free(cached);
+            return 0;
+        }
+    }
+    units = chunks(codegen, r->jobs, &count);
     if (!units) {
         fail(r, "out of memory");
         return -1;
@@ -741,7 +902,7 @@ static int recompile_llvm(struct snx_recompiler* r, struct snx_recompiled* m, Sn
         fail(r, "LLVM backend: %s", error[0] ? error : "cannot save the descriptor's IR");
         goto done;
     }
-    if (rtlib_object(r->opt, &rtlib, &rtlib_size, error, sizeof(error))) {
+    if (rtlib_object(r->cache, r->opt, &rtlib, &rtlib_size, error, sizeof(error))) {
         fail(r, "LLVM backend: %s", error);
         goto done;
     }
@@ -773,6 +934,7 @@ static int recompile_llvm(struct snx_recompiler* r, struct snx_recompiled* m, Sn
     }
     report(r, "LLVM module: %.1f MB\n", (double)linked.size / 1000000.0);
     if (load_image(r, m, linked.data, linked.size)) goto done;
+    if (cached) save_cached(cached, linked.data, linked.size);
     {
         DescriptorFn describe = (DescriptorFn)(uintptr_t)image_symbol(m, DESCRIPTOR_SYMBOL);
         if (!describe) {
@@ -789,6 +951,7 @@ done:
     free(inputs);
     free(descriptor_object);
     free(linked.data);
+    free(cached);
     snx_ir_free(ir);
     return rc;
 }
@@ -862,6 +1025,8 @@ static int jit_descriptor(SnxJit* jit, const SnxCodegen* codegen, char* error, s
     FIELD(functions, jit->t_ptr,
           gcc_jit_context_new_cast(x, NULL, gcc_jit_lvalue_get_address(functions, NULL), jit->t_ptr));
     FIELD(interp, jit->t_guest_ptr, interp_address);
+    FIELD(interp_entry, jit->t_ptr,
+          gcc_jit_context_new_cast(x, NULL, gcc_jit_lvalue_get_address(interp_entry, NULL), jit->t_ptr));
 #undef FIELD
     gcc_jit_block_end_with_return(block, NULL, gcc_jit_context_new_cast(x, NULL, base, jit->t_ptr));
     return 0;
@@ -882,7 +1047,7 @@ static int recompile_gccjit(struct snx_recompiler* r, struct snx_recompiled* m, 
     const char* message;
     int rc = -1;
     error[0] = 0;
-    units = chunks(codegen, &count);
+    units = chunks(codegen, r->jobs, &count);
     if (!units) {
         fail(r, "out of memory");
         return -1;
@@ -975,6 +1140,28 @@ done:
 
 /* ---- A64 ---- */
 
+/* the backend's half of snx_recompile_ranges and snx_recompile_from, for the functions codegen found; frees codegen */
+static struct snx_recompiled* recompile(struct snx_recompiler* r, struct snx_recompiled* m, SnxCodegen* codegen) {
+    int rc;
+    m->functions = codegen->function_count;
+    if (r->backend == SNX_RECOMPILER_FLAG_LLVM) rc = recompile_llvm(r, m, codegen);
+#ifdef SNX_WITH_GCCJIT
+    else if (r->backend == SNX_RECOMPILER_FLAG_GCCJIT)
+        rc = recompile_gccjit(r, m, codegen);
+#endif
+    else {
+        fail(r, "no backend");
+        rc = -1;
+    }
+    snx_codegen_free(codegen);
+    if (rc) {
+        snx_recompiled_free(m);
+        return NULL;
+    }
+    if (m->fallbacks) report(r, "%lu instructions run through the interpreter step\n", (unsigned long)m->fallbacks);
+    return m;
+}
+
 struct snx_recompiled* snx_recompile(struct snx_recompiler* r, uint64_t address, const void* code, size_t size) {
     struct snx_code_range range;
     range.address = address;
@@ -989,7 +1176,6 @@ struct snx_recompiled* snx_recompile_ranges(struct snx_recompiler* r, const stru
     SnxCodeImage* views;
     SnxCodegen codegen;
     uint64_t lo, hi;
-    int rc;
     r->error[0] = 0;
     views = images(r, ranges, range_count, 1, &lo, &hi);
     if (!views) return NULL;
@@ -1009,24 +1195,47 @@ struct snx_recompiled* snx_recompile_ranges(struct snx_recompiler* r, const stru
         free(m);
         return NULL;
     }
-    m->functions = codegen.function_count;
-    if (r->backend == SNX_RECOMPILER_FLAG_LLVM) rc = recompile_llvm(r, m, &codegen);
-#ifdef SNX_WITH_GCCJIT
-    else if (r->backend == SNX_RECOMPILER_FLAG_GCCJIT)
-        rc = recompile_gccjit(r, m, &codegen);
-#endif
-    else {
-        fail(r, "no backend");
-        rc = -1;
-    }
-    snx_codegen_free(&codegen);
     free(views);
-    if (rc) {
-        snx_recompiled_free(m);
+    return recompile(r, m, &codegen);
+}
+
+struct snx_recompiled* snx_recompile_from(struct snx_recompiler* r, const struct snx_code_range* ranges,
+                                          size_t range_count, const uint64_t* hints, size_t hint_count, size_t limit,
+                                          int (*skip)(void* context, uint64_t address), void* context) {
+    struct snx_recompiled* m;
+    SnxCodeImage* views;
+    SnxCodegen codegen;
+    uint64_t lo, hi;
+    size_t i;
+    r->error[0] = 0;
+    views = images(r, ranges, range_count, 1, &lo, &hi);
+    if (!views) return NULL;
+    if (snx_codegen_analyze_from(&codegen, views, range_count, hints, hint_count, limit, skip, context)) {
+        fail(r, "no code at the starting addresses");
+        snx_codegen_free(&codegen);
+        free(views);
         return NULL;
     }
-    if (m->fallbacks) report(r, "%lu instructions run through the interpreter step\n", (unsigned long)m->fallbacks);
-    return m;
+    free(views);
+    report(r, "from 0x%llx: %lu functions, %lu instructions\n", (unsigned long long)hints[0],
+           (unsigned long)codegen.function_count, (unsigned long)codegen.instruction_count);
+    m = (struct snx_recompiled*)calloc(1, sizeof(*m));
+    if (!m) {
+        fail(r, "out of memory");
+        snx_codegen_free(&codegen);
+        return NULL;
+    }
+    m->image_fd = -1;
+    /* the table covers what was found, not the ranges: they may be a whole program's code */
+    m->code_lo = ~(uint64_t)0;
+    m->code_hi = 0;
+    for (i = 0; i < codegen.function_count; ++i) {
+        const SnxFunction* f = &codegen.functions[i];
+        uint64_t first = snx_function_address(f, 0), last = snx_function_address(f, f->count - 1) + 4;
+        if (first < m->code_lo) m->code_lo = first;
+        if (last > m->code_hi) m->code_hi = last;
+    }
+    return recompile(r, m, &codegen);
 }
 
 void snx_recompiled_free(struct snx_recompiled* m) {
@@ -1060,6 +1269,15 @@ GuestFn snx_recompiled_lookup(const struct snx_recompiled* m, uint64_t pc) {
     uint64_t o = pc - m->code_lo;
     if (o < m->code_hi - m->code_lo && !(pc & 3) && m->dispatch[o >> 2]) return m->dispatch[o >> 2];
     return m->interp;
+}
+
+GuestFn snx_recompiled_function(const struct snx_recompiled* m, uint64_t pc) {
+    uint64_t o = pc - m->code_lo;
+    return o < m->code_hi - m->code_lo && !(pc & 3) ? m->dispatch[o >> 2] : NULL;
+}
+
+void snx_recompiled_set_fallback(struct snx_recompiled* m, GuestFn fallback) {
+    *m->fallback = fallback ? fallback : m->interp;
 }
 
 void snx_recompiled_call(struct snx_recompiled* m, CPU* cpu, uint64_t pc) { snx_recompiled_lookup(m, pc)(cpu, pc); }
@@ -1121,10 +1339,6 @@ struct snx_recompiled32* snx_recompile32_ranges(struct snx_recompiler* r, const 
         m->ranges[i].size = ranges[i].size;
     }
     m->count = range_count;
-    /* VFP and crypto blocks call these helpers (cpu/arm/simd.h), which the block compiler resolves in this process:
-       named here, so a program that doesn't export its symbols has them too */
-    LLVMAddSymbol("snx_arm_fp", (void*)(uintptr_t)snx_arm_fp);
-    LLVMAddSymbol("snx_arm_crypto", (void*)(uintptr_t)snx_arm_crypto);
     m->exec = snx_arm_exec_new(error, sizeof(error));
     if (!m->exec) {
         fail(r, "%s", error);

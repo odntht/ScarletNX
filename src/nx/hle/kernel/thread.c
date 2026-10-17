@@ -5,6 +5,8 @@
 /* threads: creating, starting, the thread a host thread runs, exiting */
 #include "nx/hle/kernel/kernel_int.h"
 #include "nx/gpu/renderer.h"
+#include "nx/runtime/loader.h"
+#include "nx/runtime/arm.h"
 /* ============================================================ threads */
 KThread* g_threads[256];
 int g_nthreads;
@@ -60,6 +62,18 @@ KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core) {
     c->x[0] = arg;
     c->x[31] = stack_top;
     c->pc = entry;
+    if (g_arm_mod) { /* a 32-bit thread: the kernel starts it in Thumb state when bit 0 of its entry is set */
+        SnxArmCPU* a = &t->arm;
+        memset(a, 0, sizeof *a);
+        a->mem = g_mem;
+        a->mem_size = 0x100000000ull;
+        a->rt = &g_arm_rt;
+        a->tpidruro = (u32)t->tls;
+        a->r[0] = (u32)arg;
+        a->r[13] = (u32)stack_top;
+        a->r[15] = (u32)entry & ~1u;
+        a->cpsr = 0x10 | (entry & 1 ? SNX_ARM_T : 0); /* user mode */
+    }
     return t;
 }
 
@@ -203,6 +217,7 @@ static void thread_body(void* p) {
     KThread* t = p;
     kthread_set(t);
     core_enter(t);
+    if (g_arm_mod) arm_thread_run(t);
     CPU* c = &t->cpu;
     snx_fpcr_apply(c);
     LOGV("[thread %llu] starts at %llx\n", (unsigned long long)t->id, (unsigned long long)c->pc);
@@ -266,6 +281,7 @@ void kernel_run_main(u64 entry, u64 stack_size, int prio, int core) {
     strcpy(t->name, "main");
     u32 h = h_new(&t->o);
     t->cpu.x[1] = h;
+    t->arm.r[1] = h;
     kthread_start(t);
 }
 

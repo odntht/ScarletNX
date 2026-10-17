@@ -11,7 +11,9 @@ foreach(var FROM TO KEY)
         message(FATAL_ERROR "deps_publish.cmake needs -D${var}=...")
     endif()
 endforeach()
-if(EXISTS "${TO}/snx-complete")
+# a folder already there stays, complete or not, and nothing is copied: renaming over it would fail, after 60 s on
+# Windows, where CMake retries a folder's rename that much
+if(EXISTS "${TO}")
     return()
 endif()
 string(RANDOM LENGTH 8 tag)

@@ -8,16 +8,31 @@
 #include "common/cpu/aarch64/cpu.h"
 #include <string.h>
 
-#define AS_SIZE    0x2000000000ull
-#define AS_BASE    0x08000000ull
-#define HEAP_BASE  0x100000000ull
-#define HEAP_SIZE  0x200000000ull
-#define ALIAS_BASE 0x300000000ull
-#define ALIAS_SIZE 0x1000000000ull
-#define STACK_BASE 0x1300000000ull
-#define STACK_SIZE 0x100000000ull
-#define KERN_BASE  0x1400000000ull /* TLS, kernel stacks, our own shmem */
-#define KERN_END   0x1800000000ull
+/* the host reservation: every guest address of either process width is an offset below it */
+#define AS_SIZE 0x2000000000ull
+/* The regions of the process's address space. A 64-bit process has the 39-bit layout (the default, so it holds before
+   mem_layout too); a 32-bit one has the console's 32-bit layout below 4 GiB (mem_layout) */
+typedef struct {
+    u64 base, end; /* the address space: [base, end) */
+    u64 heap, heap_size, alias, alias_size, stack, stack_size;
+    u64 kern, kern_end; /* TLS, kernel stacks, our own shmem */
+} MemLayout;
+extern MemLayout g_layout;
+#define AS_BASE        (g_layout.base)
+#define AS_END         (g_layout.end)
+#define HEAP_BASE      (g_layout.heap)
+#define HEAP_SIZE      (g_layout.heap_size)
+#define ALIAS_BASE     (g_layout.alias)
+#define ALIAS_SIZE     (g_layout.alias_size)
+#define STACK_BASE     (g_layout.stack)
+#define STACK_SIZE     (g_layout.stack_size)
+#define KERN_BASE      (g_layout.kern)
+#define KERN_END       (g_layout.kern_end)
+/* the code base of a 32-bit process, where Loader puts its first module */
+#define AS32_CODE_BASE 0x200000ull
+/* the layout of a 32-bit process (the NPDM's address space type: 0 with an alias region, 2 without one), before
+   anything is mapped */
+void mem_layout32(unsigned aspace);
 
 enum {
     MS_FREE = 0x00000000,

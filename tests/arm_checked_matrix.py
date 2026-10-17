@@ -44,7 +44,7 @@ def compile_blocks(args, root, profile, mode, opt):
     stem = root / f'{profile}-{mode}-{opt}'
     obj, lib = stem.with_suffix('.o'), stem.with_suffix('.so')
     subprocess.run([args.emitter, str(root / 'words.txt'), str(obj), opt, profile, mode], check=True)
-    subprocess.run([args.cc, '-shared', str(obj), '-o', str(lib)], check=True)
+    subprocess.run([args.cc, '-shared', str(obj), args.runtime, '-o', str(lib)], check=True)
     handle = C.CDLL(str(lib))
     functions = []
     for i in range(len(A.PROGRAMS)):
@@ -58,9 +58,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--emitter', required=True)
     parser.add_argument('--cc', required=True)
+    parser.add_argument('--runtime', required=True, help='libsnx_arm_rt.a')
     args = parser.parse_args()
     A.catalogue()
-    # Exclusives intentionally stop as unsupported on the checked backend.
+    # A57 checked exclusives remain unsupported. ARM11 reservations have an
+    # independent ISA oracle and real CTR bus witnesses, not a flat-value oracle.
     cases = [(i, group) for i, group in A.CASES if group != 'atomic']
     total = 0
     with tempfile.TemporaryDirectory(prefix='snx-checked-matrix-') as tmp:

@@ -31,6 +31,7 @@ class CPU(C.Structure):
         ('tpidruro', C.c_uint32),
         ('fpscr', C.c_uint32),
         ('d', C.c_uint64 * 32),
+        ('rt', C.c_void_p),  # the backend's SnxArmRt: none, the runtime library's defaults
     ]
 
 
@@ -118,7 +119,7 @@ def catalogue():
         0xE328F481,  # MRS/MSR
     ):
         case(word, 'misc')
-    for op in (2, 3, 6, 7):
+    for op in (0, 2, 3, 4, 6, 7):  # 0 and 4: SXTB16, UXTB16 (with add)
         for rotate in range(4):
             for n in (1, 15):
                 case(0xE6803072 | op << 20 | n << 16 | rotate << 10, 'misc')
@@ -157,6 +158,74 @@ def catalogue():
     for word in (0xE59F3004, 0xE1DF30B4, 0xE1CF00D8):
         # PC-relative word, halfword and doubleword literal loads.
         case(word, 'literal')
+    for word in (
+        0xE78F1000,  # STR r1,[pc,r0]
+        0xE70F1000,
+        0xE7CF1000,
+        0xE78F1100,
+        0xE78FF000,
+        0xE58F1004,
+        0xE50F1004,
+        0xE18F10B0,  # STRH r1,[pc,r0]
+        0xE1CF10B4,  # STRH r1,[pc,#4]
+        0xE18F20F0,  # STRD r2,r3,[pc,r0]
+        0xE1CF20F8,  # STRD r2,r3,[pc,#8]
+        0xE18F20D0,  # LDRD r2,r3,[pc,r0]
+        0xE19F10B0,  # LDRH r1,[pc,r0]
+    ):
+        # Transfers with a PC base and no writeback.
+        case(word, 'pcstore')
+    # ARMv6 media and DSP: Rd r3, Rn r1, Rm r2, Ra r4 (RdHi r3, RdLo r4).
+    for u in (0, 1):
+        for form in (1, 2, 3):
+            for op in (0, 1, 2, 3, 4, 7):
+                word = 0xE6013F12 | u << 22 | form << 20 | op << 5
+                case(word, 'dsp')
+                if form == 1:  # GE, then SEL reading it
+                    CASES.append((program(word, 0xE6815FB2), 'dsp'))
+    case(0xE6813FB2, 'dsp')  # SEL
+    for amount in (0, 1, 15, 31):
+        for tb in (0, 1):
+            case(0xE6813012 | amount << 7 | tb << 6, 'dsp')  # PKHBT/PKHTB
+    for base in (0xE6A03012, 0xE6E03012):  # SSAT, USAT
+        for sat in (0, 7, 15, 30, 31):
+            for amount in (0, 1, 31):
+                for sh in (0, 1):
+                    case(base | sat << 16 | amount << 7 | sh << 6, 'dsp')
+    for base in (0xE6A03F32, 0xE6E03F32):  # SSAT16, USAT16
+        for sat in (0, 7, 15):
+            case(base | sat << 16, 'dsp')
+    for op in range(4):
+        case(0xE1013052 | op << 21, 'dsp')  # QADD, QSUB, QDADD, QDSUB
+    for size in range(3):
+        for c in (0, 1):
+            case(0xE1013042 | size << 21 | c << 9, 'dsp')  # CRC32{C}{B,H,W}
+    for y in (0, 1):
+        for x in (0, 1):
+            case(0xE1034281 | y << 6 | x << 5, 'dsp')  # SMLA<x><y>
+            case(0xE1434281 | y << 6 | x << 5, 'dsp')  # SMLAL<x><y>
+            case(0xE16302A1 & ~0x60 | y << 6 | x << 5, 'dsp')  # SMUL<x><y>
+        case(0xE1234281 | y << 6, 'dsp')  # SMLAW<y>
+        case(0xE12302A1 | y << 6, 'dsp')  # SMULW<y>
+    for op in range(4):  # SMLAD, SMLADX, SMLSD, SMLSDX; SMUAD... with Ra 15; SMLALD...
+        case(0xE7034211 | op << 5, 'dsp')
+        case(0xE703F211 | op << 5, 'dsp')
+        case(0xE7434211 | op << 5, 'dsp')
+    for op in (0, 1, 6, 7):  # SMMLA, SMMLAR, SMMLS, SMMLSR; SMMUL, SMMULR with Ra 15
+        case(0xE7534211 | op << 5, 'dsp')
+        if op < 2:
+            case(0xE753F211 | op << 5, 'dsp')
+    case(0xE7834211, 'dsp')  # USADA8
+    case(0xE783F211, 'dsp')  # USAD8
+    case(0xE0434291, 'dsp')  # UMAAL
+    for word in (0xE320F010, 0xE320F014, 0xE320F0F5):  # ESB, CSDB, DBG: NOP
+        case(word, 'misc')
+    # MSR CPSR_c, and CPSR_xc with E 0. EL0 writes E through the x field (CPSRWriteByInstr), Unicorn (QEMU's user
+    # mask) doesn't: the 'msr_x' witness checks it
+    for word in (0xE121F002, 0xE323F0FF):
+        case(word, 'dsp')
+    for word in (0xF1010200, 0xF1010000):  # SETEND BE, LE
+        case(word, 'misc')
 
 
 def state(words, seed=1, group='data'):
@@ -176,7 +245,16 @@ def state(words, seed=1, group='data'):
     if group in ('memory', 'extra', 'multiple', 'atomic'):
         cpu.r[4] = 0x8000
         cpu.r[6] = 8
+        cpu.r[13] = 0x8800
         cpu.cpsr &= ~(1 << 29)  # RRX address must stay within this small mapping
+    if group == 'dsp':
+        halves = (0, 1, 0x7FFF, 0x8000, 0xFFFF, 0x7FFF7FFF, 0x80008000, 0x80000000, 0x7FFFFFFF, 0xFFFFFFFF, 0x00FF80FF)
+        cpu.r[1] = halves[seed % len(halves)]
+        cpu.r[2] = halves[(seed // 3) % len(halves)]
+        # Q is sticky: clear it on half the runs. GE takes every value
+        cpu.cpsr = (seed & 15) << 28 | ((seed >> 2) & 15) << 16 | (seed & 32) << 22 | 0x10
+    if group == 'pcstore':
+        cpu.r[0] = 0x800 + 8 * seed  # PC+8 +/- r0 (or r0 LSL 2) stays mapped, doubleword-aligned for ARM11
     if group == 'branch':
         cpu.r[2] = 0x2000 | (seed & 1)
         cpu.r[14] = 0x3000 | (seed & 1)
@@ -187,13 +265,13 @@ def state(words, seed=1, group='data'):
     return cpu, memory
 
 
-def compile_library(emitter, cc, directory, opt):
+def compile_library(emitter, cc, directory, opt, runtime):
     words = directory / 'words.txt'
     words.write_text(''.join(f'{pc:x} ' + ' '.join(f'{w:08x}' for w in p) + '\n' for pc, p in zip(PCS, PROGRAMS)))
     obj = directory / f'arm{opt}.o'
     lib = directory / f'arm{opt}.so'
     subprocess.run([emitter, str(words), str(obj), str(opt)], check=True)
-    subprocess.run([cc, '-shared', str(obj), '-o', str(lib)], check=True)
+    subprocess.run([cc, '-shared', str(obj), runtime, '-o', str(lib)], check=True)
     handle = C.CDLL(str(lib))
     functions = []
     for i in range(len(PROGRAMS)):
@@ -215,6 +293,10 @@ def witnesses():
         'ldm': program(0xE8B40005),
         'pop_pc': program(0xE8BD8001),
         'str_pc': program(0xE584F000),
+        'str_pc_base': program(0xE78F1000),
+        'setend': program(0xF1010200, 0xE3A00001),
+        'msr_x': program(0xE122F002, 0xE3A00001),
+        'msr_c': program(0xE121F002),
         'bx': program(0xE12FFF12),
         'blx_lr': program(0xE12FFF3E),
         'svc': program(0xEF001234),
@@ -285,6 +367,17 @@ def run_witnesses(functions, tests):
     assert cpu.exit == 0 and (cpu.r[0], cpu.r[13], cpu.r[15], cpu.cpsr & 32) == (42, 0x8008, 0x2000, 32)
     cpu, mem = run('str_pc')
     assert cpu.exit == 0 and int.from_bytes(mem[0x8000:0x8004], 'little') == PC + 8
+    cpu, mem = run('str_pc_base', lambda c, m: (c.r.__setitem__(0, 0x6FF8), c.r.__setitem__(1, 0xCAFEF00D)))
+    assert cpu.exit == 0 and cpu.r[15] == PC + 4 and int.from_bytes(mem[0x8000:0x8004], 'little') == 0xCAFEF00D
+    # E is read on a block's entry, so SETEND and MSR to the x field end the block after them.
+    for name in ('setend', 'msr_x'):
+        cpu, _ = run(name, lambda c, m: (c.r.__setitem__(0, 7), c.r.__setitem__(2, 0x200)))
+        assert cpu.exit == 0 and cpu.r[15] == PC + 4 and cpu.r[0] == 7 and cpu.cpsr & 0x200, name
+        cpu.r[15] = PC  # the next block, entered with E set
+        functions[tests[name]](C.byref(cpu))
+        assert cpu.exit == 9, name  # big-endian data: ENDIAN_UNSUPPORTED
+    cpu, _ = run('msr_c', lambda c, m: c.r.__setitem__(2, 0xFFFFFFFF))
+    assert cpu.exit == 0 and cpu.cpsr & 0x1FF == 0x10  # mode, A, I, F, T: none of it EL0's to write
     for name in ('bx', 'pc_alu'):
         cpu, _ = run(name, lambda c, m: c.r.__setitem__(2, 0x2001))
         assert cpu.exit == 0 and cpu.r[15] == 0x2000 and cpu.cpsr & 32
@@ -385,6 +478,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--emitter', required=True)
     parser.add_argument('--cc', default='clang')
+    parser.add_argument('--runtime', required=True, help='libsnx_arm_rt.a')
     parser.add_argument('--unicorn', action='store_true')
     parser.add_argument('--opt', choices=('0', '2'), action='append')
     args = parser.parse_args()
@@ -394,7 +488,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='snx-a32-') as directory:
         for opt in args.opt or ('0', '2'):
             print(f'A32 LLVM O{opt}', flush=True)
-            functions = compile_library(args.emitter, args.cc, pathlib.Path(directory), opt)
+            functions = compile_library(args.emitter, args.cc, pathlib.Path(directory), opt, args.runtime)
             run_witnesses(functions, tests)
             if args.unicorn:
                 differential(functions)

@@ -5,10 +5,12 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ['v*'] # a version's release (publish.yml)
   pull_request:
   workflow_dispatch:
 
-# Jobs only read the repository; the release job asks for more on its own
+# Jobs only read the repository. A push to main that builds everywhere becomes a nightly, and a pull request's run a
+# prerelease, in scarletnx/nightly: publish.yml does it once this workflow ends
 permissions:
   contents: read
 
@@ -46,16 +48,20 @@ jobs:
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
       # llvm: llvm-config and LLVM-C for the recompiler (llvm-libs alone has no headers). libgccjit builds the
-      # optional --backend=gcc too, so its tests (gccjit_differential, native_recompiler_gcc) run here. Mirrors drop a
-      # connection now and then (pkgforge's for aarch64 most), so each pacman install is tried 3 times, 5 s apart
+      # optional --backend=gcc too, so its tests (gccjit_differential, native_recompiler_gcc) run here. gdb: the
+      # gdbserver gdbstub_native drives. jq: scripts/pr-builds.sh, which pr_builds tests. Mirrors drop a connection now
+      # and then (pkgforge's for aarch64 most), so each pacman install is tried 3 times, 5 s apart
       - name: Install tools
         run: |
           for try in 1 2 3; do
-            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang llvm libgccjit pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast ccache && break
+            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang llvm libgccjit pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast ccache gdb jq && break
             [ "$try" = 3 ] && exit 1
             sleep 5
           done
+      # two commits: a pull request's merge commit and the base it is diffed against below
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
       - uses: actions/cache@v5
         with:
           path: .cache/cpm
@@ -91,19 +97,33 @@ jobs:
       - name: Build the runtime
         run: |
           cmake --preset default -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cmake --build --preset default
+          cmake --build --preset default --parallel "$(getconf _NPROCESSORS_ONLN)"
           cmake --install build/default --prefix stage
+      # The fallback is CMake's (cmake/dependencies.cmake pins SDL3) and the Windows job builds the same SDL3 from
+      # source: a pull request that changes no CMake file and not this workflow skips it, a push always builds it
+      - name: Look for CMake changes
+        id: cmake-changed
+        if: github.event_name == 'pull_request'
+        run: |
+          # safe.directory for this command only: the container's git refuses the checkout, and the build
+          # (cmake/commit.cmake) and build_info_commit after it must see it the same way
+          changed=$(git -c safe.directory="$GITHUB_WORKSPACE" diff --name-only HEAD^1 HEAD)
+          printf '%s\n' "$changed"
+          if grep -qE '(^|/)CMakeLists\.txt$|\.cmake$|^CMakePresets\.json$|^\.github/workflows/build\.yml$' <<<"$changed"; then
+            echo "yes=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Build the SDL3 fallback without a system package
+        if: github.event_name != 'pull_request' || steps.cmake-changed.outputs.yes == 'true'
         run: |
           cmake --preset default -B build/sdl-fallback -DCMAKE_DISABLE_FIND_PACKAGE_SDL3=ON \
             -DSNX_DEPLOY=OFF -DBUILD_TESTING=OFF -DSDL_WAYLAND=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cmake --build build/sdl-fallback --target scarletnx
+          cmake --build build/sdl-fallback --target scarletnx --parallel "$(getconf _NPROCESSORS_ONLN)"
       - name: Build SDL3 with headless Vulkan tests
         run: |
           cmake --preset default -B build/headless -DSNX_BUILD_GUI=OFF -DSNX_DEPLOY=OFF -DSNX_TEST_VULKAN=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cmake --build build/headless
+          cmake --build build/headless --parallel "$(getconf _NPROCESSORS_ONLN)"
       # Only what this run used is kept, so the cache saved is one build's worth
       - name: Trim the compiler cache
         run: |
@@ -140,7 +160,7 @@ jobs:
           python tools/run_game.py --help > /dev/null
       - uses: actions/upload-artifact@v7
         with:
-          name: scarletnx-linux-${{ matrix.arch }}-${{ steps.commit.outputs.short }}
+          name: ScarletNX-linux-${{ matrix.arch }}-${{ steps.commit.outputs.short }}-install
           path: stage
 
   appimage:
@@ -235,7 +255,7 @@ jobs:
           git config --global --add safe.directory '*'
           cmake --preset default -DSNX_DEPLOY=OFF -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cmake --build --preset default
+          cmake --build --preset default --parallel "$(getconf _NPROCESSORS_ONLN)"
           cmake --install build/default
       - name: Trim the compiler cache
         run: |
@@ -264,7 +284,7 @@ jobs:
       # Only what the script made: dist/ also holds the tracked desktop entry and icon
       - uses: actions/upload-artifact@v7
         with:
-          name: AppImage-${{ matrix.arch }}-${{ steps.commit.outputs.short }}
+          name: ScarletNX-linux-${{ matrix.arch }}-${{ steps.commit.outputs.short }}.AppImage
           path: |
             dist/*.AppImage*
             dist/appinfo
@@ -371,7 +391,7 @@ jobs:
             -DSNX_GCCJIT_INCLUDE_DIR="$(cygpath -m "$PWD/build/gccjit-include")" \
             -DSNX_GCCJIT_LIBRARY="$(cygpath -m /ucrt64/lib/libgccjit.dll.a)" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cmake --build --preset default --parallel 4
+          cmake --build --preset default --parallel "$(getconf _NPROCESSORS_ONLN)"
           cmake --install build/default --prefix stage
       - name: Trim the compiler cache
         run: |
@@ -450,7 +470,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v7
         with:
-          name: scarletnx-windows-${{ steps.commit.outputs.short }}
+          name: ScarletNX-windows-x86_64-${{ steps.commit.outputs.short }}
           path: stage
           if-no-files-found: error
 
@@ -529,7 +549,7 @@ jobs:
           JAVA_HOME=$JAVA_HOME_21_X64 scripts/android-apk.sh "$PWD/build/android" "$PWD/android-llvm" \
             ${{ matrix.abi }} -- \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cp build/android/stage/gradle/outputs/apk/debug/ScarletNX-debug.apk ScarletNX-${{ steps.commit.outputs.short }}-${{ matrix.abi }}.apk
+          cp build/android/stage/gradle/outputs/apk/debug/ScarletNX-debug.apk ScarletNX-android-${{ matrix.abi }}-${{ steps.commit.outputs.short }}.apk
       - name: Trim the compiler cache
         run: |
           ccache --show-stats --verbose
@@ -554,13 +574,13 @@ jobs:
       # Not zipped: the artifact is the APK itself, named after it
       - uses: actions/upload-artifact@v7
         with:
-          path: ScarletNX-${{ steps.commit.outputs.short }}-${{ matrix.abi }}.apk
+          path: ScarletNX-android-${{ matrix.abi }}-${{ steps.commit.outputs.short }}.apk
           archive: false
           if-no-files-found: error
       # What android-apk packs: the libraries, SDL's Java and the icon, without this APK's Gradle output
       - uses: actions/upload-artifact@v7
         with:
-          name: android-stage-${{ matrix.abi }}
+          name: ScarletNX-android-${{ matrix.abi }}-${{ steps.commit.outputs.short }}-stage
           path: |
             build/android/stage
             !build/android/stage/gradle
@@ -582,18 +602,18 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          pattern: android-stage-*
+          pattern: ScarletNX-android-*-${{ steps.commit.outputs.short }}-stage
           merge-multiple: true
           path: stage
       - name: Pack the APK of both ABIs
         run: |
           JAVA_HOME=$JAVA_HOME_21_X64 gradle -p dist/android assembleDebug -Pscarletnx.stage="$PWD/stage"
-          cp stage/gradle/outputs/apk/debug/ScarletNX-debug.apk ScarletNX-${{ steps.commit.outputs.short }}.apk
+          cp stage/gradle/outputs/apk/debug/ScarletNX-debug.apk ScarletNX-android-universal-${{ steps.commit.outputs.short }}.apk
       # A library that needs one Android 5.0 lacks fails to load there, and the app with it
       - name: Check the APK's libraries
         run: |
           set -euo pipefail
-          apk=ScarletNX-${{ steps.commit.outputs.short }}.apk
+          apk=ScarletNX-android-universal-${{ steps.commit.outputs.short }}.apk
           readelf=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf
           mkdir apk && unzip -q "$apk" 'lib/*' -d apk
           system=" libc.so libm.so libdl.so liblog.so libandroid.so libz.so libEGL.so libGLESv1_CM.so libGLESv2.so libOpenSLES.so "
@@ -608,7 +628,231 @@ jobs:
           done
       - uses: actions/upload-artifact@v7
         with:
-          path: ScarletNX-${{ steps.commit.outputs.short }}.apk
+          path: ScarletNX-android-universal-${{ steps.commit.outputs.short }}.apk
+          archive: false
+          if-no-files-found: error
+
+  # macOS and iOS (docs/APPLE.md), on Apple silicon with Xcode's Clang and SDKs; FFmpeg, OpenSSL and SDL3 are built from
+  # the pinned sources as everywhere. Until both have built green once, a failure here does not fail the run
+  # (continue-on-error), which would hold back the nightly: they are new, and no Mac checked them before CI. Each app
+  # carries Ryujinx's MoltenVK (V380-Ori/Ryujinx.MoltenVK): mainline's lacks patches emulators' pipelines need. The
+  # release's tar, its SHA-256 the one GitHub lists for it
+  macos:
+    name: macOS (arm64)
+    runs-on: macos-26
+    timeout-minutes: 150
+    continue-on-error: true
+    env:
+      MOLTENVK_RELEASE: v1.4.1-ryujinx
+      MOLTENVK_SHA256: ea1c633808d0a61e86ee35af4bdc280f5f07f95633b95935f3e695dc5226e640
+    steps:
+      # Artifacts carry the commit they came from: the branch's head in a pull request, else the commit pushed
+      - name: Name the commit
+        id: commit
+        shell: bash
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v5
+        with:
+          path: .cache/cpm
+          key: cpm-${{ github.job }}-${{ hashFiles('cmake/dependencies.cmake') }}
+      # LLVM's libraries for the Mac (scripts/apple-llvm.sh) with AArch64's code generator alone, the one the recompiler
+      # uses, built once per script and Xcode as the iOS job's. Saved as soon as they are built: actions/cache saves
+      # only a job that succeeds, and a later step's failure would build them again next run. Xcode's Clang builds
+      # everything, as a user's Mac does
+      - name: Name the Xcode
+        id: xcode
+        run: echo "version=$(xcodebuild -version | tr '\n' ' ' | tr -s ' ' '-')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v5
+        id: llvm
+        with:
+          path: apple-llvm
+          key: macos-llvm-${{ hashFiles('scripts/apple-llvm.sh') }}-${{ steps.xcode.outputs.version }}
+      - name: Install tools
+        run: brew install ninja ccache
+      - name: Build LLVM's libraries
+        if: steps.llvm.outputs.cache-hit != 'true'
+        run: scripts/apple-llvm.sh macos "$PWD/apple-llvm"
+      - if: steps.llvm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: apple-llvm
+          key: ${{ steps.llvm.outputs.cache-primary-key }}
+      # ccache and the dependency builds, set up as in the linux job
+      - uses: actions/cache/restore@v5
+        with:
+          path: .cache/ccache
+          key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-${{ github.job }}-
+      - uses: actions/cache/restore@v5
+        id: deps
+        with:
+          path: .cache/deps
+          key: deps-${{ github.job }}-${{ github.run_id }}
+          restore-keys: deps-${{ github.job }}-
+      - name: Set up the caches
+        run: |
+          {
+            echo "CCACHE_DIR=$GITHUB_WORKSPACE/.cache/ccache"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "SNX_DEPS_CACHE=$GITHUB_WORKSPACE/.cache/deps"
+            echo "SNX_CCACHE_START=$(date +%s)"
+          } >> "$GITHUB_ENV"
+      - name: Build the runtime
+        run: |
+          cmake --preset macos -DLLVM_DIR="$PWD/apple-llvm/lib/cmake/llvm" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build --preset macos --parallel "$(getconf _NPROCESSORS_ONLN)"
+          cmake --install build/macos --prefix stage
+      - name: Trim the compiler cache
+        run: |
+          ccache --show-stats --verbose
+          ccache --evict-older-than "$(( $(date +%s) - SNX_CCACHE_START ))s"
+          ccache --zero-stats
+          du -sh "$CCACHE_DIR"
+      - uses: actions/cache/save@v5
+        with:
+          path: .cache/ccache
+          key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Name the dependency builds
+        id: deps-used
+        run: |
+          used=$(find build -path '*/snx-deps/*.dir' -exec cat {} + | sort -u)
+          for d in .cache/deps/*; do grep -qxF "${d##*/}" <<<"$used" || rm -rf "$d"; done
+          echo "key=deps-${{ github.job }}-$(shasum -a 256 <<<"$used" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - if: steps.deps-used.outputs.key != steps.deps.outputs.cache-matched-key
+        uses: actions/cache/save@v5
+        with:
+          path: .cache/deps
+          key: ${{ steps.deps-used.outputs.key }}
+      - name: Check the ABI helpers compile
+        run: clang -fsyntax-only -Wall -fno-strict-aliasing -fwrapv -I src src/common/cpu/aarch64/cpu_helpers.c
+      - name: Test native tooling and indexed filesystems
+        run: ctest --test-dir build/macos --output-on-failure --parallel 4
+      - name: Fetch MoltenVK
+        run: |
+          curl -fL -o moltenvk.tar \
+            "https://github.com/V380-Ori/Ryujinx.MoltenVK/releases/download/$MOLTENVK_RELEASE/MoltenVK-macos.tar"
+          echo "$MOLTENVK_SHA256  moltenvk.tar" | shasum -a 256 -c
+          mkdir moltenvk && tar -xf moltenvk.tar -C moltenvk
+      # ditto keeps the app's links and its signature, which zip would not
+      - name: Make the app
+        run: |
+          scripts/apple-app.sh macos stage app moltenvk
+          ditto -c -k --keepParent app/ScarletNX.app ScarletNX-macos-arm64-${{ steps.commit.outputs.short }}.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          path: ScarletNX-macos-arm64-${{ steps.commit.outputs.short }}.zip
+          archive: false
+          if-no-files-found: error
+
+  ios:
+    name: iOS (arm64)
+    runs-on: macos-26
+    timeout-minutes: 150
+    continue-on-error: true
+    env:
+      MOLTENVK_RELEASE: v1.4.1-ryujinx
+      MOLTENVK_SHA256: 7cec48d4e73cf9eb89b60e8596758900caaf8398c49ae8abe4544295fb7e0c84
+    steps:
+      # Artifacts carry the commit they came from: the branch's head in a pull request, else the commit pushed
+      - name: Name the commit
+        id: commit
+        shell: bash
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v5
+        with:
+          path: .cache/cpm
+          key: cpm-${{ github.job }}-${{ hashFiles('cmake/dependencies.cmake') }}
+      # LLVM's libraries for iOS (scripts/apple-llvm.sh) with AArch64's code generator alone, built once per script and
+      # Xcode as Android's per NDK, and saved as soon as they are built (see the macos job)
+      - name: Name the Xcode
+        id: xcode
+        run: echo "version=$(xcodebuild -version | tr '\n' ' ' | tr -s ' ' '-')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v5
+        id: llvm
+        with:
+          path: ios-llvm
+          key: ios-llvm-${{ hashFiles('scripts/apple-llvm.sh') }}-${{ steps.xcode.outputs.version }}
+      - name: Install tools
+        run: brew install ninja ccache
+      - name: Build LLVM's libraries
+        if: steps.llvm.outputs.cache-hit != 'true'
+        run: scripts/apple-llvm.sh ios "$PWD/ios-llvm"
+      - if: steps.llvm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ios-llvm
+          key: ${{ steps.llvm.outputs.cache-primary-key }}
+      # ccache and the dependency builds, set up as in the linux job
+      - uses: actions/cache/restore@v5
+        with:
+          path: .cache/ccache
+          key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-${{ github.job }}-
+      - uses: actions/cache/restore@v5
+        id: deps
+        with:
+          path: .cache/deps
+          key: deps-${{ github.job }}-${{ github.run_id }}
+          restore-keys: deps-${{ github.job }}-
+      - name: Set up the caches
+        run: |
+          {
+            echo "CCACHE_DIR=$GITHUB_WORKSPACE/.cache/ccache"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "SNX_DEPS_CACHE=$GITHUB_WORKSPACE/.cache/deps"
+            echo "SNX_CCACHE_START=$(date +%s)"
+          } >> "$GITHUB_ENV"
+      - name: Build the app
+        run: |
+          cmake --preset ios -DLLVM_DIR="$PWD/ios-llvm/lib/cmake/llvm" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build --preset ios --parallel "$(getconf _NPROCESSORS_ONLN)"
+          cmake --install build/ios --prefix stage
+      - name: Trim the compiler cache
+        run: |
+          ccache --show-stats --verbose
+          ccache --evict-older-than "$(( $(date +%s) - SNX_CCACHE_START ))s"
+          ccache --zero-stats
+          du -sh "$CCACHE_DIR"
+      - uses: actions/cache/save@v5
+        with:
+          path: .cache/ccache
+          key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Name the dependency builds
+        id: deps-used
+        run: |
+          used=$(find build -path '*/snx-deps/*.dir' -exec cat {} + | sort -u)
+          for d in .cache/deps/*; do grep -qxF "${d##*/}" <<<"$used" || rm -rf "$d"; done
+          echo "key=deps-${{ github.job }}-$(shasum -a 256 <<<"$used" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - if: steps.deps-used.outputs.key != steps.deps.outputs.cache-matched-key
+        uses: actions/cache/save@v5
+        with:
+          path: .cache/deps
+          key: ${{ steps.deps-used.outputs.key }}
+      - name: Fetch MoltenVK
+        run: |
+          curl -fL -o moltenvk.tar \
+            "https://github.com/V380-Ori/Ryujinx.MoltenVK/releases/download/$MOLTENVK_RELEASE/MoltenVK-ios.tar"
+          echo "$MOLTENVK_SHA256  moltenvk.tar" | shasum -a 256 -c
+          mkdir moltenvk && tar -xf moltenvk.tar -C moltenvk
+      # Unsigned: AltStore, SideStore or a developer account sign it for the device it goes on, with
+      # dist/apple/ScarletNX.entitlements
+      - name: Make the IPA
+        run: |
+          scripts/apple-app.sh ios stage app moltenvk
+          mv app/ScarletNX.ipa ScarletNX-ios-arm64-${{ steps.commit.outputs.short }}.ipa
+      - uses: actions/upload-artifact@v7
+        with:
+          path: ScarletNX-ios-arm64-${{ steps.commit.outputs.short }}.ipa
           archive: false
           if-no-files-found: error
 
@@ -638,7 +882,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          name: AppImage-${{ matrix.arch }}-${{ steps.commit.outputs.short }}
+          name: ScarletNX-linux-${{ matrix.arch }}-${{ steps.commit.outputs.short }}.AppImage
           path: dist
       # Artifacts drop the executable bit
       # --backend=gcc runs the AppImage's own as and ld: check-package.sh leaves the runner's binutils off PATH
@@ -669,11 +913,102 @@ jobs:
           path: source
       - uses: actions/download-artifact@v8
         with:
-          name: scarletnx-windows-${{ steps.commit.outputs.short }}
+          name: ScarletNX-windows-x86_64-${{ steps.commit.outputs.short }}
           path: package
       # --backend=gcc with the zip's libgccjit, as and ld: check-package.sh leaves any binutils of the runner off PATH
       - name: Run the zip's scarletnx.exe as a user would
         run: bash source/scripts/check-package.sh package/bin/scarletnx.exe
+
+  # edenprobe's probes (docs/EDENPROBE.md), a release of scarletnx/edenprobe pinned by its sha256, recompiled by the
+  # Linux install and run on lavapipe: a case of tests/edenprobe/linux-x86_64.txt, the ones that passed before, that no
+  # longer passes fails the job. Another release or other mode words want that file written again
+  edenprobe:
+    name: edenprobe (Linux x86_64, lavapipe)
+    needs: linux
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    container: archlinux:latest
+    env:
+      EDENPROBE_VERSION: v0.4.0
+      EDENPROBE_SHA256: 4e33a924db5eda09b28395982b3cd93e532dbecc5aefd24e386ad88e3674a88b
+      # every family that needs no person or network: headless, the audio family's sound is never played
+      EDENPROBE_MODE: quick notime fatal cpu graphics fs video display kernel audio
+    outputs:
+      result: ${{ steps.probe.outputs.result }}
+    steps:
+      # Artifacts carry the commit they came from: the branch's head in a pull request, else the commit pushed
+      - name: Name the commit
+        id: commit
+        shell: bash
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
+      # The libraries the install links, and lavapipe; each pacman install tried 3 times, as in the Linux job
+      - name: Install the runtime's libraries and lavapipe
+        run: |
+          for try in 1 2 3; do
+            pacman -Syu --noconfirm --needed python llvm-libs libgccjit sdl3 vulkan-icd-loader vulkan-swrast && break
+            [ "$try" = 3 ] && exit 1
+            sleep 5
+          done
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: ScarletNX-linux-x86_64-${{ steps.commit.outputs.short }}-install
+          path: stage
+      - name: Fetch edenprobe
+        run: |
+          if [ -z "$EDENPROBE_SHA256" ]; then
+            echo "EDENPROBE_SHA256 is empty: pin the sha256 of edenprobe $EDENPROBE_VERSION" >&2
+            exit 1
+          fi
+          curl -fsSL --retry 3 -o edenprobe.nro \
+            "https://github.com/scarletnx/edenprobe/releases/download/$EDENPROBE_VERSION/edenprobe.nro"
+          echo "$EDENPROBE_SHA256  edenprobe.nro" | sha256sum -c -
+      # Artifacts drop the executable bit. The summary's title is the line of the pull request's comment (links)
+      - name: Run edenprobe
+        id: probe
+        run: |
+          chmod +x stage/bin/*
+          status=0
+          python3 scripts/edenprobe.py run --runtime stage/bin/scarletnx --nro edenprobe.nro --mode "$EDENPROBE_MODE" \
+            --out edenprobe --baseline tests/edenprobe/linux-x86_64.txt --summary "$GITHUB_STEP_SUMMARY" || status=$?
+          if [ -f edenprobe/summary.md ]; then
+            echo "result=$(head -n 1 edenprobe/summary.md | cut -c5-)" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+      # edenprobe's main, cases the release has not got yet: beside the release's report it only warns, and a nightly
+      # that cannot be fetched is a warning too (docs/EDENPROBE.md)
+      - name: Fetch edenprobe's main
+        id: main
+        if: ${{ !cancelled() }}
+        run: |
+          url=https://github.com/scarletnx/edenprobe/releases/download/nightly
+          if curl -fsSL --retry 3 -o edenprobe-main.nro "$url/edenprobe.nro" &&
+            curl -fsSL --retry 3 -o edenprobe-main.nro.sha256 "$url/edenprobe.nro.sha256" &&
+            echo "$(cut -d ' ' -f 1 edenprobe-main.nro.sha256)  edenprobe-main.nro" | sha256sum -c -; then
+            echo "nro=edenprobe-main.nro" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning title=edenprobe main::edenprobe's nightly could not be fetched or checked"
+          fi
+      - name: Run edenprobe's main, warnings only
+        if: ${{ !cancelled() && steps.main.outputs.nro }}
+        run: |
+          chmod +x stage/bin/*
+          python3 scripts/edenprobe.py run --runtime stage/bin/scarletnx --nro edenprobe-main.nro \
+            --mode "$EDENPROBE_MODE" --out edenprobe-main --advisory edenprobe/report.jsonl \
+            --summary "$GITHUB_STEP_SUMMARY"
+      # The report, the failures' pictures, the logs and this run's baseline.txt; not the recompiled game. Each attempt
+      # its own: a run takes one artifact of a name, and a job run again keeps the earlier attempt's to compare
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: edenprobe-${{ steps.commit.outputs.short }}-${{ github.run_attempt }}
+          path: |
+            edenprobe
+            !edenprobe/work
+            edenprobe-main
+            !edenprobe-main/work
 
   # A pull request's builds, linked from a comment on it that each run rewrites, as soon as they are built
   # (scripts/pr-builds.sh). A pull request from a fork gets a token that may not write, so it gets none
@@ -682,7 +1017,7 @@ jobs:
     if: >-
       !cancelled() && github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository
-    needs: [linux, appimage, windows, android-apk]
+    needs: [linux, appimage, windows, android-apk, macos, ios, edenprobe]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
@@ -701,86 +1036,3 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.event.pull_request.head.sha }}
         run: scripts/pr-builds.sh "$GITHUB_REPOSITORY" "$PR" "$GITHUB_RUN_ID" "$SHA"
-
-  # Every push to main that builds everywhere replaces the rolling "nightly" prerelease with Linux (x86-64 and
-  # AArch64), Windows and Android builds.
-  # A newer push cancels a release still running, so an older commit never publishes last
-  release:
-    name: Nightly release
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [linux, appimage, windows, appimage-check, windows-check, android-apk]
-    runs-on: ubuntu-26.04
-    timeout-minutes: 15
-    concurrency:
-      group: nightly-release
-      cancel-in-progress: true
-    permissions:
-      contents: write
-    steps:
-      # Artifacts carry the commit they came from: the branch's head in a pull request, else the commit pushed
-      - name: Name the commit
-        id: commit
-        shell: bash
-        env:
-          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
-      # The history the notes list changes from, beside the files the release takes from the workspace
-      - uses: actions/checkout@v7
-        with:
-          path: source
-          fetch-depth: 0
-      # Read before the action below deletes that release: its notes link the commit it was built from first
-      - name: Find the commit of the nightly this one replaces
-        id: previous
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          body=$(gh release view nightly --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null || true)
-          echo "sha=$(grep -o -m1 -E '[0-9a-f]{40}' <<<"$body" | head -n1)" >> "$GITHUB_OUTPUT"
-      # Both AppImages beside one appinfo (the same name and version), where the action takes *.AppImage*
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: AppImage-*-${{ steps.commit.outputs.short }}
-          merge-multiple: true
-      - name: Release the AppImages
-        uses: pkgforge-dev/make-nightly-appimage-release@17cbe90fc0796286e424619a54a82a3a880efe4c # v1.1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Download the Windows build
-        uses: actions/download-artifact@v8
-        with:
-          name: scarletnx-windows-${{ steps.commit.outputs.short }}
-          path: windows
-      - name: Package the Windows nightly
-        run: |
-          cd windows
-          zip -r ../ScarletNX-windows-x86_64.zip .
-      - name: Publish the Windows nightly
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload nightly ScarletNX-windows-x86_64.zip --repo "$GITHUB_REPOSITORY" --clobber
-      # Under a fixed name in the release, as the zip, so a link to it keeps working
-      - name: Download the Android APK
-        uses: actions/download-artifact@v8
-        with:
-          name: ScarletNX-${{ steps.commit.outputs.short }}.apk
-          path: android
-      - name: Publish the Android nightly
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cp android/ScarletNX-${{ steps.commit.outputs.short }}.apk ScarletNX-android.apk
-          gh release upload nightly ScarletNX-android.apk --repo "$GITHUB_REPOSITORY" --clobber
-      # The title the action gives the release, with a number for the time, is replaced by the commit's date and hash.
-      # The notes say which file is for which system, what changed since the previous nightly and where the source
-      # is, which the GPL asks for beside the binaries (scripts/nightly-notes.py). A new file in the release needs its
-      # line in that script's SYSTEMS, or this step stops and names it
-      - name: Write the title and the notes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PREVIOUS: ${{ steps.previous.outputs.sha }}
-        run: |
-          python3 source/scripts/nightly-notes.py "$GITHUB_SHA" "$PREVIOUS" --checkout source --repo "$GITHUB_REPOSITORY" \
-            --files ScarletNX-*.AppImage ScarletNX-windows-x86_64.zip ScarletNX-android.apk > notes.md
-          gh release edit nightly --repo "$GITHUB_REPOSITORY" --notes-file notes.md \
-            --title "$(python3 source/scripts/nightly-notes.py "$GITHUB_SHA" --checkout source --title)"

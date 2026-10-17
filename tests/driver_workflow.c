@@ -109,20 +109,31 @@ int snx_extract(int argc, char** argv, const SnxPaths* paths) {
         CHECK(!snx_remove_tree(argv[1]));
     return rc;
 }
-unsigned snx_game_abi(void) { return 4; }
+/* this build's stamp: ABI 4, made from commit abc1234 */
+#define SNX_WORKFLOW_STAMP "4\nabc1234\n"
+char* snx_game_stamp(void) { return snx_strdup(SNX_WORKFLOW_STAMP); }
 int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
     char *game, *partial, *name, *folder;
     int rc;
     if (getenv("SNX_WORKFLOW_BACKEND") && *getenv("SNX_WORKFLOW_BACKEND")) {
-        CHECK(argc == 6 && !strcmp(argv[2], "--backend") && !strcmp(argv[3], getenv("SNX_WORKFLOW_BACKEND")));
+        CHECK((argc == 6 || argc == 7) && !strcmp(argv[2], "--backend") &&
+              !strcmp(argv[3], getenv("SNX_WORKFLOW_BACKEND")));
         /* Normalize for the shared synthetic compilation assertions below. */
         argv[2] = argv[4];
         argv[3] = argv[5];
-        argc = 4;
+        if (argc == 7) argv[4] = argv[6];
+        argc -= 2;
     }
-    /* no name given: the recompile names the game */
-    CHECK(argc == 4 && !strcmp(argv[0], "--outdir") && !strcmp(argv[2], "--"));
-    if (getenv("SNX_WORKFLOW_NRO") && *getenv("SNX_WORKFLOW_NRO")) {
+    /* a dump's: no name given, the recompile names the game; a game made already: its folder's name */
+    CHECK((argc == 4 || argc == 5) && !strcmp(argv[0], "--outdir") && !strcmp(argv[2], "--"));
+    if (getenv("SNX_WORKFLOW_SOURCE") && *getenv("SNX_WORKFLOW_SOURCE")) {
+        char *given = snx_absolute(argv[3]), *expected = snx_absolute(getenv("SNX_WORKFLOW_SOURCE"));
+        const char* named = getenv("SNX_WORKFLOW_NAMED"); /* the name a game made already is given, if any */
+        CHECK(named && *named ? argc == 5 && !strcmp(argv[4], named) : argc == 4);
+        CHECK(given && expected && !strcmp(given, expected));
+        free(given);
+        free(expected);
+    } else if (getenv("SNX_WORKFLOW_NRO") && *getenv("SNX_WORKFLOW_NRO")) {
         char *given, *expected;
         CHECK(snx_is_file(argv[3]));
         /* The driver hands the stage a resolved path (Windows: backslashes and long
@@ -142,15 +153,30 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
     if (rc || (!strcmp(getenv("SNX_WORKFLOW_MODE"), "missing") && getenv("SNX_WORKFLOW_FAIL") &&
                !strcmp(getenv("SNX_WORKFLOW_FAIL"), "R")))
         return rc;
-    {
+    if (argc == 5)
+        name = snx_strdup(argv[4]);
+    else {
         SnxNpdm npdm;
         char error[256];
         CHECK(!snx_load_npdm(argv[3], &npdm, error, sizeof error));
         name = snx_game_name(NULL, &npdm, argv[3]);
     }
-    /* the game in a folder of its own, as the recompile makes it */
+    /* the game in a folder of its own, with its data, as the recompile makes it */
     folder = snx_path_join(argv[1], name);
     CHECK(!snx_mkdirs(folder));
+    partial = snx_format("%s/%s_data/exefs", folder, name);
+    CHECK(!snx_mkdirs(partial));
+    { /* the extraction's ExeFS in it, as the recompile stages it */
+        static const char* const files[] = {"main", "main.npdm"};
+        size_t k;
+        for (k = 0; k < 2; ++k) {
+            char *from = snx_format("%s/exefs/%s", argv[3], files[k]), *to = snx_path_join(partial, files[k]);
+            if (snx_is_file(from) && strcmp(from, to)) CHECK(!snx_copy_file(from, to));
+            free(from);
+            free(to);
+        }
+    }
+    free(partial);
 #ifdef _WIN32
     game = snx_format("%s/%s.exe", folder, name);
 #else
@@ -167,7 +193,7 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
                                 "so"
 #endif
         );
-        CHECK(!snx_write_file(stamp, "4\n", 2));
+        CHECK(!snx_write_file(stamp, SNX_WORKFLOW_STAMP, strlen(SNX_WORKFLOW_STAMP)));
         CHECK(!snx_write_file(code, "synthetic", 9));
         free(stamp);
         free(code);
@@ -179,8 +205,9 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
 }
 static void run(const char* exe, const char* repo, const char* dump, const char* log, int expected, const char* events,
                 const char* diagnostic) {
-    const char* args[16];
+    const char* args[24];
     const char *headless = getenv("SNX_WORKFLOW_HEADLESS"), *flags = getenv("SNX_WORKFLOW_FLAGS");
+    const char *outdir = getenv("SNX_WORKFLOW_OUTDIR"), *out = getenv("SNX_WORKFLOW_OUT");
     int n = 5;
     char* output = NULL;
     unsigned char* recorded;
@@ -197,6 +224,14 @@ static void run(const char* exe, const char* repo, const char* dump, const char*
     args[n++] = dump;
     if (flags && !strncmp(flags, "--backend=", 10)) args[n++] = flags;
     if (headless && *headless && strcmp(getenv("SNX_WORKFLOW_PREFIX"), "1")) args[n++] = headless;
+    if (outdir && *outdir) { /* "none": the option without its folder */
+        args[n++] = "--outdir";
+        if (strcmp(outdir, "none")) args[n++] = outdir;
+    }
+    if (out && *out) {
+        args[n++] = "--out";
+        args[n++] = out;
+    }
     if (getenv("SNX_WORKFLOW_ARGS") && *getenv("SNX_WORKFLOW_ARGS")) {
         args[n++] = "--";
         args[n++] = "some arg";
@@ -296,6 +331,10 @@ int main(int argc, char** argv) {
     set_env("SNX_WORKFLOW_HEADLESS", "");
     set_env("SNX_WORKFLOW_PREFIX", "0");
     set_env("SNX_WORKFLOW_NRO", "");
+    set_env("SNX_WORKFLOW_SOURCE", "");
+    set_env("SNX_WORKFLOW_NAMED", "");
+    set_env("SNX_WORKFLOW_OUTDIR", "");
+    set_env("SNX_WORKFLOW_OUT", "");
     reset(repo, dump);
     run(exe, repo, dump, log, 0, "ERG", NULL);
     CHECK(snx_is_dir(extracted) && snx_is_file(game));
@@ -307,17 +346,19 @@ int main(int argc, char** argv) {
     set_env("SNX_WORKFLOW_FAIL", "");
     run(exe, repo, dump, log, 0, "G", NULL);
 
-    /* Missing/mismatched/malformed ABI stamps are never trusted. */
+    /* Missing/mismatched/malformed ABI stamps are never trusted, nor one another build wrote with the same ABI: an
+       older version's ABI alone, another commit's, or this one's cut short or with more after it */
     {
+        const char* const stale[] = {
+            "3\nabc1234\n",      "broken", "4", "4garbage\n", "4\n", "4\ndef5678\n", "4\nabc1234", "4\nabc1234\n\n",
+            "4\nabc1234-dirty\n"};
         char* stamp = snx_path_join(repo, "games/Test game/Test game.abi");
-        CHECK(!snx_write_file(stamp, "3\n", 2));
-        run(exe, repo, dump, log, 0, "RG", NULL);
-        CHECK(!snx_write_file(stamp, "broken", 6));
-        run(exe, repo, dump, log, 0, "RG", NULL);
-        CHECK(!snx_write_file(stamp, "4", 1));
-        run(exe, repo, dump, log, 0, "RG", NULL);
-        CHECK(!snx_write_file(stamp, "4garbage\n", 9));
-        run(exe, repo, dump, log, 0, "RG", NULL);
+        size_t j;
+        for (j = 0; j < sizeof stale / sizeof *stale; ++j) {
+            CHECK(!snx_write_file(stamp, stale[j], strlen(stale[j])));
+            run(exe, repo, dump, log, 0, "RG", NULL);
+            run(exe, repo, dump, log, 0, "G", NULL); /* the recompile stamped it as this build */
+        }
         CHECK(!snx_remove_tree(stamp));
         run(exe, repo, dump, log, 0, "RG", NULL);
         free(stamp);
@@ -472,6 +513,16 @@ int main(int argc, char** argv) {
         run(exe, repo, dump, log, 0, "ERG", NULL);
         CHECK(snx_is_file(named) && !snx_is_file(game));
         run(exe, repo, dump, log, 0, "G", NULL);
+        { /* made already, recompiled where it is with no name given: shown again by its control.nacp, not its ID */
+            char *stamp = snx_format("%s/0100ABCD12345000.abi", folder),
+                 *data = snx_format("%s/0100ABCD12345000_data", folder);
+            CHECK(!snx_write_file(stamp, "4\n", 2));
+            set_env("SNX_WORKFLOW_SOURCE", data);
+            run(exe, repo, named, log, 0, "RG", NULL);
+            set_env("SNX_WORKFLOW_SOURCE", "");
+            free(data);
+            free(stamp);
+        }
         reset(repo, dump);
         set_env("SNX_WORKFLOW_NPDM", "bad");
         run(exe, repo, dump, log, 1, "E", "NPDM: access-control region exceeds file");
@@ -495,6 +546,9 @@ int main(int argc, char** argv) {
             set_env("SNX_WORKFLOW_HEADLESS", "--headless");
             run(exe, repo, nro, log, 0, "RG", NULL);
             CHECK(!snx_is_dir(extracted) && snx_is_file(game));
+            set_env("SNX_WORKFLOW_OUT", extracted); /* an extraction an NRO does not have */
+            run(exe, repo, nro, log, 1, "", "--out names a dump's extraction, and an NRO has none");
+            set_env("SNX_WORKFLOW_OUT", "");
             CHECK(!snx_mkdirs(extracted));
             run(exe, repo, nro, log, 0, "RG", NULL);
             set_env("SNX_WORKFLOW_FAIL", "R");
@@ -507,6 +561,105 @@ int main(int argc, char** argv) {
         }
         set_env("SNX_WORKFLOW_NRO", "");
         set_env("SNX_WORKFLOW_HEADLESS", "");
+    }
+    /* a game made already, named by its program or its folder: played as it is when this build made it, else
+       recompiled where it is from its _data (an NRO's from the NRO there), its name kept; -r recompiles it without
+       playing. A program an older version laid out beside the others is neither: the driver says what to do */
+    {
+        char *folder = snx_path_join(repo, "games/Test game"),
+             *data = snx_path_join(repo, "games/Test game/Test game_data");
+        char *stamp = snx_path_join(repo, "games/Test game/Test game.abi"), *slash = snx_format("%s/", folder);
+        char *nro = snx_path_join(data, "exefs/main.nro"), *old = snx_path_join(repo, "games/Old"), *old_data;
+#ifdef _WIN32
+        char* code = snx_path_join(folder, "Test game_code.dll");
+#else
+        char* code = snx_path_join(folder, "Test game_code.so");
+#endif
+        reset(repo, dump);
+        run(exe, repo, dump, log, 0, "ERG", NULL);
+        set_env("SNX_WORKFLOW_SOURCE", data);
+        set_env("SNX_WORKFLOW_NAMED", "Test game"); /* by its extraction's folder: the name kept is given */
+        run(exe, repo, game, log, 0, "G", NULL);
+        run(exe, repo, folder, log, 0, "G", NULL);
+        run(exe, repo, slash, log, 0, "G", NULL);
+        CHECK(!snx_write_file(stamp, "4\n", 2)); /* an older version's */
+        run(exe, repo, game, log, 0, "RG", NULL);
+        run(exe, repo, game, log, 0, "G", NULL);
+        CHECK(!snx_write_file(stamp, "4\ndef5678\n", 10)); /* another build's */
+        run(exe, repo, folder, log, 0, "RG", NULL);
+        CHECK(!snx_remove_tree(code));
+        run(exe, repo, game, log, 0, "RG", NULL);
+        set_env("SNX_WORKFLOW_FLAGS", "-r");
+        run(exe, repo, game, log, 0, "R", NULL);
+        run(exe, repo, folder, log, 0, "R", NULL);
+#ifndef _WIN32
+        set_env("SNX_WORKFLOW_FLAGS", "-rx");
+        run(exe, repo, game, log, 1, "", "-rx requires");
+#endif
+        set_env("SNX_WORKFLOW_FLAGS", "--backend=gcc");
+        set_env("SNX_WORKFLOW_BACKEND", "gcc");
+        run(exe, repo, game, log, 0, "RG", NULL);
+        set_env("SNX_WORKFLOW_BACKEND", "");
+        set_env("SNX_WORKFLOW_FLAGS", "");
+        set_env("SNX_WORKFLOW_OUTDIR", repo);
+        run(exe, repo, game, log, 1, "", "is a game");
+        set_env("SNX_WORKFLOW_OUTDIR", "");
+        set_env("SNX_WORKFLOW_OUT", extracted);
+        run(exe, repo, folder, log, 1, "", "is a game");
+        set_env("SNX_WORKFLOW_OUT", "");
+        CHECK(!snx_mkdirs(data) && !snx_write_file(stamp, "4\n", 2));
+        { /* an NRO's game: recompiled from the NRO its data keeps */
+            char* exefs = snx_path_join(data, "exefs");
+            CHECK(!snx_mkdirs(exefs) && !snx_write_file(nro, "NRO", 3));
+            set_env("SNX_WORKFLOW_SOURCE", nro);
+            run(exe, repo, game, log, 0, "RG", NULL);
+            free(exefs);
+        }
+        set_env("SNX_WORKFLOW_SOURCE", "");
+        set_env("SNX_WORKFLOW_NAMED", "");
+        old_data = snx_format("%s_data", old);
+        CHECK(!snx_copy_file(game, old) && !snx_mkdirs(old_data));
+        run(exe, repo, old, log, 1, "", "laid out by an older version: move its files as docs/DEPRECATIONS.md says");
+        set_env("SNX_WORKFLOW_FLAGS", "-r");
+        run(exe, repo, old, log, 1, "", "laid out by an older version");
+        set_env("SNX_WORKFLOW_FLAGS", "");
+        free(old_data);
+        free(old);
+        free(nro);
+        free(code);
+        free(slash);
+        free(stamp);
+        free(data);
+        free(folder);
+    }
+    /* --outdir and --out, as the menu passes the games and the extractions of Settings > App > Folders: the game and
+       the extraction go there, not in the data folder, and are used again there */
+    {
+        char *outdir = snx_path_join(root, "games elsewhere"), *out = snx_path_join(root, "work elsewhere/Test game");
+        char *folder = snx_path_join(outdir, "Test game"), *moved;
+#ifdef _WIN32
+        moved = snx_path_join(folder, "Test game.exe");
+#else
+        moved = snx_path_join(folder, "Test game");
+#endif
+        reset(repo, dump);
+        set_env("SNX_WORKFLOW_GAMES", folder);
+        set_env("SNX_WORKFLOW_OUTDIR", outdir);
+        set_env("SNX_WORKFLOW_OUT", out);
+        run(exe, repo, dump, log, 0, "ERG", NULL);
+        CHECK(snx_is_dir(out) && snx_is_file(moved) && !snx_is_dir(extracted) && !snx_is_file(game));
+        run(exe, repo, dump, log, 0, "G", NULL);
+        set_env("SNX_WORKFLOW_OUT", "");
+        set_env("SNX_WORKFLOW_OUTDIR", "none");
+        run(exe, repo, dump, log, 1, "", "--outdir requires a directory");
+        set_env("SNX_WORKFLOW_OUTDIR", "");
+        free(folder);
+        folder = snx_path_join(repo, "games/Test game");
+        set_env("SNX_WORKFLOW_GAMES", folder);
+        free(folder);
+        free(moved);
+        free(out);
+        free(outdir);
     }
     /* The probe takes a third argument, so use a separate, terminated vector. */
     {

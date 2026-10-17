@@ -2,6 +2,8 @@
    Copyright 2026 the ScarletNX contributors */
 #include "common/cpu/arm/exec.h"
 #include "common/cpu/arm/llvm.h"
+#include "common/cpu/arm/simd.h"
+#include <llvm-c/Support.h>
 #include <llvm-c/ExecutionEngine.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/Core.h>
@@ -28,15 +30,17 @@ static size_t code_span(const SnxArmExecRange* ranges, size_t n, uint32_t pc, un
     return 0;
 }
 
-static SnxArmBlock arm_block(SnxArmExec* e, const SnxArmExecRange* ranges, size_t nranges, uint32_t pc, int thumb,
-                             const unsigned char* base) {
+SnxArmBlock snx_arm_exec_block(SnxArmExec* e, const SnxArmExecRange* ranges, size_t nranges, uint32_t pc, int thumb,
+                               const unsigned char* base) {
     uint64_t key = ((uint64_t)pc << 1) | (unsigned)thumb;
     for (size_t i = 0; i < e->count; i++)
         if (e->blocks[i].key == key) return e->blocks[i].fn;
+    size_t consumed = 0, span = code_span(ranges, nranges, pc, thumb ? 2 : 4);
+    if (!span) return NULL;
+    if (span > 65536) span = 65536; /* the block compiler's limit */
     char name[40];
     snprintf(name, sizeof name, "a32_%08x_%d", pc, thumb);
     LLVMModuleRef module = LLVMModuleCreateWithNameInContext(name, e->ctx);
-    size_t consumed = 0, span = code_span(ranges, nranges, pc, thumb ? 2 : 4);
     LLVMValueRef fn = thumb ? snx_thumb_llvm_block(module, name, (const uint16_t*)(base + pc), span, pc, &consumed)
                             : snx_arm_llvm_block(module, name, (const uint32_t*)(base + pc), span, pc, &consumed);
     if (!fn) {
@@ -64,6 +68,13 @@ static int run_syscall(SnxArmSyscallFn syscall, void* context, SnxArmCPU* cpu, u
     return syscall(context, imm, cpu->r[7], arguments);
 }
 
+void snx_arm_exec_symbols(void) {
+    LLVMAddSymbol("snx_arm_fp", (void*)(uintptr_t)snx_arm_fp);
+    LLVMAddSymbol("snx_arm_crypto", (void*)(uintptr_t)snx_arm_crypto);
+    LLVMAddSymbol("snx_arm_undefined", (void*)(uintptr_t)snx_arm_undefined);
+    LLVMAddSymbol("snx_arm_coproc", (void*)(uintptr_t)snx_arm_coproc);
+}
+
 SnxArmExec* snx_arm_exec_new(char* error, size_t error_size) {
     if (error_size) error[0] = 0;
     if (LLVMInitializeNativeTarget() || LLVMInitializeNativeAsmPrinter()) {
@@ -71,6 +82,7 @@ SnxArmExec* snx_arm_exec_new(char* error, size_t error_size) {
         return NULL;
     }
     LLVMLinkInMCJIT();
+    snx_arm_exec_symbols();
     SnxArmExec* e = calloc(1, sizeof *e);
     if (!e) {
         snprintf(error, error_size, "out of memory");
@@ -106,7 +118,7 @@ int snx_arm_exec_run(SnxArmExec* e, SnxArmCPU* cpu, const SnxArmExecRange* range
     while (cpu->exit == SNX_ARM_OK) {
         uint32_t pc = cpu->r[15];
         int thumb = (cpu->cpsr & SNX_ARM_T) != 0;
-        SnxArmBlock block = arm_block(e, ranges, range_count, pc, thumb, base);
+        SnxArmBlock block = snx_arm_exec_block(e, ranges, range_count, pc, thumb, base);
         if (!block) {
             cpu->exit = SNX_ARM_BAD_ENTRY;
             break;

@@ -3,10 +3,14 @@
 # Copyright 2026 the ScarletNX contributors
 """Runs a recompiled game unattended, one or more times, and summarizes each run.
 
-    tools/run_game.py Game                               # one 60 s run of the New Game script
-    tools/run_game.py Game --runs 5 --seconds 45         # five runs, for an intermittent bug
-    tools/run_game.py Game --script 15000:400 --out /tmp/x
-    tools/run_game.py Game --fps_limit=0                 # options it doesn't know go to the runtime
+    tools/run_game.py 0100DA801624E000                        # one 60 s run of the New Game script
+    tools/run_game.py 0100DA801624E000 --runs 5 --seconds 45  # five runs, for an intermittent bug
+    tools/run_game.py ~/.local/share/scarletnx/games/0100DA801624E000 --script 15000:400 --out /tmp/x
+    tools/run_game.py Game --fps_limit=0                      # options it doesn't know go to the runtime
+
+The game is its folder in the user's data folder's games/ (where the driver puts it when no --repo names another),
+named by its title ID or by the name -r was given, a path to that folder, or the program the recompile's "Built" line
+names. A game an older version left loose in games/ runs from there.
 
 Each run writes run<N>.log and run<N>.png (the last frame; .ppm without Pillow) into --out (default: a new folder in
 the system's temporary folder). The summary line has the exit, the crash site (game pc and the symbol, with --dump),
@@ -24,6 +28,19 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def data_folder():
+    """The user's data folder, the driver's when no --repo names one (snx_user_data_dir in common.c)"""
+    if sys.platform == 'win32':
+        return os.path.join(os.environ.get('APPDATA', ''), 'scarletnx')
+    if sys.platform == 'darwin':
+        return os.path.expanduser('~/Library/Application Support/scarletnx')
+    xdg = os.environ.get('XDG_DATA_HOME', '')  # the XDG spec ignores a relative one
+    return os.path.join(xdg if os.path.isabs(xdg) else os.path.expanduser('~/.local/share'), 'scarletnx')
+
+
+GAMES = os.path.join(data_folder(), 'games')
 # Catherine from boot to the New Game cutscene: skip the intro movie, accept the terms, pick New Game, skip prompts
 NEW_GAME = '15000:400,16000:1,18000:400,21000:1,31000:1,36000:1,40000:1,44000:1'
 
@@ -59,10 +76,29 @@ def summarize(log, dump, seconds):
     return ', '.join(parts), bool(crash or brk)
 
 
+def find_game(game):
+    """The game's program: games/<id>/<id>[.exe] as the driver lays it out (driver.c, recompile.c)"""
+    ext = '.exe' if sys.platform == 'win32' else ''
+    if os.path.isfile(game):
+        return os.path.abspath(game)
+    folder = game if os.path.isdir(game) else os.path.join(GAMES, game)
+    folder = os.path.abspath(folder)
+    exe = os.path.join(folder, os.path.basename(folder) + ext)
+    if os.path.isfile(exe):
+        return exe
+    # an older version's game, its program loose in games/
+    old = os.path.join(GAMES, game + ext)
+    if os.path.isfile(old):
+        return old
+    raise SystemExit('%s does not exist: recompile the game (scarletnx -r)' % exe)
+
+
 def main():
     # No abbreviations: a runtime option must never be taken for a prefix of one of these
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0], allow_abbrev=False)
-    ap.add_argument('game', help='name of the game in games/ (the runtime copy, e.g. Game)')
+    ap.add_argument(
+        'game', help='its folder in games/ (the title ID, or the name -r gave it), or a path to the folder or program'
+    )
     ap.add_argument('--runs', type=int, default=1)
     ap.add_argument('--seconds', type=int, default=60)
     ap.add_argument(
@@ -71,15 +107,13 @@ def main():
         help='button script, "" for none (default: the New Game script of the game the fork is tested with)',
     )
     ap.add_argument('--out', help='folder for logs and screenshots')
-    ap.add_argument('--dump', help='extracted game folder, to name crash sites (e.g. work/Game)')
+    ap.add_argument('--dump', help='extracted game folder, to name crash sites (e.g. ~/.cache/scarletnx/work/Game)')
     ap.add_argument('args', nargs='*', help='more runtime options, e.g. --fps_limit=0 (with or without -- before them)')
     a, unknown = ap.parse_known_args()
     a.args += unknown
 
-    games = os.path.join(REPO, 'games')
-    exe = os.path.join(games, a.game + ('.exe' if sys.platform == 'win32' else ''))
-    if not os.path.isfile(exe):
-        raise SystemExit('%s does not exist: build the runtime (it deploys there) or recompile the game' % exe)
+    exe = find_game(a.game)
+    folder = os.path.dirname(exe)
     out = a.out or tempfile.mkdtemp(prefix='snx-run-')
     os.makedirs(out, exist_ok=True)
     failed, no_pillow = 0, False
@@ -89,7 +123,7 @@ def main():
         cmd = [exe, '--seconds=%d' % a.seconds, '--shot=' + shot] + (['--script=' + a.script] if a.script else [])
         with open(log, 'w') as f:
             try:
-                r = subprocess.run(cmd + a.args, cwd=games, stdout=f, stderr=subprocess.STDOUT, timeout=a.seconds + 60)
+                r = subprocess.run(cmd + a.args, cwd=folder, stdout=f, stderr=subprocess.STDOUT, timeout=a.seconds + 60)
                 code = r.returncode
             except subprocess.TimeoutExpired:
                 code = 'timeout'

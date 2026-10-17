@@ -25,7 +25,7 @@ typedef struct {
     char text[80];
     bool dirty, leaving; /* changed since it was saved; ESC pressed once over changes */
     int preview;         /* GUI_SCREEN_MENU or GUI_SCREEN_COMPILING */
-    char note[160];      /* what the last key did, when it did not do what it was asked */
+    char note[320];      /* what the last key did, when it did not do what it was asked */
     bool flat;           /* no section column: the form's rows are all of one */
     int step;            /* the last GUI_EDITOR_ACTION's key: 0 Select, -1 Left, 1 Right */
     bool picking;        /* the colour picker over the focused colour row, which Select opened */

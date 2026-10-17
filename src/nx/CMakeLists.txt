@@ -10,7 +10,7 @@
 #   vk        the renderer                                            platform  the OS layer and a window backend
 
 add_library(snx_nx_flags INTERFACE)
-target_link_libraries(snx_nx_flags INTERFACE scarletnx-common scarletnx-net)
+target_link_libraries(snx_nx_flags INTERFACE scarletnx-common scarletnx-net scarletnx-filesystem)
 # Every function and global used across files is declared once, in the header of the file that defines it, and
 # everything else is static: a declaration that disagrees with the definition is then a compile error instead of a
 # miscompile. Third-party sources keep their own warnings off.
@@ -26,14 +26,21 @@ function(snx_component name)
     target_link_libraries(snx_${name} PUBLIC snx_nx_flags)
 endfunction()
 
-snx_component(core runtime/main.c runtime/loader.c runtime/rtapi.c runtime/clock.c runtime/crash.c runtime/options.c
+snx_component(core runtime/main.c runtime/arm.c runtime/loader.c runtime/rtapi.c runtime/clock.c runtime/crash.c runtime/options.c
               runtime/ini.c runtime/startup.c runtime/gdbstub.c runtime/present.c)
 target_link_libraries(snx_core PRIVATE snx_driver snx_lz4)
+if(APPLE)
+    # main.c's weak snx_module_static, which no build defines yet: ld64 refuses an undefined symbol, weak or not,
+    # unless told it is resolved at run time
+    target_link_options(snx_core INTERFACE "LINKER:-U,_snx_module_static")
+endif()
 snx_component(kernel hle/kernel/kernel.c hle/kernel/thread.c hle/kernel/sync.c hle/svc/svc.c hle/svc/svc_mem.c hle/kernel/debug.c
               memory/mem.c hle/kernel/ipc.c)
 snx_component(hle hle/services/services.c hle/services/audren.c hle/services/audren_dsp.c hle/services/pl.c hle/services/sm.c hle/services/am.c hle/services/set.c hle/services/time.c hle/services/acc.c hle/services/audio.c
               hle/services/misc.c hle/services/ldr.c hle/services/network/bsd.c hle/services/network/dns.c
-              hle/services/network/nifm.c hle/services/network/ssl.c hle/filesystem/fs.c hle/filesystem/fs_tree.c hle/services/hid.c hle/services/hid_motion.c hle/services/hid_touch.c hle/services/vi.c hle/services/nvdrv.c)
+              hle/services/network/nifm.c hle/services/network/ssl.c hle/filesystem/fs.c hle/services/hid.c hle/services/hid_motion.c hle/services/hid_touch.c hle/services/vi.c hle/services/nvdrv.c)
+# the shared fonts' stand-ins (cmake/shared_fonts.cmake), which hle/services/pl.c hands out
+target_sources(snx_hle PRIVATE "${CMAKE_BINARY_DIR}/generated/shared_fonts.c")
 # the IPC interfaces of the services (docs/IPC.md): their dispatchers are generated, the handlers are in the services'
 # files. A type is defined before the files that use it
 include("${PROJECT_SOURCE_DIR}/cmake/swipc.cmake")
@@ -44,11 +51,11 @@ snx_swipc(snx_hle ROOT "${CMAKE_CURRENT_SOURCE_DIR}" FILES
           hle/services/vi.swipc hle/services/nvdrv.swipc hle/services/network/bsd.swipc
           hle/services/network/dns.swipc hle/services/network/nifm.swipc hle/services/network/ssl.swipc
           hle/filesystem/fs.swipc)
-snx_component(video gpu/video/host1x.c gpu/video/nvdec.c gpu/video/vic.c)
+snx_component(video gpu/video/host1x.c gpu/video/nvdec.c gpu/video/vp9_rebuild.cpp gpu/video/vic.c)
 target_link_libraries(snx_video PRIVATE FFmpeg::avcodec)
 # hwopus (hle/services/audio.c) decodes Opus with FFmpeg too
 target_link_libraries(snx_hle PRIVATE FFmpeg::avcodec OpenSSL::SSL)
-snx_component(gpu gpu/gpu.c gpu/maxwell/engines.c gpu/maxwell/mme.c gpu/maxwell/compute.c gpu/maxwell/fermi2d.c gpu/maxwell/dma.c gpu/maxwell/maxwell3d.c gpu/renderer.c)
+snx_component(gpu gpu/gpu.c gpu/maxwell/engines.c gpu/maxwell/mme.c gpu/maxwell/compute.c gpu/maxwell/fermi2d.c gpu/maxwell/dma.c gpu/maxwell/write_pages.c gpu/maxwell/maxwell3d.c gpu/renderer.c)
 
 include("${PROJECT_SOURCE_DIR}/cmake/controls_atlas.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/gui_themes.cmake")
@@ -66,8 +73,8 @@ snx_component(platform ${platform})
 snx_component(shader gpu/shader/shader.c gpu/shader/decode.c gpu/shader/corpus.c
                      gpu/shader/spirv_translate.c gpu/shader/spirv_compute.c gpu/shader/spirv_emit.c)
 snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/cmd.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
-                 gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/render.c gpu/vk/compute.c
-                 gpu/vk/astc.c gpu/vk/ui.c gpu/texture/etc2.c gpu/vk/vma.cpp "${volk_SOURCE_DIR}/volk.c")
+                 gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/render.c gpu/vk/release.c gpu/vk/compute.c
+                 gpu/vk/astc.c gpu/vk/ui.c gpu/texture/etc2.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp "${volk_SOURCE_DIR}/volk.c")
 set(components core kernel hle video gpu platform shader vk)
 # third-party code (vma.cpp is VMA's implementation)
 set_source_files_properties("${volk_SOURCE_DIR}/volk.c" gpu/vk/vma.cpp PROPERTIES COMPILE_OPTIONS -w)
@@ -89,6 +96,15 @@ else()
         target_link_libraries(scarletnx PRIVATE scarletnx-gui)
         target_compile_definitions(scarletnx PRIVATE SNX_WITH_GUI)
     endif()
+endif()
+if(IOS)
+    # the app (dist/apple): the menu and then the game it plays, in the one process an iOS app has
+    set_target_properties(scarletnx PROPERTIES MACOSX_BUNDLE ON
+                          MACOSX_BUNDLE_INFO_PLIST "${PROJECT_SOURCE_DIR}/dist/apple/Info-iOS.plist"
+                          MACOSX_BUNDLE_GUI_IDENTIFIER org.scarletnx
+                          MACOSX_BUNDLE_BUNDLE_NAME ScarletNX
+                          MACOSX_BUNDLE_SHORT_VERSION_STRING 0.1
+                          MACOSX_BUNDLE_BUNDLE_VERSION 1)
 endif()
 list(TRANSFORM components PREPEND snx_)
 add_library(scarletnx-nx STATIC)
@@ -183,16 +199,17 @@ endif()
 
 # a sanitized build (SNX_TEST_SANITIZERS) is a test build, its runtime instrumented: it doesn't go next to the games
 if(SNX_DEPLOY AND SNX_TEST_SANITIZERS AND BUILD_TESTING)
-    message(STATUS "SNX_TEST_SANITIZERS: the runtime is not deployed to ${SNX_GAMES_DIR}")
+    message(STATUS "SNX_TEST_SANITIZERS: the runtime is not deployed to the games")
 elseif(SNX_DEPLOY)
     add_custom_command(TARGET scarletnx POST_BUILD
         COMMAND "${CMAKE_COMMAND}" "-DRUNTIME=$<TARGET_FILE:scarletnx>" "-DGAMES=${SNX_GAMES_DIR}" "-DWINDOWS=${WIN32}"
+                "-DMACOS=${APPLE}"
                 -P "${CMAKE_SOURCE_DIR}/cmake/deploy.cmake"
         VERBATIM)
 endif()
 
 # All model names share the same Horizon/Maxwell implementation.
-if(ANDROID)
+if(ANDROID OR IOS) # an app has one program, started by its icon
     set(snx_models "")
 else()
     set(snx_models erista mariko aula)

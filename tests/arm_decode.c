@@ -3,6 +3,7 @@
 #include "common/cpu/arm/arm.h"
 #include "common/cpu/arm/simd.h"
 #include <stdio.h>
+#include <string.h>
 
 int main(void) {
     static const struct {
@@ -11,6 +12,8 @@ int main(void) {
     } cases[] = {
         {0xe1a00000, SNX_A32_DATA},
         {0xe59f0004, SNX_A32_SINGLE},
+        {0xe78f1000, SNX_A32_SINGLE},    /* STR r1, [pc, r0] */
+        {0xe7af1000, SNX_A32_UNDEFINED}, /* STR r1, [pc, r0]!: PC base with writeback */
         {0xe1cf00d8, SNX_A32_EXTRA},
         {0xe8bd8001, SNX_A32_MULTIPLE},
         {0xe12fff3e, SNX_A32_BX},
@@ -21,10 +24,11 @@ int main(void) {
         {0xe7df301f, SNX_A32_BITFIELD},
         {0xe10f3000, SNX_A32_MRS},
         {0xe128f002, SNX_A32_MSR},
-        {0xee1d3f50, SNX_A32_TLS},
-        {0xee1d3f70, SNX_A32_TLS},
-        {0xee0d3f50, SNX_A32_TLS},
-        {0xee0d3f70, SNX_A32_UNDEFINED}, /* TPIDRURO is read-only at EL0 */
+        {0xee1d3f50, SNX_A32_COPROC}, /* MRC TPIDRURW */
+        {0xee1d3f70, SNX_A32_COPROC}, /* MRC TPIDRURO */
+        {0xee0d3f50, SNX_A32_COPROC}, /* MCR TPIDRURW */
+        {0xee0d3f70, SNX_A32_COPROC}, /* MCR TPIDRURO: the backend refuses it (snx_arm_coproc_user, below) */
+        {0xec510f1e, SNX_A32_COPROC}, /* MRRC p15, 1, r0, r1, c14 (CNTVCT): the backend's */
         {0xe1940f9f, SNX_A32_EXCLUSIVE},
         {0xe1841f90, SNX_A32_EXCLUSIVE},
         {0xe1b40e9f, SNX_A32_EXCLUSIVE},
@@ -44,11 +48,14 @@ int main(void) {
         {0xf1a00000, SNX_A32_UNDEFINED}, /* cond=1111 in the integer space is not AL */
         {0xf3a00000, SNX_A32_VECTOR},    /* VADDL.U32, the AdvSIMD space uses cond=1111 */
         {0xe14f3000, SNX_A32_UNDEFINED}, /* MRS SPSR */
-        {0xe121f002, SNX_A32_UNDEFINED}, /* MSR control */
+        {0xe121f002, SNX_A32_MSR},       /* MSR CPSR_c: EL0 writes nothing of the c field */
+        {0xe161f002, SNX_A32_UNDEFINED}, /* MSR SPSR_c */
         {0xe1b0f00e, SNX_A32_UNDEFINED}, /* MOVS PC,LR exception return */
         {0xe8fd8000, SNX_A32_UNDEFINED}, /* privileged LDM^ */
         {0xe5b44004, SNX_A32_UNDEFINED}, /* writeback/load base overlap */
-        {0xe8b40010, SNX_A32_UNDEFINED}, /* LDM base in list with writeback */
+        {0xe8b40010, SNX_A32_MULTIPLE},  /* LDM base in list with writeback: loaded base wins (ARM11 MPCore/Unicorn) */
+        {0xe8a40010,
+         SNX_A32_MULTIPLE}, /* STM base in list with writeback: stores the old base (ARM11 MPCore/Unicorn) */
         {0xe8940000, SNX_A32_UNDEFINED}, /* empty register list */
         {0xe1c410d8, SNX_A32_UNDEFINED}, /* odd doubleword register pair */
         {0xe1840f90, SNX_A32_UNDEFINED}, /* STREX status/data overlap */
@@ -112,6 +119,34 @@ int main(void) {
         if (snx_thumb_decode(0xF8D1, 0x00FF, &t) != 2 || t.shape != TH_LOAD) return 1;
         /* Reserved/undefined encodings are rejected. */
         if (snx_thumb_decode(0xDE00, 0, &t) != 0) return 1; /* UDF space */
+        /* B<c>.W, not wide data processing */
+        if (snx_thumb_decode(0xF000, 0x83F9, &t) != 2 || t.shape != TH_BRANCH || t.op != BR_BCOND_W || t.ra != 0)
+            return 1;
+        /* Thumb32 instructions run as their A32 twins */
+        if (snx_thumb_decode(0xE8BD, 0x8FF0, &t) != 2 || t.shape != TH_A32 || t.imm != 0xE8BD8FF0u)
+            return 1; /* POP.W */
+        if (snx_thumb_decode(0xE92D, 0x4FF0, &t) != 2 || t.shape != TH_A32 || t.imm != 0xE92D4FF0u)
+            return 1;                                            /* PUSH.W */
+        if (snx_thumb_decode(0xE8BD, 0x2010, &t) != 0) return 1; /* POP.W {r4, sp}: SP in the list */
+        if (snx_thumb_decode(0xEE1D, 0x0F70, &t) != 2 || t.shape != TH_A32 || t.imm != 0xEE1D0F70u) return 1; /* MRC */
+        if (snx_thumb_decode(0xED9F, 0x0B02, &t) != 2 || t.imm != 0xED9F0B02u) return 1;                      /* VLDR */
+        if (snx_thumb_decode(0xEF60, 0x08E2, &t) != 2 || t.imm != 0xF26008E2u) return 1; /* VADD.I32 */
+        if (snx_thumb_decode(0xF960, 0x0A8F, &t) != 2 || t.imm != 0xF4600A8Fu) return 1; /* VLD1 */
+    }
+    {
+        /* the runtime library's coprocessor registers without a backend */
+        SnxArmCPU cpu;
+        memset(&cpu, 0, sizeof(cpu));
+        cpu.r[3] = 0x1234;
+        cpu.tpidruro = 0x5678;
+        snx_arm_coproc(&cpu, 0xee0d3f50); /* MCR TPIDRURW */
+        snx_arm_coproc(&cpu, 0xee1d2f70); /* MRC r2, TPIDRURO */
+        if (cpu.exit || cpu.tpidrurw != 0x1234 || cpu.r[2] != 0x5678) return 1;
+        snx_arm_coproc(&cpu, 0xee0d3f70); /* MCR TPIDRURO */
+        if (cpu.exit != SNX_ARM_UNDEFINED || cpu.syndrome != 0xee0d3f70 || cpu.tpidruro != 0x5678) return 1;
+        cpu.exit = 0;
+        snx_arm_undefined(&cpu, 0xe7f000f0, SNX_ARM_UNDEFINED);
+        if (cpu.exit != SNX_ARM_UNDEFINED || cpu.syndrome != 0xe7f000f0) return 1;
     }
     if (snx_arm_gccjit_stub() != SNX_ARM_BACKEND_UNSUPPORTED) return 1;
     {

@@ -37,14 +37,14 @@ static void pause_ms(long ms) {
 static void count(void* data) { ++*(int*)data; }
 
 int main(int argc, char** argv) {
-    const char* command[3];
+    const char *command[3], *quick[4];
     char *self, *output;
     int ticks, rc;
     double start, took;
-    if (argc == 2 && !strcmp(argv[1], "--child")) { /* a tool that says something, works a while, and fails */
+    if (argc >= 2 && !strcmp(argv[1], "--child")) { /* a tool that says something, works a while, and fails */
         puts("before");
         fflush(stdout);
-        pause_ms(1600);
+        if (argc == 2) pause_ms(1600); /* "--child now": no tick to wait for */
         puts("after");
         return 3;
     }
@@ -67,8 +67,12 @@ int main(int argc, char** argv) {
     rc = snx_run_ticking(command, NULL, NULL, NULL, count, &ticks);
     CHECK(rc == 3 && ticks >= 1);
     /* snx_run, no tick */
+    quick[0] = self;
+    quick[1] = "--child";
+    quick[2] = "now";
+    quick[3] = NULL;
     output = NULL;
-    CHECK(snx_run(command, NULL, NULL, &output) == 3 && output && strstr(output, "after"));
+    CHECK(snx_run(quick, NULL, NULL, &output) == 3 && output && strstr(output, "after"));
     free(output);
     free(self);
     puts("run_ticking passed");

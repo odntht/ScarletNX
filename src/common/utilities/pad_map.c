@@ -26,20 +26,10 @@ const char* snx_pad_control_name(int control, const int* labels) {
 const char* snx_pad_button_name(int bit) { return bit >= 0 && bit < SNX_PAD_BUTTONS ? BUTTONS[bit] : "None"; }
 
 void snx_pad_map_position(SnxPadMap* map) { memcpy(map->bit, POSITION, sizeof map->bit); }
-void snx_pad_map_labels(SnxPadMap* map, const int* labels) {
-    /* the symbols as the letters at their places on the most common layout: Cross is A, Circle B, Square X and
-       Triangle Y */
-    static const signed char BY_LABEL[] = {SNX_PAD_NONE, 0, 1, 2, 3, 0, 1, 2, 3};
-    static const int XBOX[4] = {SNX_PAD_LABEL_A, SNX_PAD_LABEL_B, SNX_PAD_LABEL_X, SNX_PAD_LABEL_Y};
+void snx_pad_map_swap_ab(SnxPadMap* map) {
     int c;
-    snx_pad_map_position(map);
-    if (!labels) labels = XBOX;
-    for (c = SNX_PAD_SOUTH; c <= SNX_PAD_NORTH; ++c) {
-        int label = labels[c];
-        /* SDL leaves labels unset for some third-party pads even when they have a valid gamepad mapping. */
-        if (label <= SNX_PAD_LABEL_NONE || label > SNX_PAD_LABEL_TRIANGLE) label = XBOX[c];
-        map->bit[c] = BY_LABEL[label];
-    }
+    for (c = 0; c < SNX_PAD_CONTROLS; ++c)
+        if (map->bit[c] == 0 || map->bit[c] == 1) map->bit[c] = (signed char)(1 - map->bit[c]); /* A is 0, B 1 */
 }
 void snx_pad_map_unset(SnxPadMap* map) { memset(map->bit, SNX_PAD_UNSET, sizeof map->bit); }
 void snx_pad_map_fill(SnxPadMap* map, const SnxPadMap* from) {

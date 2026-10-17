@@ -17,11 +17,16 @@ def main():
         assert p.returncode == status, (args, p.returncode, output)
         assert contains in output, (args, output)
         assert 'ScarletNX - ' not in output, output  # no false launch/completion banner
+        return output
 
-    run(['--help'], 0, 'Stage 2a')
+    help_text = run(['--help'], 0, 'recompile if needed, then play')
+    assert '--recomp' in help_text and '--extract' in help_text and 'scarletnx-3ds-aot' not in help_text
+    run(['-x', '-r', 'game.cia'], 2, 'Usage:')
+    run(['-r', '--max-blocks', '5', 'game.cia'], 2, 'Usage:')
+    run(['--board-info', '-r'], 2, 'Usage:')
     run(['--output'], 2, 'requires a directory')
     run(['--repo'], 2, 'requires a directory')
-    run(['--board-info', '--repo', '.'], 2, 'Usage:')
+    run(['--board-info', '--repo', '.'], 0, 'Old 3DS')  # --repo is a global data-directory option
     run(['--board-info', '-x'], 2, 'Usage:')
     run([], 2, 'Usage:')
     run(['--model'], 2, 'requires old or new')

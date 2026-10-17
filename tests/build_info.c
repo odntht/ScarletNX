@@ -6,6 +6,9 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 int main(void) {
     char want[256];
@@ -16,6 +19,10 @@ int main(void) {
     os = "Linux";
 #elif defined(__FreeBSD__)
     os = "FreeBSD";
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+    os = "iOS";
+#elif defined(__APPLE__)
+    os = "macOS";
 #else
     os = "unknown OS";
 #endif
@@ -36,7 +43,8 @@ int main(void) {
     printf("%s\n", snx_build_info());
     assert(!arch || !strcmp(snx_build_info(), want));
     assert(strlen(SNX_COMMIT) >= 7); /* a hash, or "unknown" */
-    assert(SNX_BRANCH[0]);           /* a branch, "detached" or "unknown" */
+    assert(!strcmp(snx_build_commit(), SNX_COMMIT));
+    assert(SNX_BRANCH[0]); /* a branch, "detached" or "unknown" */
     puts("build info: commit, compiler and host in the window titles' line passed");
     return 0;
 }

@@ -19,11 +19,19 @@ typedef struct {
     int slot;         /* the next instruction is a delay slot: its exit bit doesn't count */
     int exiting;      /* the macro ends after the next instruction, its exit's delay slot */
 } GpuMme;
+/* a method batch's place in the stream: one can continue into the next GPFIFO entry */
+typedef struct {
+    u32 mode, sub, m, cnt, k;
+} PbBatch;
 typedef struct GpuChannel {
     u32 id;
     u32 sub_class[8];
     u32 puller[0x40];
     u32 r3d[0x1000]; /* 3D engine regs, 0xE00+ are MME macro calls */
+    u32 r3d_shadow[0xE00]; /* SET_MME_SHADOW_RAM_CONTROL track/replay state */
+    u32 r3d_shadow_mode;
+    u64 r3d_counter_base[32]; /* draw-count baselines for estimated Maxwell counter reports */
+    u32 r3d_counter_reset_mask;
     u32 rcomp[0x1000];
     u32 r2d[0x400];
     u32 rdma[0x200];
@@ -35,7 +43,7 @@ typedef struct GpuChannel {
     int i2m_linear;
     u32 i2m_bd, i2m_dw, i2m_dh, i2m_x, i2m_y, i2m_z;
     /* macros (MME) */
-    u32 pb_mode, pb_sub, pb_m, pb_cnt, pb_k; /* a method batch can continue into the next GPFIFO entry */
+    PbBatch pb;
     u32 mme_code[0x2000];
     u32 mme_start[0x100];
     u32 mme_upload_ptr, mme_start_ptr;
@@ -58,6 +66,10 @@ typedef struct GpuChannel {
     u64 cbind[5][18];
     u32 cbind_size[5][18];
     u32 instance_count; /* the instance the next draw is, counted by BEGIN's next-instance bit and 0x486 */
+    u64 dma_job_id;
+    u32 dma_launch_index;
+    u32* inline_indices; /* 3D inline index methods, widened to u32 until END draws them */
+    u32 inline_n, inline_cap;
     GpuMme mme;         /* the macro running, or one a wait stopped after the method that asked for it */
     /* what the stream waits for before its next method (gpu_park): the GPU thread runs other channels' work meanwhile,
        as the GPU's Host unit (PFIFO) switches channels on a semaphore acquire that fails */
@@ -83,7 +95,34 @@ typedef struct {
     u32 format, linear, bh, depth, layer, pitch, width, height;
     u64 addr;
 } Surf2D;
+/* the VIC composition (gpu/video/vic.c): a surface plane as VIC addresses it (pitch linear rows or block linear
+   GOBs), a slot's resolved rectangles and color matrix, and a job's planes and slots. The renderer's vic_compose
+   runs the composition as a compute shader (gpu/vk/vic.c); when it returns 0 the caller composes in guest memory */
+typedef struct VicPlane {
+    u8* p;   /* the plane's bytes in guest memory */
+    u64 lim; /* bytes p may touch */
+    u32 pitch, h, blk, bh;
+} VicPlane;
+typedef struct VicSlot {
+    int on; /* the slot composes */
+    u32 sx0, sy0, dx0, dy0, w, h; /* the resolved rectangles: source start, destination start and size */
+    int mat[3][4], mat_shift, mat_enable; /* the color matrix, out = (R*c0 + G*c1 + B*c2) >> shift, + c3, >> 8 */
+    u32 alpha, clamp_lo, clamp_hi; /* the planar alpha and the soft clamp range (10 bit) */
+    VicPlane iy, ic;
+} VicSlot;
+typedef struct VicJob {
+    u32 fmt, sw, sh;
+    VicPlane oy, oc; /* oc.p is NULL when the format has no chroma */
+    VicSlot slots[8];
+} VicJob;
 int gmem_read(u64 gva, void* dst, u64 size);
+/* gmem_read and gmem_write in halves, for a copy of many small runs (a block linear row's 16 byte runs): the
+   renderer's hooks once over the span the runs fall in (gmem_need before reading it, gmem_before_write before writing
+   it and gpu_mem_written after), then the runs themselves without them. The hooks look through every render target */
+void gmem_need(u64 gva, u64 size);
+void gmem_read_raw(u64 gva, void* dst, u64 size);
+void gmem_before_write(u64 gva, u64 size);
+void gmem_write_raw(u64 gva, const void* src, u64 size);
 void gmem_read_code(u64 gva, void* dst, u64 size); /* a shader program: stops where guest memory does */
 int gmem_write(u64 gva, const void* src, u64 size);
 u8* gmem_ptr(u64 gva, u64 size);
@@ -101,6 +140,11 @@ void compute_method(GpuChannel* ch, u32 m, u32 v, int last);
 void kepler_i2m_method(GpuChannel* ch, u32 m, u32 v);
 void fermi2d_method(GpuChannel* ch, u32 m, u32 v);
 void dma_method(GpuChannel* ch, u32 m, u32 v);
+/* the linear source of a LAUNCH_DMA (v) with registers r, read now for the channel's copy to use when it runs: called
+   in the channel's submit order, for every launch the stream will run (gpu_submit) */
+void dma_snap_launch(u32 channel, u64 job_id, u32 launch_index, const u32* r, u32 v);
+void dma_snap_finish(u32 channel, u64 job_id);
+void dma_snap_reset(u32 channel);                                 /* the channel closed: what it queued goes */
 void gpu_mem_written(u64 gva, u64 size);
 void gpu_mem_written_shader(u64 gva, u64 size); /* shader writeback tracks both GPU VA and guest backing */
 void gpu_signal_point(void);                    /* the GPU is about to do something the game can observe */
@@ -117,6 +161,7 @@ void gpu_submit(const void* entries, u32 n, u32 channel, u32 incs, u32 wait_id, 
    chans[0..nchans) (n at most 4) are done. Other channels' jobs, queued before or after it, don't hold it back */
 void gpu_call(void (*fn)(void*), void* arg, const u32* chans, u32 nchans);
 void gpu_channel_close(u32 channel); /* nvdrv closed the channel: a new one with the same id starts from reset */
+void gpu_release_retire(u32 channel); /* complete pending syncpoint releases before nvdrv reuses its id */
 /* the channel's stream waits for the u32 at GPU address addr (a syncpoint's id for the syncpoint kinds) to equal val,
    or reach it (geq), before its next method. Met already, nothing waits. Otherwise the method that asked returns and
    the stream stops after it (a macro after the method too, mme_resume), and the GPU thread goes on with other
@@ -133,6 +178,10 @@ extern void (*g_gpu_mem_changed)(u64 cpu_addr, u64 len); /* the renderer's side 
 /* the renderer lands pending shader results before the stream goes on past them: before a write of
    memory those results overlap (size > 0), and before anything the game can observe (gpu_signal_point, size 0) */
 extern void (*g_gpu_before_write)(u64 gva, u64 size);
+extern int g_gpu_releases; /* the renderer holds releases waiting to happen (renderer.h release_need) */
+/* a semaphore or report payload the game can poll, and a syncpoint increment of the stream: they happen once
+   everything before them in the stream is done */
+void gpu_release_write(u64 gva, const void* data, u32 len);
 /* Hold the renderer's memory lock across a backing change. full is for CPU guest pages, whose GPU aliases are
    unknown; GPU-VA changes supply the affected range. Begin precedes the memory manager's own lock. */
 extern void (*g_gpu_mapping_begin)(u64 gva, u64 size, int full);
@@ -158,6 +207,6 @@ void r3d_const_upload(GpuChannel* ch, u32 v, int last);
 void r3d_const_flush(GpuChannel* ch); /* writes the constant buffer data r3d_const_upload is holding */
 int r3d_blit(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, int dh, double sx, double sy, double sdx,
              double sdy);
-u64 gpu_mem_generation(void); /* the last fully published GPU-side write-log generation */
+u64 gpu_mem_generation(void); /* the last fully published GPU-side write generation */
 int gpu_mem_dirty_since(u64 since, u64 a, u64 sz);
 #endif

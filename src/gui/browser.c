@@ -22,6 +22,23 @@ bool gui_is_dump(const char* name) {
     return suffix(name, ".nro") || suffix(name, ".xci") || suffix(name, ".nsp") || suffix(name, ".dxci") ||
            suffix(name, ".dnsp");
 }
+bool gui_game_folder(const char* path) {
+    char *folder = snx_dirname(path), *name, *data;
+    const char *own = path + strlen(path), *leaf = folder + strlen(folder);
+    bool found;
+    while (own > path && own[-1] != '/' && own[-1] != '\\') --own;
+    while (leaf > folder && leaf[-1] != '/' && leaf[-1] != '\\') --leaf;
+    name = snx_strdup(own);
+#ifdef _WIN32
+    if (suffix(name, ".exe")) name[strlen(name) - 4] = 0;
+#endif
+    data = snx_format("%s/%s_data", folder, name);
+    found = *name && !strcmp(leaf, name) && snx_is_file(path) && snx_is_dir(data);
+    free(data);
+    free(name);
+    free(folder);
+    return found;
+}
 void gui_games_free(GuiGames* games) {
     snx_free_strings(games->names, games->count);
     snx_free_strings(games->shown, games->count);
@@ -58,12 +75,16 @@ static bool playable(const char* directory, char* name, int kinds) {
         return listed;
     }
     if (!(kinds & GUI_GAMES_RUN)) return false;
-#ifdef __ANDROID__
-    if (suffix(name, "_code.so")) {
-        name[strlen(name) - 8] = 0;
-        return true;
+#if defined(__ANDROID__) || defined(SNX_IOS)
+    { /* a game's code or a dump, a file: a folder named so is neither. An app's games have no runtime copy */
+        bool code = suffix(name, "_code.so");
+        if (!code && !gui_is_dump(name)) return false;
+        path = snx_path_join(directory, name);
+        listed = path && snx_is_file(path);
+        free(path);
+        if (listed && code) name[strlen(name) - 8] = 0;
+        return listed;
     }
-    return gui_is_dump(name);
 #else
 #ifdef _WIN32
     if (!suffix(name, ".exe")) return false;
@@ -93,7 +114,7 @@ static char* folder_game(const char* directory, const char* name, int kinds) {
     if (!(kinds & GUI_GAMES_RUN) || name[0] == '.') return NULL;
     folder = snx_path_join(directory, name);
     if (folder && snx_is_dir(folder) && !snx_is_link(folder)) {
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(SNX_IOS)
         own = snx_format("%s_code.so", name);
 #elif defined(_WIN32)
         own = snx_format("%s.exe", name);
@@ -126,15 +147,17 @@ static int before(const char* a, const char* b) {
     for (; *a && tolower((unsigned char)*a) == tolower((unsigned char)*b); ++a, ++b) {}
     return tolower((unsigned char)*a) < tolower((unsigned char)*b);
 }
-bool gui_games_add(GuiGames* games, const char* directory, int kinds, char* error, size_t size) {
+/* directory's games into games, sorted from first on by what they are shown as; with depth, its folders' games too, down
+   that many levels, a folder that is a game or hidden left alone */
+static bool add_games(GuiGames* games, const char* directory, int kinds, size_t first, int depth, char* error,
+                      size_t size) {
     char **names = NULL, **more;
     size_t count = 0, i;
-    if (size) error[0] = 0;
     if (snx_list_dir(directory, &names, &count)) {
         snprintf(error, size, "Cannot open %s.", directory);
         return false;
     }
-    size_t first = games->count, j;
+    size_t j;
     more = (char**)realloc(games->names, (games->count + count + 1) * sizeof *more);
     if (more) games->names = more;
     more = more ? (char**)realloc(games->shown, (games->count + count + 1) * sizeof *more) : NULL;
@@ -150,6 +173,12 @@ bool gui_games_add(GuiGames* games, const char* directory, int kinds, char* erro
         char* path = folder_game(directory, names[i], kinds);
         char* shown;
         if (!path && playable(directory, names[i], kinds)) path = snx_path_join(directory, names[i]);
+        if (!path && depth > 0 && names[i][0] != '.') { /* a folder of games, not one */
+            char* sub = snx_path_join(directory, names[i]);
+            if (sub && snx_is_dir(sub)) add_games(games, sub, kinds, first, depth - 1, error, 0);
+            free(sub);
+            continue;
+        }
         if (!path) continue;
         shown = shown_name(path, names[i]);
         if (!shown) {
@@ -170,6 +199,30 @@ bool gui_games_add(GuiGames* games, const char* directory, int kinds, char* erro
     }
     snx_free_strings(names, count);
     return true;
+}
+bool gui_games_add(GuiGames* games, const char* directory, int kinds, char* error, size_t size) {
+    return gui_games_add_deep(games, directory, kinds, 0, error, size);
+}
+bool gui_games_add_deep(GuiGames* games, const char* directory, int kinds, int depth, char* error, size_t size) {
+    if (size) error[0] = 0;
+    return add_games(games, directory, kinds, games->count, depth, error, size);
+}
+bool gui_has_folders(const char* directory, int kinds) {
+    char** names = NULL;
+    size_t count = 0, i;
+    bool found = false;
+    if (snx_list_dir(directory, &names, &count)) return false;
+    for (i = 0; i < count && !found; ++i) {
+        char *sub, *game;
+        if (names[i][0] == '.') continue;
+        sub = snx_path_join(directory, names[i]);
+        game = folder_game(directory, names[i], kinds);
+        found = sub && snx_is_dir(sub) && !game;
+        free(game);
+        free(sub);
+    }
+    snx_free_strings(names, count);
+    return found;
 }
 bool gui_games_scan(GuiGames* games, const char* directory, bool cia, char* error, size_t size) {
     gui_games_free(games);

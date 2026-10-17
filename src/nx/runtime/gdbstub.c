@@ -6,8 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #ifdef _WIN32
-int snx_gdb_start(int stop) {
+int snx_gdb_start(int stop, int port) {
     (void)stop;
+    (void)port;
     fputs("scarletnx: the GDB stub is UNIX only\n", stderr);
     return 1;
 }
@@ -145,7 +146,7 @@ done:
     _exit(0);
 }
 
-int snx_gdb_start(int stop) {
+int snx_gdb_start(int stop, int port) {
     struct sockaddr_in address;
     int listener = -1, life[2] = {-1, -1}, gate[2] = {-1, -1}, one = 1;
     pid_t helper = -1;
@@ -167,7 +168,7 @@ int snx_gdb_start(int stop) {
 #else
     address.sin_addr.s_addr = htonl(0x7f000001);
 #endif
-    address.sin_port = htons(SNX_GDB_PORT);
+    address.sin_port = htons((unsigned short)port);
     if (bind(listener, (struct sockaddr*)&address, sizeof(address)) || listen(listener, 1) || pipe(life) || pipe(gate))
         goto failed;
     if (fcntl(life[1], F_SETFD, FD_CLOEXEC) < 0) goto failed;
@@ -195,7 +196,7 @@ int snx_gdb_start(int stop) {
     fprintf(stderr,
             stop ? "Connect gdb to port %i now (tar rem :%i). Waiting before startup.\n"
                  : "GDB stub listening on localhost:%i (tar rem :%i).\n",
-            SNX_GDB_PORT, SNX_GDB_PORT);
+            port, port);
     fflush(stderr);
     if (write(life[1], &ready, 1) != 1) goto failed;
     if (stop) {
@@ -211,7 +212,7 @@ int snx_gdb_start(int stop) {
     free(server);
     return 0;
 failed:
-    perror("scarletnx: cannot start GDB stub on localhost:1234");
+    fprintf(stderr, "scarletnx: cannot start GDB stub on localhost:%i: %s\n", port, strerror(errno));
     if (helper > 0) {
         kill(helper, SIGKILL);
         while (waitpid(helper, NULL, 0) < 0 && errno == EINTR) {}

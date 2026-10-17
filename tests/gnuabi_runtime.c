@@ -128,11 +128,14 @@ int main(void) {
     CHECK(p->exited && p->exit_code == 42);
     p->cpu.mem = p->memory.base;
     p->exited = 0;
-    SnxExecution protected_execution = {0};
-    protected_execution.entry = faulting_guest;
-    CHECK(gnu_runtime_run(p, &protected_execution) == 139);
+    CHECK(gnu_jit_init(&p->jit, GNU_JIT, NULL, NULL, error, sizeof error) == 0);
+    gnu_jit_bind(&p->jit, &p->cpu);
+    gnu_jit_install(&p->jit, 0x400100, faulting_guest);
+    p->cpu.pc = 0x400100;
+    CHECK(gnu_runtime_run(p) == 139);
     CHECK(p->faulted == 11 && strstr(p->diagnostic, "mapped permissions"));
     gnu_process_destroy(p);
+    gnu_jit_destroy(&p->jit);
     memset(p, 0, sizeof *p);
     executable(bytes, 3);
     CHECK(gnu_memory_init(&p->memory) == 0);
@@ -146,12 +149,15 @@ int main(void) {
     CHECK(gnu_elf_load_image(&p->elf, &p->memory, bytes, sizeof bytes, error, sizeof error) < 0);
     CHECK(strstr(error, "PT_LOAD") != NULL);
     executable(bytes, 2);
-    put32(bytes + 64, 3);
-    put64(bytes + 72, 256);
-    put64(bytes + 96, 16);
-    memcpy(bytes + 256, "/lib/ld.so", 11);
-    CHECK(gnu_elf_load_image(&p->elf, &p->memory, bytes, sizeof bytes, error, sizeof error) < 0);
-    CHECK(strstr(error, "interpreter") != NULL);
+    put16(bytes + 56, 2); /* PT_LOAD, then PT_INTERP */
+    put32(bytes + 120, 3);
+    put64(bytes + 128, 300);
+    put64(bytes + 152, 11);
+    put64(bytes + 160, 11);
+    memcpy(bytes + 300, "/lib/ld.so", 11);
+    CHECK(gnu_elf_load_image(&p->elf, &p->memory, bytes, sizeof bytes, error, sizeof error) == 0);
+    CHECK(!strcmp(p->elf.interp, "/lib/ld.so")); /* the dynamic linker the process loads beside it */
+    gnu_elf_destroy(&p->elf);
     gnu_memory_destroy(&p->memory);
     free(p);
     puts("GNU ABI memory, ELF, stack, syscall tests passed");

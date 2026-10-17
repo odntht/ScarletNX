@@ -82,8 +82,8 @@ typedef struct {
     GuiPrompt prompt;
     uint32_t fade_in_ms, fade_out_ms, line_in_ms, typing_ms, blink_ms;
     uint32_t scroll_ms; /* a line too long for its row slides a column every scroll_ms, and back; 0 cuts it */
-    /* the boot's splash: the program's icon on splash_page for splash_ms (0: none), this theme's in splash_chance
-       boots of 100, the default theme's in the others */
+    /* the boot's splash: one of Wimsy's drawings (splash.h) on splash_page for splash_ms (0: none), this theme's in
+       splash_chance boots of 100, the default theme's in the others */
     GuiRgb splash_page;
     uint32_t splash_ms, splash_chance;
 } GuiTheme;

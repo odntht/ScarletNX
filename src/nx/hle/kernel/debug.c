@@ -5,6 +5,8 @@
 /* debugging output: guest symbols, backtraces, unresolved calls, register and thread dumps. These run from the crash
    handler too, where a fault while reading guest memory would end the report: every read is checked first */
 #include "nx/hle/kernel/kernel_int.h"
+#include "nx/runtime/loader.h"
+#include "nx/runtime/arm.h"
 /* [a, a+n) is mapped game memory, safe to read */
 static int mapped(u64 a, u64 n) {
     if (a < AS_BASE || a >= AS_SIZE || n > AS_SIZE - a) return 0;
@@ -176,7 +178,28 @@ static void dump_unresolved(void) {
     }
     if (shown) WARN("  %d unresolved imports in total\n", shown);
 }
+/* a 32-bit thread's registers, the code around its pc and lr, and the words its registers point at */
+static void dump_arm(const SnxArmCPU* a) {
+    for (int i = 0; i < 16; i += 4)
+        WARN("  r%-2d=%08x r%-2d=%08x r%-2d=%08x r%-2d=%08x\n", i, a->r[i], i + 1, a->r[i + 1], i + 2, a->r[i + 2],
+             i + 3, a->r[i + 3]);
+    WARN("  cpsr=%08x (%s) fpscr=%08x tpidrurw=%08x tpidruro=%08x\n", a->cpsr, a->cpsr & SNX_ARM_T ? "Thumb" : "A32",
+         a->fpscr, a->tpidrurw, a->tpidruro);
+    WARN("  pc%s  lr%s\n", gsym(a->r[15]), gsym(a->r[14] & ~1u));
+    if (a->r[15] > 0x100) dump_code(0, (a->r[15] & ~3u) - 0x20, (a->r[15] & ~3u) + 0x20);
+    if ((a->r[14] & ~1u) > 0x100) dump_code(0, (a->r[14] & ~3u) - 0x40, (a->r[14] & ~3u) + 0x10);
+    for (int r = 0; r < 13; r++) {
+        u32 p = a->r[r];
+        if (p < 0x10000 || (p & 3) || !mapped(p, 16)) continue;
+        WARN("  mem r%d %08x: %08x %08x %08x %08x\n", r, p, gr32(p), gr32(p + 4), gr32(p + 8), gr32(p + 12));
+    }
+}
+
 void kernel_dump_regs(CPU* c) {
+    if (g_arm_mod && c->thread) {
+        dump_arm(&((KThread*)c->thread)->arm);
+        return;
+    }
     if (c->pc < 0x1000 || getenv("SNX_UNRES")) dump_unresolved();
     for (int i = 0; i < 31; i += 4)
         WARN("  x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx\n", i, (unsigned long long)c->x[i], i + 1,

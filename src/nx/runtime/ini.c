@@ -102,6 +102,7 @@ static const struct {
                       {"resolucion", "now resolution"},
                       {"sombras", "now shadows"},
                       {"perfil", "now profile"},
+                      {"gamepad_buttons", "now gamepad_swap_ab; gamepad_map always applies"},
                       {NULL, NULL}};
 const char* ini_deprecated(const char* k) {
     int i;

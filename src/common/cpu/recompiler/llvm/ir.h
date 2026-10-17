@@ -100,6 +100,8 @@ int snx_ir_object(SnxIr* ir, char opt, unsigned char** data, size_t* size, char*
 /* The runtime library (rtlib.c) as a host object file (malloc'd): its bitcode, embedded when the recompiler was
    built, compiled for this machine like the generated code */
 int snx_ir_rtlib_object(char opt, unsigned char** data, size_t* size, char* error, size_t error_size);
+/* The same for a 32-bit module's library (armlib.c: the AArch32 blocks' helpers) */
+int snx_ir_armlib_object(char opt, unsigned char** data, size_t* size, char* error, size_t error_size);
 /* The module's IR as text (LLVMDisposeMessage) */
 char* snx_ir_text(SnxIr* ir);
 
@@ -129,10 +131,14 @@ int snx_ir_more_simd(SnxIr* ir, SnxU32 word);
 
 /* ---- floating point fast paths (ir_fp.c) ----
    The host's IEEE arithmetic gives the soft-float helpers' exact result and flags when the rounding mode is
-   to-nearest, the operands are normal and the result is well inside the normal range: no denormal, overflow,
-   underflow or NaN can occur, FZ/DN/AHP don't apply, and the only flag is IXC. IXC is computed exactly (TwoSum for
-   add/sub, an FMA residual for mul/div/sqrt where the host has FMA), or not needed: it is sticky, and once set an
-   inexact result changes nothing. Everything else takes the helper call. */
+   to-nearest, the operands are normal or zero and the result is well inside the normal range or an exact zero: no
+   denormal, overflow, underflow or NaN can occur, FZ/DN/AHP don't apply, and the only flag is IXC. A zero result is
+   exact when a product's operand or a dividend is zero, or for any sum (floats only cancel exactly); nonzero
+   operands that round to zero underflowed and take the helper. Zeros keep IEEE's signs, which are the
+   architecture's in round to nearest. IXC is computed exactly (TwoSum for add/sub, an FMA residual for mul/div/sqrt
+   where the host has FMA), or not needed: it is sticky, and once set an inexact result changes nothing. Everything
+   else takes the helper call. All of this assumes the host thread never flushes denormals (x86 MXCSR.FTZ/DAZ, or
+   FPCR.FZ on an AArch64 host): a sum of normals that is a denormal would read as an exact zero */
 enum { SNX_IR_FP_ADD, SNX_IR_FP_SUB, SNX_IR_FP_MUL, SNX_IR_FP_DIV, SNX_IR_FP_SQRT, SNX_IR_FP_FMA };
 typedef struct {
     LLVMValueRef value;   /* result bits: iN, or <lanes x iN> */
@@ -147,6 +153,54 @@ void ir_fp_fast(SnxIr* ir, unsigned op, unsigned width, unsigned lanes, LLVMValu
 LLVMBasicBlockRef ir_fp_branch(SnxIr* ir, LLVMValueRef ok, LLVMBasicBlockRef* slow);
 void ir_fp_else(SnxIr* ir, LLVMBasicBlockRef join, LLVMBasicBlockRef slow, LLVMValueRef inexact);
 void ir_fp_join(SnxIr* ir, LLVMBasicBlockRef join);
+/* FMAX/FMIN (and the NM forms, which differ only for NaNs) with no NaN operand in any lane, and no denormal one
+   when FPCR.FZ is set (flushing it sets IDC): FPMax/FPMin then return the larger or smaller operand unchanged, and
+   for equal operands their bitwise AND (max: +0 beats -0) or OR (min: -0 beats +0), raising nothing. inexact is
+   false */
+void ir_fp_minmax_fast(SnxIr* ir, unsigned width, unsigned lanes, LLVMValueRef a, LLVMValueRef b, unsigned minimum,
+                       SnxFpFast* out);
+/* snx_fp_minmax(c, a, b, width, minimum, numeric) */
+LLVMValueRef ir_fp_minmax(SnxIr* ir, LLVMValueRef a, LLVMValueRef b, unsigned width, unsigned minimum,
+                          unsigned numeric);
+/* the AdvSIMD compares' lane masks (simd.c's fcmpmask): a == b, a >= b, a > b, a <= b, a < b */
+enum { SNX_IR_CMP_EQ, SNX_IR_CMP_GE, SNX_IR_CMP_GT, SNX_IR_CMP_LE, SNX_IR_CMP_LT };
+/* all ones where the comparison holds, under the minmax guard: without a NaN no FPSR bit changes (only NaNs raise
+   IOC, quiet ones for every predicate but EQ), and the host's ordered comparison is FPCompare's */
+void ir_fp_compare_fast(SnxIr* ir, unsigned cmp, unsigned width, unsigned lanes, LLVMValueRef a, LLVMValueRef b,
+                        SnxFpFast* out);
+/* one lane through snx_fp_compare, signalling for all but EQ: all ones (iN) or zero */
+LLVMValueRef ir_fp_compare_mask(SnxIr* ir, unsigned cmp, LLVMValueRef a, LLVMValueRef b, unsigned width);
+/* SCVTF/UCVTF of integer lanes v (one iN, or lanes as wide as the float) scaled by 2^-fbits: exact when every magnitude fits the
+   precision, or once IXC is set, in round to nearest (the host rounds the same way, and no conversion can overflow
+   or be tiny). inexact is false */
+void ir_fp_from_int_fast(SnxIr* ir, unsigned width, unsigned lanes, LLVMValueRef v, unsigned uns, unsigned fbits,
+                         SnxFpFast* out);
+/* FCVT[NPMZA][SU] (rm 0-4 as snx_fp_to_int's) of float lanes scaled by 2^fbits, to integer lanes of the integer's
+   width: fast for finite values whose rounded value is in range (no IOC), denormals only without FZ (flushing sets
+   IDC), inexact when rounding changed the value. 0 when the host can't round inline (no fast path: out unset) */
+int ir_fp_to_int_fast(SnxIr* ir, unsigned width, unsigned lanes, LLVMValueRef bits, unsigned integer, unsigned uns,
+                      unsigned rm, unsigned fbits, SnxFpFast* out);
+/* FRECPE (rsqrt 0) or FRSQRTE (1): snx_fp_unary's 8-bit estimate computed inline for the lanes whose result is a
+   normal number and raises nothing (a normal operand, positive for FRSQRTE, and for FRECPE an exponent below
+   emax-2: from there the reciprocal is denormal, or flushed under FZ). inexact is false */
+void ir_fp_estimate_fast(SnxIr* ir, unsigned rsqrt, unsigned width, unsigned lanes, LLVMValueRef bits, SnxFpFast* out);
+/* FRECPS (rsqrt 0: 2 - a*b) or FRSQRTS (1: (3 - a*b) / 2), fused with one rounding, under ir_fp_fast's FMA guard
+   (which also keeps out the infinity-times-zero lanes) */
+void ir_fp_step_fast(SnxIr* ir, unsigned rsqrt, unsigned width, unsigned lanes, LLVMValueRef a, LLVMValueRef b,
+                     SnxFpFast* out);
+/* FCVTN (odd 0: FPCR's rounding, fast only in round to nearest) or FCVTXN (odd 1: round to odd, whatever the mode)
+   of float lanes of from bits (64 or 32) to half that width, in integer arithmetic: fast for normal operands whose
+   result is normal before rounding and finite after it (no flush, underflow, overflow, NaN or infinity, so FZ, DN
+   and AHP don't apply). value: <lanes x i(from/2)> or i(from/2); inexact when bits were dropped */
+void ir_fp_narrow_fast(SnxIr* ir, unsigned from, unsigned lanes, LLVMValueRef bits, unsigned odd, SnxFpFast* out);
+/* one lane through snx_fp_convert from from bits to half that width, rounded per FPCR or (odd) to odd (result i64) */
+LLVMValueRef ir_fp_narrow(SnxIr* ir, LLVMValueRef bits, unsigned from, unsigned odd);
+/* one lane through the helpers: snx_fp_binary, snx_fp_unary, snx_fp_to_int and snx_fp_from_int (result i64) */
+LLVMValueRef ir_fp_binary(SnxIr* ir, LLVMValueRef a, LLVMValueRef b, unsigned width, unsigned op);
+LLVMValueRef ir_fp_unary(SnxIr* ir, LLVMValueRef bits, unsigned width, unsigned op);
+LLVMValueRef ir_fp_to_int(SnxIr* ir, LLVMValueRef bits, unsigned fp, unsigned integer, unsigned uns, unsigned fbits,
+                          unsigned rm);
+LLVMValueRef ir_fp_from_int(SnxIr* ir, LLVMValueRef bits, unsigned integer, unsigned fp, unsigned uns, unsigned fbits);
 
 /* ---- building blocks (ir.c) ---- */
 LLVMValueRef ir_i8(SnxIr* ir, unsigned v);

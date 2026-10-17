@@ -69,6 +69,10 @@ vldr d17,[pc,#12]
 vstr d17,[r4,#-12]
 vldmia r4!,{s2-s5}
 vstmdb r4!,{d17-d20}
+vstr d17,[pc,#64]
+vstr s3,[pc,#-12]
+vldmia pc,{d0-d3}
+vstmia pc,{s1-s4}
 vmov.8 d17[3],r0
 vmov.u8 r0,d17[3]
 vmov.s16 r0,d17[2]

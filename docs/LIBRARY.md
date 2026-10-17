@@ -1,5 +1,11 @@
 # The recompiler as a library
 
+## Index
+
+* [Build and install](#build-and-install)
+* [Use](#use)
+* [Limits](#limits)
+
 The recompiler can be used on its own, without the Switch runtime (HLE, GPU) or the
 GNU ABI runtime: a program hands it ARM64 (A64) machine code in memory, gets host
 code loaded into its own process, and runs that code on CPU states it owns, with its
@@ -117,6 +123,18 @@ there records the fault for the caller to act on, or longjmps out of the generat
 as the Switch runtime does with a fatal error. `snx_recompiled_lookup` gives the host
 function for an address, for callers with a run loop of their own.
 
+A just-in-time compiler is built from three more calls. `snx_recompile_from` compiles
+only the functions at its hints and the functions they call, breadth first, until about
+a given number of instructions, skipping call targets a callback says are compiled
+already, and splits a function longer than 4096 instructions into pieces. Its module's
+table covers just what it found. `snx_recompiled_function` gives the function a module
+has for an address (NULL for any other), for the caller's own dispatch table, and
+`snx_recompiled_set_fallback` replaces the interpreter the module's lookups fall back to
+with the caller's handler, which compiles the code at that address and runs it. The Linux
+runtime (`src/gnuabi/runtime/jit.c`) works this way. `snx_recompiler_set_cache` names a
+folder that keeps linked modules (LLVM) by a hash of everything they are made from, and
+the compiled runtime library: a module found there is loaded instead of compiled.
+
 For A32 and Thumb, `snx_recompile32` prepares an address range whose blocks are compiled
 on first use by the LLVM block compiler (`src/common/cpu/arm/`), and
 `snx_recompiled32_run` runs an `SnxArmCPU` (`cpu/arm/arm.h`) from `r[15]` until an exit.
@@ -124,7 +142,10 @@ The SVC hook is an `snx_svc_call32`: it sees `r7` as the number and `r0` to `r5`
 zero-extended, the console's 64-bit SVC surface, and returns non-zero to end the run.
 The bytes are read from `cpu->mem`, so the code must be there. Ranges are multiples of 2
 bytes (Thumb) and end at or below 4 GiB. `cpu->exit` is cleared when a run starts, so a
-run after an exit starts over from `r[15]`. libgccjit has no A32
+run after an exit starts over from `r[15]`. `cpu->rt` (an `SnxArmRt`, or NULL) decides
+what the blocks leave to the system: instructions they can't run, and the coprocessor
+registers (`cpu/arm/README.md`). With NULL, they stop with an exit, and the thread ID
+registers come from the CPU's fields. libgccjit has no A32
 backend, and a libgccjit recompiler refuses A32 code with a reason.
 
 ## Limits

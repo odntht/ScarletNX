@@ -1,12 +1,11 @@
 # ScarletNX (Linux fork)
 
-A Linux-first fork of SwitchRecomp by MZ Labs, a static recompiler for Switch games: ARM64 code is translated to C
-and compiled into `<Game>_code.so`, and the runtime in `src/nx/` emulates the OS (kernel, IPC, services) and the GPU
-(Maxwell command buffers and shaders, drawn with Vulkan). Catherine: Full Body (USA release, 0100BF00112C0000, with
-its v2.0 update) is the game every change is checked against. Until 2026-10-11 it was the Asian release
-(0100BC4010896000), so earlier game addresses in Git history refer to that release. `README.md` has
-setup and commands, `docs/ROADMAP.md` the plan and current state, `docs/ARCHITECTURE.md` how the parts fit together. This
-file holds the rules sessions get wrong and points to the skills that carry the procedures.
+A Linux-first fork of SwitchRecomp by MZ Labs, a static recompiler for Switch games: ARM64 code is translated to LLVM
+IR (libgccjit on DEC Alpha) and compiled into a game module (`games/<id>/<id>_code.so`, by title ID), and the runtime
+in `src/nx/` emulates the OS (kernel, IPC, services) and the GPU (Maxwell command buffers and shaders, drawn with
+Vulkan). A change is checked against the games it affects. `README.md` has setup and commands, `docs/ROADMAP.md`
+the plan and current state, `docs/ARCHITECTURE.md` how the parts fit together. This file holds the rules sessions
+get wrong and points to the skills that carry the procedures.
 
 ## Rules
 
@@ -45,20 +44,20 @@ file holds the rules sessions get wrong and points to the skills that carry the 
   `pgrep -x cc1`, by process name), then `kill PID` with the numbers in a separate command.
 - Don't build while a timing-sensitive test runs: the build deploys a new runtime into `games/` and loads the CPU.
 - No `sudo` and no system packages: the user installs those. `uvx` fetches ruff on its own.
-- Context is scarce. Never print a whole log (`games/Catherine.log` grows to megabytes), a whole disassembly or a
+- Context is scarce. Never print a whole log (a game's `<id>.log` grows to megabytes), a whole disassembly or a
   ninja log. Use `grep -n`, `tail`, `tools/disasm.py` on one function.
 
 ## Build and run
 
 | Task | Command |
 | --- | --- |
-| Build the runtime, hactool and the third-party libraries (deploys to every game in `games/`) | `cmake --preset default && cmake --build --preset default` (Windows: `scripts\bootstrap.ps1` once, `Set-ExecutionPolicy -Scope Process Bypass` and `. scripts\env.ps1` per window) |
+| Build the runtime, hactool and the third-party libraries (deploys to every game in `games/`) | `cmake --preset default -B build && cmake --build build` (Windows: `scripts\bootstrap.ps1` once, `Set-ExecutionPolicy -Scope Process Bypass` and `. scripts\env.ps1` per window) |
 | Cross-build for Windows (llvm-mingw on PATH) | `cmake --preset windows-cross && cmake --build --preset windows-cross` |
-| Extract a dump | `build/default/scarletnx -x "Game.xci" --name Game [--update u.nsp]` |
-| Recompile a game | `build/default/scarletnx -r work/Game Game` |
-| Run with scripted input and a screenshot | `cd games && ./Catherine --seconds=60 --shot=/path/out --script=ms:hexbuttons,...` |
-| Name addresses / disassemble game code | `tools/symbols.py work/Catherine ADDR...` / `tools/disasm.py work/Catherine FUNC` |
-| Run the tests | `ctest` in `build/default` (`ctest -R swipc` for the IPC generator) |
+| Extract a dump | `build/scarletnx -x "Game.xci" --name Game [--update u.nsp]` |
+| Recompile a game (into `games/<id>/`, named by its title ID, or by a name given after the folder) | `build/scarletnx -r work/Game` |
+| Run with scripted input and a screenshot | `cd games/<id> && ./<id> --seconds=60 --shot=/path/out --script=ms:hexbuttons,...` |
+| Name addresses / disassemble game code | `tools/symbols.py work/Game ADDR...` / `tools/disasm.py work/Game FUNC` |
+| Run the tests | `ctest --test-dir build` (`-R swipc` for the IPC generator) |
 | Format / check | `scripts/format.sh` / `scripts/format.sh --check` |
 
 Clang is the only compiler: the configure stops on any other; the recompiler builds game code with LLVM (required) or
@@ -80,15 +79,16 @@ silently. Bumping `SNX_ABI` makes the runtime refuse every module built before i
 | C90 host driver (`src/nx/runtime/driver/`) | `driver.c` (dispatch), `extract.c` (XCI/NSP), `recompile.c` (AOT workflow/data), `toolchain.c` (runtime deploy build, shader prebuild); `src/nx/loader/loader.c` (NSO/NRO, metadata), `src/common/cpu/recompiler/codegen.c` (functions, and their C for the interpreter and gnuabi) + `src/common/cpu/aarch64/a64.c` + `a64_templates.inc` (the instructions' C), `src/common/utilities/common.c` (host APIs); `--backend=llvm` (default): `src/common/cpu/recompiler/llvm/` (IR emitters, ELF/COFF linkers, `rtlib.c`) + `src/nx/loader/module_llvm.c`; `--backend=gcc` (optional, DEC Alpha EV67): `src/common/cpu/recompiler/gccjit/` + `src/nx/loader/module_gccjit.c` |
 | Generated-code ABI | `src/common/cpu/aarch64/`: `cpu.h` (with `SNX_ABI`), `cpu_helpers.c` (compiled into each game module, with the topic files it includes from `helpers/`: `fp.c`, `integer.c`, `simd.c`, `crypto.c`, `simd_mem.c`) |
 | The recompiler as a library (`docs/LIBRARY.md`, #171) | `src/common/cpu/recompiler/snx_recompiler.h` (the interface), `library.c` (code in memory through the backends and `llvm/link.c`, a small descriptor instead of the NX `SnxModule`, loaded from memory), `CMakeLists.txt` (`scarletnx-recompiler`, one archive of the backends' objects, installed with a CMake package), `tests/recompiler_library.c` |
+| 32-bit games (A32/Thumb) | `src/common/cpu/arm/` (the block compiler, `README.md`; `rt_helpers.c`, what blocks leave to the backend), `src/nx/loader/module_arm.c` (block discovery, the `SnxArmModule`), `src/nx/runtime/arm.c` (thread loop, block tables, run-time compiles and hints, the NX `SnxArmRt`), `snx_svc32` in `hle/svc/svc.c` (the 32-bit SVC registers), `mem_layout32` in `memory/mem.c`; `tests/nx_arm32_smoke.py` runs a synthetic one |
 | Startup | `src/nx/runtime/`: `main.c` (startup, loading the game module), `options.c` (the .ini), `ini.c` (the settings tables each module describes its keys with), `clock.c` (guest time), `rtapi.c` (what the game module calls), `crash.c`, `present.c` (vi's present and the frame pacing), `loader.c`, `entry.c`, `startup.c` (switches parsed before loading), `gdbstub.c` |
 | Kernel and memory | `src/nx/hle/kernel/`: `kernel.c` (handles, waits, events), `thread.c` (threads, the per-core lock), `sync.c` (mutexes, condition variables, address arbitration, WaitSynchronization), `debug.c` (backtraces, dumps), `ipc.c` (HIPC/CMIF parsing and replies, sessions, domains, the service registry); `src/nx/hle/svc/`: `svc.c` (the SVC dispatch), `svc_mem.c` (memory SVCs, GetInfo); `src/nx/memory/mem.c` |
 | IPC interfaces | Every service interface is declared in a `.swipc` file beside its C file (SwIPC's language, `docs/IPC.md`). `tools/swipc/swipc.c` (C90) generates the dispatchers into the build folder (`snx_swipc` in `cmake/swipc.cmake`, the list in `src/nx/CMakeLists.txt`). A service's C file includes its generated `.swipc.inc` and defines one static handler per command that isn't a `@stub`, `nn_ns_IFoo_Command(SvcObj* self, args..., outs...)`. A new command goes in the `.swipc` file first |
 | Services | `src/nx/hle/services/`: one file per service family (`sm.c`, `am.c`, `set.c`, `time.c`, `acc.c`, `audio.c` (hwopus decodes with FFmpeg), `misc.c` for the small ones, `services.c` registers them), `audren.c` (the audio renderer's update), `pl.c` (shared fonts), `hid.c`, `vi.c`, `ldr.c`, `network/` (bsd, nifm, dns), `nvdrv.c` (nvhost devices, syncpoints); `src/nx/hle/filesystem/` (`fs.c`, `fs_tree.c`) |
 | GPU | `src/nx/gpu/`: `gpu.c` (GPFIFO, the GPU thread), `maxwell/` (`engines.c` 3D engine methods, `mme.c` macros, `compute.c`, `fermi2d.c`, `dma.c`, `maxwell3d.c`), `renderer.h` (the `Renderer` table for Vulkan, `g_renderer`), `renderer.c` (shared renderer state), `shader/` (Maxwell to SPIR-V: `shader.c` handles program hashing and flow, `decode.c` the instruction table, `spirv_translate.c` and `spirv_compute.c` emit stages through `spirv_emit.c`, `corpus.c` records shaders), `texture/` (`astc.c` CPU reference for tests, `etc2.c`) |
 | Vulkan renderer | `src/nx/gpu/vk/`: `vk.h` (lists the parts), `device.c` (instance, device, queues, swapchain, VMA), `cmd.c` (frames in flight, staging), `surface.c` and `format.c` (render targets, formats), `texture.c` (textures, samplers), `astc.c` (ASTC compute uploads), `buffer.c` (guest memory as buffers), `pipeline.c` (shader modules, pipelines), `render.c` (rendering passes, clears, draws), `compute.c` (compute on the compute queue, results landing in guest memory), `renderer.c` (its side of the renderer interface, presenting), `vma.cpp` (VMA's implementation); Vulkan-Headers, volk and VMA are CPM packages (`cmake/dependencies.cmake`) |
-| Shader corpus | `SNX_SHADER_CORPUS=dir` records each translated shader; `build/<dir>/snx-shaderc dir --validate` translates it directly to SPIR-V and validates it with `spirv-val`, which must be on PATH (`--out DIR` from two builds, diffed, shows a translator change kept the output) |
+| Shader corpus | `SNX_SHADER_CORPUS=dir` records each translated shader; `build/snx-shaderc dir --validate` translates it directly to SPIR-V and validates it with `spirv-val`, which must be on PATH (`--out DIR` from two builds, diffed, shows a translator change kept the output) |
 | Video | `src/nx/gpu/video/`: `host1x.c` (IOVA, ioctls, a channel per nvdrv NVDEC or VIC fd, each NVDEC one with its own decoder), `nvdec.c` (H.264 with FFmpeg's libavcodec, the picture written into the surface its job names), `vic.c` (composes from those surfaces in guest memory) |
-| Platform | `src/nx/runtime/platform/`: `plat.c` (logging, fatal), `plat_posix.c` and `plat_win32.c` (threads, locks, time, memory, files per OS), `profiler_win32.c`, `runtime.rc` and `runtime.manifest` (the Windows UTF-8 code page), `unattended.c` (scripted input, timed exit, screenshots, shared by both backends), `backend/sdl3.c` (Linux and Windows, windowed or headless) |
+| Platform | `src/nx/runtime/platform/`: `plat.c` (logging, fatal), `plat_posix.c` and `plat_win32.c` (threads, locks, time, memory, files per OS), `profiler_win32.c`, `runtime.rc` and `runtime.manifest` (the Windows UTF-8 code page), `unattended.c` (scripted input, timed exit, screenshots, shared by both backends), `backend/sdl3.c` (Linux and Windows, windowed or headless), `backend/gamepad.c` (SDL gamepads, each player's mapping and settings) |
 
 The NX runtime components are CMake object libraries in `src/nx/CMakeLists.txt`: `core`, `kernel`, `hle`, `video`,
 `gpu`, `platform`, `shader` and `vk`. Game modules compile the ABI helpers separately. Includes are written
@@ -120,6 +120,8 @@ whether the agent may build and run: only one at a time can):
 - `snx-emu-expert`: how Ryujinx, the yuzu family, Citra, Cemu and others solved a problem, with the license of the code.
 - `snx-vulkan-expert`: Vulkan 1.3 and SPIR-V, synchronization, lifetimes, Maxwell state onto Vulkan.
 - `snx-perf-expert`: profiling and judging optimizations with perf, bpftrace, heaptrack and llvm-mca.
+- `snx-gamemath-expert`: math, algorithms and physics in the runtime, HLE services, shader translator and renderer
+  (numerics, linear algebra, DSP, sensors, color, time), and the poor algorithms to reject there.
 
 ## Git
 
@@ -150,9 +152,9 @@ comments and developer docs under `.claude/` are out of scope.
 - The recompiler's old runtime build dropped the H.264 decoder (then OpenH264) silently when the library was missing,
   and movies stayed black. The runtime is only built by CMake now, which fetches FFmpeg with the other libraries.
 - SPIR-V lets the driver assume a shader has no infinities or NaNs unless it declares SignedZeroInfNanPreserve, and
-  Maxwell shaders rely on them (NVIDIA's compiler makes -inf with `MUFU.LG2` of zero). Without it, Tears of the
-  Kingdom's lighting came out as NaN blocks. The direct SPIR-V emitter declares the float controls requested by
-  `spirv_translate.c` for supported shader modules.
+  Maxwell shaders rely on them (NVIDIA's compiler makes -inf with `MUFU.LG2` of zero). Without it, lighting came out
+  as NaN blocks. The direct SPIR-V emitter declares the float controls requested by `spirv_translate.c` for
+  supported shader modules.
 - Nothing in a draw's setup may submit or wait for the GPU (`vk_finish`, a readback like `vk_rt_flush`): the frame's
   descriptor pools and staging reset after it, and the draw's sets already allocated turn to garbage. Copy on the GPU
   instead.

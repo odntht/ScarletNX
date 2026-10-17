@@ -112,6 +112,13 @@ int snx_net_getaddrinfo(const char* host, const char* service, const SnxAddrInfo
         h.ai_protocol = hints->protocol;
     }
     int r = getaddrinfo(host && *host ? host : NULL, service && *service ? service : NULL, hints ? &h : NULL, &res);
+#ifdef __APPLE__
+    /* Darwin says EAI_NONAME for a service it doesn't know, as for a host. glibc, whose answers the guest's resolver
+       gets elsewhere, looks a named service up first and says EAI_SERVICE: the same lookup, of the services database */
+    if (r == EAI_NONAME && service && *service && !(h.ai_flags & AI_NUMERICSERV) &&
+        strspn(service, "0123456789") != strlen(service) && !getservbyname(service, NULL))
+        return SNX_EAI_SERVICE;
+#endif
     if (r) return gai_from_host(r);
     /* Eden: the HB App Store's cURL takes the first entry, and a bug in its DNS cache breaks when that's UDP
        (https://github.com/curl/curl/issues/9274), so UDP entries go last */

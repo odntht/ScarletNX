@@ -7,6 +7,7 @@
 #ifndef SNX_KERNEL_H
 #define SNX_KERNEL_H
 #include "common/cpu/aarch64/cpu.h"
+#include "common/cpu/arm/arm.h"
 #include "nx/runtime/platform/plat.h"
 
 #define K_PROCESS_ID 0x51ull /* the single application process, also injected into IPC PID descriptors */
@@ -45,6 +46,7 @@ typedef struct KEvent {
 struct KThread {
     KObj o;
     CPU cpu;
+    SnxArmCPU arm; /* a 32-bit game's thread runs this instead (nx/runtime/arm.c); its SVCs pass through cpu.x */
     u64 id;
     int prio;           /* the priority it runs at: base_prio raised by the mutex waiters it owns (sync.c) */
     int base_prio;      /* as the game set it */
@@ -105,6 +107,8 @@ void core_leave(KThread* t); /* lets another thread on its core run */
 void core_poll(KThread* t);  /* RtAPI.poll: a loop met CPU.poll, the runtime may take its core */
 void kernel_run_main(u64 entry, u64 stack_size, int prio, int core);
 void snx_svc(CPU* c, u32 imm);
+/* a 32-bit thread's SVC: its registers in the 32-bit SVC ABI's places, through snx_svc in the 64-bit one's */
+void snx_svc32(SnxArmCPU* a, u32 imm);
 extern PMutex g_klock;
 extern u64 g_title_id;
 extern u64 g_sysres_size;

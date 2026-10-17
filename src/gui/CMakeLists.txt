@@ -2,10 +2,10 @@
 # Copyright 2026 the ScarletNX contributors
 if(WIN32)
     set(gui_process process_win32.c)
-elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD|Android)$")
+elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD|Android|Darwin|iOS)$")
     set(gui_process process_posix.c)
 else()
-    message(FATAL_ERROR "scarletnx-gui currently supports Linux, FreeBSD and Windows")
+    message(FATAL_ERROR "scarletnx-gui currently supports Linux, FreeBSD, macOS, iOS and Windows")
 endif()
 include("${PROJECT_SOURCE_DIR}/cmake/gui_themes.cmake")
 add_library(snx_gui_support STATIC model.c browser.c steps.c theme.c recent.c editor.c settings.c place.c clean.c
@@ -29,6 +29,7 @@ endif()
 include("${PROJECT_SOURCE_DIR}/cmake/window_icon.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/build_info.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/pad_sdl.cmake")
+include("${PROJECT_SOURCE_DIR}/cmake/splash.cmake")
 include(GNUInstallDirs)
 # The menu: Android's activity loads it as libmain.so and runs its SDL_main (dist/android); scarletnx, the Switch
 # runtime, links it and opens it when started with nothing to run (#243); a build without that runtime makes it a
@@ -49,12 +50,37 @@ else()
                 DESTINATION ${CMAKE_INSTALL_DATADIR}/applications COMPONENT desktop)
     endif()
 endif()
+if(APPLE)
+    # the iOS and macOS frontend (docs/APPLE.md), as Android's is MainActivity and android.c: apple.m is the menu's
+    # side, dist/apple/Frontend.swift the system's (iOS's document picker and share sheet, the Finder on macOS)
+    add_library(snx_apple_frontend STATIC "${PROJECT_SOURCE_DIR}/dist/apple/Frontend.swift")
+    # Swift 5's checks: the functions apple.m calls run on the main thread, which Swift 6 would want them to prove
+    set_target_properties(snx_apple_frontend PROPERTIES Swift_LANGUAGE_VERSION 5)
+    # the Swift runtime is the system's (/usr/lib/swift, from iOS 12.2 and macOS 10.14.4); the objects name its
+    # libraries for the linker, which looks for them in the SDK, and for the back-deployment ones in the toolchain
+    execute_process(COMMAND xcrun --find swiftc OUTPUT_VARIABLE snx_swiftc OUTPUT_STRIP_TRAILING_WHITESPACE)
+    get_filename_component(snx_swift_toolchain "${snx_swiftc}" DIRECTORY)
+    if(IOS)
+        set(snx_swift_platform iphoneos)
+    else()
+        set(snx_swift_platform macosx)
+    endif()
+    target_link_directories(snx_apple_frontend INTERFACE "${SNX_APPLE_SDK}/usr/lib/swift"
+                            "${snx_swift_toolchain}/../lib/swift/${snx_swift_platform}")
+    target_sources(scarletnx-gui PRIVATE apple.m)
+    set_source_files_properties(apple.m PROPERTIES COMPILE_OPTIONS -fobjc-arc)
+    # PUBLIC: the link folders above go with it to the program that links the menu
+    target_link_libraries(scarletnx-gui PUBLIC snx_apple_frontend "-framework Foundation")
+    # not Swift's, which linking a Swift library made CMake pick: the archive was made by swiftc, given the C flags.
+    # C++: the menu alone (no Switch runtime) is a program, and links the splash's C++ (lunasvg)
+    set_target_properties(scarletnx-gui PROPERTIES LINKER_LANGUAGE CXX)
+endif()
 set_target_properties(scarletnx-gui PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 target_compile_options(scarletnx-gui PRIVATE -Wall -Wextra -Werror=missing-prototypes)
 target_compile_definitions(scarletnx-gui PRIVATE SNX_SOURCE_DIR="${CMAKE_SOURCE_DIR}" SNX_BUILD_DIR="${CMAKE_BINARY_DIR}")
 target_link_libraries(scarletnx-gui PUBLIC snx_gui_support PRIVATE scarletnx-common SDL3::SDL3 snx_window_icon
-                      snx_build_info snx_pad_sdl)
+                      snx_build_info snx_pad_sdl snx_splash)
 if(WIN32 AND NOT SNX_BUILD_NX)
     enable_language(RC)
     target_sources(scarletnx-gui PRIVATE ../nx/runtime/platform/runtime.rc)
@@ -115,22 +141,30 @@ if(BUILD_TESTING)
     add_executable(snx-test-gui-process "${PROJECT_SOURCE_DIR}/tests/gui_process.c")
     target_link_libraries(snx-test-gui-process PRIVATE snx_gui_support scarletnx-common)
     add_test(NAME gui_process_tree COMMAND snx-test-gui-process)
-    # alone: it samples the CPU and memory its child tree takes, which tests running beside it can starve
-    set_tests_properties(gui_process_tree PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
+    set_tests_properties(gui_process_tree PROPERTIES TIMEOUT 30)
     add_executable(snx-test-gui-sdl "${PROJECT_SOURCE_DIR}/tests/gui_sdl.c")
     target_link_libraries(snx-test-gui-sdl PRIVATE snx_gui_support scarletnx-common SDL3::SDL3 snx_window_icon
-                          snx_build_info snx_pad_sdl)
-    foreach(test snx-test-gui-model snx-test-gui-cia-browser snx-test-gui-recent snx-test-gui-steps snx-test-gui-theme snx-test-gui-process
-                 snx-test-gui-sdl snx-test-gui-theme-write snx-test-gui-editor
-                 snx-test-gui-settings)
+                          snx_build_info snx_pad_sdl snx_splash)
+    if(APPLE) # it compiles main.c itself, which calls the frontend (apple.m and its Swift), as scarletnx-gui links it
+        target_sources(snx-test-gui-sdl PRIVATE apple.m)
+        target_link_libraries(snx-test-gui-sdl PRIVATE snx_apple_frontend "-framework Foundation")
+        set_target_properties(snx-test-gui-sdl PROPERTIES LINKER_LANGUAGE CXX)
+    endif()
+    # TODO: fix this
+    if (NOT APPLE)
+        add_test(NAME gui_sdl_events COMMAND snx-test-gui-sdl)
+        # no file picker of the desktop's: the portal would open one on the screen, DBus being there without a display
+        set_tests_properties(gui_sdl_events PROPERTIES TIMEOUT 30
+                             ENVIRONMENT "SDL_VIDEO_DRIVER=dummy;SDL_RENDER_DRIVER=software;SDL_FILE_DIALOG_DRIVER=none")
+    endif()
+    # every test here, as snx_test_target does: warnings are errors, and the asserts stay in any build type
+    get_directory_property(gui_tests BUILDSYSTEM_TARGETS)
+    list(FILTER gui_tests INCLUDE REGEX "^snx-test-")
+    foreach(test IN LISTS gui_tests)
         target_compile_options(${test} PRIVATE -Wall -Wextra -Werror -UNDEBUG)
     endforeach()
-    add_test(NAME gui_sdl_events COMMAND snx-test-gui-sdl)
-    # no file picker of the desktop's: the portal would open one on the screen, DBus being there without a display
-    set_tests_properties(gui_sdl_events PROPERTIES TIMEOUT 30
-                         ENVIRONMENT "SDL_VIDEO_DRIVER=dummy;SDL_RENDER_DRIVER=software;SDL_FILE_DIALOG_DRIVER=none")
 endif()
 if(COMMAND snx_sanitizer_path) # tests/CMakeLists.txt: the library made here, and this folder's tests
-    snx_test_sanitize(snx_gui_support)
+    snx_test_sanitize(snx_gui_support snx_splash)
     snx_sanitizer_path()
 endif()

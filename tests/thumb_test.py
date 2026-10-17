@@ -163,6 +163,92 @@ def catalogue():
         'mls r0, r1, r2, r3',
         # Thumb32 wide load/store
         'ldr.w r0, [r1, #255]',
+        'ldr.w r0, [r1, #2304]',  # imm12 with bits 11 and 8 set: not the imm8 form
+        'ldr r0, [r1, #-8]',
+        'ldrb r0, [r1, #-1]',
+        'ldrsh r0, [r1, #-2]',
+        'strb r0, [r1, #-1]!',
+        'ldrt r0, [r1, #4]',
+        'ldr.w r0, [pc, #16]',
+        'ldr.w r0, [pc, #-16]',
+        'pld [r1, #64]',
+        'ldrd r0, r1, [r2, #8]',
+        'ldrd r3, r10, [r2, #-1020]',
+        'ldrd r4, r5, [r2], #-8',
+        'ldrd r0, r1, [pc, #8]',
+        'strd r3, r9, [r2, #16]!',
+        'strd r0, r1, [r2]',
+        # Thumb32 LDM/STM (A32 twins)
+        'ldm.w r0!, {r1, r2, r8}',
+        'ldmdb r0, {r1, r9}',
+        'stmdb sp!, {r1, r2, lr}',
+        'stm.w r0, {r1, r10}',
+        'push.w {r4-r11, lr}',
+        'pop.w {r4-r11}',
+        'pop.w {r4, r5, pc}',
+        # Thumb32 branches and miscellaneous control
+        'beq.w #4096',
+        'blt.w #-4092',
+        'b.w #-2',
+        'dmb ish',
+        'dsb sy',
+        'isb sy',
+        'clrex',
+        'nop.w',
+        'mrs r0, apsr',
+        'msr apsr_nzcvq, r1',
+        # Thumb32 register data processing (REV, CLZ, extends with add: A32 twins)
+        'clz r0, r1',
+        'rbit r0, r1',
+        'rev.w r0, r1',
+        'rev16.w r0, r1',
+        'revsh.w r0, r1',
+        'rev r0, r1',
+        'rev16 r0, r1',
+        'revsh r0, r1',
+        'sxtab r0, r1, r2',
+        'uxtah r0, r1, r2, ror #8',
+        'uxtb.w r0, r1, ror #16',
+        'sxth.w r3, r4, ror #24',
+        'lsls.w r0, r1, r2',
+        'ands.w r0, r1, #0xff000000',  # a rotated immediate: C is its bit 31
+        'orrs.w r0, r1, #255',  # an unrotated one: C unchanged
+        'tst.w r0, #0x80000000',
+        'movs.w r0, r1, lsr #1',
+        'eors.w r0, r1, r2, ror #4',
+        'mvns.w r0, r1, asr #32',
+        'rors.w r0, r1, r2',
+        # Thumb32 long multiply and divide (A32 twins)
+        'smull r0, r1, r2, r3',
+        'umull r0, r1, r2, r3',
+        'smlal r0, r1, r2, r3',
+        'umlal r0, r1, r2, r3',
+        'sdiv r0, r1, r2',
+        'udiv r0, r1, r2',
+        # Thumb32 exclusives and acquire/release (A32 twins, a doubleword one's pair any two registers)
+        'ldrex r0, [r1]',
+        'strex r2, r3, [r1]',
+        'lda r0, [r1]',
+        'stl r0, [r1]',
+        'ldaexd r0, r1, [r12]',
+        # Thumb32 coprocessor, VFP and Advanced SIMD (A32 twins)
+        'vldr d0, [r1, #8]',
+        'vldr d1, [pc, #8]',
+        'vstr s2, [r1, #4]',
+        'vadd.f64 d0, d1, d2',
+        'vmul.f32 s0, s1, s2',
+        'vadd.i32 q8, q8, q9',
+        'vld1.32 {d16, d17}, [r0]',
+        'vst1.8 {d0}, [r1]!',
+        'vmov r0, s1',
+        'vmov s3, r2',
+        'vmrs r0, fpscr',
+        'vpush {d8, d9}',
+        'vpop {d8}',
+        'vcvt.f32.s32 s0, s1',
+        'vselgt.f32 s0, s1, s2',
+        'vrintm.f64 d0, d1',
+        'aese.8 q0, q1',
         'str.w r0, [r1, #255]',
         'ldr.w r0, [r1, r2]',
         'str.w r0, [r1, r2]',
@@ -185,6 +271,20 @@ def catalogue():
         'ite eq; moveq r8, r1; movne r8, r2',
         'itte eq; moveq r8, r1; addeq r0, r8; movne r8, r3',
         'itee eq; moveq r8, r1; movne r8, r2; movne r8, r3',
+        # PC reads at an address 2 mod 4: ADD from the PC is PC + 4, literals and ADR use Align(PC, 4)
+        'nop; add r0, pc',
+        'nop; mov r0, pc',
+        'nop; ldr.w r0, [pc, #12]',
+        'nop; adr.w r0, #12',
+        'nop; vldr d1, [pc, #8]',
+        # an exclusive pair, and the doubleword ones with any second register
+        'ldrex r0, [r1]; strex r2, r3, [r1]',
+        'ldrexb r0, [r1]; strexb r2, r3, [r1]',
+        'ldrexh r0, [r1]; strexh r2, r3, [r1]',
+        'ldrexd r4, r5, [r1]; strexd r2, r6, r7, [r1]',
+        'ldrexd r0, r8, [r2]; strexd r3, r9, r4, [r2]',
+        'ldaex r0, [r1]; stlex r2, r3, [r1]',
+        'ldaexd r0, r1, [r12]; stlexd r3, lr, r2, [r12]',
     ]
     lines = []
     for m in single:
@@ -242,6 +342,8 @@ def initial(seed, n, is_mem):
         else:
             cpu.r[i] = rng.getrandbits(32)
     cpu.r[15] = PC
+    for i in range(32):
+        cpu.d[i] = rng.getrandbits(64)
     mem[PC : PC + 4 * n] = bytes(4 * n)
     return cpu, mem
 
@@ -258,7 +360,7 @@ def compare(functions, entries, halfwords, states):
         u = U.Uc(U.UC_ARCH_ARM, U.UC_MODE_THUMB)
         u.ctl_set_cpu_model(A.UC_CPU_ARM_MAX)
         u.mem_map(0, SIZE)
-        is_mem = '[' in text or 'push' in text or 'pop' in text or 'ldmia' in text or 'stmia' in text
+        is_mem = '[' in text or any(op in text for op in ('push', 'pop', 'ldm', 'stm', 'vst1', 'vld1'))
         for seed in range(states):
             cpu, mem = initial(seed, len(hws) // 2, is_mem)
             for i, h in enumerate(hws):
@@ -266,8 +368,12 @@ def compare(functions, entries, halfwords, states):
             u.mem_write(0, bytes(mem))
             u.ctl_remove_cache(0, SIZE)
             u.reg_write(A.UC_ARM_REG_CPSR, cpu.cpsr)
+            u.reg_write(A.UC_ARM_REG_FPEXC, 0x40000000)
+            u.reg_write(A.UC_ARM_REG_FPSCR, cpu.fpscr)
             for r, value in zip(regs, cpu.r):
                 u.reg_write(r, value)
+            for i, value in enumerate(cpu.d):
+                u.reg_write(A.UC_ARM_REG_D0 + i, value)
             try:
                 u.emu_start(PC | 1, PC + 2 * len(hws), count=n)
                 fetched = True
@@ -285,8 +391,13 @@ def compare(functions, entries, halfwords, states):
                 assert cpu.exit == 4, f'{text} seed={seed} expected SVC exit, got {cpu.exit}'
                 total += 1
                 continue
-            actual = list(cpu.r) + [cpu.cpsr]
-            expected = [u.reg_read(r) for r in regs] + [u.reg_read(A.UC_ARM_REG_CPSR)]
+            actual = list(cpu.r) + [cpu.cpsr] + list(cpu.d) + [cpu.fpscr]
+            expected = (
+                [u.reg_read(r) for r in regs]
+                + [u.reg_read(A.UC_ARM_REG_CPSR)]
+                + [u.reg_read(A.UC_ARM_REG_D0 + i) for i in range(32)]
+                + [u.reg_read(A.UC_ARM_REG_FPSCR)]
+            )
             label = f'{text} seed={seed}'
             assert cpu.exit == 0, f'{label} exit={cpu.exit} syndrome={cpu.syndrome:x}'
             assert actual == expected, (
@@ -305,6 +416,7 @@ def main():
     p.add_argument('--emitter', required=True)
     p.add_argument('--mc', required=True)
     p.add_argument('--cc', default='clang')
+    p.add_argument('--runtime', required=True, help='libsnx_arm_rt.a')
     p.add_argument('--states', type=int, default=24)
     p.add_argument('--opt', choices=('0', '2'), action='append')
     args = p.parse_args()
@@ -318,7 +430,7 @@ def main():
             print(f'Thumb16/32 LLVM O{opt}', flush=True)
             obj, dll = directory / f'test{opt}.o', directory / f'test{opt}.so'
             subprocess.run([args.emitter, str(source), str(obj), opt], check=True)
-            subprocess.run([args.cc, '-shared', str(obj), '-o', str(dll)], check=True)
+            subprocess.run([args.cc, '-shared', str(obj), args.runtime, '-o', str(dll)], check=True)
             lib = C.CDLL(str(dll))
             functions = [getattr(lib, f'block_{i}') for i in range(len(entries))]
             for fn in functions:

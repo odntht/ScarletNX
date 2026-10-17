@@ -35,6 +35,15 @@ static int host_protect(GnuMemory* m, uint64_t address, uint64_t length, unsigne
     return mprotect(m->base + address, (size_t)length, p) ? -GNU_ENOMEM : 0;
 #endif
 }
+/* executable pages in [a, a + n) are about to change */
+static void code_changes(GnuMemory* m, uint64_t a, uint64_t n) {
+    if (!m->code_changed) return;
+    for (uint64_t i = a / GNU_PAGE_SIZE; i < (a + n + GNU_PAGE_SIZE - 1) / GNU_PAGE_SIZE; i++)
+        if (m->pages[i] & GNU_PROT_EXEC) {
+            m->code_changed(m->code_context, a, n);
+            return;
+        }
+}
 int gnu_memory_init(GnuMemory* m) {
     memset(m, 0, sizeof *m);
     m->size = GNU_ADDRESS_LIMIT;
@@ -66,9 +75,32 @@ void gnu_memory_destroy(GnuMemory* m) {
 void* gnu_memory_access(GnuMemory* m, uint64_t a, size_t n, unsigned p) {
     if (!m->base || a > m->size || n > m->size - a) return NULL;
     if (!n) return m->base + a;
-    for (uint64_t i = a / GNU_PAGE_SIZE; i <= (a + n - 1) / GNU_PAGE_SIZE; i++)
+    for (uint64_t i = a / GNU_PAGE_SIZE; i <= (a + n - 1) / GNU_PAGE_SIZE; i++) {
         if ((m->pages[i] & (GNU_PAGE_MAPPED | p)) != (GNU_PAGE_MAPPED | p)) return NULL;
+        /* the runtime (a read() into the buffer) is about to write over compiled code */
+        if ((p & GNU_PROT_WRITE) && (m->pages[i] & GNU_PAGE_CODE)) gnu_memory_code_written(m, i * GNU_PAGE_SIZE);
+    }
     return m->base + a;
+}
+void gnu_memory_watch_code(GnuMemory* m, uint64_t a, uint64_t n) {
+    if (!n || a >= m->size) return;
+    if (n > m->size - a) n = m->size - a;
+    for (uint64_t i = a / GNU_PAGE_SIZE; i <= (a + n - 1) / GNU_PAGE_SIZE; i++) {
+        unsigned flags = m->pages[i];
+        if ((flags & (GNU_PAGE_MAPPED | GNU_PROT_WRITE | GNU_PAGE_CODE)) != (GNU_PAGE_MAPPED | GNU_PROT_WRITE)) continue;
+        if (host_protect(m, i * GNU_PAGE_SIZE, GNU_PAGE_SIZE, flags & ~GNU_PROT_WRITE & 7u)) continue;
+        m->pages[i] = (unsigned char)(flags | GNU_PAGE_CODE);
+    }
+}
+int gnu_memory_code_written(GnuMemory* m, uint64_t a) {
+    uint64_t page = a & ~(uint64_t)(GNU_PAGE_SIZE - 1);
+    unsigned flags;
+    if (a >= m->size) return 0;
+    flags = m->pages[page / GNU_PAGE_SIZE];
+    if (!(flags & GNU_PAGE_CODE)) return 0;
+    m->pages[page / GNU_PAGE_SIZE] = (unsigned char)(flags & ~GNU_PAGE_CODE);
+    if (m->code_changed) m->code_changed(m->code_context, page, GNU_PAGE_SIZE);
+    return !host_protect(m, page, GNU_PAGE_SIZE, flags & 7u);
 }
 int gnu_memory_read(GnuMemory* m, uint64_t a, void* d, size_t n) {
     void* source = gnu_memory_access(m, a, n, GNU_PROT_READ);
@@ -95,6 +127,7 @@ int gnu_memory_map(GnuMemory* m, uint64_t a, uint64_t n, unsigned p, int replace
     if (!replace)
         for (uint64_t i = a / GNU_PAGE_SIZE; i < (a + n) / GNU_PAGE_SIZE; i++)
             if (m->pages[i] & GNU_PAGE_MAPPED) return -GNU_EEXIST;
+    code_changes(m, a, n);
 #ifdef _WIN32
     if (!VirtualAlloc(m->base + a, (SIZE_T)n, MEM_COMMIT, PAGE_READWRITE)) return -GNU_ENOMEM;
 #endif
@@ -107,6 +140,7 @@ int gnu_memory_map(GnuMemory* m, uint64_t a, uint64_t n, unsigned p, int replace
 int gnu_memory_unmap(GnuMemory* m, uint64_t a, uint64_t n) {
     if (!range(m, a, n)) return -GNU_EINVAL;
     n = up(n);
+    code_changes(m, a, n);
 #ifdef _WIN32
     if (!VirtualFree(m->base + a, (SIZE_T)n, MEM_DECOMMIT)) return -GNU_ENOMEM;
 #else
@@ -122,6 +156,7 @@ int gnu_memory_protect(GnuMemory* m, uint64_t a, uint64_t n, unsigned p) {
     n = up(n);
     for (uint64_t i = a / GNU_PAGE_SIZE; i < (a + n) / GNU_PAGE_SIZE; i++)
         if (!(m->pages[i] & GNU_PAGE_MAPPED)) return -GNU_ENOMEM;
+    code_changes(m, a, n);
     if (host_protect(m, a, n, p)) return -GNU_ENOMEM;
     memset(m->pages + a / GNU_PAGE_SIZE, (int)(GNU_PAGE_MAPPED | p), (size_t)(n / GNU_PAGE_SIZE));
     return 0;
@@ -179,8 +214,8 @@ size_t gnu_memory_maps(GnuMemory* m, char* destination, size_t capacity) {
             continue;
         }
         uint64_t begin = i;
-        unsigned p = m->pages[i];
-        do { i++; } while (i < m->size / GNU_PAGE_SIZE && m->pages[i] == p);
+        unsigned p = m->pages[i] & 15u;
+        do { i++; } while (i < m->size / GNU_PAGE_SIZE && (m->pages[i] & 15u) == p);
         char line[128];
         int n = snprintf(line, sizeof line, "%016llx-%016llx %c%c%cp 00000000 00:00 0\n",
                          (unsigned long long)(begin * GNU_PAGE_SIZE), (unsigned long long)(i * GNU_PAGE_SIZE),

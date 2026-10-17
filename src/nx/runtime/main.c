@@ -6,6 +6,7 @@
 /* startup: load GAME_code.dll/.so, set up memory + services + main thread, then run the frontend
    loop (window, input, vsync). */
 #include "nx/runtime/main.h"
+#include "nx/runtime/arm.h"
 #include "nx/runtime/clock.h"
 #include "nx/runtime/loader.h"
 #include "nx/runtime/options.h"
@@ -83,7 +84,14 @@ static int load_code(void) {
         return -1;
     }
     ModFn f = (ModFn)plat_dl_sym(h, "snx_module");
-    if (!f) {
+    if (!f) { /* a 32-bit game's (nx/runtime/arm.c), whose own version arm_module checks */
+        const SnxArmModule* (*arm)(void) = (const SnxArmModule* (*)(void))plat_dl_sym(h, "snx_module_arm");
+        if (arm) {
+            static SnxModule other; /* abi 0: from another version, which snx_main reports */
+            g_mod = arm_module(arm());
+            if (!g_mod) g_mod = &other;
+            return 0;
+        }
         WARN("%s is not a ScarletNX module\n", p);
         return -1;
     }
@@ -232,6 +240,20 @@ static int is_dump(const char* path) {
     return 0;
 }
 
+void snx_save_before_exit(void) {
+    static PMutex lock = PMUTEX_INIT;
+    static int done;
+    pm_lock(&lock);
+    if (!done) {
+        done = 1;
+        save_hints();
+        /* the process ends without shutting the renderer down, so it saves what it keeps across runs (the pipeline
+           cache) here */
+        if (g_renderer && g_renderer->save) g_renderer->save();
+    }
+    pm_unlock(&lock);
+}
+
 int snx_main(int argc, char** argv) {
     int startup = snx_startup_options(argc, argv);
     if (startup) return startup;
@@ -240,7 +262,7 @@ int snx_main(int argc, char** argv) {
         return 0;
     }
     /* Start the helper before creating any host threads. */
-    if (g_opt_gdb && snx_gdb_start(g_opt_gdb_stop)) return 2;
+    if (g_opt_gdb && snx_gdb_start(g_opt_gdb_stop, SNX_GDB_PORT)) return 2;
     /* In an AppImage argv[0] points into its mount (APPDIR). APPIMAGE is the file that was run, so a copy named after
        the game (games/Catherine or games/Catherine.AppImage) finds games/Catherine_code.so like the bare runtime does.
        Both variables are inherited, so they only count when this runtime is the one inside the mount */
@@ -275,6 +297,8 @@ int snx_main(int argc, char** argv) {
     if (load_code()) fatal("Could not load the game's recompiled code.");
     user_folders(); /* before the log's first line */
     if (g_mod->abi != SNX_ABI) fatal("The recompiled code is from another ScarletNX version.");
+    /* a 32-bit game's address space is below 4 GiB, laid out as the console lays it out, before anything reads it */
+    if (g_arm_mod) mem_layout32(g_arm_mod->aspace);
     /* --key=value sets a setting for this run, over the .ini. The value is used where it is, so a long --script
        isn't cut */
     for (int i = 1; i < argc && strcmp(argv[i], "--"); i++) {
@@ -305,6 +329,7 @@ int snx_main(int argc, char** argv) {
     mem_init();
     kernel_init();
     build_dispatch();
+    if (g_arm_mod) arm_dispatch_init();
     load_hints();
     if (loader_load()) fatal("Could not load the game executables from %sexefs/", g_datadir);
     kernel_load_symbols();
@@ -372,10 +397,7 @@ int snx_main(int argc, char** argv) {
             next = now;
     }
     ini_poll(1); /* what changed in the game since the last poll (F4, the menu) is saved: it runs once a second */
-    save_hints();
-    /* the process ends without shutting the renderer down, so it saves what it keeps across runs (the pipeline cache)
-       here */
-    if (g_renderer && g_renderer->save) g_renderer->save();
+    snx_save_before_exit();
     LOG("Exit.\n");
     plat_exit_now(0); /* the guest threads are still running: they aren't joined */
 }

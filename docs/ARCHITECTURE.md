@@ -1,7 +1,17 @@
 # Architecture
 
-ScarletNX AOT: AArch64 -> C -> native module, shared by Horizon HLE/Maxwell
-and CPU-only Linux AArch64 ABI runtimes.
+## Index
+
+* [Runtime boundaries](#runtime-boundaries)
+* [Recompiler + module ABI](#recompiler--module-abi)
+* [Runtime ownership](#runtime-ownership)
+  * [Guest exec](#guest-exec)
+  * [GPU submit/present](#gpu-submitpresent)
+  * [Renderer coherence + lifetime](#renderer-coherence--lifetime)
+  * [Videodec/VIC channels](#videodecvic-channels)
+
+ScarletNX compiles AArch64 code into native modules through LLVM IR (or libgccjit).
+The CPU implementation is shared by Horizon HLE/Maxwell and CPU-only Linux AArch64 ABI runtimes.
 Source map: [CLAUDE.md](../CLAUDE.md).
 
 ## Runtime boundaries
@@ -14,13 +24,27 @@ Source map: [CLAUDE.md](../CLAUDE.md).
 
 The experimental `src/3ds/` / `scarletnx-3ds` target supplies board profiles,
 decrypted CIA/NCCH/ExeFS/RomFS extraction and an independent checked page-memory
-controller, not CIA application execution. `snx_ctr_cpu` connects the page
-controller to a separate opt-in checked A32 ABI, with static native-object
-witnesses. The common A32 backend's A57/flat defaults and CPU ABI 2 are unchanged;
-ARM11 ISA and callback memory are explicit codegen options, never global 3DS
-defines. The CPU adapter links neither LLVM/MCJIT nor NX/GNU ABI runtimes.
-See [3DS port](3DS.md) for unsupported instructions and production process,
-module/discovery/dispatch and cache work still needed.
+controller. `SNX_3DS_AOT=ON` adds a native Linux static-AOT pipeline:
+extraction -> the driver's offline LLVM compiler/host linker (only when the module is missing or stale) ->
+native ELF -> checked process/ARM/Thumb dispatch. `snx_ctr_process` maps raw
+ExHeader segments/BSS/stack/TLS; `snx_ctr_native` validates/loads module ABI 1.
+The driver links LLVM for its compiler, the modules do not. The runtime uses neither MCJIT nor NX/GNU
+ABI code. `common/filesystem/` / `scarletnx-filesystem` owns NX and CTR's shared
+indexed host tree, immutable file mappings and on-demand opens. CTR uses its own
+level-3 RomFS serializer/file objects and wire protocol, not Switch FS IPC.
+Host staging/process utilities are also reused.
+
+The shared A32 backend's A57/flat defaults and CPU ABI 2 are unchanged. ARM11 ISA
+and callback memory are explicit codegen options, never global 3DS defines. The
+shared backend CMake target is initialized once when several runtimes request it.
+The compiler exhaustively emits one-instruction entries for images up to 4 KiB.
+Larger images use bounded offline CFG discovery, code-pointer candidates and a
+bounded PC-relative ADD jump window, with blocks of at most 32 instructions.
+It emits 128 entries per LLVM chunk and links all PIC objects with a separate
+ABI-1 full-geometry index object; unproven targets remain NULL. There is no
+runtime discovery or compilation. SuperTux reaches its first SVC through this
+path, not gameplay. See [3DS port](3DS.md) for coverage limits, absent HLE/devices
+and remaining cache/ISA work.
 
 The common target has no runtime-specific imports. NX and GNU ABI each link
 common and have no dependency on each other. The GNU executable target is
@@ -82,8 +106,8 @@ NX tooling under `src/nx/runtime/driver/` and `src/nx/loader/`:
 - The LLVM backend's speed: guest memory and the CPU structure are separate alias scopes (registers stay in host
   registers) and guest accesses are volatile (each happens, as on the hardware); logical immediates and SIMD
   immediates are folded; FP arithmetic, compares and conversions run inline on the host's IEEE unit when the result
-  is provably the soft-float helper's, flags included (`ir_fp_fast`); common SIMD (loads/stores, permutes, shifts,
-  compares, byte ops, saturating and halving adds) is inline instead of `snx_simd`. Build == host == target: the
+  is provably the soft-float helper's, flags included (`ir_fp_fast`); the AdvSIMD and crypto encodings are inline
+  instead of `snx_simd`, all but AES on a host without AES-NI (and on libgccjit). Build == host == target: the
   generated code uses the host's extensions (`snx_ir_host`, from LLVM's host detection) and the runtime library is
   built with `-march=native`, its helpers choosing paths from the compiler's feature macros; nothing is detected at
   run time. x86 paths sit under `__x86_64__` or the target triple: AES-NI, PCLMULQDQ (PMULL, CRC32 by Barrett
@@ -117,7 +141,7 @@ bump `SNX_ABI` for ABI changes. Version mismatches reject loading.
 | `hle/kernel/`, `hle/svc/`, `memory/` | Objects, threads, sync, SVC, Switch memory, IPC |
 | `hle/services/`, `hle/filesystem/` | Services, nvdrv, guest filesystem services |
 | `gpu/` and `gpu/maxwell/` | GPFIFO, Maxwell engine implementation, shaders, Vulkan renderer |
-| `gpu/video/` | host1x, NVDEC/FFmpeg, VIC |
+| `gpu/video/` | host1x, NVDEC H.264 and VP9 decoding through FFmpeg, VIC |
 | `runtime/platform/` | Host APIs, SDL3/headless, input, screenshots, timed exit |
 
 ### Guest exec

@@ -10,16 +10,15 @@ kernel and services, and a GPU thread that drives Vulkan.
 
 ## Project specifics
 - A workload is a scene reached by a fixed script (`snx-run` skill: `--seconds`, `--script`, `--shot`), run on an
-  otherwise idle machine. Catherine: Full Body is the reference game. Tears of the Kingdom, where it is extracted
-  under `work/`, is the heavy one. Never measure while a build runs: the build deploys into `games/` and loads the
-  CPU.
+  otherwise idle machine. Measure the games under `work/` that the change affects, and a heavy one for anything on
+  the hot path. Never measure while a build runs: the build deploys into `games/` and loads the CPU.
 - Check which tools the host has (`command -v perf bpftrace heaptrack valgrind llvm-mca llvm-objdump gdb`) and use
   what is there rather than assuming any. On Linux, check `/proc/sys/kernel/perf_event_paranoid` before
   profiling: if it blocks what you need, ask the user to change it (sessions have no sudo). On Windows, use the
   runtime's own profiler (below) or the platform's tools.
 - The host's scheduler, CPU frequency governor, SMT and background load move results between runs. Record the OS,
   kernel, CPU and governor with each measurement, and use repeat runs.
-- Known profile (TotK gameplay, October 2026): about 31 percent of CPU samples in `snx_fp_*` and `simd_*` helpers,
+- Known profile (heavy gameplay, October 2026): about 31 percent of CPU samples in `snx_fp_*` and `simd_*` helpers,
   27 percent of soft-FP helper time in SIMD encodings going through the runtime decoder, and `vk_finish` landings
   taking 30 to 40 percent of the GPU thread. The agreed order: FP zeros fast path, SIMD to native IR, lazy GPU
   landing, then a runtime JIT replacing the interpreter. Exactness is not negotiable for speed.

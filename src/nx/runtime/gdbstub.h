@@ -3,6 +3,7 @@
 #ifndef SNX_GDBSTUB_H
 #define SNX_GDBSTUB_H
 #define SNX_GDB_PORT 1234
-/* Native host debugging via a separate UNIX gdbserver. Call before threads start. */
-int snx_gdb_start(int stop);
+/* Native host debugging via a separate UNIX gdbserver, on localhost's PORT (SNX_GDB_PORT but in its test). Call
+   before threads start. */
+int snx_gdb_start(int stop, int port);
 #endif

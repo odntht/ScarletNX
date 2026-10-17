@@ -20,10 +20,10 @@ frame.
   frame's descriptor pools and staging reset after it and the draw's sets already allocated turn to garbage. Copy
   on the GPU instead.
 - Agreed work (October 2026): compute dispatches and graphics storage writes currently land in guest memory with a
-  `vk_finish` each, about 30 to 40 percent of the GPU thread's time in TotK. They should land lazily, batched, at
-  the points where the guest can observe the memory.
-- Shaders must declare `SignedZeroInfNanPreserve`: Maxwell code relies on infinities and NaNs (TotK's lighting
-  became NaN blocks without it).
+  `vk_finish` each, about 30 to 40 percent of the GPU thread's time in a heavy game. They should land lazily,
+  batched, at the points where the guest can observe the memory.
+- Shaders must declare `SignedZeroInfNanPreserve`: Maxwell code relies on infinities and NaNs (lighting became
+  NaN blocks without it).
 
 ## Validation layers
 Every renderer change is run under the Khronos validation layer before it is called done, and its messages are
@@ -34,8 +34,8 @@ part of the result.
   not installed"). If it is missing, ask the user to install it rather than skipping the check.
 - `SNX_VK_VALIDATION=1` makes `src/nx/gpu/vk/device.c` enable the layer with a debug messenger. Errors are logged
   with `WARN` and everything else with `LOG`, each line starting `vulkan validation:`. Count them with
-  `grep -c 'vulkan validation:' games/<Game>.log` and read the distinct ones with
-  `grep 'vulkan validation:' games/<Game>.log | sort | uniq -c | sort -rn | head`. Never print the whole log.
+  `grep -c 'vulkan validation:' games/<id>/<id>.log` and read the distinct ones with
+  `grep 'vulkan validation:' games/<id>/<id>.log | sort | uniq -c | sort -rn | head`. Never print the whole log.
 - The runtime enables only the layer's default checks. Turn on the others per run through the layer's settings
   variables: `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` (synchronization validation: missing barriers, hazards
   between the graphics and compute queues), `VK_KHRONOS_VALIDATION_VALIDATE_GPU_BASED=GPU_BASED_GPU_ASSISTED`

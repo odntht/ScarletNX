@@ -28,12 +28,21 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <signal.h>
+#ifdef __APPLE__
+/* Darwin's <ucontext.h> stops the build unless _XOPEN_SOURCE asks for the deprecated context functions; the type the
+   signal handler reads is in this one */
+#include <sys/ucontext.h>
+#else
 #include <ucontext.h>
+#endif
 #include <sched.h>
 #include <errno.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 extern char** environ;
-#ifdef __ANDROID__
-/* zenity and kdialog are a desktop's: Android has no dialog to ask for text yet */
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+/* zenity and kdialog are a desktop's: Android has no dialog to ask for text yet, and an iOS app runs no program */
 int plat_text_input(char* out, size_t cap, const char* initial) {
     (void)out;
     (void)cap;
@@ -89,6 +98,23 @@ static int text_dialog_run(char* out, size_t cap, char* const argv[]) {
 int plat_text_input(char* out, size_t cap, const char* initial) {
     if (!cap) return -1;
     if (!initial) initial = "";
+#ifdef __APPLE__
+    /* macOS's own dialog, through AppleScript. The text is the script's argument, never part of it: it is game data.
+       Cancel exits with 1, as zenity's does */
+    char* osascript[] = {"osascript",
+                         "-e",
+                         "on run argv",
+                         "-e",
+                         "text returned of (display dialog \"Enter text\" default answer (item 1 of argv) with title "
+                         "\"ScarletNX\")",
+                         "-e",
+                         "end run",
+                         "--",
+                         (char*)initial,
+                         NULL};
+    int apple = text_dialog_run(out, cap, osascript);
+    return apple == -2 ? -1 : apple;
+#endif
     char* zenity[] = {"zenity",       "--entry", "--title=ScarletNX", "--text=Enter text", "--entry-text",
                       (char*)initial, NULL};
     char* kdialog[] = {"kdialog", "--title", "ScarletNX", "--inputbox", "Enter text", (char*)initial, NULL};
@@ -103,14 +129,12 @@ int plat_text_input(char* out, size_t cap, const char* initial) {
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
 #endif
-void pm_init(PMutex* m) { pthread_mutex_init(&m->l, NULL); }
-void pm_lock(PMutex* m) { pthread_mutex_lock(&m->l); }
-void pm_unlock(PMutex* m) { pthread_mutex_unlock(&m->l); }
-int pm_trylock(PMutex* m) { return !pthread_mutex_trylock(&m->l); }
 void pc_init(PCond* c) {
     pthread_condattr_t a;
     pthread_condattr_init(&a);
+#ifndef __APPLE__ /* Darwin has no clock to choose: pc_wait waits a relative time there */
     pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+#endif
     pthread_cond_init(&c->c, &a);
 }
 void pc_signal(PCond* c) { pthread_cond_signal(&c->c); }
@@ -121,6 +145,11 @@ int pc_wait(PCond* c, PMutex* m, i64 ns) {
         return 0;
     }
     struct timespec ts;
+#ifdef __APPLE__
+    ts.tv_sec = ns / 1000000000;
+    ts.tv_nsec = ns % 1000000000;
+    return pthread_cond_timedwait_relative_np(&c->c, &m->l, &ts) == ETIMEDOUT;
+#endif
     clock_gettime(CLOCK_MONOTONIC, &ts);
     u64 t = (u64)ts.tv_sec * 1000000000ull + ts.tv_nsec + (u64)ns;
     ts.tv_sec = t / 1000000000ull;
@@ -171,6 +200,10 @@ int plat_thread(PThreadFn fn, void* arg, size_t stack) {
     pthread_attr_init(&at);
     /* below the minimum, pthread_attr_setstacksize fails and the thread would get the default size instead */
     if (stack && stack < (size_t)PTHREAD_STACK_MIN) stack = (size_t)PTHREAD_STACK_MIN;
+#ifdef __APPLE__
+    /* and Darwin's takes only whole pages (16 KiB on Apple silicon) */
+    if (stack) stack = (stack + (size_t)sysconf(_SC_PAGESIZE) - 1) & ~((size_t)sysconf(_SC_PAGESIZE) - 1);
+#endif
     if (stack) pthread_attr_setstacksize(&at, stack);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_t t;
@@ -275,8 +308,13 @@ u8* plat_vm_reserve(u64 size) {
 }
 int plat_vm_commit(u8* p, u64 size) { return mprotect(p, size, PROT_READ | PROT_WRITE); }
 void plat_vm_decommit(u8* p, u64 size) {
+#ifdef __APPLE__
+    /* Darwin's MADV_DONTNEED keeps the pages' contents: a new mapping in their place is what gives zeroes back */
+    mmap(p, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+#else
     madvise(p, size, MADV_DONTNEED);
     mprotect(p, size, PROT_NONE);
+#endif
 }
 #ifdef __ANDROID__
 #include <SDL3/SDL_system.h>
@@ -309,7 +347,6 @@ const char* plat_dl_error(void) {
     const char* e = dlerror();
     return e ? e : "no error reported";
 }
-int plat_mkdir(const char* p) { return mkdir(p, 0755); }
 int plat_is_dir(const char* p) {
     struct stat s;
     return !stat(p, &s) && S_ISDIR(s.st_mode);
@@ -413,54 +450,6 @@ void plat_file_unmap(PFileMap* m) {
     m->size = 0;
     m->borrowed = 0;
 }
-/* Descriptors left to everything opened on demand: saves, the Vulkan driver, audio, dlopen */
-#define SHARE_FD_RESERVE 256
-/* A RomFS holds thousands of files and the soft limit is usually 1024, against a hard one in the hundreds of
-   thousands: raise it once. Nothing in the runtime uses select(), the one API that breaks on descriptors >= 1024 */
-static rlim_t share_fd_limit(void) {
-    static rlim_t limit;
-    if (!limit) {
-        struct rlimit r;
-        if (getrlimit(RLIMIT_NOFILE, &r)) {
-            limit = 1024;
-        } else {
-            if (r.rlim_cur < r.rlim_max) {
-                rlim_t soft = r.rlim_cur;
-                r.rlim_cur = r.rlim_max;
-                if (setrlimit(RLIMIT_NOFILE, &r)) r.rlim_cur = soft; /* a hard limit above the kernel's nr_open */
-            }
-            limit = r.rlim_cur;
-        }
-    }
-    return limit;
-}
-int plat_file_share(const char* path, u64 size, int* fd, const u8** data) {
-    *fd = -1;
-    *data = NULL;
-    if (size > SIZE_MAX || size > INT64_MAX) return -1;
-    rlim_t limit = share_fd_limit();
-    int f = open(path, O_RDONLY | O_CLOEXEC);
-    if (f < 0) return -1;
-    /* descriptors are handed out lowest first, so the number counts the ones in use */
-    if (limit != RLIM_INFINITY && (rlim_t)f + SHARE_FD_RESERVE >= limit) {
-        close(f);
-        return -1;
-    }
-    if (size) { /* lazy: no MAP_POPULATE, a page is read when the game first touches it */
-        void* p = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED, f, 0);
-        if (p == MAP_FAILED) {
-            close(f);
-            return -1;
-        }
-        *data = p;
-    }
-    *fd = f;
-    return 0;
-}
-void plat_file_unshare(int fd, const u8* data, u64 size) {
-    if (data) munmap((void*)data, (size_t)size);
-    if (fd >= 0) close(fd);
-}
 int plat_replace_file(const char* tmp, const char* dst) {
     if (!rename(tmp, dst)) return 0;
     remove(tmp);
@@ -482,6 +471,10 @@ static void sighandler(int sig, siginfo_t* si, void* uc_) {
     pc = (void*)uc->uc_mcontext.mc_rip;
 #elif defined(__FreeBSD__) && defined(__aarch64__)
     pc = (void*)uc->uc_mcontext.mc_gpregs.gp_elr;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    pc = (void*)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+#elif defined(__APPLE__) && defined(__x86_64__)
+    pc = (void*)uc->uc_mcontext->__ss.__rip;
 #elif defined(__x86_64__)
     pc = (void*)uc->uc_mcontext.gregs[REG_RIP];
 #elif defined(__aarch64__)

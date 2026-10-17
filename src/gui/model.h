@@ -7,7 +7,8 @@
 #include <stdint.h>
 #include "common/utilities/font.h" /* gui_glyph */
 
-/* the menu's items, in order: the loads, the keys, Settings and Share log, Exit. The games are the Games tab's */
+/* the menu's items, in order: the loads, the keys, Settings and Share log, on Android the data folder, Exit. The games
+   are the Games tab's */
 enum {
     GUI_SWITCH,
     GUI_LINUX,
@@ -15,6 +16,9 @@ enum {
     GUI_KEYS,
     GUI_SETTINGS, /* the game's .ini settings, the launcher's own for the runs and its App: settings.h */
     GUI_LOG,      /* the logs in one file, for a bug report: a phone has no terminal to copy them from */
+#ifdef __ANDROID__
+    GUI_DATA, /* the data folder, the app's own storage, in the system's Files app (dist/android's DataProvider) */
+#endif
     GUI_EXIT,
     GUI_ITEM_COUNT
 };
@@ -31,22 +35,41 @@ typedef struct {
     int text_size; /* the font's scale, 1 to GUI_TEXT_MAX; 0 fits the screen */
 } GuiMenu;
 /* what a key on the menu asks of the GUI: nothing more, the Settings or the logs shared */
-typedef enum { GUI_MENU_STAY, GUI_MENU_SETTINGS, GUI_MENU_LOG } GuiMenuDo;
+typedef enum { GUI_MENU_STAY, GUI_MENU_SETTINGS, GUI_MENU_LOG, GUI_MENU_DATA } GuiMenuDo;
 GuiMenuDo gui_menu_key(GuiMenu* menu, GuiKey key);
-/* The question a running run's abort asks first, or leaving the menu on a computer: shown or not, which one, and the
-   choice in focus, the one that stays first */
+/* The menu's questions, one box for all (main.c's render_ask): shown or not, which one, the choice in focus (the first
+   stays first: it keeps things as they are), and whether its second choice takes a second press */
 enum { GUI_CONFIRM_KEEP, GUI_CONFIRM_ABORT };
+typedef enum {
+    GUI_ASK_ABORT,   /* a running run's, when ask_abort says to ask */
+    GUI_ASK_EXIT,    /* leaving the menu on a computer */
+    GUI_ASK_DEEP,    /* a folder picked with folders in it: are their games listed too */
+    GUI_ASK_OUTSIDE, /* a folder picked in Folders outside the app's own storage, which Android slows */
+    GUI_ASK_ROOM     /* a run whose extraction may not fit (gui_room) */
+} GuiAsk;
 typedef struct {
     bool shown;
-    bool exit; /* leaving the app, not aborting a run */
+    GuiAsk ask;
     int selected;
+    bool twice; /* the second choice is pressed twice: the first press only arms it */
+    bool armed; /* pressed once, its focus kept */
 } GuiConfirm;
+void gui_confirm_open(GuiConfirm* confirm, GuiAsk ask, bool twice);
 /* A key on the question: the arrows move between its choices, Select takes the one in focus and Cancel keeps going,
-   both closing it. True when the run is to be aborted */
+   both closing it; a question asked twice takes its second choice at the second Select, a move between choices
+   undoing the first. True when the second choice is taken */
 bool gui_confirm_key(GuiConfirm* confirm, GuiKey key);
+/* the pointer on a choice: it takes the focus, a press armed on the other undone */
+void gui_confirm_focus(GuiConfirm* confirm, int choice);
 const char* gui_setting_description(const GuiMenu* menu);
-/* bytes in MB, or in GB from 1024 MB on */
+/* bytes in KB under a MB (a byte is 1 KB, nothing is 0 MB), in MB, or in GB from 1024 MB on */
 void gui_size_text(char* out, size_t size, uint64_t bytes);
+/* Whether a run's first time with a dump of dump bytes has room: its extraction, about its size, in a folder with
+   work_free bytes free and, for a Switch game (copy), its RomFS copied into its folder in games/, about its size
+   again, with games_free free; on one disk (shared) both from work_free. need and left say what it takes and what is
+   free, on the disk it does not fit on (else the extraction's) */
+bool gui_room(uint64_t dump, bool copy, uint64_t work_free, uint64_t games_free, bool shared, uint64_t* need,
+              uint64_t* left);
 /* the footer's line: RAM in MB or GB, the CPU as a share of all cores and the cores in use (cpu_percent counts one
    core as 100%) */
 void gui_usage_text(char* out, size_t size, bool available, uint64_t memory_bytes, double cpu_percent, int cores);
@@ -87,4 +110,7 @@ char* gui_drop_path(const char* text, bool text_drop);
    download it names by path, NULL for any other (an app's, a cloud's); elsewhere the path or file:// URI it gave.
    Owned. */
 char* gui_document_path(const char* uri);
+/* 1 for text as a prod.keys has it: no NUL byte, and a line "name = hex" at least (a key's name of letters, digits and
+   _, its value hexadecimal), what tells it from any other file where it has no name to go by */
+int gui_keys_text(const char* data, size_t size);
 #endif

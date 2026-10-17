@@ -110,6 +110,44 @@ void jit_fp_join(SnxJit* jit, gcc_jit_block* join);
 /* snx_fp_binary/snx_fp_fma(c, ...) */
 gcc_jit_rvalue* jit_fp_binary(SnxJit* jit, gcc_jit_rvalue* a, gcc_jit_rvalue* b, unsigned width, unsigned op);
 gcc_jit_rvalue* jit_fp_fma(SnxJit* jit, gcc_jit_rvalue* add, gcc_jit_rvalue* a, gcc_jit_rvalue* b, unsigned width);
+/* ir_fp_minmax_fast's FMAX/FMIN without a NaN (or a denormal under FZ), a lane at a time; inexact is NULL */
+void jit_fp_minmax_fast(SnxJit* jit, unsigned width, unsigned lanes, gcc_jit_rvalue* const* a, gcc_jit_rvalue* const* b,
+                        unsigned minimum, SnxJitFpFast* out);
+/* snx_fp_minmax(c, a, b, width, minimum, numeric) */
+gcc_jit_rvalue* jit_fp_minmax(SnxJit* jit, gcc_jit_rvalue* a, gcc_jit_rvalue* b, unsigned width, unsigned minimum,
+                              unsigned numeric);
+/* the AdvSIMD compares' lane masks (simd.c's fcmpmask): a == b, a >= b, a > b, a <= b, a < b */
+enum { SNX_JIT_CMP_EQ, SNX_JIT_CMP_GE, SNX_JIT_CMP_GT, SNX_JIT_CMP_LE, SNX_JIT_CMP_LT };
+/* ir_fp_compare_fast's masks under the same guard; inexact is NULL */
+void jit_fp_compare_fast(SnxJit* jit, unsigned cmp, unsigned width, unsigned lanes, gcc_jit_rvalue* const* a,
+                         gcc_jit_rvalue* const* b, SnxJitFpFast* out);
+/* one lane through snx_fp_compare, signalling for all but EQ: all ones (uN) or zero */
+gcc_jit_rvalue* jit_fp_compare_mask(SnxJit* jit, unsigned cmp, gcc_jit_rvalue* a, gcc_jit_rvalue* b, unsigned width);
+/* ir_fp_from_int_fast's SCVTF/UCVTF of integers (the low integer bits of each v) scaled by 2^-fbits; inexact is
+   NULL */
+void jit_fp_from_int_fast(SnxJit* jit, unsigned width, unsigned lanes, gcc_jit_rvalue* const* v, unsigned integer,
+                          unsigned uns, unsigned fbits, SnxJitFpFast* out);
+/* ir_fp_to_int_fast's FCVT[NPMZA][SU], results uN of the integer's width; 0 when the host can't round inline */
+int jit_fp_to_int_fast(SnxJit* jit, unsigned width, unsigned lanes, gcc_jit_rvalue* const* bits, unsigned integer,
+                       unsigned uns, unsigned rm, unsigned fbits, SnxJitFpFast* out);
+/* ir_fp_estimate_fast's FRECPE (rsqrt 0) or FRSQRTE (1) estimate; inexact is NULL */
+void jit_fp_estimate_fast(SnxJit* jit, unsigned rsqrt, unsigned width, unsigned lanes, gcc_jit_rvalue* const* bits,
+                          SnxJitFpFast* out);
+/* ir_fp_step_fast's FRECPS (rsqrt 0) or FRSQRTS (1) */
+void jit_fp_step_fast(SnxJit* jit, unsigned rsqrt, unsigned width, unsigned lanes, gcc_jit_rvalue* const* a,
+                      gcc_jit_rvalue* const* b, SnxJitFpFast* out);
+/* ir_fp_narrow_fast's FCVTN (odd 0) or FCVTXN (odd 1) of float lanes of from bits to half that width (values
+   u(from/2)) */
+void jit_fp_narrow_fast(SnxJit* jit, unsigned from, unsigned lanes, gcc_jit_rvalue* const* bits, unsigned odd,
+                        SnxJitFpFast* out);
+/* one lane through snx_fp_convert from from bits to half that width, rounded per FPCR or (odd) to odd (result u64) */
+gcc_jit_rvalue* jit_fp_narrow(SnxJit* jit, gcc_jit_rvalue* bits, unsigned from, unsigned odd);
+/* one lane through snx_fp_unary, snx_fp_to_int and snx_fp_from_int (result u64) */
+gcc_jit_rvalue* jit_fp_unary(SnxJit* jit, gcc_jit_rvalue* bits, unsigned width, unsigned op);
+gcc_jit_rvalue* jit_fp_to_int(SnxJit* jit, gcc_jit_rvalue* bits, unsigned fp, unsigned integer, unsigned uns,
+                              unsigned fbits, unsigned rm);
+gcc_jit_rvalue* jit_fp_from_int(SnxJit* jit, gcc_jit_rvalue* bits, unsigned integer, unsigned fp, unsigned uns,
+                                unsigned fbits);
 
 /* ---- building blocks (jit.c) ----
    Values follow the C's evaluation order: anything that reads memory or calls is assigned to a fresh local where it

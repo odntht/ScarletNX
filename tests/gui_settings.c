@@ -13,7 +13,7 @@
 /* as scarletnx --settings prints them, and a line of something else, an older runtime's of seven fields, values with
    one missing its word, a Windows line end and no last one */
 static const char list[] =
-    "Display\tdocked\t0\tint\t0\t1\t1 = TV mode\t\t0=0|1=1\n"
+    "Display\tdocked\t1\tint\t0\t1\t1 = TV mode\t\t0=0|1=1\n"
     "Display\tfullscreen\t0\tint\t0\t1\t1 = start in fullscreen\t\t0=0|1=1\r\n"
     "Display\tlanguage\t1\tint\t-2.14748e+09\t2.14748e+09\tGame language: 0 Japanese\t\t\n"
     "Graphics\tresolution\t1\tfloat\t0.25\t4\tInternal 3D resolution\t\t\n"
@@ -165,6 +165,9 @@ int main(int argc, char** argv) {
                             assert(gui_settings_set(&s, "libgccjit", gcc ? "on" : "off") ==
                                    (!gcc || SNX_GUI_HAS_GCCJIT));
                             assert(gui_settings_set(&s, "gdbstub", stub ? "on" : "off"));
+                            /* what R's recompile takes, alone */
+                            assert(gcc && SNX_GUI_HAS_GCCJIT ? !strcmp(gui_settings_backend(&s), "--backend=gcc")
+                                                             : !gui_settings_backend(&s));
                             n = gui_settings_options(&s, launch, prepared, options);
                             assert(n <= (size_t)s.count + 1);
                             if (fullscreen) {
@@ -261,12 +264,23 @@ int main(int argc, char** argv) {
     if (argc > 1) {
         const char* run[] = {argv[1], "--settings", NULL};
         char* output = NULL;
-        const char* c;
-        int lines = 0;
+        const char *c, *next, *last = NULL;
+        int lines = 0, pages = 0;
         assert(!snx_run(run, NULL, NULL, &output) && output);
-        for (c = output; *c; ++c) lines += *c == '\n';
-        assert(!gui_settings_read(&s, output) &&
-               s.count == GUI_SETTINGS_OWN + lines + 4); /* two pages: a row, an All */
+        for (c = output; *c; c = next, ++lines) {
+            size_t section = strcspn(c, "\t\n");
+            /* a page: a run of lines whose section has a '/', a row and an All more */
+            if (memchr(c, '/', section) && !(last && strcspn(last, "\t") == section && !strncmp(c, last, section)))
+                ++pages;
+            last = c;
+            next = c + strcspn(c, "\n");
+            if (*next) ++next;
+        }
+        assert(pages > 0 && !gui_settings_read(&s, output) && s.count == GUI_SETTINGS_OWN + lines + 2 * pages);
+        /* each player's own, on Controllers' Player page: a word row whose default is every player's */
+        assert(words(key(&s, "gamepad_p1_swap_ab")) == 4 && !strcmp(key(&s, "gamepad_p8_swap_ab")->words[1], "As All"));
+        assert(key(&s, "gamepad_p3_device")->type == GUI_KEY_TEXT &&
+               !strcmp(key(&s, "gamepad_p3_device")->section, "Controllers/Player"));
         assert(!strcmp(s.keys[GUI_SETTINGS_OWN].section, "Display") && !strcmp(s.keys[s.count - 1].section, "Debug"));
         assert(words(key(&s, "fullscreen")) == 3 && words(key(&s, "touch")) == 4 && words(key(&s, "controls")) == 3);
         assert(!strcmp(key(&s, "controls")->key, "Show controls") && !strcmp(key(&s, "touch")->words[3], "Mouse too"));

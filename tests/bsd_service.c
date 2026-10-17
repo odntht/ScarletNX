@@ -287,6 +287,18 @@ int main(void) {
     out(OUT0, 0);
     out(IN0, 16);
     CHECK(call(&e) == 0 && word(2) == 0 && GP(IN0)[0] == 0xA5);
+    /* still queued, so readable: polled before the non-blocking RecvFrom, as macOS hands a loopback datagram to its
+       socket a moment after SendTo returns (Linux before) */
+    {
+        u8 ready[8] = {0};
+        memcpy(ready, &u1, 4);
+        ready[4] = 0x01; /* POLLIN */
+        memcpy(GP(IN0), ready, 8);
+        request(6, 1, 2000, 0);
+        in(IN0, 8);
+        out(OUT0, 8);
+        CHECK(call(&e) == 1 && (GP(OUT0)[6] & 0x01));
+    }
     request(9, (u32)u1, 0x80, 0);
     out(OUT0, 64);
     out(IN0, 16);

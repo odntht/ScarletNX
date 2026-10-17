@@ -26,7 +26,7 @@
 
 int g_opt_diag = 0;
 int g_opt_auto_stub_ipc = 1;
-int g_opt_docked = 0, g_opt_lang = 1, g_opt_fps = SNX_FPS_GAME, g_opt_fullscreen = 0;
+int g_opt_docked = 1, g_opt_lang = 1, g_opt_fps = SNX_FPS_GAME, g_opt_fullscreen = 0;
 float g_opt_resf = 1.0f;
 int g_opt_shadows = 1;
 int g_opt_vsync = 1, g_opt_aniso = 0;
@@ -121,7 +121,7 @@ static void heap_max_set(const IniOpt* o, const char* v) {
 }
 /* the settings this file reads; the platform's (backend.h, vpad.h) are written with them */
 static const IniOpt INI_DISPLAY[] = {
-    {"docked", "0", "1 = TV mode (1920x1080 / 1600x900 games), 0 = handheld mode (1280x720)", INI_INT, INI_STARTUP,
+    {"docked", "1", "1 = TV mode (1920x1080 / 1600x900 games), 0 = handheld mode (1280x720)", INI_INT, INI_STARTUP,
      &g_opt_docked, 0, 1, NULL, NULL, NULL, 0, 0},
     {"fullscreen", "0",
      "1 = start in fullscreen (not in timed test runs). -f or --fullscreen=0 sets it for one run.\n"
@@ -164,7 +164,7 @@ static const IniOpt INI_PERF[] = {
     {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0}};
 static const IniOpt INI_NETWORK[] = {
     {"network", "0",
-     "1 = host networking. Known Nintendo service domains are blocked by the resolver, not by an IP firewall.\n;   0 = "
+     "1 = host networking. Known console service domains are blocked by the resolver, not by an IP firewall.\n;   0 = "
      "report offline and restrict outbound destinations to loopback. This is not a network sandbox",
      INI_INT, 0, &g_opt_network, 0, 1, NULL, NULL, NULL, 0, 0},
     {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0}};
@@ -199,7 +199,10 @@ static const IniSec INI_SECS[] = {
     {"Performance", {{INI_PERF, NULL}}},
     {SNX_VPAD_PAGE,
      {{g_vpad_ini, backend_ini}, {g_backend_ini, backend_ini}, {g_vpad_shown_ini, backend_ini, SNX_VPAD_BUTTONS}}},
-    {SNX_GAMEPAD_PAGE, {{g_gamepad_ini, backend_ini}, {g_gamepad_map_ini, backend_ini, SNX_GAMEPAD_MAP}}},
+    {SNX_GAMEPAD_PAGE,
+     {{g_gamepad_ini, backend_ini},
+      {g_gamepad_map_ini, backend_ini, SNX_GAMEPAD_MAP},
+      {g_gamepad_players_ini, backend_ini, SNX_GAMEPAD_PLAYERS}}},
     {"Network", {{INI_NETWORK, NULL}}},
     {"Debug", {{INI_DBG, NULL}}},
     {NULL, {{NULL, NULL}}}};

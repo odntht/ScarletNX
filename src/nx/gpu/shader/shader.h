@@ -10,7 +10,8 @@
 extern "C" {
 #endif
 enum { ST_VS = 0, ST_TCS = 1, ST_TES = 2, ST_GS = 3, ST_FS = 4, ST_CS = 5 };
-#define SH_MAXTEX 32
+#define SH_MAXTEX         64
+#define SH_INDEXED_TABLES 10
 typedef struct {
     u32 cbuf_off; /* handle offset in the texture cbuf, in words */
     u8 type;      /* 0 1D 1 2D 2 3D 3 CUBE */
@@ -22,6 +23,10 @@ typedef struct {
     u8 flags;    /* 1: raw integer surface load, 2: multisample texel fetch, 4: indexed (SNX_TEX_INDEXED) */
     u32 bl2_off; /* word offset of read2 */
 } ShTex;
+static inline int shader_same_indexed_table(const ShTex* a, const ShTex* b) {
+    return a->bl_cbuf == b->bl_cbuf && a->cbuf_off == b->cbuf_off && a->flags == b->flags && a->type == b->type &&
+           a->array == b->array && a->shadow == b->shadow;
+}
 typedef struct {
     int stage;
     u32 sph[20];
@@ -50,21 +55,36 @@ typedef struct {
     int nimg; /* storage image stores and atomics */
     /* FS key: integer textures / outputs. rt_int_mask keys the primitives of the other stages instead: the
        tessellation parameters (register 0xC8) for TES, and the input primitive's vertex count for GS */
-    u32 tex_int_mask, tex_sint_mask, rt_int_mask, rt_sint_mask;
+    u64 tex_int_mask, tex_sint_mask;
+    u32 rt_int_mask, rt_sint_mask;
+    u32 gp_skip_mask[8]; /* GS key: POST_VTG_SHADER_ATTRIB_SKIP_MASK, one bit per scalar attribute */
+    /* FS key: depth-compare samples of a color texture (TEX.DC on a color format compares its first component, which
+       Vulkan's compare samplers don't do): the slots, and their compare functions 3 bits each in slot order */
+    u64 tex_dc_color_mask;
+    u32 tex_dc_color_funcs;
+    u32 out_mask; /* generic outputs 0..31 written (all of them after an attribute store at a register's offset) */
+    /* FS key: generic inputs the stage before rasterization doesn't write. They read as 0, 0, 0, 1 (yuzu's choice,
+       GPL-2.0-or-later, shader_recompiler emit_spirv_context_get_set.cpp): an input no output feeds is undefined in
+       Vulkan */
+    u32 in_unfed_mask;
 } ShaderInfo;
+#define SH_DC_COLOR_MAX  10 /* slots tex_dc_color_funcs holds */
 /* the shader flushes FP32 denormals everywhere: every FADD, FMUL and FFMA it has asks for it, as the console's
    compiler emits them (Eden declares DenormFlushToZero on the same condition) */
 /* One descriptor set per stage, with bindings grouped by resource kind. */
 #define SNX_VKB_CB       0  /* 18 constant buffers */
 #define SNX_VKB_SSBO     18 /* 16 global memory buffers */
-#define SNX_VKB_TEX      34 /* 32 combined image samplers */
-#define SNX_VKB_IMG      66 /* 8 storage images (compute) */
-#define SNX_VKB_RS       74 /* fragment: 1/resolution scale (SNX_RS) */
-#define SNX_VKB_FMT      75 /* compute: image format classes (SNX_FMT) */
-#define SNX_VKB_SMAP     76 /* graphics: storage-buffer page indices for aliased bindings */
-#define SNX_VKB_IMGBUF   77 /* 8 storage texel buffers: surface operations on buffer images (compute) */
-#define SNX_VKB_TEXARRAY 85 /* SNX_TEX_ARRAY textures: the handles an indexed LDC loads (graphics) */
-#define SNX_VKB_END      86 /* one past the last binding */
+#define SNX_VKB_TEX      34 /* SH_MAXTEX combined image samplers */
+#define SNX_VKB_IMG      (SNX_VKB_TEX + SH_MAXTEX) /* 8 storage images (compute) */
+#define SNX_VKB_RS       (SNX_VKB_IMG + 8)         /* fragment: 1/resolution scale (SNX_RS) */
+#define SNX_VKB_FMT      (SNX_VKB_RS + 1)          /* compute: image format classes (SNX_FMT) */
+#define SNX_VKB_SMAP     (SNX_VKB_FMT + 1)         /* graphics: storage-buffer page indices for aliased bindings */
+#define SNX_VKB_IMGBUF   (SNX_VKB_SMAP + 1) /* 8 storage texel buffers: surface operations on buffer images (compute) */
+#define SNX_VKB_TEXARRAY (SNX_VKB_IMGBUF + 8)   /* up to SNX_TEX_ARRAY unique indexed handles */
+#define SNX_VKB_TEXFUNCS (SNX_VKB_TEXARRAY + 1) /* depth comparison functions */
+#define SNX_VKB_TEXDEPTH (SNX_VKB_TEXFUNCS + 1) /* depth counterparts */
+#define SNX_VKB_TEXMAP   (SNX_VKB_TEXDEPTH + 1) /* table/element to compact descriptor index */
+#define SNX_VKB_END      (SNX_VKB_TEXMAP + 1)   /* one past the last binding */
 /* An indexed texture's handle is loaded by an LDC whose address takes a register: the shader picks one of
    SNX_TEX_ARRAY handles, each (1 << shift) bytes after the one before, from cbuf_off on. ShTex.flags holds the shift
    in bits 4-7. */

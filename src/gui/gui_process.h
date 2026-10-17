@@ -14,6 +14,23 @@ typedef struct {
     bool available;
 } GuiUsage;
 
+/* A process tree's CPU use between two looks, from its CPU seconds at now seconds. The base moves only when the clock
+   has: looks closer than its resolution (GetTickCount64's 15.6 ms) add up instead of losing the CPU used between them.
+   CPU that went down, a process gone from the sum, starts the base again */
+typedef struct {
+    double cpu, time;
+    bool measured;
+} GuiCpuBase;
+static inline double gui_cpu_percent(GuiCpuBase* base, double cpu, double now) {
+    double percent = 0;
+    if (base->measured && now <= base->time && cpu >= base->cpu) return 0;
+    if (base->measured && now > base->time && cpu >= base->cpu) percent = 100 * (cpu - base->cpu) / (now - base->time);
+    base->cpu = cpu;
+    base->time = now;
+    base->measured = true;
+    return percent;
+}
+
 /* No shell. stdout and stderr share one pipe inherited by all descendants.
    The window's working directory is also the child's working directory. */
 GuiProcess* gui_process_create(void);

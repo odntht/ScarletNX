@@ -1,5 +1,5 @@
 # scripts/make-icons.py drew these from wimsy.svg with rsvg-convert version 2.62.3 and OptiPNG version 0.7.8 (-o7 -strip all -nc -nb); run it again after changing the SVG
-1db48430bc0a3a23885d83591c2160cd7443711fc89d7f86bd78bc68f940932b  wimsy.svg
+b004fe42c99e10ee167ba1d4e3c53623a9dcc73b4e056ddd78b3e11b09353579  wimsy.svg
 c12f0f06a6a21d1720766a5c10f1f20b5d6876a6d1472810377765e0f6e81e13  icons/hicolor/16x16/apps/wimsy.png
 ed9c8767993c77c20ccf4ce4196657d1b6621171054e96b723a654cb75c9fcdb  icons/hicolor/22x22/apps/wimsy.png
 e3e777b66f28ccb4eb859bb3a7e314cc390b3112d1d7813cec0c5ddd46b50024  icons/hicolor/24x24/apps/wimsy.png

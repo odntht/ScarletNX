@@ -34,6 +34,7 @@ typedef struct {
     size_t error_size;
     size_t symbol_cap, function_cap, relptr_cap, fde_cap, import_cap;
     int oom;
+    int elf32; /* a 32-bit program's module (the NPDM says): ELF32 dynamic structures, Thumb bit in code addresses */
 } Parser;
 
 static void error_text(char* out, size_t capacity, const char* text) {
@@ -110,9 +111,14 @@ static int add_offset(Parser* p, SnxU64** array, size_t* count, size_t* capacity
     return 0;
 }
 
-static int in_text(const SnxModuleImage* m, SnxU64 offset) {
-    return !(offset & 3) && offset >= m->text_off && offset - m->text_off < m->text_size;
+/* A64 code is word aligned. An AArch32 code address has the Thumb bit in bit 0, as interworking branches take it: an
+   A32 one is word aligned, a Thumb one halfword aligned */
+static int in_text32(const SnxModuleImage* m, SnxU64 offset, int elf32) {
+    if (elf32 ? (offset & 3) == 2 : (offset & 3) != 0) return 0;
+    offset &= ~(SnxU64)1;
+    return offset >= m->text_off && offset - m->text_off < m->text_size;
 }
+static int in_text(const SnxModuleImage* m, SnxU64 offset) { return in_text32(m, offset, 0); }
 
 static int compare_offset(const void* a, const void* b) {
     SnxU64 x, y;
@@ -229,10 +235,45 @@ static int lz4_block(Parser* p, const unsigned char* src, size_t n, unsigned cha
     return (size_t)got == size ? 0 : fail(p, "LZ4: decompressed length differs from segment header");
 }
 
+/* The dynamic table's tags it reads: DT_PLTRELSZ (2) to DT_RELENT (19). A 64-bit module has RELA relocations, a
+   32-bit one REL, whose addend is the word the relocation is applied to */
+#define DYN_TAGS 20
+static int relr_pointer(Parser* p, SnxU64 target) {
+    SnxModuleImage* m = p->module;
+    SnxU64 addend, word = p->elf32 ? 4 : 8;
+    if (target > m->size || m->size - target < word) return fail(p, "ELF: relocation target exceeds module");
+    addend = span(m->image_size, target, word)
+                 ? (p->elf32 ? get32(m->image + (size_t)target) : get64(m->image + (size_t)target))
+                 : 0;
+    return in_text32(m, addend, p->elf32) ? add_offset(p, &m->relptrs, &m->relptr_count, &p->relptr_cap, addend) : 0;
+}
+
+static int parse_relr(Parser* p, SnxU64 table, SnxU64 size, SnxU64 entry_size) {
+    const SnxModuleImage* m = p->module;
+    SnxU64 at, entry, where, i, word = p->elf32 ? 4 : 8;
+    if ((entry_size && entry_size != word) || size % word) return fail(p, "ELF: invalid RELR entry size");
+    if (!span(m->image_size, table, size)) return fail(p, "ELF: RELR table exceeds image");
+    where = 0;
+    for (at = table; at < table + size; at += word) {
+        entry = p->elf32 ? get32(m->image + (size_t)at) : get64(m->image + (size_t)at);
+        if (!(entry & 1)) {
+            if (relr_pointer(p, entry)) return -1;
+            where = entry + word;
+            continue;
+        }
+        if (where > m->size) return fail(p, "ELF: relocation target exceeds module");
+        for (i = 0, entry >>= 1; entry; entry >>= 1, i++)
+            if ((entry & 1) && relr_pointer(p, where + i * word)) return -1;
+        where += (word * 8 - 1) * word;
+    }
+    return 0;
+}
+
 static int parse_dynamic(Parser* p, size_t offset) {
     SnxModuleImage* m;
-    SnxU64 tags[12], present, tag, value, count, i, at, string_size, name_at, symbol_value, symbol_size;
-    SnxU64 addend, target, info;
+    SnxU64 tags[DYN_TAGS], relr[3], present, tag, value, count, i, at, string_size, name_at, symbol_value, symbol_size;
+    SnxU64 addend, target, info, word, entry, symbol_entry, table, table_size, table_entry;
+    unsigned relative;
     const unsigned char *s, *end;
     char* name;
     void* r;
@@ -240,25 +281,38 @@ static int parse_dynamic(Parser* p, size_t offset) {
     unsigned type;
     int terminated;
     m = p->module;
+    word = p->elf32 ? 4 : 8;
+    entry = 2 * word;                  /* Elf32_Dyn, Elf64_Dyn */
+    symbol_entry = p->elf32 ? 16 : 24; /* Elf32_Sym, Elf64_Sym */
+    relative = p->elf32 ? 23 : 1027;   /* R_ARM_RELATIVE, R_AARCH64_RELATIVE */
     memset(tags, 0, sizeof tags);
+    memset(relr, 0, sizeof relr);
+    memset(relr, 0, sizeof relr);
     present = 0;
     terminated = 0;
-    while (span(m->image_size, offset, 16)) {
-        tag = get64(m->image + offset);
-        value = get64(m->image + offset + 8);
-        offset += 16;
+    while (span(m->image_size, offset, entry)) {
+        tag = p->elf32 ? get32(m->image + offset) : get64(m->image + offset);
+        value = p->elf32 ? get32(m->image + offset + 4) : get64(m->image + offset + 8);
+        offset += (size_t)entry;
         if (!tag) {
             terminated = 1;
             break;
         }
-        if (tag < 12 && !(present & ((SnxU64)1 << (unsigned)tag))) {
+        if (tag < DYN_TAGS && !(present & ((SnxU64)1 << (unsigned)tag))) {
             tags[(unsigned)tag] = value;
+            present |= (SnxU64)1 << (unsigned)tag;
+        } else if (tag >= 35 && tag <= 37 && !(present & ((SnxU64)1 << (unsigned)tag))) {
+            relr[(unsigned)tag - 35] = value;
+            present |= (SnxU64)1 << (unsigned)tag;
+        } else if (tag >= 35 && tag <= 37 && !(present & ((SnxU64)1 << (unsigned)tag))) {
+            relr[(unsigned)tag - 35] = value; /* DT_RELRSZ, DT_RELR, DT_RELRENT */
             present |= (SnxU64)1 << (unsigned)tag;
         }
     }
     if (!terminated) return fail(p, "MOD0: unterminated dynamic table");
-    if (!(present & ((SnxU64)1 << 11))) tags[11] = 24;
-    if (!(present & ((SnxU64)1 << 9))) tags[9] = 24;
+    if (!(present & ((SnxU64)1 << 11))) tags[11] = symbol_entry;
+    if (!(present & ((SnxU64)1 << 9))) tags[9] = 3 * word;
+    if (!(present & ((SnxU64)1 << 19))) tags[19] = 2 * word;
     count = 0;
     if (present & ((SnxU64)1 << 4)) {
         if (!span(m->image_size, tags[4], 8)) return fail(p, "ELF: hash header exceeds image");
@@ -267,7 +321,7 @@ static int parse_dynamic(Parser* p, size_t offset) {
         if (!span(m->image_size, tags[4], 8 + (count + value) * 4)) return fail(p, "ELF: hash table exceeds image");
     }
     if ((present & 0x60) == 0x60) {
-        if (tags[11] < 24) return fail(p, "ELF: invalid symbol entry size");
+        if (tags[11] < symbol_entry) return fail(p, "ELF: invalid symbol entry size");
         if (!(present & ((SnxU64)1 << 4)) && tags[5] > tags[6]) count = (tags[5] - tags[6]) / tags[11];
         if (tags[6] > m->image_size || count > ((SnxU64)m->image_size - tags[6]) / tags[11])
             return fail(p, "ELF: symbol table exceeds image");
@@ -278,10 +332,17 @@ static int parse_dynamic(Parser* p, size_t offset) {
             at = tags[6] + i * tags[11];
             s = m->image + (size_t)at;
             name_offset = get32(s);
-            type = s[4] & 15;
-            section = get16(s + 6);
-            symbol_value = get64(s + 8);
-            symbol_size = get64(s + 16);
+            if (p->elf32) { /* st_name, st_value, st_size, st_info, st_other, st_shndx */
+                symbol_value = get32(s + 4);
+                symbol_size = get32(s + 8);
+                type = s[12] & 15;
+                section = get16(s + 14);
+            } else {
+                type = s[4] & 15;
+                section = get16(s + 6);
+                symbol_value = get64(s + 8);
+                symbol_size = get64(s + 16);
+            }
             if (!name_offset) continue;
             if (name_offset >= string_size) return fail(p, "ELF: symbol name exceeds string table");
             name_at = tags[5] + name_offset;
@@ -311,26 +372,38 @@ static int parse_dynamic(Parser* p, size_t offset) {
                 m->symbols[m->symbol_count].value = symbol_value;
                 m->symbols[m->symbol_count].size = symbol_size;
                 m->symbols[m->symbol_count++].type = type;
-                if (type == 2 && in_text(m, symbol_value) &&
+                if (type == 2 && in_text32(m, symbol_value, p->elf32) &&
                     add_offset(p, &m->functions, &m->function_count, &p->function_cap, symbol_value))
                     return -1;
             }
         }
     }
-    if (present & ((SnxU64)1 << 7)) {
-        if (tags[9] != 24 || tags[8] % 24) return fail(p, "ELF: invalid RELA entry size");
-        if (!span(m->image_size, tags[7], tags[8])) return fail(p, "ELF: relocation table exceeds image");
-        for (at = tags[7]; at < tags[7] + tags[8]; at += 24) {
+    /* DT_RELA (7, 8, 9), then DT_REL (17, 18, 19) */
+    for (i = 0; i < 2; i++) {
+        table = tags[i ? 17 : 7];
+        table_size = tags[i ? 18 : 8];
+        table_entry = tags[i ? 19 : 9];
+        if (!(present & ((SnxU64)1 << (i ? 17 : 7)))) continue;
+        if (table_entry != (i ? 2 : 3) * word || table_size % table_entry)
+            return fail(p, i ? "ELF: invalid REL entry size" : "ELF: invalid RELA entry size");
+        if (!span(m->image_size, table, table_size)) return fail(p, "ELF: relocation table exceeds image");
+        for (at = table; at < table + table_size; at += table_entry) {
             s = m->image + (size_t)at;
-            target = get64(s);
-            info = get64(s + 8);
-            addend = get64(s + 16);
-            if (target > m->size || m->size - target < 8) return fail(p, "ELF: relocation target exceeds module");
-            if ((SnxU32)info == 1027 && in_text(m, addend) &&
-                add_offset(p, &m->relptrs, &m->relptr_count, &p->relptr_cap, addend))
+            target = p->elf32 ? get32(s) : get64(s);
+            info = p->elf32 ? get32(s + 4) & 0xFF : get64(s + 8) & 0xFFFFFFFFUL;
+            if (target > m->size || m->size - target < word) return fail(p, "ELF: relocation target exceeds module");
+            if (info != relative) continue;
+            if (i) /* REL: the addend is in the image, unless the target is in the BSS */
+                addend = span(m->image_size, target, word)
+                             ? (p->elf32 ? get32(m->image + (size_t)target) : get64(m->image + (size_t)target))
+                             : 0;
+            else
+                addend = p->elf32 ? get32(s + 8) : get64(s + 16);
+            if (in_text32(m, addend, p->elf32) && add_offset(p, &m->relptrs, &m->relptr_count, &p->relptr_cap, addend))
                 return -1;
         }
     }
+    if ((present & ((SnxU64)1 << 36)) && parse_relr(p, relr[1], relr[0], relr[2])) return -1;
     return 0;
 }
 
@@ -592,12 +665,25 @@ static int parse_module(Parser* p) {
     fields[2] = &m->mod0.bss_end;
     fields[3] = &m->mod0.ehf_start;
     fields[4] = &m->mod0.ehf_end;
-    for (i = 0; i < 5; i++)
-        if (signed_relative(p, mod0, get32(m->image + mod0 + 4 + i * 4), fields[i])) return -1;
+    for (i = 0; i < 5; i++) {
+        SnxU32 displacement = get32(m->image + mod0 + 4 + i * 4);
+        /* Large BSS ranges can exceed signed 32-bit reach. */
+        if (i == 2 && (displacement & 0x80000000UL) && mod0 < (~displacement + 1)) {
+            *fields[i] = (SnxU64)mod0 + displacement;
+        } else if (signed_relative(p, mod0, displacement, fields[i])) {
+            return -1;
+        }
+    }
     if (m->mod0.bss_start > m->mod0.bss_end || m->mod0.bss_end > m->size)
         return fail(p, "MOD0: BSS range exceeds module");
     if (!span(m->image_size, m->mod0.dynamic, 16)) return fail(p, "MOD0: dynamic table exceeds image");
     if (parse_dynamic(p, (size_t)m->mod0.dynamic)) return -1;
+    /* AArch32 code unwinds with .ARM.exidx, not .eh_frame: no FDEs */
+    if (p->elf32) {
+        unique_offsets(m->functions, &m->function_count);
+        unique_offsets(m->relptrs, &m->relptr_count);
+        return finish_symbols(p);
+    }
     error = p->error;
     error_size = p->error_size;
     p->error = unwind_error;
@@ -672,7 +758,7 @@ static int image_layout(Parser* p) {
     return 0;
 }
 
-int snx_load_nso(const char* path, const char* name, SnxModuleImage* m, char* error, size_t error_size) {
+static int load_nso(const char* path, const char* name, int elf32, SnxModuleImage* m, char* error, size_t error_size) {
     Parser p;
     unsigned char *file, digest[32];
     size_t file_size, i;
@@ -689,6 +775,7 @@ int snx_load_nso(const char* path, const char* name, SnxModuleImage* m, char* er
     p.module = m;
     p.error = error;
     p.error_size = error_size;
+    p.elf32 = elf32;
     if (!path) return fail(&p, "NSO: missing path");
     if (read_file(path, &file, &file_size, error, error_size)) return -1;
     result = -1;
@@ -755,6 +842,13 @@ done:
     free(file);
     if (result) snx_free_module(m);
     return result;
+}
+
+int snx_load_nso(const char* path, const char* name, SnxModuleImage* m, char* error, size_t error_size) {
+    return load_nso(path, name, 0, m, error, error_size);
+}
+int snx_load_nso32(const char* path, const char* name, SnxModuleImage* m, char* error, size_t error_size) {
+    return load_nso(path, name, 1, m, error, error_size);
 }
 
 int snx_load_nro(const char* path, SnxModuleImage* m, char* error, size_t error_size) {
@@ -1062,22 +1156,7 @@ int snx_load_program(const char* entry, SnxProgram* program, char* error, size_t
         }
     } else {
         if (find_exefs(program->entry_path, &program->exefs_path, error, error_size)) goto bad;
-        for (i = 0; i < 13; i++) {
-            path = join_path(program->exefs_path, order[i]);
-            if (!path) goto memory;
-            kind = path_kind(path, 0);
-            if (kind < 0) {
-                free(path);
-                error_text(error, error_size, "loader: cannot query module path");
-                goto bad;
-            }
-            if (kind && snx_load_nso(path, order[i], &program->modules[program->module_count], error, error_size)) {
-                free(path);
-                goto bad;
-            }
-            if (kind) program->module_count++;
-            free(path);
-        }
+        /* the NPDM first: it says whether the modules are 32-bit ones, whose ELF structures differ */
         path = join_path(program->exefs_path, "main.npdm");
         if (!path) goto memory;
         kind = path_kind(path, 0);
@@ -1091,6 +1170,24 @@ int snx_load_program(const char* entry, SnxProgram* program, char* error, size_t
             goto bad;
         }
         free(path);
+        if (snx_parse_npdm(program->npdm_data, program->npdm_size, &program->npdm, error, error_size)) goto bad;
+        for (i = 0; i < 13; i++) {
+            path = join_path(program->exefs_path, order[i]);
+            if (!path) goto memory;
+            kind = path_kind(path, 0);
+            if (kind < 0) {
+                free(path);
+                error_text(error, error_size, "loader: cannot query module path");
+                goto bad;
+            }
+            if (kind && load_nso(path, order[i], !program->npdm.is64, &program->modules[program->module_count], error,
+                                 error_size)) {
+                free(path);
+                goto bad;
+            }
+            if (kind) program->module_count++;
+            free(path);
+        }
         program->root_path = same_ascii(path_basename(program->exefs_path), "exefs") ? parent_path(program->exefs_path)
                                                                                      : copy_string(program->exefs_path);
         if (!program->root_path) goto memory;
@@ -1120,8 +1217,9 @@ int snx_load_program(const char* entry, SnxProgram* program, char* error, size_t
         }
     }
     if (snx_parse_npdm(program->npdm_data, program->npdm_size, &program->npdm, error, error_size)) goto bad;
-    base = SNX_CODE_BASE;
-    address_limit = (SnxU64)0x20 << 32;
+    /* Loader's code base, and the end of the code region: a 32-bit process's modules go below its alias region */
+    base = program->npdm.is64 ? SNX_CODE_BASE : SNX_CODE_BASE32;
+    address_limit = program->npdm.is64 ? (SnxU64)0x20 << 32 : (SnxU64)0x40000000UL;
     for (i = 0; i < program->module_count; i++) {
         if (base > address_limit - SNX_PAGE_SIZE || program->modules[i].size > address_limit - base - SNX_PAGE_SIZE) {
             error_text(error, error_size, "loader: modules exceed guest address space");

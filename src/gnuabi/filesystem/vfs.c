@@ -1,15 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* Guest filesystem only: paths never reach host open/stat/unlink APIs.
-   ABI constants/layout follow Linux asm-generic UAPI; host errors are translated. */
+/* The guest filesystem: the virtual nodes (/proc, /dev, /tmp in memory, the files the runtime adds), and with a sysroot
+   (gnu_vfs_set_root) the host's files through it (hostfs/hostfs.c). Without one, paths never reach host
+   open/stat/unlink APIs. ABI constants/layout follow Linux asm-generic UAPI; host errors are translated. */
 #include "gnuabi/filesystem/internal.h"
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(_WIN32)
 #include <fcntl.h>
+#if defined(_WIN32)
+#include <direct.h>
 #include <io.h>
 #define host_read  _read
 #define host_write _write
@@ -83,6 +85,7 @@ static GnuDescriptor* descriptor(GnuVfsState* s, int fd) {
 static void drop_descriptor(GnuDescriptor* d) {
     if (d->file && --d->file->references == 0) {
         if (d->file->ops && d->file->ops->release) d->file->ops->release(d->file->object);
+        if (d->file->node->kind == GNU_NODE_HOST) gnu_hostfs_release(d->file);
         free(d->file->snapshot);
         free(d->file);
     }
@@ -253,6 +256,11 @@ int gnu_vfs_init(GnuVfs* vfs) {
 void gnu_vfs_destroy(GnuVfs* vfs) {
     GnuVfsState* s = vfs->state;
     if (!s) return;
+    /* the guest closes the process's standard descriptors with close(); tearing the namespace down leaves them */
+    for (int fd = 0; fd < GNU_VFS_FD_MAX; ++fd)
+        if (s->descriptors[fd].file && s->descriptors[fd].file->node->kind == GNU_NODE_HOST &&
+            s->descriptors[fd].file->host >= 0 && s->descriptors[fd].file->host <= 2 && !s->descriptors[fd].file->path)
+            s->descriptors[fd].file->host = -1;
     for (int fd = 0; fd < GNU_VFS_FD_MAX; ++fd) drop_descriptor(&s->descriptors[fd]);
     GnuNode* n = s->allocated;
     while (n) {
@@ -264,6 +272,8 @@ void gnu_vfs_destroy(GnuVfs* vfs) {
     }
     free(s->cmdline);
     free(s->executable_path);
+    free(s->sysroot);
+    free(s->cwd_path);
     free(s);
     vfs->state = NULL;
 }
@@ -298,6 +308,7 @@ int gnu_vfs_set_process(GnuVfs* vfs, uint32_t pid, const char* exe, int argc, co
     s->pid = pid;
     return 0;
 }
+void gnu_vfs_set_pid(GnuVfs* vfs, uint32_t pid) { vfs->state->pid = pid; }
 int gnu_vfs_set_executable(GnuVfs* vfs, const void* bytes, size_t length) {
     GnuVfsState* s = vfs->state;
     if (!s) return -GNU_EINVAL;
@@ -347,6 +358,33 @@ static int open_file(GnuVfsState* s, GnuMemory* memory, int dirfd, const char* p
             break;
         }
     if (!available) return -GNU_EMFILE;
+    char virtual_path[GNU_VFS_PATH_MAX];
+    if (s->sysroot) {
+        GnuHostPath* at = (GnuHostPath*)malloc(sizeof *at);
+        GnuOpen* opened = NULL;
+        int r;
+        if (!at) return -GNU_ENOMEM;
+        r = gnu_hostfs_resolve(s, dirfd, path, (flags & GNU_O_NOFOLLOW) ? 0 : GNU_HOST_FOLLOW, at);
+        if (!r && at->is_virtual) {
+            /* /proc, /dev and the added files: the virtual nodes', by their absolute path */
+            strcpy(virtual_path, at->guest);
+            path = virtual_path;
+            dirfd = GNU_AT_FDCWD;
+            free(at);
+        } else {
+            free(at);
+            r = gnu_hostfs_open(s, dirfd, path, flags, mode, &opened);
+            if (r < 0) return r;
+            if (r == 0) {
+                int fd = install(s, opened, (flags & GNU_O_CLOEXEC) ? 1 : 0, 0);
+                if (fd < 0) {
+                    gnu_hostfs_release(opened);
+                    free(opened);
+                }
+                return fd;
+            }
+        }
+    }
     GnuNode* node = NULL;
     int fdlink = -1;
     int error = resolve(s, dirfd, path, !(flags & GNU_O_NOFOLLOW), &node, &fdlink);
@@ -387,6 +425,7 @@ static int open_file(GnuVfsState* s, GnuMemory* memory, int dirfd, const char* p
     file->node = node;
     file->flags = flags & ~(GNU_O_CREAT | GNU_O_EXCL | GNU_O_TRUNC | GNU_O_CLOEXEC);
     file->fdlink = (flags & GNU_O_PATH) && (flags & GNU_O_NOFOLLOW) ? fdlink : -1;
+    if (node->kind == GNU_NODE_PROC && !(flags & GNU_O_PATH) && !memory) return -GNU_EACCES; /* gnu_vfs_load */
     if (node->kind == GNU_NODE_PROC && !(flags & GNU_O_PATH)) {
         error = gnu_procfs_snapshot(s, memory, node->subtype, &file->snapshot, &file->snapshot_size);
         if (error) {
@@ -422,6 +461,10 @@ static int64_t file_read(GnuOpen* file, void* data, size_t length, uint64_t posi
 int64_t gnu_vfs_pread(GnuVfs* vfs, int fd, void* destination, size_t length, uint64_t offset) {
     GnuDescriptor* d = descriptor(vfs->state, fd);
     if (!d) return -GNU_EBADF;
+    if (d->file->node->kind == GNU_NODE_HOST) {
+        if ((d->file->flags & GNU_O_PATH) || (d->file->flags & GNU_O_ACCMODE) == GNU_O_WRONLY) return -GNU_EBADF;
+        return gnu_hostfs_read(d->file, destination, length, 1, offset);
+    }
     if (d->file->node->kind == GNU_NODE_STDIO || d->file->ops) return -GNU_ESPIPE;
     return file_read(d->file, destination, length, offset);
 }
@@ -465,6 +508,14 @@ static int64_t io(GnuVfsState* s, GnuMemory* memory, int fd, uint64_t address, u
         length ? gnu_memory_access(memory, address, (size_t)length, write ? GNU_PROT_READ : GNU_PROT_WRITE) : &dummy;
     if (!data) return -GNU_EFAULT;
     uint64_t offset = positional ? position : d->file->offset;
+    if (d->file->node->kind == GNU_NODE_HOST) {
+        /* the host descriptor keeps the position, which a forked child shares */
+        if (d->file->flags & GNU_O_PATH) return -GNU_EBADF;
+        if (write ? !(d->file->flags & GNU_O_ACCMODE) : (d->file->flags & GNU_O_ACCMODE) == GNU_O_WRONLY)
+            return -GNU_EBADF;
+        return write ? gnu_hostfs_write(d->file, data, (size_t)length, positional, position)
+                     : gnu_hostfs_read(d->file, data, (size_t)length, positional, position);
+    }
     int64_t result = write ? file_write(d->file, data, (size_t)length, offset, positional)
                            : file_read(d->file, data, (size_t)length, offset);
     if (result > 0 && !positional && !write && d->file->node->kind != GNU_NODE_DEVICE &&
@@ -532,6 +583,7 @@ static int64_t seek(GnuVfsState* s, int fd, int64_t offset, unsigned whence) {
     GnuOpen* f = d->file;
     GnuNode* n = f->node;
     if (f->flags & GNU_O_PATH) return -GNU_EBADF;
+    if (n->kind == GNU_NODE_HOST) return gnu_hostfs_seek(f, offset, whence);
     if (n->kind == GNU_NODE_STDIO || f->ops) return -GNU_ESPIPE;
     if (whence > 2) return -GNU_EINVAL;
     if (n->kind == GNU_NODE_DEVICE) return 0;
@@ -550,16 +602,65 @@ static unsigned node_type(const GnuNode* n) {
         default: return 0100000;
     }
 }
-static int stat_write(GnuVfsState* s, GnuMemory* memory, GnuNode* node, uint64_t address, int fdlink) {
+int gnu_stat_put(GnuMemory* memory, uint64_t address, const GnuStat* st) {
     unsigned char bytes[128] = {0};
+    gnu_vfs_put64(bytes, st->dev);
+    gnu_vfs_put64(bytes + 8, st->inode);
+    gnu_vfs_put32(bytes + 16, st->mode);
+    gnu_vfs_put32(bytes + 20, st->nlink);
+    gnu_vfs_put32(bytes + 24, st->uid);
+    gnu_vfs_put32(bytes + 28, st->gid);
+    gnu_vfs_put64(bytes + 32, st->rdev);
+    gnu_vfs_put64(bytes + 48, st->size);
+    gnu_vfs_put32(bytes + 56, st->blksize);
+    gnu_vfs_put64(bytes + 64, st->blocks);
+    gnu_vfs_put64(bytes + 72, (uint64_t)st->atime);
+    gnu_vfs_put64(bytes + 80, st->atime_ns);
+    gnu_vfs_put64(bytes + 88, (uint64_t)st->mtime);
+    gnu_vfs_put64(bytes + 96, st->mtime_ns);
+    gnu_vfs_put64(bytes + 104, (uint64_t)st->ctime);
+    gnu_vfs_put64(bytes + 112, st->ctime_ns);
+    /* exact 128-byte asm-generic stat layout */
+    return gnu_memory_write(memory, address, bytes, sizeof bytes);
+}
+/* struct statx: every basic field is there (STATX_BASIC_STATS), the birth time is not */
+int gnu_statx_put(GnuMemory* memory, uint64_t address, const GnuStat* st) {
+    unsigned char bytes[256] = {0};
+    gnu_vfs_put32(bytes, 0x7ffu);
+    gnu_vfs_put32(bytes + 4, st->blksize);
+    gnu_vfs_put32(bytes + 16, st->nlink);
+    gnu_vfs_put32(bytes + 20, st->uid);
+    gnu_vfs_put32(bytes + 24, st->gid);
+    gnu_vfs_put16(bytes + 28, (uint16_t)st->mode);
+    gnu_vfs_put64(bytes + 32, st->inode);
+    gnu_vfs_put64(bytes + 40, st->size);
+    gnu_vfs_put64(bytes + 48, st->blocks);
+    gnu_vfs_put64(bytes + 64, (uint64_t)st->atime);
+    gnu_vfs_put32(bytes + 72, st->atime_ns);
+    gnu_vfs_put64(bytes + 96, (uint64_t)st->ctime);
+    gnu_vfs_put32(bytes + 104, st->ctime_ns);
+    gnu_vfs_put64(bytes + 112, (uint64_t)st->mtime);
+    gnu_vfs_put32(bytes + 120, st->mtime_ns);
+    gnu_vfs_put32(bytes + 128, (uint32_t)(st->rdev >> 8) & 0xfff);
+    gnu_vfs_put32(bytes + 132, (uint32_t)(st->rdev & 0xff) | (uint32_t)(st->rdev >> 12 & 0xfff00));
+    gnu_vfs_put32(bytes + 136, (uint32_t)(st->dev >> 8) & 0xfff);
+    gnu_vfs_put32(bytes + 140, (uint32_t)(st->dev & 0xff) | (uint32_t)(st->dev >> 12 & 0xfff00));
+    return gnu_memory_write(memory, address, bytes, sizeof bytes);
+}
+static int node_stat(GnuVfsState* s, GnuNode* node, int fdlink, GnuStat* st) {
     uint64_t size = node->size;
     unsigned type = node_type(node);
     if (fdlink >= 0) type = 0120000;
     if (type == 0120000) {
         if (fdlink >= 0 && node != s->executable) {
             char target[GNU_VFS_PATH_MAX];
+            const GnuOpen* f = s->descriptors[fdlink].file;
             if (node->kind == GNU_NODE_STDIO)
                 snprintf(target, sizeof target, "pipe:[%d]", 10000 + node->host_fd);
+            else if (node->kind == GNU_NODE_HOST && f && f->path)
+                snprintf(target, sizeof target, "%s", f->path);
+            else if (node->kind == GNU_NODE_HOST)
+                snprintf(target, sizeof target, "pipe:[%llu]", (unsigned long long)(f ? f->inode : 0));
             else {
                 int error = node_path(node, target, sizeof target);
                 if (error) return error;
@@ -569,25 +670,32 @@ static int stat_write(GnuVfsState* s, GnuMemory* memory, GnuNode* node, uint64_t
             size = s->executable_path ? strlen(s->executable_path) : 0;
     }
     if (type == 0040000) size = 4096;
-    gnu_vfs_put64(bytes, 1);
-    gnu_vfs_put64(bytes + 8, node->inode);
-    gnu_vfs_put32(bytes + 16, type | (fdlink >= 0 ? 0777 : node->mode));
-    gnu_vfs_put32(bytes + 20, node->deleted ? 0 : type == 0040000 ? 2 : 1);
-    gnu_vfs_put32(bytes + 24, 1000);
-    gnu_vfs_put32(bytes + 28, 1000);
+    memset(st, 0, sizeof *st);
+    st->dev = 1;
+    st->inode = node->inode;
+    st->mode = type | (fdlink >= 0 ? 0777 : node->mode);
+    st->nlink = node->deleted ? 0 : type == 0040000 ? 2 : 1;
+    st->uid = 1000;
+    st->gid = 1000;
     if (type == 0020000) {
         unsigned minor = node->kind != GNU_NODE_DEVICE   ? 3
                          : node->subtype == GNU_DEV_NULL ? 3
                          : node->subtype == GNU_DEV_ZERO ? 5
                          : !strcmp(node->name, "random") ? 8
                                                          : 9;
-        gnu_vfs_put64(bytes + 32, 0x100u + minor);
+        st->rdev = 0x100u + minor;
     }
-    gnu_vfs_put64(bytes + 48, size);
-    gnu_vfs_put32(bytes + 56, 4096);
-    gnu_vfs_put64(bytes + 64, (size + 511) / 512);
-    /* Fixed deterministic guest times, with exact 128-byte asm-generic stat layout. */
-    return gnu_memory_write(memory, address, bytes, sizeof bytes);
+    st->size = size;
+    st->blksize = 4096;
+    st->blocks = (size + 511) / 512;
+    /* Fixed deterministic guest times. */
+    return 0;
+}
+static int stat_write(GnuVfsState* s, GnuMemory* memory, GnuNode* node, uint64_t address, int fdlink, int extended) {
+    GnuStat st;
+    int error = node_stat(s, node, fdlink, &st);
+    if (error) return error;
+    return extended ? gnu_statx_put(memory, address, &st) : gnu_stat_put(memory, address, &st);
 }
 static int readlink_path(GnuVfsState* s, int dirfd, const char* path, char output[GNU_VFS_PATH_MAX]) {
     GnuNode* node = NULL;
@@ -610,6 +718,15 @@ static int readlink_path(GnuVfsState* s, int dirfd, const char* path, char outpu
         }
         if (node->kind == GNU_NODE_STDIO) {
             snprintf(output, GNU_VFS_PATH_MAX, "pipe:[%d]", 10000 + node->host_fd);
+            return 0;
+        }
+        if (node->kind == GNU_NODE_HOST && s->descriptors[fdlink].file) {
+            const GnuOpen* f = s->descriptors[fdlink].file;
+            if (f->path)
+                snprintf(output, GNU_VFS_PATH_MAX, "%s", f->path);
+            else
+                snprintf(output, GNU_VFS_PATH_MAX, "%s:[%llu]", f->host_type == 0010000 ? "pipe" : "anon_inode",
+                         (unsigned long long)f->inode);
             return 0;
         }
         if (node->kind == GNU_NODE_OBJECT && s->descriptors[fdlink].file && s->descriptors[fdlink].file->ops) {
@@ -639,10 +756,11 @@ static int64_t directory_entries(GnuVfsState* s, GnuMemory* memory, int fd, uint
     GnuOpen* f = d->file;
     GnuNode* dir = f->node;
     if (f->flags & GNU_O_PATH) return -GNU_EBADF;
-    if (dir->kind != GNU_NODE_DIR) return -GNU_ENOTDIR;
     if (count > INT_MAX) count = INT_MAX;
     unsigned char* destination = (unsigned char*)gnu_memory_access(memory, address, (size_t)count, GNU_PROT_WRITE);
     if (count && !destination) return -GNU_EFAULT;
+    if (dir->kind == GNU_NODE_HOST) return gnu_hostfs_getdents(f, destination, (size_t)count);
+    if (dir->kind != GNU_NODE_DIR) return -GNU_ENOTDIR;
     size_t used = 0;
     uint64_t ordinal = 0;
     for (unsigned index = 0;; ++index) {
@@ -708,6 +826,7 @@ static int64_t fcntl_file(GnuVfsState* s, int fd, int command, uint64_t argument
         case 2: d->flags = (unsigned)argument & 1; return 0;
         case 3: return d->file->flags;
         case 4:
+            if (d->file->node->kind == GNU_NODE_HOST) return gnu_hostfs_set_flags(d->file, (unsigned)argument);
             d->file->flags = (d->file->flags & ~(GNU_O_APPEND | GNU_O_NONBLOCK)) |
                              ((unsigned)argument & (GNU_O_APPEND | GNU_O_NONBLOCK));
             return 0;
@@ -738,12 +857,15 @@ static int64_t ioctl_file(GnuVfsState* s, GnuMemory* memory, int fd, uint32_t re
                 if ((error = f->ops->readable_bytes(f->object, &bytes))) return error;
             } else if (f->node->kind == GNU_NODE_FILE)
                 bytes = f->offset < f->node->size ? (int)(f->node->size - f->offset) : 0;
+            else if (f->node->kind == GNU_NODE_HOST)
+                return gnu_hostfs_ioctl(f, memory, request, argument);
             else
                 return -GNU_ENOTTY;
             gnu_vfs_put32(word, (uint32_t)bytes);
             return gnu_memory_write(memory, argument, word, 4);
         }
     }
+    if (d->file->node->kind == GNU_NODE_HOST) return gnu_hostfs_ioctl(d->file, memory, request, argument);
     return -GNU_ENOTTY;
 }
 static int object_stat(GnuMemory* memory, const GnuOpen* f, uint64_t address) {
@@ -798,6 +920,9 @@ int gnu_vfs_fd_info(GnuVfs* vfs, int fd, GnuFdInfo* out) {
     out->identity = d->file;
     if (d->file->node->kind == GNU_NODE_STDIO)
         out->host_fd = d->file->node->host_fd;
+    else if (d->file->node->kind == GNU_NODE_HOST && d->file->host >= 0 && d->file->host_type != 0100000 &&
+             d->file->host_type != 0040000)
+        out->host_fd = d->file->host; /* a pipe, a terminal: the host waits on it */
     else if (!d->file->ops)
         out->regular = 1;
     return 0;
@@ -831,12 +956,55 @@ int gnu_vfs_add_file(GnuVfs* vfs, const char* path, const void* data, size_t siz
         parent = node;
     }
 }
-bool gnu_vfs_syscall(GnuVfs* vfs, GnuMemory* memory, uint64_t number, const uint64_t a[6], int64_t* result) {
-    GnuVfsState* s = vfs->state;
+/* the host-backed namespace's working folder is a guest path: a virtual folder's is its path in the tree */
+static int set_cwd_path(GnuVfsState* s, GnuNode* node) {
     char path[GNU_VFS_PATH_MAX];
+    char* copy;
+    int error;
+    if (!s->sysroot) return 0;
+    if ((error = node_path(node, path, sizeof path))) return error;
+    if (!(copy = copy_string(path))) return -GNU_ENOMEM;
+    free(s->cwd_path);
+    s->cwd_path = copy;
+    return 0;
+}
+static int descriptor_stat(GnuVfsState* s, GnuMemory* memory, GnuDescriptor* d, uint64_t address, int extended) {
+    GnuStat st;
+    int error;
+    if (d->file->ops) return object_stat(memory, d->file, address);
+    if (d->file->node->kind == GNU_NODE_HOST) {
+        if ((error = gnu_hostfs_fstat(d->file, &st))) return error;
+        if (!d->file->path && !st.inode) st.inode = d->file->inode;
+        return extended ? gnu_statx_put(memory, address, &st) : gnu_stat_put(memory, address, &st);
+    }
+    return stat_write(s, memory, d->file->node, address, d->file->fdlink, extended);
+}
+bool gnu_vfs_syscall(GnuVfs* vfs, GnuMemory* memory, uint64_t number, const uint64_t arguments[6], int64_t* result) {
+    GnuVfsState* s = vfs->state;
+    char path[GNU_VFS_PATH_MAX], virtual_path[GNU_VFS_PATH_MAX];
     GnuNode* node = NULL;
     GnuDescriptor* d;
     int error = 0, fdlink = -1;
+    uint64_t a[6];
+    memcpy(a, arguments, sizeof a);
+    virtual_path[0] = 0;
+    if (s->sysroot) {
+        if (gnu_hostfs_syscall(s, memory, number, a, virtual_path, result)) return true;
+        /* a virtual node, named by its absolute path from here on */
+        if (virtual_path[0] && number != 49) a[0] = (uint64_t)(int64_t)GNU_AT_FDCWD;
+        /* the descriptor calls only host files have */
+        if (number == 44 || number == 52 || number == 55 || number == 82 || number == 83 ||
+            (number == 88 && !a[1])) {
+            d = descriptor(s, (int)a[0]);
+            if (!d)
+                *result = -GNU_EBADF;
+            else if (d->file->node->kind == GNU_NODE_HOST)
+                *result = gnu_hostfs_fd_call(d->file, memory, number, a);
+            else
+                *result = number == 82 || number == 83 ? 0 : number == 44 ? -GNU_ENOSYS : -GNU_EPERM;
+            return true;
+        }
+    }
     switch (number) {
         case 17:
             error = node_path(s->cwd, path, sizeof path);
@@ -884,7 +1052,12 @@ bool gnu_vfs_syscall(GnuVfs* vfs, GnuMemory* memory, uint64_t number, const uint
         case 56:
         case 78:
         case 79:
+        case 291:
         case 439:
+            if (virtual_path[0]) {
+                strcpy(path, virtual_path);
+                break;
+            }
             error = gnu_memory_read_string(memory, number == 49 ? a[0] : a[1], path, sizeof path);
             if (error) {
                 *result = error;
@@ -901,6 +1074,10 @@ bool gnu_vfs_syscall(GnuVfs* vfs, GnuMemory* memory, uint64_t number, const uint
                 *result = -GNU_EBADF;
                 return true;
             }
+            if (d->file->node->kind == GNU_NODE_HOST) {
+                *result = (int64_t)a[1] < 0 ? -GNU_EINVAL : gnu_hostfs_truncate(d->file, a[1]);
+                return true;
+            }
             if (d->file->node->kind != GNU_NODE_FILE || (int64_t)a[1] < 0) {
                 *result = -GNU_EINVAL;
                 return true;
@@ -911,11 +1088,20 @@ bool gnu_vfs_syscall(GnuVfs* vfs, GnuMemory* memory, uint64_t number, const uint
             d = descriptor(s, (int)a[0]);
             if (!d)
                 *result = -GNU_EBADF;
-            else if (d->file->node->kind != GNU_NODE_DIR)
+            else if (d->file->node->kind == GNU_NODE_HOST) {
+                char* copy = d->file->path && d->file->host_type == 0040000 ? copy_string(d->file->path) : NULL;
+                if (!copy)
+                    *result = d->file->host_type == 0040000 ? -GNU_ENOMEM : -GNU_ENOTDIR;
+                else {
+                    free(s->cwd_path);
+                    s->cwd_path = copy;
+                    *result = 0;
+                }
+            } else if (d->file->node->kind != GNU_NODE_DIR)
                 *result = -GNU_ENOTDIR;
             else {
                 s->cwd = d->file->node;
-                *result = 0;
+                *result = set_cwd_path(s, d->file->node);
             }
             return true;
         case 57:
@@ -940,9 +1126,7 @@ bool gnu_vfs_syscall(GnuVfs* vfs, GnuMemory* memory, uint64_t number, const uint
         case 66: *result = vectored_io(s, memory, (int)a[0], a[1], a[2], number == 66); return true;
         case 80:
             d = descriptor(s, (int)a[0]);
-            *result = !d             ? -GNU_EBADF
-                      : d->file->ops ? object_stat(memory, d->file, a[1])
-                                     : stat_write(s, memory, d->file->node, a[1], d->file->fdlink);
+            *result = !d ? -GNU_EBADF : descriptor_stat(s, memory, d, a[1], 0);
             return true;
         default: return false;
     }
@@ -1007,6 +1191,7 @@ bool gnu_vfs_syscall(GnuVfs* vfs, GnuMemory* memory, uint64_t number, const uint
             error = resolve(s, GNU_AT_FDCWD, path, 1, &node, NULL);
             if (!error && node->kind != GNU_NODE_DIR) error = -GNU_ENOTDIR;
             if (!error) s->cwd = node;
+            if (!error) error = set_cwd_path(s, node);
             *result = error;
             return true;
         case 78: {
@@ -1027,28 +1212,238 @@ bool gnu_vfs_syscall(GnuVfs* vfs, GnuMemory* memory, uint64_t number, const uint
             return true;
         }
         case 79:
-            if (a[3] & ~(GNU_AT_SYMLINK_NOFOLLOW | GNU_AT_EMPTY_PATH | 2048u)) {
+        case 291: {
+            /* newfstatat(dirfd, path, buf, flags) and statx(dirfd, path, flags, mask, buf) */
+            uint64_t flags = number == 79 ? a[3] : a[2], buffer = number == 79 ? a[2] : a[4];
+            int extended = number == 291;
+            if (flags & ~(uint64_t)(GNU_AT_SYMLINK_NOFOLLOW | GNU_AT_EMPTY_PATH | 2048u | (extended ? 0x6000u : 0))) {
                 *result = -GNU_EINVAL;
                 return true;
             }
-            if (!*path && (a[3] & GNU_AT_EMPTY_PATH)) {
+            if (!*path && (flags & GNU_AT_EMPTY_PATH)) {
                 if ((int)a[0] == GNU_AT_FDCWD)
-                    node = s->cwd;
+                    node = s->cwd; /* the host-backed namespace's is hostfs.c's "." */
                 else {
                     d = descriptor(s, (int)a[0]);
                     if (!d)
                         error = -GNU_EBADF;
                     else {
-                        node = d->file->node;
-                        fdlink = d->file->fdlink;
+                        *result = descriptor_stat(s, memory, d, buffer, extended);
+                        return true;
                     }
                 }
             } else
-                error = resolve(s, (int)a[0], path, !(a[3] & GNU_AT_SYMLINK_NOFOLLOW), &node, &fdlink);
-            *result =
-                error ? error
-                      : stat_write(s, memory, node, a[2], (!*path || (a[3] & GNU_AT_SYMLINK_NOFOLLOW)) ? fdlink : -1);
+                error = resolve(s, (int)a[0], path, !(flags & GNU_AT_SYMLINK_NOFOLLOW), &node, &fdlink);
+            *result = error ? error
+                            : stat_write(s, memory, node, buffer,
+                                         (!*path || (flags & GNU_AT_SYMLINK_NOFOLLOW)) ? fdlink : -1, extended);
             return true;
+        }
         default: return false;
     }
+}
+
+int gnu_vfs_set_root(GnuVfs* vfs, const char* sysroot) {
+    GnuVfsState* s = vfs->state;
+    char cwd[GNU_VFS_PATH_MAX], guest[GNU_VFS_PATH_MAX];
+    size_t n;
+    GnuNode* tmp;
+    if (!s || !sysroot) return -GNU_EINVAL;
+    n = strlen(sysroot);
+    if (n >= GNU_VFS_PATH_MAX) return -GNU_ENAMETOOLONG;
+    free(s->sysroot);
+    if (!(s->sysroot = copy_string(sysroot))) return -GNU_ENOMEM;
+    for (size_t i = 0; i < n; ++i)
+        if (s->sysroot[i] == '\\') s->sysroot[i] = '/';
+    while (n > 0 && s->sysroot[n - 1] == '/') s->sysroot[--n] = 0; /* "/" is "": the host itself */
+    if (!s->host && !(s->host = gnu_vfs_node(s, NULL, "host", GNU_NODE_HOST, 0777, 0))) return -GNU_ENOMEM;
+    /* the host's /tmp, which the processes the guest starts share, instead of one in this process's memory */
+    if ((tmp = child(s->root, "tmp")) && tmp->kind == GNU_NODE_DIR) tmp->deleted = 1;
+#ifdef _WIN32
+    if (!_getcwd(cwd, sizeof cwd)) strcpy(cwd, "/");
+#else
+    if (!getcwd(cwd, sizeof cwd)) strcpy(cwd, "/");
+#endif
+    gnu_hostfs_guest_path(s, cwd, guest, sizeof guest);
+    free(s->cwd_path);
+    if (!(s->cwd_path = copy_string(guest))) return -GNU_ENOMEM;
+    /* standard input, output and error as host files: a file, a pipe or a terminal, as the host has them */
+    for (int fd = 0; fd < 3; ++fd) {
+        GnuOpen* f;
+        if (!s->descriptors[fd].file || s->descriptors[fd].file->node->kind != GNU_NODE_STDIO) continue;
+        f = gnu_hostfs_wrap(s, fd, fd ? GNU_O_WRONLY : 0, NULL, NULL);
+        if (!f) return -GNU_ENOMEM;
+        f->inode = ++s->next_inode;
+        drop_descriptor(&s->descriptors[fd]);
+        s->descriptors[fd].file = f;
+        f->references = 1;
+    }
+    return 0;
+}
+
+void gnu_vfs_close_on_exec(GnuVfs* vfs) {
+    GnuVfsState* s = vfs->state;
+    for (int fd = 0; fd < GNU_VFS_FD_MAX; ++fd)
+        if (s->descriptors[fd].file && (s->descriptors[fd].flags & 1)) drop_descriptor(&s->descriptors[fd]);
+}
+
+int gnu_vfs_pipe(GnuVfs* vfs, unsigned flags, int fds[2]) {
+    GnuVfsState* s = vfs->state;
+    int host[2], guest[2] = {-1, -1};
+    if (flags & ~(unsigned)(GNU_O_CLOEXEC | GNU_O_NONBLOCK | 040000 /* O_DIRECT */)) return -GNU_EINVAL;
+    if (!s->host && !(s->host = gnu_vfs_node(s, NULL, "host", GNU_NODE_HOST, 0777, 0))) return -GNU_ENOMEM;
+#ifdef _WIN32
+    if (_pipe(host, 65536, _O_BINARY | _O_NOINHERIT)) return gnu_host_errno(errno);
+#else
+    if (pipe(host)) return gnu_host_errno(errno);
+    for (int i = 0; i < 2; ++i) {
+        (void)fcntl(host[i], F_SETFD, FD_CLOEXEC);
+        if (flags & GNU_O_NONBLOCK) (void)fcntl(host[i], F_SETFL, fcntl(host[i], F_GETFL) | O_NONBLOCK);
+    }
+#endif
+    for (int i = 0; i < 2; ++i) {
+        GnuOpen* f = gnu_hostfs_wrap(s, host[i], (i ? GNU_O_WRONLY : 0) | (flags & GNU_O_NONBLOCK), NULL, NULL);
+        int fd = f ? install(s, f, (flags & GNU_O_CLOEXEC) ? 1 : 0, 0) : -GNU_ENOMEM;
+        if (f) {
+            f->host_type = 0010000;
+            f->inode = ++s->next_inode;
+        }
+        if (fd < 0) {
+            if (f) {
+                gnu_hostfs_release(f);
+                free(f);
+            } else
+                close(host[i]);
+            if (!i) close(host[1]);
+            if (i) drop_descriptor(&s->descriptors[guest[0]]);
+            return fd;
+        }
+        guest[i] = fd;
+    }
+    fds[0] = guest[0];
+    fds[1] = guest[1];
+    return 0;
+}
+
+int gnu_vfs_load(GnuVfs* vfs, int dirfd, const char* path, unsigned char** bytes, size_t* size, char* guest,
+                 size_t guest_capacity) {
+    GnuVfsState* s = vfs->state;
+    GnuDescriptor* d;
+    GnuStat st;
+    unsigned char* data = NULL;
+    size_t used = 0, capacity = 0;
+    int error, fd = open_file(s, NULL, dirfd, path, 0, 0);
+    if (fd < 0) return fd;
+    d = &s->descriptors[fd];
+    if (d->file->node->kind == GNU_NODE_HOST) {
+        error = gnu_hostfs_fstat(d->file, &st);
+        snprintf(guest, guest_capacity, "%s", d->file->path ? d->file->path : path);
+    } else {
+        error = node_stat(s, d->file->node, -1, &st);
+        if (!error) error = node_path(d->file->node, guest, guest_capacity);
+    }
+    if (!error && (st.mode & 0170000) != 0100000) error = -GNU_EACCES;
+    if (!error && !(st.mode & 0111)) error = -GNU_EACCES;
+    if (!error && st.size > UINT64_C(0x10000000)) error = -GNU_ENOMEM;
+    while (!error) {
+        int64_t n;
+        if (used == capacity) {
+            unsigned char* bigger;
+            capacity = capacity ? capacity * 2 : (size_t)(st.size ? st.size + 1 : 65536);
+            if (!(bigger = (unsigned char*)realloc(data, capacity))) {
+                error = -GNU_ENOMEM;
+                break;
+            }
+            data = bigger;
+        }
+        n = d->file->node->kind == GNU_NODE_HOST ? gnu_hostfs_read(d->file, data + used, capacity - used, 1, used)
+                                                 : file_read(d->file, data + used, capacity - used, used);
+        if (n < 0) error = (int)n;
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    drop_descriptor(d);
+    if (error) {
+        free(data);
+        return error;
+    }
+    *bytes = data;
+    *size = used;
+    return 0;
+}
+
+int gnu_vfs_host_descriptor(GnuVfs* vfs, int fd) {
+    GnuDescriptor* d = descriptor(vfs->state, fd);
+    if (!d) return -1;
+    if (d->file->node->kind == GNU_NODE_HOST) return d->file->host;
+    if (d->file->node->kind == GNU_NODE_STDIO) return d->file->node->host_fd;
+    return -1;
+}
+
+int gnu_hostfs_program_path(GnuVfs* vfs, const char* host, char* guest, size_t capacity) {
+    return gnu_hostfs_guest_path(vfs->state, host, guest, capacity);
+}
+
+int gnu_vfs_host_path(GnuVfs* vfs, const char* guest, char* host, size_t capacity) {
+    GnuHostPath* at = (GnuHostPath*)malloc(sizeof *at);
+    int error;
+    if (!at) return -GNU_ENOMEM;
+    error = gnu_hostfs_resolve(vfs->state, GNU_AT_FDCWD, guest, GNU_HOST_FOLLOW, at);
+    if (!error && at->is_virtual) error = -GNU_ENOENT;
+    if (!error) snprintf(host, capacity, "%s", at->host);
+    free(at);
+    return error;
+}
+
+const char* gnu_vfs_cwd(GnuVfs* vfs) { return vfs->state->cwd_path ? vfs->state->cwd_path : "/"; }
+
+int gnu_vfs_set_cwd(GnuVfs* vfs, const char* guest) {
+    GnuVfsState* s = vfs->state;
+    char* copy;
+    if (!s->sysroot) return -GNU_EINVAL;
+    if (!(copy = copy_string(guest))) return -GNU_ENOMEM;
+    free(s->cwd_path);
+    s->cwd_path = copy;
+    return 0;
+}
+
+int gnu_vfs_adopt(GnuVfs* vfs, int fd, int host) {
+    GnuVfsState* s = vfs->state;
+    GnuOpen* f;
+    if (fd < 0 || fd >= GNU_VFS_FD_MAX) return -GNU_EBADF;
+    if (!s->host && !(s->host = gnu_vfs_node(s, NULL, "host", GNU_NODE_HOST, 0777, 0))) return -GNU_ENOMEM;
+    if (!(f = gnu_hostfs_wrap(s, host, GNU_O_RDWR, NULL, NULL))) return -GNU_ENOMEM;
+    f->inode = ++s->next_inode;
+    drop_descriptor(&s->descriptors[fd]);
+    s->descriptors[fd].file = f;
+    s->descriptors[fd].flags = 0;
+    f->references = 1;
+    return 0;
+}
+
+struct GnuVfsTable {
+    GnuDescriptor descriptors[GNU_VFS_FD_MAX];
+    char* cwd_path;
+};
+
+struct GnuVfsTable* gnu_vfs_save_table(GnuVfs* vfs) {
+    GnuVfsState* s = vfs->state;
+    struct GnuVfsTable* t = (struct GnuVfsTable*)calloc(1, sizeof *t);
+    if (!t) return NULL;
+    memcpy(t->descriptors, s->descriptors, sizeof t->descriptors);
+    for (int fd = 0; fd < GNU_VFS_FD_MAX; ++fd)
+        if (t->descriptors[fd].file) ++t->descriptors[fd].file->references;
+    t->cwd_path = s->cwd_path ? copy_string(s->cwd_path) : NULL;
+    return t;
+}
+
+void gnu_vfs_restore_table(GnuVfs* vfs, struct GnuVfsTable* t) {
+    GnuVfsState* s = vfs->state;
+    for (int fd = 0; fd < GNU_VFS_FD_MAX; ++fd) drop_descriptor(&s->descriptors[fd]);
+    memcpy(s->descriptors, t->descriptors, sizeof t->descriptors);
+    if (t->cwd_path) {
+        free(s->cwd_path);
+        s->cwd_path = t->cwd_path;
+    }
+    free(t);
 }

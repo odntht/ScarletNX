@@ -17,6 +17,9 @@ Implemented: Clang/CMake, Linux/Windows CI, SDL3/Vulkan, shader caches, componen
 - **GPU:** per-channel scheduling so a blocked channel cannot stall its fence producer.
   90-degree framebuffer rotation, attachment feedback, BCn fallback.
 - **CPU:** ARM NaN propagation/default-NaN and directed FP rounding. Thread suspension at WFE.
+  32-bit games run (A32 and Thumb, `src/nx/runtime/arm.c`), checked only with the synthetic program
+  (`tests/nx_arm32_smoke.py`): a real one, ldr:ro's NROs in a 32-bit process, the Thumb32 DSP and
+  saturating instructions (QADD16, SMULxy, SSAT), and TBB/TBH targets ahead of time.
 - **Host:** vsync during Win32 window drags, native Windows/gamepad coverage.
 - **Performance:** runtime/guest profiling, Vulkan measurements, broader title coverage.
 

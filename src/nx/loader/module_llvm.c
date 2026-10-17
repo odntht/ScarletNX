@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-#include "nx/loader/module_llvm.h"
+#include "nx/loader/module_ir.h"
 #include "common/cpu/recompiler/codegen.h"
 #include "nx/loader/codegen_view.h"
 #include "common/cpu/recompiler/llvm/ir.h"
@@ -174,7 +174,7 @@ static LLVMValueRef global(SnxIr* ir, LLVMTypeRef type, const char* name, LLVMVa
     return g;
 }
 
-static LLVMValueRef string(SnxIr* ir, const char* text) {
+LLVMValueRef snx_module_string(SnxIr* ir, const char* text) {
     LLVMValueRef value = LLVMConstStringInContext(ir->ctx, text, (unsigned)strlen(text), 0);
     LLVMValueRef g = global(ir, LLVMTypeOf(value), "", value, 1);
     LLVMSetUnnamedAddress(g, LLVMGlobalUnnamedAddr);
@@ -194,7 +194,7 @@ static void field(SnxIr* ir, LLVMValueRef base, size_t offset, LLVMValueRef valu
 }
 
 /* SnxModInfo as an LLVM struct; its layout is checked against the C one */
-static LLVMTypeRef mod_info_type(SnxIr* ir, char* error, size_t error_size) {
+LLVMTypeRef snx_module_info_type(SnxIr* ir, char* error, size_t error_size) {
     LLVMTypeRef fields[11], type;
     LLVMTargetDataRef layout;
     size_t i;
@@ -226,12 +226,40 @@ static LLVMTypeRef mod_info_type(SnxIr* ir, char* error, size_t error_size) {
     return type;
 }
 
+LLVMValueRef snx_module_mods(SnxIr* ir, LLVMTypeRef info, const SnxProgram* loaded) {
+    LLVMValueRef *values, mods;
+    size_t i, j;
+    values = (LLVMValueRef*)snx_alloc(loaded->module_count * sizeof(*values));
+    for (i = 0; i < loaded->module_count; ++i) {
+        const SnxModuleImage* m = &loaded->modules[i];
+        LLVMValueRef f[12], id[32];
+        f[0] = snx_module_string(ir, m->name);
+        f[1] = ir_i64(ir, m->base);
+        f[2] = ir_i64(ir, m->size);
+        for (j = 0; j < 32; ++j) id[j] = ir_i8(ir, m->build_id[j]);
+        f[3] = LLVMConstArray(ir->t_i8, id, 32);
+        f[4] = ir_i32(ir, m->text_off);
+        f[5] = ir_i32(ir, m->text_size);
+        f[6] = ir_i32(ir, m->ro_off);
+        f[7] = ir_i32(ir, m->ro_size);
+        f[8] = ir_i32(ir, m->data_off);
+        f[9] = ir_i32(ir, m->data_size);
+        f[10] = ir_i32(ir, m->bss);
+        f[11] = ir_i32(ir, !!m->is_nro);
+        values[i] = LLVMConstNamedStruct(info, f, 12);
+    }
+    mods = global(ir, LLVMArrayType(info, (unsigned)loaded->module_count), "MODS",
+                  LLVMConstArray(info, values, (unsigned)loaded->module_count), 1);
+    free(values);
+    return mods;
+}
+
 static int emit_module(SnxIr* ir, const SnxCodegen* codegen, const SnxCodegenOptions* options, const SnxProgram* loaded,
                        size_t* entry_count, char* error, size_t error_size) {
     SnxModuleEntry* entries;
-    size_t count, arraysize, i, j, nfns = codegen->function_count ? codegen->function_count : 1;
+    size_t count, arraysize, i, nfns = codegen->function_count ? codegen->function_count : 1;
     LLVMValueRef *values, fns, ent_off, ent_fn, ent_addr, ent_ptr, mods, mod, interp, entry, fn, loop_i, phi_values[2];
-    LLVMTypeRef info, t_fns, t_u32s, t_addrs, t_ptrs, t_mods;
+    LLVMTypeRef info, t_fns, t_u32s, t_addrs, t_ptrs;
     LLVMBasicBlockRef start, head, body, done, phi_blocks[2];
     SnxU64 lo = ~(SnxU64)0, hi = 0;
     const SnxNpdm* npdm = &loaded->npdm;
@@ -243,7 +271,7 @@ static int emit_module(SnxIr* ir, const SnxCodegen* codegen, const SnxCodegenOpt
             snprintf(error, error_size, "AOT entry exceeds the module ABI's 32-bit offset range");
             return -1;
         }
-    info = mod_info_type(ir, error, error_size);
+    info = snx_module_info_type(ir, error, error_size);
     if (!info) {
         free(entries);
         return -1;
@@ -268,30 +296,12 @@ static int emit_module(SnxIr* ir, const SnxCodegen* codegen, const SnxCodegenOpt
     ent_ptr = global(ir, t_ptrs, "ENT_PTR", NULL, 0);
     free(values);
     /* static const SnxModInfo MODS[] */
-    values = (LLVMValueRef*)snx_alloc(loaded->module_count * sizeof(*values));
+    mods = snx_module_mods(ir, info, loaded);
     for (i = 0; i < loaded->module_count; ++i) {
         const SnxModuleImage* m = &loaded->modules[i];
-        LLVMValueRef f[12], id[32];
-        f[0] = string(ir, m->name);
-        f[1] = ir_i64(ir, m->base);
-        f[2] = ir_i64(ir, m->size);
-        for (j = 0; j < 32; ++j) id[j] = ir_i8(ir, m->build_id[j]);
-        f[3] = LLVMConstArray(ir->t_i8, id, 32);
-        f[4] = ir_i32(ir, m->text_off);
-        f[5] = ir_i32(ir, m->text_size);
-        f[6] = ir_i32(ir, m->ro_off);
-        f[7] = ir_i32(ir, m->ro_size);
-        f[8] = ir_i32(ir, m->data_off);
-        f[9] = ir_i32(ir, m->data_size);
-        f[10] = ir_i32(ir, m->bss);
-        f[11] = ir_i32(ir, !!m->is_nro);
-        values[i] = LLVMConstNamedStruct(info, f, 12);
         if (m->base + m->text_off < lo) lo = m->base + m->text_off;
         if (m->base + m->text_off + m->text_size > hi) hi = m->base + m->text_off + m->text_size;
     }
-    t_mods = LLVMArrayType(info, (unsigned)loaded->module_count);
-    mods = global(ir, t_mods, "MODS", LLVMConstArray(info, values, (unsigned)loaded->module_count), 1);
-    free(values);
     /* static SnxModule MOD; */
     mod = global(ir, LLVMArrayType(ir->t_i8, sizeof(SnxModule)), "MOD", NULL, 0);
     LLVMSetAlignment(mod, 8);
@@ -340,7 +350,7 @@ static int emit_module(SnxIr* ir, const SnxCodegen* codegen, const SnxCodegenOpt
     field(ir, mod, offsetof(SnxModule, interp), interp);
     field(ir, mod, offsetof(SnxModule, code_lo), ir_i64(ir, lo));
     field(ir, mod, offsetof(SnxModule, code_hi), ir_i64(ir, hi));
-    field(ir, mod, offsetof(SnxModule, title), string(ir, options->title ? options->title : "Game"));
+    field(ir, mod, offsetof(SnxModule, title), snx_module_string(ir, options->title ? options->title : "Game"));
     field(ir, mod, offsetof(SnxModule, title_id), ir_i64(ir, npdm->title_id));
     field(ir, mod, offsetof(SnxModule, main_stack), ir_i32(ir, (SnxU32)npdm->stack));
     field(ir, mod, offsetof(SnxModule, main_prio), ir_i32(ir, npdm->prio));

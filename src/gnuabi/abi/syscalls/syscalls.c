@@ -8,14 +8,19 @@
 #include "gnuabi/network/network.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 static int64_t file_mmap(GnuProcess* p, const uint64_t a[6]) {
     if (a[2] & ~UINT64_C(7)) return -GNU_EINVAL;
     if (a[5] & 4095) return -GNU_EINVAL;
-    if ((a[3] & 3) != 2) return -GNU_ENOTSUP; /* Shared file writeback needs a coherent VFS mapping. */
+    /* Shared file writeback needs a coherent VFS mapping. A shared mapping nothing writes to is its copy */
+    if ((a[3] & 3) != 2 && ((a[3] & 3) != 1 || (a[2] & 2))) return -GNU_ENOTSUP;
     unsigned char probe;
     int64_t r = gnu_vfs_pread(&p->vfs, (int)a[4], &probe, 0, a[5]);
     if (r < 0) return r;
-    int64_t mapped = gnu_memory_mmap(&p->memory, a[0], a[1], 3, a[3] | 0x20);
+    int64_t mapped = gnu_memory_mmap(&p->memory, a[0], a[1], 3, (a[3] & ~UINT64_C(3)) | 0x22);
     if (mapped < 0) return mapped;
     r = gnu_vfs_pread(&p->vfs, (int)a[4], p->memory.base + (uint64_t)mapped, (size_t)a[1], a[5]);
     if (r >= 0) r = gnu_memory_protect(&p->memory, (uint64_t)mapped, a[1], (unsigned)a[2]);
@@ -25,10 +30,25 @@ static int64_t file_mmap(GnuProcess* p, const uint64_t a[6]) {
     }
     return mapped;
 }
+static int64_t dispatch(GnuProcess* p, uint64_t number, const uint64_t a[6]);
+/* SNX_GNU_STRACE=1: every syscall on stderr, with its arguments and result, a line each */
 int64_t gnu_syscall(GnuProcess* p, uint64_t number, const uint64_t a[6]) {
+    static int trace = -1;
     int64_t result;
+    if (trace < 0) trace = getenv("SNX_GNU_STRACE") && getenv("SNX_GNU_STRACE")[0] == '1';
     /* arm64 el0_svc_common takes an int syscall number from x8. */
     number = (uint32_t)number;
+    if (trace)
+        fprintf(stderr, "[%u] %llu(0x%llx, 0x%llx, 0x%llx, 0x%llx) ...\n", p->pid, (unsigned long long)number,
+                (unsigned long long)a[0], (unsigned long long)a[1], (unsigned long long)a[2],
+                (unsigned long long)a[3]);
+    result = dispatch(p, number, a);
+    if (trace) fprintf(stderr, "[%u] %llu = %lld\n", p->pid, (unsigned long long)number, (long long)result);
+    return result;
+}
+static int64_t dispatch(GnuProcess* p, uint64_t number, const uint64_t a[6]) {
+    int64_t result;
+    if (gnu_spawn_syscall(p, number, a, &result)) return result;
     if (gnu_vfs_syscall(&p->vfs, &p->memory, number, a, &result)) return result;
     if (gnu_net_syscall(p, number, a, &result)) return result;
     switch (number) {
@@ -36,11 +56,77 @@ int64_t gnu_syscall(GnuProcess* p, uint64_t number, const uint64_t a[6]) {
         case GNU_NR_exit_group: gnu_process_exit(p, (int)a[0]); return 0;
         case GNU_NR_getpid: return p->pid;
         case GNU_NR_gettid: return p->tid;
-        case 173: return 1; /* getppid */
+#ifdef _WIN32
         case 174:
         case 175:
         case 176:
         case 177: return 1000; /* uid/euid/gid/egid */
+#else
+        /* the host user's: the files the guest makes and stats are the host's */
+        case 174: return getuid();
+        case 175: return geteuid();
+        case 176: return getgid();
+        case 177: return getegid();
+#endif
+        case 158: /* getgroups: none beyond the group */
+            return 0;
+        case 99: return 0;              /* set_robust_list: one thread, which never dies with a robust lock */
+        case 233: return 0;             /* madvise: advice */
+        case 293: return -GNU_ENOSYS;   /* rseq */
+        case 283: return -GNU_ENOSYS;   /* membarrier */
+        case 101:                       /* nanosleep(req, rem) */
+        case 115: {                     /* clock_nanosleep(clock, flags, req, rem) */
+            int64_t t[2];
+            uint64_t req = number == 101 ? a[0] : a[2];
+            if (gnu_memory_read(&p->memory, req, t, sizeof t)) return -GNU_EFAULT;
+            if (t[0] < 0 || t[1] < 0 || t[1] >= 1000000000) return -GNU_EINVAL;
+            if (number == 115 && (a[1] & 1)) { /* TIMER_ABSTIME: until the clock reads t */
+                int64_t now_s, now_ns;
+                if (gnu_clock_gettime((int)a[0], &now_s, &now_ns)) return -GNU_EINVAL;
+                t[0] -= now_s;
+                t[1] -= now_ns;
+                if (t[1] < 0) {
+                    t[1] += 1000000000;
+                    t[0]--;
+                }
+                if (t[0] < 0) return 0;
+            }
+            gnu_sleep(t[0], t[1]);
+            return 0;
+        }
+        case 123: { /* sched_getaffinity(pid, size, mask): one CPU */
+            unsigned char mask[8] = {1};
+            if (a[1] < 8) return -GNU_EINVAL;
+            return gnu_memory_write(&p->memory, a[2], mask, sizeof mask) ? -GNU_EFAULT : 8;
+        }
+        case 165: { /* getrusage: nothing measured */
+            unsigned char usage[144] = {0};
+            return gnu_memory_write(&p->memory, a[1], usage, sizeof usage) ? -GNU_EFAULT : 0;
+        }
+        case 153: { /* times */
+            int64_t sec, ns;
+            uint64_t ticks[4] = {0};
+            if (!gnu_clock_gettime(2, &sec, &ns)) ticks[0] = (uint64_t)(sec * 100 + ns / 10000000);
+            if (a[0] && gnu_memory_write(&p->memory, a[0], ticks, sizeof ticks)) return -GNU_EFAULT;
+            if (gnu_clock_gettime(1, &sec, &ns)) return 0;
+            return sec * 100 + ns / 10000000;
+        }
+        case 179: { /* sysinfo */
+            unsigned char info[112] = {0};
+            int64_t sec, ns;
+            if (!gnu_clock_gettime(1, &sec, &ns)) memcpy(info, &sec, 8);
+            info[32] = 0; /* totalram etc.: an 8 GiB machine with 4 GiB free, in units of one byte */
+            {
+                uint64_t total = UINT64_C(8) << 30, available = UINT64_C(4) << 30;
+                uint32_t unit = 1;
+                uint16_t procs = 1;
+                memcpy(info + 32, &total, 8);
+                memcpy(info + 40, &available, 8);
+                memcpy(info + 80, &procs, 2);
+                memcpy(info + 104, &unit, 4);
+            }
+            return gnu_memory_write(&p->memory, a[0], info, sizeof info) ? -GNU_EFAULT : 0;
+        }
         case GNU_NR_set_tid_address: p->clear_tid = a[0]; return p->tid;
         case GNU_NR_futex: return gnu_futex(p, a);
         case GNU_NR_rt_sigaction: return gnu_sigaction(p, a);
@@ -89,7 +175,7 @@ int64_t gnu_syscall(GnuProcess* p, uint64_t number, const uint64_t a[6]) {
         case 261: { /* prlimit64: query guest resource limits */
             if (a[0] && a[0] != p->pid) return -GNU_ESRCH;
             if (a[1] >= 16) return -GNU_EINVAL;
-            if (a[2]) return -GNU_ENOSYS;
+            if (a[2]) return 0; /* setting a limit: nothing here enforces one */
             uint64_t limits[2] = {UINT64_MAX, UINT64_MAX};
             if (a[1] == 3) limits[0] = UINT64_C(0x800000);
             if (a[1] == 7) limits[0] = limits[1] = 256;

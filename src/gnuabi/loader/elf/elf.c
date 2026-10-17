@@ -49,6 +49,10 @@ void gnu_elf_destroy(GnuElf* elf) {
     memset(elf, 0, sizeof *elf);
 }
 int gnu_elf_load_image(GnuElf* elf, GnuMemory* m, const void* source, size_t size, char* error, size_t cap) {
+    return gnu_elf_load_at(elf, m, source, size, GNU_ELF_PROGRAM_BIAS, 1, error, cap);
+}
+int gnu_elf_load_at(GnuElf* elf, GnuMemory* m, const void* source, size_t size, uint64_t dyn_bias, int program,
+                    char* error, size_t cap) {
     const unsigned char* b = source;
     memset(elf, 0, sizeof *elf);
     if (size < 52 || memcmp(b, "\177ELF", 4) || b[5] != 1 || b[6] != 1)
@@ -67,7 +71,7 @@ int gnu_elf_load_image(GnuElf* elf, GnuMemory* m, const void* source, size_t siz
         phoff > size || (uint64_t)phnum * phsize > size - phoff)
         return fail(error, cap, "Invalid or unsupported ELF/program headers");
     elf->thumb = bits == 32 && (entry & 1);
-    elf->bias = type == 3 ? UINT64_C(0x10000000) : 0;
+    elf->bias = type == 3 ? dyn_bias : 0;
     elf->stack_permissions = GNU_PROT_READ | GNU_PROT_WRITE;
     size_t executable_segments = 0, load_segments = 0;
     uint64_t phdr = 0, end = 0;
@@ -75,10 +79,13 @@ int gnu_elf_load_image(GnuElf* elf, GnuMemory* m, const void* source, size_t siz
     for (unsigned i = 0; i < phnum; i++) {
         rd_phdr(b + phoff + i * phsize, bits, &h);
         if (h.pt == 3) {
-            if (h.offset <= size && h.filesz && h.filesz <= size - h.offset && b[h.offset + h.filesz - 1] == 0)
-                return fail(error, cap, "Dynamic ELF interpreter '%s' is unsupported; use a static executable",
-                            b + h.offset);
-            return fail(error, cap, "Dynamic ELF interpreters are unsupported; use a static executable");
+            /* the dynamic linker, which the process loads beside the program (gnu_process_load) */
+            if (!program) return fail(error, cap, "The dynamic linker itself names a dynamic linker");
+            if (h.offset > size || !h.filesz || h.filesz > size - h.offset || h.filesz > sizeof elf->interp ||
+                b[h.offset + h.filesz - 1] != 0)
+                return fail(error, cap, "Invalid PT_INTERP");
+            memcpy(elf->interp, b + h.offset, (size_t)h.filesz);
+            continue;
         }
         if (h.pt == 0x6474e551)
             elf->stack_permissions = (h.flags & 4 ? 1u : 0u) | (h.flags & 2 ? 2u : 0u) | (h.flags & 1 ? 4u : 0u);
@@ -174,7 +181,7 @@ int gnu_elf_load_image(GnuElf* elf, GnuMemory* m, const void* source, size_t siz
         gnu_elf_destroy(elf);
         return fail(error, cap, "ELF entry is not an aligned executable address");
     }
-    if (!phdr) {
+    if (!phdr && program) {
         phdr = GNU_PAGE_SIZE;
         uint64_t bytes = (uint64_t)phnum * phsize;
         if (gnu_memory_map(m, phdr, bytes, 3, 0) || gnu_memory_write(m, phdr, b + phoff, (size_t)bytes) ||
@@ -187,9 +194,13 @@ int gnu_elf_load_image(GnuElf* elf, GnuMemory* m, const void* source, size_t siz
     elf->phnum = phnum;
     elf->phentsize = phsize;
     elf->image_end = up(end);
-    m->brk_base = m->brk_current = up(end);
-    m->brk_limit = up(end) + UINT64_C(0x04000000);
-    if (m->brk_limit > UINT64_C(0x40000000)) m->brk_limit = UINT64_C(0x40000000);
+    if (program) {
+        m->brk_base = m->brk_current = up(end);
+        m->brk_limit = up(end) + UINT64_C(0x04000000);
+        if (m->brk_limit > UINT64_C(0x40000000)) m->brk_limit = UINT64_C(0x40000000);
+        /* below the dynamic linker */
+        if (m->brk_base < GNU_ELF_INTERP_BIAS && m->brk_limit > GNU_ELF_INTERP_BIAS) m->brk_limit = GNU_ELF_INTERP_BIAS;
+    }
     if (cap) error[0] = 0;
     return 0;
 }

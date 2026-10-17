@@ -27,6 +27,9 @@ typedef struct {
 
 int snx_codegen_analyze(SnxCodegen* codegen, const SnxCodeImage* modules, size_t module_count, const SnxU64* hints,
                         size_t hint_count, int quiet);
+int snx_codegen_analyze_from(SnxCodegen* codegen, const SnxCodeImage* modules, size_t module_count, const SnxU64* hints,
+                             size_t hint_count, size_t limit, int (*skip)(void* context, SnxU64 address),
+                             void* context);
 void snx_codegen_free(SnxCodegen* codegen);
 SnxCodeImage* snx_codegen_module(SnxCodegen* codegen, SnxU64 address);
 int snx_codegen_word(SnxCodegen* codegen, SnxU64 address, SnxU32* word);

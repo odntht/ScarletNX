@@ -98,14 +98,15 @@ file(READ "${WORK}/tree1/snx-deps/lib.key" key)
 if(NOT complete STREQUAL key)
     fail("the folder holds its key")
 endif()
-# a tree that loses the race (another one's folder is there, not yet marked complete) leaves no copy behind
+# a tree that loses the race (another one's folder is there, not yet marked complete) copies nothing (its FROM is not
+# there) and leaves the folder as it is
 dir_of(h tree8 "# recipe" "source: 3")
 file(WRITE "${h}/lib/libx.a" "other tree")
-execute_process(COMMAND "${CMAKE_COMMAND}" "-DFROM=${WORK}/install2" "-DTO=${h}" "-DKEY=${WORK}/tree8/snx-deps/lib.key"
-                        -P "${SRC}/cmake/deps_publish.cmake" RESULT_VARIABLE rc)
+execute_process(COMMAND "${CMAKE_COMMAND}" "-DFROM=${WORK}/not-installed" "-DTO=${h}"
+                        "-DKEY=${WORK}/tree8/snx-deps/lib.key" -P "${SRC}/cmake/deps_publish.cmake" RESULT_VARIABLE rc)
 file(READ "${h}/lib/libx.a" kept)
 if(NOT rc EQUAL 0 OR NOT kept STREQUAL "other tree")
-    fail("a folder that is there is not replaced")
+    fail("a folder that is there is not replaced, and nothing is copied")
 endif()
 file(GLOB partial "${SNX_DEPS_CACHE}/*.partial-*")
 if(partial)

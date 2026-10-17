@@ -60,6 +60,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: %s CORPUS_DIR [--out DIR] [--validate] [--verbose]\n", argv[0]);
         return 2;
     }
+    /* Match a renderer with non-uniform sampled image array indexing. Otherwise indexed
+       LDC handles look like plain bindless textures and corpus validation misses them. */
+    g_shader_texture_arrays = 1;
     DIR* directory = opendir(dir);
     if (!directory) {
         fprintf(stderr, "cannot open %s\n", dir);

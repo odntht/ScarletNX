@@ -9,8 +9,9 @@
 #include "common/cpu/recompiler/image.h"
 #include <stddef.h>
 
-#define SNX_CODE_BASE 0x08000000UL
-#define SNX_PAGE_SIZE 0x1000UL
+#define SNX_CODE_BASE   0x08000000UL
+#define SNX_CODE_BASE32 0x00200000UL /* a 32-bit process's (mem.h's AS32_CODE_BASE) */
+#define SNX_PAGE_SIZE   0x1000UL
 
 typedef struct {
     SnxU64 value, size;
@@ -75,6 +76,9 @@ typedef struct {
 int snx_load_program(const char* entry, SnxProgram* program, char* error, size_t error_size);
 void snx_free_program(SnxProgram* program);
 int snx_load_nso(const char* path, const char* name, SnxModuleImage* module, char* error, size_t error_size);
+/* the same for a 32-bit program's module (ELF32 dynamic table, symbols and REL relocations). Code addresses in its
+   functions and relptrs keep the Thumb bit (bit 0) their symbol or pointer has */
+int snx_load_nso32(const char* path, const char* name, SnxModuleImage* module, char* error, size_t error_size);
 int snx_load_nro(const char* path, SnxModuleImage* module, char* error, size_t error_size);
 void snx_free_module(SnxModuleImage* module);
 int snx_parse_npdm(const unsigned char* data, size_t size, SnxNpdm* npdm, char* error, size_t error_size);

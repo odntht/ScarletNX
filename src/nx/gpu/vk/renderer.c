@@ -28,6 +28,7 @@ static Surf* g_last;
 static u32 g_last_x, g_last_y, g_last_w, g_last_h;
 static u32 g_last_transform;
 static void vkr_before_write(u64 gva, u64 size) {
+    if (size) vk_release_need(gva, size);
     vk_buf_before_write(gva, size);
     if (size)
         vk_gfx_image_mem_need(gva, size);
@@ -42,6 +43,7 @@ static void vkr_gfx_mem_need(u64 gva, u64 size) {
 }
 static void vkr_mapping_begin(u64 gva, u64 size, int full) {
     vk_lock();
+    vk_release_drain();
     if (full) {
         vk_buf_land_map();
         vk_gfx_image_land();
@@ -95,12 +97,45 @@ static void vkr_draw(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 c
     vk_render_draw(ch, indexed, topology, first, count, bv, bi, instances);
     vk_unlock();
 }
+static void vkr_method_barrier(int kind) {
+    vk_lock();
+    if (kind == 3) {
+        /* The TIC/TSC words are read from guest memory on each bind. Expire cached texture backing as well. */
+        vk_tex_invalidate_all();
+        __atomic_add_fetch(&g_vk_epoch, 1, __ATOMIC_RELAXED);
+    } else {
+        vk_render_end();
+        /* The GPU queue orders work across this barrier, including WAIT_FOR_IDLE. CPU-visible releases
+           are gated on GPU completion by the release path instead of stalling this command stream. */
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                               .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                               .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                               .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                               .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+        VkDependencyInfo di = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vkCmdPipelineBarrier2(vk_cmd(), &di);
+        if (kind == 2) {
+            /* Texture invalidation orders later reads after earlier GPU writes. The release path handles
+               CPU-visible results; waiting for every invalidation stalls games that issue them per draw. */
+            vk_tex_invalidate_all();
+            __atomic_add_fetch(&g_vk_epoch, 1, __ATOMIC_RELAXED);
+        }
+    }
+    vk_unlock();
+}
 static int vkr_blit(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, int dh, double sx, double sy, double sdx,
                     double sdy) {
     vk_lock();
     int r = vk_blit2d(s, d, dx, dy, dw, dh, sx, sy, sdx, sdy);
     vk_unlock();
     return r; /* 0: the front end copies through memory, with the renderer's rt_flush and rt_reload around it */
+}
+static int vkr_vic_compose(const VicJob* j) {
+    static int off = -1;
+    if (off < 0) off = getenv("SNX_NO_VIC_GPU") != NULL;
+    if (off) return 0;
+    return vk_vic_compose(j); /* 0: the caller composes in guest memory. It takes vk_lock where it needs it */
 }
 static void vkr_rt_flush(u64 gva) {
     vk_lock();
@@ -128,12 +163,7 @@ static void vkr_before_syncwait(void) {
     vk_gfx_image_land();
     vk_compute_land();
 }
-static void vkr_stream_incr(u32 id) {
-    vk_buf_land();
-    vk_gfx_image_land();
-    vk_compute_land();
-    syncpt_incr(id);
-}
+static void vkr_stream_incr(u32 id) { vk_release_incr(id); }
 
 /* ------------------------------------------------------------ presenting */
 /* the frame from memory when no render target holds it (the game drew it on the CPU, or a video frame) */
@@ -234,7 +264,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
     int recreate = 0;
     if (shown && (src || !game) && (g_vk.swapchain || (!tried && vk_swapchain_create(srgb)))) {
         VkCommandBuffer cb = vk_cmd(); /* waits for this frame slot, so its acquire semaphore is free */
-        VkSemaphore acq = g_acquired[vk_frame_number() % VK_FRAMES];
+        VkSemaphore acq = g_acquired[vk_frame_id() % VK_FRAMES];
         /* no wait: vk_lock is held (guest threads mapping memory take it too), and the game's pace is present_pace's.
            Every image still on the display or queued for it (FIFO behind) leaves this frame unshown */
         VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, 0, acq, VK_NULL_HANDLE, &idx);
@@ -310,14 +340,17 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
         vk_tex_frame();
         vk_buf_frame();
         if (g_vk_present % 600 == 0) {
-            LOG("vulkan: %llu draws, %llu skipped; %llu dispatches in %llu batches (%llu ms waiting), %llu skipped\n",
+            LOG("vulkan: %llu draws, %llu skipped; %llu dispatches in %llu batches (%llu ms waiting), %llu skipped; "
+                "%llu finishes (%llu ms)\n",
                 (unsigned long long)g_vk_drawn, (unsigned long long)g_vk_skipped, (unsigned long long)g_vk_dispatches,
-                (unsigned long long)g_vk_cs_batches, (unsigned long long)(g_vk_cs_wait_ns / 1000000),
-                (unsigned long long)g_vk_cs_skipped);
+                (unsigned long long)g_vk_cs_batches, (unsigned long long)(__atomic_load_n(&g_vk_cs_wait_ns, __ATOMIC_RELAXED) / 1000000),
+                (unsigned long long)g_vk_cs_skipped, (unsigned long long)g_vk_finishes,
+                (unsigned long long)(g_vk_finish_ns / 1000000));
         }
     }
     /* Offscreen frames still submit and advance the frame ring. g_last remains available for readback. */
     vk_submit(wait, VK_PIPELINE_STAGE_2_CLEAR_BIT, signal);
+    vk_frame_next(); /* every show used this frame's slot and acquire semaphore, the menu's own too */
     if (signal) {
         VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                                .waitSemaphoreCount = 1,
@@ -426,6 +459,7 @@ static u64 surf_save(Surf* s, u32 x, u32 y, u32 w, u32 h, u32 transform, const c
         vmaDestroyImage(g_vk.vma, tmp, tmem);
         return hash;
     }
+    vk_render_end(); /* the blit, the copy and their barriers can't be recorded inside a rendering pass */
     VkCommandBuffer cb = vk_cmd();
     vk_surf_use(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT,
                 VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -488,7 +522,9 @@ const Renderer vk_renderer = {
     .clear = vkr_clear,
     .draw_texture = vkr_draw_texture,
     .draw = vkr_draw,
+    .method_barrier = vkr_method_barrier,
     .blit = vkr_blit,
+    .vic_compose = vkr_vic_compose,
     .rt_flush = vkr_rt_flush,
     .rt_reload = vkr_rt_reload,
     .dispatch = vkr_dispatch,
@@ -496,6 +532,10 @@ const Renderer vk_renderer = {
     .gfx_mem_need = vkr_gfx_mem_need,
     .before_syncwait = vkr_before_syncwait,
     .stream_incr = vkr_stream_incr,
+    .release_write = vk_release_write,
+    .release_need = vk_release_need,
+    .release_value = vk_release_value,
+    .release_retire = vk_release_retire,
     .present_buffer = vkr_present_buffer,
     .screenshot = vkr_screenshot,
     .refresh = vkr_refresh,

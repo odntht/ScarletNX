@@ -178,19 +178,19 @@ interface nn::am::service::ILibraryAppletCreator {
         -> object<nn::am::service::IStorage> storage;
 }
 
-# library applets (swkbd, error...) finish immediately: no applet UI here
+# Library applet lifecycle and storage channels, including inline software keyboard replies.
 interface nn::am::service::ILibraryAppletAccessor {
     [0] GetAppletStateChangedEvent() -> handle<copy, event> event;
     [1] IsCompleted() -> b8 completed;
     @stub [10] Start();
-    @stub [20] RequestExit();
-    @stub [25] Terminate();
+    [20] RequestExit();
+    [25] Terminate();
     @stub [30] GetResult();
     @stub [50] SetOutOfFocusApplicationSuspendingEnabled(b8 enabled);
     @stub [60] PresetLibraryAppletGpuTimeSliceZero();
     [100] PushInData(object<nn::am::service::IStorage> storage);
     [101] PopOutData() -> object<nn::am::service::IStorage> storage;
-    @stub [103] PushInteractiveInData(object<nn::am::service::IStorage> storage);
+    [103] PushInteractiveInData(object<nn::am::service::IStorage> storage);
     [104] PopInteractiveOutData() -> object<nn::am::service::IStorage> storage;
     [105] GetPopOutDataEvent() -> handle<copy, event> event;
     [106] GetPopInteractiveOutDataEvent() -> handle<copy, event> event;

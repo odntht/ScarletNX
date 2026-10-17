@@ -2,11 +2,12 @@
 
 This is an initial ARMv8-A AArch32 **user-mode CPU backend**, not an AArch32 guest OS or a complete Cortex-A57 emulator. It emits native LLVM IR, not calls to an instruction interpreter. The `snx_arm_llvm` CMake target is built alongside, and linked by, the existing LLVM backend.
 
-The NX and GNU ABI loaders, module ABI, syscall handlers and thread dispatch currently remain A64-specific. They do **not** automatically run 32-bit applications with this change. Connecting those components to the A32 block ABI is a separate integration step. In particular, never pass an existing `CPU*` to an A32 block.
+The NX runtime runs 32-bit programs with it. The recompiler compiles a 32-bit program's blocks ahead of time into its game module (`src/nx/loader/module_arm.c`, an `SnxArmModule`), and the runtime's threads run them one after another (`src/nx/runtime/arm.c`), compiling a block it reaches that the recompiler didn't find and recording it in the hints file for the next recompile. Their SVCs go through the same handlers as 64-bit ones, with the registers moved into the 64-bit SVC ABI's places (`snx_svc32` in `src/nx/hle/svc/svc.c`). The GNU ABI runner (`src/gnuabi/runtime/arm_exec.c`) and the recompiler library (`snx_recompile32`) compile blocks on first use. Never pass an A64 `CPU*` to an A32 block.
 
 ## Files and API
 
-- `arm.h`: separate, versioned `SnxArmCPU` state and exit reasons, plus the Thumb decode model.
+- `arm.h`: separate, versioned `SnxArmCPU` state and exit reasons, the backend's `SnxArmRt`, plus the Thumb decode model.
+- `rt_helpers.c`: the runtime library's calls into the backend (`snx_arm_undefined`, `snx_arm_coproc`), with the defaults for no backend.
 - `a32.c`: validated A32 decoder and explicit libgccjit unsupported stub. No LLVM dependency.
 - `thumb_decode.c`: validated Thumb16/Thumb32 decoder to an explicit operand model.
 - `llvm.h`, `llvm.c`, `llvm_vector.inc`, `llvm_thumb.inc`: `snx_arm_llvm_block(module, name, words, count, pc, &consumed)` and `snx_thumb_llvm_block(module, name, halfwords, count, pc, &consumed)` emit `void name(SnxArmCPU*)` into a **host-target** LLVM module.
@@ -29,10 +30,23 @@ On return:
 
 Use bounded blocks for scheduling and polling. The caller owns instruction fetching, executable-page validation, block lookup, object loading, code-cache invalidation, syscall dispatch, and clearing monitors on context switches. For example, the existing `SnxIr` module/object utilities can host these functions, but its A64 function dispatcher cannot call them.
 
+## What the backend decides
+
+Generated code doesn't decide two things itself. It calls the runtime library, which asks the backend through `cpu->rt` (an `SnxArmRt`, `SNX_ARM_ABI` 3):
+
+- An instruction the block compiler doesn't implement, or can't with the block's memory model, calls `snx_arm_undefined(cpu, word, reason)`. The backend runs it and returns with `exit` clear, and the block goes on after it, or it sets `exit` and the block stops at it. Without a backend, `exit` is `reason` (`SNX_ARM_UNDEFINED`, `SNX_ARM_BACKEND_UNSUPPORTED`) and `syndrome` the word, as before.
+- MRC, MCR, MRRC and MCRR to coprocessors 14 and 15 call `snx_arm_coproc(cpu, word)`: which system registers user mode reaches, and what they hold, is the system's. The NX runtime gives the generic timer's CNTPCT, CNTVCT and CNTFRQ (the SDK's system tick) and the CP15 barriers. Without a backend, `snx_arm_coproc_user` gives TPIDRURW and TPIDRURO from the CPU's fields, and anything else is `SNX_ARM_UNDEFINED`.
+
+Programs linking blocks link `snx_arm_rt`; LLVM's JIT finds its functions through `snx_arm_exec_symbols` (`exec.h`).
+
+## Thumb32 instructions with A32 twins
+
+Many Thumb32 instructions are A32 ones with their fields elsewhere: coprocessor, VFP and Advanced SIMD (the same bits, or the top byte moved), LDM/STM and PUSH.W/POP.W, the exclusives and acquire/release, barriers, MRS/MSR, long multiplies and divides, REV/RBIT/CLZ and the extends with add. `thumb_decode.c` decodes them to `TH_A32`, the A32 word and its kind, and the A32 emitter runs them reading Thumb's PC. A doubleword exclusive's second register, which Thumb names freely, comes with it. LDRD/STRD (`TH_DUAL`) are Thumb's own, as their register pair and offset are.
+
 ## Opt-in ARM11 profile and checked memory
 
-The existing APIs still select **A57 + flat memory**; `SnxArmCPU`, `SNX_ARM_ABI=2`
-and its field offsets have not changed. No board-specific compile definition
+The existing APIs still select **A57 + flat memory**; `SnxArmCPU` (`SNX_ARM_ABI=3`,
+which added `rt` after the register file) and its field offsets are shared by both. No board-specific compile definition
 changes shared code generation. Other boards opt in through the `_ex` APIs:
 
 ```c
@@ -48,9 +62,17 @@ Invalid option versions/enums are refused without modifying the LLVM module.
 
 The ARM11 profile implements a **conservative ARMv6K integer subset**, rejecting
 MOVW/MOVT, MLS, divide, RBIT, bitfields, ARMv7 barrier encodings, acquire/release,
-NEON, VFPv3/v4 and D16..D31. It recognizes the ARM11 CP15 barrier forms. VFPv2
-recognition currently exits with `BACKEND_UNSUPPORTED`: VFPv2 short vectors are
-not implemented by the A57 FP helpers. This is not a complete ARM11 ISA model.
+NEON, VFPv3/v4 and D16..D31. It recognizes the ARM11 CP15 barrier forms.
+Scalar VFPv2 F32/F64 arithmetic, non-fused multiply/accumulate, compares,
+conversions, register/status transfers and up-to-64-byte memory transfers are
+implemented. Arithmetic uses the shared raw-bit integer FP primitives, not host
+floating point or ARMv8 fused replacements. LEN/STRIDE and exception enables must
+be zero for arithmetic. FPSCR writes outside NZCV, rounding mode, DN/FZ and
+cumulative exceptions stop before mutation; short vectors, traps, legacy
+FLDMX/FSTMX format words and larger transfers remain explicitly unsupported.
+Checked VFP memory operations are aligned to four bytes and staged as one
+RAM-only transaction before register/base writeback. This is not complete VFPv2
+or a complete ARM11 ISA model; A57 checked vector operations remain unsupported.
 
 ARM11 ALU writes to PC remain in ARM state. Its Thumb BL prefix and BL/BLX suffix
 are **separately executable 16-bit instructions**, with the original signed
@@ -72,16 +94,23 @@ A fault reports `PREFETCH_ABORT`; a mismatch reports `CODE_CHANGED` before the
 stale instruction executes. These exits must return to the dispatcher. There
 is no automatic recompilation, block discovery or executable-module loader.
 
-Integer transfers use bounded little-endian transaction buffers. Reads complete
+Integer and supported ARM11 VFP transfers use bounded little-endian transaction buffers. Reads complete
 before register updates; stores commit before base/SP writeback. Paired and
 multiword accesses are whole-range RAM transactions and carry `ACCESS_MULTI`,
 which callbacks must reject on MMIO. This intentionally preflights all bytes,
 not hardware partial-transfer behavior on abort. Ordinary aligned single MMIO
 accesses remain one callback, not byte-split accesses. Callers serialize CPU,
 permissions, mappings, callbacks and device/memory writes; concurrent code
-mutation and multicore reservation semantics are not supported. Exclusives,
-acquire/release, vectors and Thumb table branches explicitly stop as unsupported
-on checked memory rather than touching a flat pointer.
+mutation and a concurrent multicore scheduler are not supported. ARM11 checked
+exclusives now use optional ABI-1 `READ|EXCLUSIVE` and `WRITE|EXCLUSIVE` RAM
+transactions. The callback owns reservation metadata without modifying CPU
+state. A serialized, saturating board-wide write/mapping epoch rejects aliases,
+other-space/kernel writes and ABA changes. Unrelated writes may cause spurious
+failure. B/H/word/double, CLREX and natural alignment have native tests. MMIO
+exclusives are rejected. Legacy callbacks reject unknown operations and fail
+closed. ABI layouts and existing operations are unchanged. A57 checked exclusives,
+acquire/release, vectors and Thumb table branches remain explicitly unsupported.
+The A57 flat path, including its existing atomic operations, is unchanged.
 
 Asset-free native tests (LLVM SDK required; no NX/SDL dependencies):
 
@@ -99,22 +128,30 @@ for both profiles at both optimization levels (55,068 comparisons). With
 `SNX_TEST_ARM_DIFF=ON` and Python `unicorn==2.1.4`, the isolated build also runs
 independent ARM11 MPCore integer comparisons and the existing A57 integer,
 VFP/NEON and Thumb regression suites. ARM11 Thumb BL halves have C golden tests,
-not a claimed independent differential oracle. Production dispatch, process
-setup, cache identity and full CIA-to-native integration remain separate work.
+not a claimed independent differential oracle. The optional CTR pipeline
+supplies process setup, offline conservative CFG discovery/chunking and native
+module loading/dispatch under `src/3ds/`; see `docs/3DS.md`. The pinned external
+SuperTux bootstrap retains the first-SVC CPU-only gate and continues through
+real kernel initialization to ConnectToPort. Differential tests compare GPRs,
+CPSR and RAM at both boundaries. The second CPU reference uses a test-scripted
+HLE transcript, not independent hardware validation of kernel policy. Neither
+reference is an execution fallback. Broader target coverage, full ARM11 semantics and
+cache/resume still need work; none of these are shared A57 defaults.
 
 ## Implemented instructions (default A57/flat configuration)
 
-- Word/byte LDR and STR, immediate and shifted-register offsets, positive/negative offsets, pre/post indexing, writeback and unprivileged aliases.
+- Word/byte LDR and STR, immediate and shifted-register offsets, positive/negative offsets, pre/post indexing, writeback and unprivileged aliases. Stores, like loads, take the PC (PC+8) as their base without writeback.
 - LDRH, STRH, LDRSB, LDRSH, LDRD, STRD, including literal loads and applicable unprivileged aliases.
 - LDM/STM IA, IB, DA, DB, PUSH/POP, and loads of PC. Register sources and writeback use the original base.
 - LDREX/STREX byte, halfword, word and doubleword, CLREX, and ARMv8 LDA/STL and LDAEX/STLEX variants.
-- DMB, DSB, ISB and PLD/PLDW/PLI prefetch hints.
+- DMB, DSB, ISB and PLD/PLDW/PLI prefetch hints. NOP, YIELD, WFE, WFI, SEV, SEVL and the unallocated hints (CSDB, ESB, DBG) complete as NOP.
 - All sixteen ordinary data-processing opcodes, including ADC/SBC/RSC and tests/comparisons, with NZCV semantics and conditional execution.
 - Immediate rotation, LSL/LSR/ASR/ROR/RRX, including register-shift amounts zero, 32, above 32 and multiples of 32.
-- MOVW/MOVT, MUL/MLA/MLS, signed/unsigned long multiplies and accumulates, SDIV/UDIV.
-- CLZ, REV/REV16/REVSH/RBIT, scalar byte/halfword extends and extend-adds, UBFX/SBFX/BFI/BFC.
+- MOVW/MOVT, MUL/MLA/MLS, signed/unsigned long multiplies and accumulates, UMAAL, SDIV/UDIV.
+- CLZ, REV/REV16/REVSH/RBIT, scalar byte/halfword extends and extend-adds, SXTB16/UXTB16 and their adds, UBFX/SBFX/BFI/BFC.
+- The ARMv6 media and DSP instructions: SSAT/USAT/SSAT16/USAT16, PKHBT/PKHTB, SEL, the parallel add and subtract family (signed, unsigned, saturating and halving ADD16/ASX/SAX/SUB16/ADD8/SUB8, setting GE), QADD/QSUB/QDADD/QDSUB, the halfword multiplies SMLA<x><y>/SMUL<x><y>/SMLAW<y>/SMULW<y>/SMLAL<x><y>, the dual multiplies SMLAD/SMUAD/SMLSD/SMUSD/SMLALD/SMLSLD (with X), SMMLA/SMMUL/SMMLS (with R), USAD8/USADA8, with the sticky Q flag. CRC32 and CRC32C (B, H, W).
 - B, BL, BX, BLX immediate/register, SVC and BKPT.
-- MRS CPSR, MSR APSR flag fields, and user TPIDRURW/TPIDRURO accesses through MRC/MCR.
+- MRS CPSR, MSR to the CPSR as EL0 writes it (NZCVQ, GE and E, the privileged fields ignored), SETEND, and user TPIDRURW/TPIDRURO accesses through MRC/MCR. A block reads E on entry, so SETEND and MSR to the x field end it; a big-endian E then stops the next block with `SNX_ARM_ENDIAN_UNSUPPORTED`.
 
 ## VFP and Advanced SIMD
 
@@ -133,7 +170,8 @@ than host floating point:
 - FP approximation instructions VRSQRTE/VSQRTE/VRECPE/VRSQRTS/VRECPS and the integer urecpe/ursqrte forms,
   using ARM's estimate algorithms.
 - VLDn/VSTn structure loads and stores (1 to 4 registers, single/multiple elements, all lanes, replicate,
-  pre/post-indexed with writeback), VLD/VSTM/VLDR/VSTR, and core-to-lane and lane-to-core moves.
+  pre/post-indexed with writeback), VLD/VSTM/VLDR/VSTR (in A32 with a PC base too, VLDM/VSTM without writeback), and
+  core-to-lane and lane-to-core moves.
 - AES (AESE/AESD/AESMC/AESIMC), SHA1 and SHA256 (SHA1H/P/M/C/SU0/SU1, SHA256H/H2/SU0/SU1), and polynomial
   multiply VMULL.P8/P64, all through portable reference implementations. No AES-NI or CLMUL is used here.
 

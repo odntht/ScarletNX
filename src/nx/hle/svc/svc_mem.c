@@ -244,7 +244,7 @@ static u32 svc_get_info_(u32 id0, u32 h, u64 id1, u64* out) {
             return 0;
         }
         case 12: *out = AS_BASE; return 0;
-        case 13: *out = AS_SIZE - AS_BASE; return 0;
+        case 13: *out = AS_END - AS_BASE; return 0;
         case 14: *out = STACK_BASE; return 0;
         case 15: *out = STACK_SIZE; return 0;
         case 16: *out = g_sysres_size; return 0; /* SystemResourceSize (npdm) */

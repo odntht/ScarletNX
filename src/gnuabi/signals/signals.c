@@ -11,6 +11,7 @@ int64_t gnu_sigaction(GnuProcess* p, const uint64_t a[6]) {
     if (a[1]) {
         action.mask &= ~((UINT64_C(1) << 8) | (UINT64_C(1) << 18));
         p->actions[a[0]] = action;
+        gnu_spawn_signal_disposition((int)a[0], action.handler);
     }
     return 0;
 }

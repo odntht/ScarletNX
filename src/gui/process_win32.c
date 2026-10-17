@@ -11,8 +11,9 @@
 struct GuiProcess {
     HANDLE process, job, output;
     int status;
-    bool exited, eof, measured;
-    double retired_cpu, previous_cpu, previous_time;
+    bool exited, eof;
+    double retired_cpu;
+    GuiCpuBase cpu_base;
 };
 static wchar_t* wide(const char* text) {
     int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, NULL, 0);
@@ -227,11 +228,7 @@ GuiUsage gui_process_usage(GuiProcess* process) {
             capacity *= 2;
         }
     }
-    if (process->measured && now > process->previous_time && cpu >= process->previous_cpu)
-        usage.cpu_percent = 100 * (cpu - process->previous_cpu) / (now - process->previous_time);
-    process->previous_cpu = cpu;
-    process->previous_time = now;
-    process->measured = true;
+    usage.cpu_percent = gui_cpu_percent(&process->cpu_base, cpu, now);
     return usage;
 }
 void gui_process_terminate(GuiProcess* process) {

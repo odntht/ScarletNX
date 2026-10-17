@@ -13,6 +13,26 @@
 #include <string.h>
 
 u8* g_mem;
+MemLayout g_layout = {0x08000000ull,   0x2000000000ull, 0x100000000ull, 0x200000000ull,  0x300000000ull,
+                      0x1000000000ull, 0x1300000000ull, 0x100000000ull, 0x1400000000ull, 0x1800000000ull};
+/* Switchbrew's Memory layout (the kernel's placement without ASLR): the alias ("map") region at 1 GiB and the heap
+   region after it, 1 GiB each; without an alias region the heap takes both. The code region ends where they begin,
+   and the stack region is the code region, as the kernel makes it when a process's space has no room for one of its
+   own. The runtime's own pages (TLS) go above the heap */
+void mem_layout32(unsigned aspace) {
+    MemLayout l;
+    l.base = AS32_CODE_BASE;
+    l.end = 0x100000000ull;
+    l.alias = 0x40000000ull;
+    l.alias_size = aspace == 2 ? 0 : 0x40000000ull;
+    l.heap = l.alias + l.alias_size;
+    l.heap_size = 0x80000000ull - l.alias_size;
+    l.stack = l.base;
+    l.stack_size = l.alias - l.base;
+    l.kern = 0xC0000000ull;
+    l.kern_end = l.end;
+    g_layout = l;
+}
 u64 g_heap_size, g_heap_max, g_phys_mapped;
 u64 g_code_memory, g_main_stack_size;
 static MemBlock* blk;
@@ -87,7 +107,7 @@ static void merge(void) {
     }
 }
 /* [a, a+s) lies in the game's address space (page 0 below AS_BASE is the runtime's) */
-static int in_as(u64 a, u64 s) { return a >= AS_BASE && a + s <= AS_SIZE && a + s >= a; }
+static int in_as(u64 a, u64 s) { return a >= AS_BASE && a + s <= AS_END && a + s >= a; }
 
 static int is_free_nl(u64 a, u64 s) {
     if (!in_as(a, s)) return 0;
@@ -274,16 +294,16 @@ int mem_set_attr(u64 a, u64 s, u32 mask, u32 attr) {
 void mem_query(u64 a, MemBlock* o) {
     int held = t_memlock_held; /* only when crashing inside mem.c */
     if (!held) memlock();
-    if (a >= AS_SIZE) {
-        o->addr = AS_SIZE;
-        o->size = 0 - AS_SIZE;
+    if (a >= AS_END) {
+        o->addr = AS_END;
+        o->size = 0 - AS_END;
         o->state = MS_INACCESSIBLE;
         o->perm = 0;
         o->attr = o->ipc = o->dev = 0;
         if (!held) memunlock();
         return;
     }
-    u64 lo = 0, hi = AS_SIZE;
+    u64 lo = 0, hi = AS_END;
     for (int i = 0; i < nblk; i++) {
         MemBlock* b = &blk[i];
         if (b->addr <= a && a < b->addr + b->size) {

@@ -51,7 +51,7 @@ typedef struct {
     float pitch, volume, prev_volume;
     u64 data, data_size;
     ARWave wave[SNX_AUDREN_WAVES];
-    i16 bq_b[2][3], bq_a[2][2]; /* its two biquads in Q14, the feedback ones added */
+    float bq_b[2][3], bq_a[2][2]; /* its two biquads, the feedback ones added; Q14 over 16384 before revision 15 */
     u8 bq_on[2], bq_was_on[2];
 } ARVoice;
 

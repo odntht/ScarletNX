@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2026 the ScarletNX contributors
+name: Discord cards, a build followed
+
+# A Build run followed from when it is requested until it ends (scripts/discord-cards.py): its pull request's or its
+# nightly's card edited each time one of its jobs changes, each package waiting, building, built or failed. It only
+# edits a card, which cards.yml posts. A file of its own, as a workflow_run's runs are no pull request's checks. The
+# secrets are cards.yml's
+on:
+  workflow_run:
+    workflows: [Build]
+    types: [requested]
+
+permissions:
+  contents: read
+  actions: read # the build's jobs
+  pull-requests: read
+
+env:
+  NIGHTLY_REPO: scarletnx/nightly
+  PYTHONUNBUFFERED: '1' # a build followed for minutes says each step as it happens
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  NIGHTLY_TOKEN: ${{ secrets.NIGHTLY_TOKEN }}
+  DISCORD_WEBHOOK_NIGHTLY: ${{ secrets.DISCORD_WEBHOOK_NIGHTLY }}
+  DISCORD_WEBHOOK_PRS: ${{ secrets.DISCORD_WEBHOOK_PRS }}
+
+jobs:
+  watch:
+    name: Follow the build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    steps:
+      # main's scripts and history, which a nightly's changes come from
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          sparse-checkout: scripts
+      - run: python3 scripts/discord-cards.py event --repo "$GITHUB_REPOSITORY" --to "$NIGHTLY_REPO" --checkout .

@@ -1,11 +1,22 @@
 # Linux AArch64 GNU ABI runtime
 
-ScarletNX executes static Linux AArch64 ELF programs with its existing ARM64-to-C
-recompiler. `scarletnx-gnuabi` loads the ELF, translates executable ranges into a
-temporary native module with host Clang, and runs that module with Linux runtime
-callbacks. The shared generated interpreter remains the fallback for indirect
-targets. QEMU is an external reference used by tests; it is never the execution
-engine or a dependency of this executable.
+## Index
+
+* [Build and run](#build-and-run)
+* [The sysroot](#the-sysroot)
+* [How code runs](#how-code-runs)
+* [Processes](#processes)
+* [Implemented scope](#implemented-scope)
+* [Differential validation and fuzzing](#differential-validation-and-fuzzing)
+* [ABI references](#abi-references)
+
+ScarletNX runs Linux AArch64 programs, static or dynamically linked, with its ARM64
+recompiler. `scarletnx-gnuabi` loads the ELF (and its dynamic linker from the sysroot),
+compiles the guest's code into host code in its own process as execution reaches it,
+and answers the program's Linux system calls. Processes the guest starts are host
+processes, its pipes are host pipes, and its files are the sysroot's or the host's.
+QEMU is an external reference used by tests; it is never the execution engine or a
+dependency of this executable.
 
 ## Build and run
 
@@ -21,75 +32,165 @@ ctest --test-dir build/gnuabi --output-on-failure
 Both runtimes are enabled by default. The NX runtime always requires SDL3, Vulkan and FFmpeg.
 Windows uses the existing
 llvm-mingw toolchain and bootstrap environment described in [BUILD.md](BUILD.md).
-The GNU runtime needs host Clang when executing a new ELF; use `--cc=PATH` to
-select it explicitly.
 
 ```sh
-aarch64-linux-gnu-gcc -static -O2 tests/gnuabi/libc.c -o /tmp/libc-aarch64
-build/gnuabi/scarletnx-gnuabi /tmp/libc-aarch64
+build/gnuabi/scarletnx-gnuabi [options] [--] PROGRAM [arguments...]
+build/gnuabi/scarletnx-gnuabi -L ~/aarch64-sysroot ./hello
 ```
 
-Arguments following the ELF are passed to the guest. The guest environment is
-currently `PATH=/bin` and `LANG=C`. The input ELF is the only host file exposed as
-guest `/program`; guest file operations otherwise use the isolated virtual
-filesystem. Standard input, output, and error connect to the launching process.
+PROGRAM is a host path. Arguments after it are passed to the guest, with the host's
+environment (`-E VAR=VALUE` sets a variable and `-U VAR` removes one, as with QEMU).
+`-0 ARGV0` replaces the program's `argv[0]`. `--help` lists every option.
+
+| Option | Effect |
+| --- | --- |
+| `-L DIR`, `--sysroot=DIR` | The guest's root (see below). `SNX_LINUX_SYSROOT` names it too |
+| `--isolated` | No host files: `/tmp` in memory and the program alone as `/program`, the namespace the unit tests use |
+| `--jit` (default) | Compile the guest's code in process as it runs |
+| `--aot`, `--cc=COMPILER` | Compile the program before it starts with the host compiler, the rest as it runs |
+| `--jit-cache=DIR`, `--no-jit-cache` | Where compiled code is kept between runs (default `linux-jit` in the user's cache folder) |
+| `--jit-opt=LEVEL` | The JIT's LLVM optimization level (default 2) |
+| `--verbose-jit` | A line for each piece of code compiled, and how long it took |
+
+`SNX_GNU_STRACE=1` writes every system call, its arguments and its result to stderr,
+prefixed with the process id. `SNX_GNU_SAMPLE=1` writes the guest's program counter
+once a second, for a loop that makes no system call.
+
+## The sysroot
+
+The guest's file namespace works like QEMU's `-L`. A guest path names the file at that
+path under the sysroot when the sysroot has one, and the host's file at that path
+otherwise. The program's own path, its working folder (the host's) and files named on
+its command line therefore work as they do natively, while `/lib/ld-linux-aarch64.so.1`,
+`/usr/include` and `/usr/lib/libc.a` come from the sysroot. A file the guest creates is
+made in the tree its folder is in.
+
+Unlike QEMU, a path is resolved one component at a time, so a symlink in the sysroot
+whose target is absolute (`lib64 -> /lib`, the linker scripts' neighbors) leads to the
+sysroot's `/lib` rather than the host's, as under chroot. `/proc` and `/dev` are the
+runtime's own (`/proc/self/exe` and `/proc/self/fd/N` lead to the host files they name),
+as are the resolver files the network layer provides under `/etc`.
+
+Without `-L`, the sysroot is `linux/` of the data folder `games/` and `work/` are in
+([USAGE](USAGE.md#folders)): the portable folder beside a portable copy, the user's data
+folder otherwise (`~/.local/share/scarletnx` on Linux), from a build tree too. The guest
+path `/usr/lib/libc.a` is then `linux/usr/lib/libc.a`. Nothing in `linux/` is ever committed: it holds whatever
+sysroot and guest toolchains are put there (`.gitignore`). A glibc sysroot such as
+[gnu-cross](https://github.com/cross-tools/gnu-cross/releases)'s
+`aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/sysroot`, copied to `linux/`, is
+enough to run dynamically linked programs and an AArch64-hosted GCC:
+
+```sh
+cp -a aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/sysroot ~/.local/share/scarletnx/linux
+build/scarletnx-gnuabi ~/.local/share/scarletnx/linux/opt/gcc/bin/aarch64-linux-gcc --sysroot=/ hello.c -o hello
+build/scarletnx-gnuabi ./hello
+```
+
+The guest compiler's `--sysroot=/` points it at the guest's root, which is `linux/`.
+
+## How code runs
+
+Both modes share one dispatch table over the whole 4 GiB guest address space. A guest
+address the table has no host function for sends the generated code to the runtime,
+which compiles the code there with the LLVM backend (the recompiler library's
+`snx_recompile_from`) and runs it:
+
+- JIT (the default) compiles everything that way. One step is the function execution
+  reached and the functions it calls, breadth first, up to 64Ki instructions, split
+  into pieces of at most 4096 instructions (LLVM's time grows faster than a function's
+  size) and compiled on every core.
+- AOT compiles the main executable with the host compiler before it starts, with
+  per-instruction fetch checks (as this runtime always did). Code mapped later, the
+  dynamic linker and shared libraries, is compiled as it runs.
+
+Compiled modules are kept in the cache, named by a hash of the code, its addresses and
+entries, the backend's settings, `SNX_ABI` and the host CPU, together with the compiled
+runtime library every module links. A program run again (or a toolchain run on another
+file) loads instead of compiling. The first run of a large program is mostly compiling:
+the first compile of a C file with GCC (`cc1`, `as`, `collect2`, `ld`) spent about seven
+minutes compiling on six cores, and the same compile then took 6 seconds.
+
+`mmap`, `munmap` and `mprotect` over executable pages drop their compiled code, and a
+syscall that changed the code it returns into resumes through the dispatch table.
+Code on a writable and executable page is compiled one function at a time, so its calls
+go through the table, and the page is write-protected on the host: a write to it drops
+its code, and the store is retried. `tests/gnuabi/self_modify.S` and `rewrite.S` exit
+42 in both modes. Fetching from a page without execute permission faults.
+
+Guest calls are host calls in the generated code, so the guest runs on a host thread
+with a 1 GiB stack reservation.
+
+## Processes
+
+On Linux and the other POSIX hosts, `clone` is the host's `fork`: the child has a copy
+of the guest's memory, registers and descriptor table, and its descriptors share the
+host's open files with the parent's, as Linux shares them. `CLONE_VFORK` (`vfork`,
+`posix_spawn`) waits in the parent until the child has exec'd or exited, as the kernel
+does. The child has a copy of the memory rather than sharing it, which is all a vfork
+child may rely on before `execve`. `execve` loads the new program into the same host
+process, keeping its pid, its descriptors without the close-on-exec ones, and the
+signals it ignores. `#!` scripts run their interpreter, found through the sysroot.
+`wait4`, `waitid`, `kill`, `tgkill`, process groups and sessions are the host's, with
+signal numbers and wait statuses translated. A guest that ignores a signal has the
+host ignore it (`SIGPIPE`, `SIGCHLD`, `SIGINT`). A signal whose default action ends a
+process ends the host process with the same signal, so a parent sees what it would on
+Linux.
+
+Windows has no fork. A vfork child runs in its parent's process (with its own
+descriptor table, registers and signal state) until it execs. Then another copy of
+this runtime starts the program, adopting the child's descriptors as inherited
+handles (`--fd=N:HANDLE`, `--cwd`), and the parent goes on from its `clone`. A child
+that exits before its exec leaves a status for `wait4`. An `execve` outside a vfork
+child starts the new program the same way and ends with its status. A plain `fork`
+returns `ENOSYS` there. The Windows paths compile with llvm-mingw but have not been run.
 
 ## Implemented scope
 
 The independent ELF loader accepts ELF64 little-endian `EM_AARCH64` `ET_EXEC`
 and `ET_DYN`, validates program headers and load intervals, maps `PT_LOAD` with
 their permissions, zeroes BSS, and creates an aligned stack containing `argc`,
-`argv`, `envp`, and Linux auxiliary vectors. ET_DYN receives a load bias;
-position-independent code must handle its own relocations. `PT_INTERP` produces
-an explicit unsupported-interpreter error. This is a bounded 4 GiB guest address
-space with executable load segments below 1 GiB and an 8 MiB initial stack.
+`argv`, `envp`, and Linux auxiliary vectors. A position-independent program loads at
+0x10000000. `PT_INTERP` names the dynamic linker, which is loaded from the guest's
+namespace at 0x38000000 (`AT_BASE`), and the program starts there. This is a bounded
+4 GiB guest address space with executable load segments below 1 GiB and an 8 MiB
+initial stack. Dynamically linked AArch32 programs are unsupported.
 
 `SVC #0` dispatches syscall number `x8`, arguments `x0` through `x5`, and result
 `x0`. Failed calls return negative Linux errno values. Other SVC immediates,
-unimplemented instructions, and guest breakpoints terminate with a diagnostic.
+undefined instructions, and guest breakpoints terminate with a diagnostic.
 Unsupported syscalls return `-ENOSYS`.
 
-The GNU runtime checks alignment and guest execute permission before every
-instruction, including AOT instructions. Changed instruction words use the shared
-interpreter. Protected guest data accesses terminate with a guest fault diagnostic
-and release the temporary compiler module. Guest signal handlers are not entered.
-
-GNU execution checks current instruction-fetch permissions and the live
-instruction word. A changed instruction uses shared interpreter semantics rather
-than its stale compiled form. Memory permission faults terminate the guest with
-a diagnostic and signal-style exit status; this does not deliver a user signal
-handler. The shared fetch callback is optional and NX preserves its existing
-execution path.
-
 Implemented syscall families cover file descriptors (`read`, `write`, vectored
-I/O, `openat`, `close`, `lseek`, `dup`, `fcntl`), metadata and directory operations
-(`fstat`, `newfstatat`, `readlinkat`, `getdents64`, `mkdirat`, `unlinkat`,
-`ftruncate`, `chdir`, `getcwd`), memory (`brk`, `mmap`, `munmap`, `mprotect`),
-process exit and identification, `uname`, clocks, random bytes, signal action and
+I/O, `openat`, `close`, `lseek`, `dup`, `dup3`, `fcntl`, `pipe2`, `ioctl` for terminals and
+`FIONREAD`), metadata and directory operations (`fstat`, `newfstatat`, `statx`,
+`readlinkat`, `getdents64`, `mkdirat`, `unlinkat`, `renameat2`, `linkat`, `symlinkat`,
+`fchmodat`, `fchownat`, `utimensat`, `faccessat2`, `truncate`, `statfs`, `fsync`,
+`chdir`, `fchdir`, `getcwd`), memory (`brk`, `mmap` with private file mappings and
+read-only shared ones, `munmap`, `mprotect`), processes (`clone`, `execve`,
+`execveat`, `wait4`, `waitid`, `kill`, `tgkill`, `exit_group`, ids, process groups,
+`umask`), `uname`, clocks and sleeps, random bytes, resource queries, signal action and
 mask storage, and basic single-thread futex operations. Networking adds host-backed
 sockets, socketpair, poll/select, epoll and eventfd through the shared stack;
 read-only virtual `/etc` files support guest libc DNS. See [NETWORKING.md](NETWORKING.md)
 for configuration, tests, and current semantic limitations. Guest structures and
 constants are encoded for AArch64 rather than copied from the host ABI.
 
-The initial runtime executes one guest thread. `clone`, signal delivery and
-`rt_sigreturn`, dynamic linking, file-backed `MAP_SHARED`, and a general Linux
-distribution environment are unsupported. Futex wake returns zero without
-peers; waits with a mismatched value return `-EAGAIN`, timed waits can return
-`-ETIMEDOUT`, and a blocking wait without a timeout returns `-ENOSYS`. Signal
-actions and masks are stored, but no signal handler is entered. These limits
-must be considered when choosing test programs.
+Each process runs one guest thread: `clone` of a thread (`CLONE_THREAD`) returns
+`ENOSYS`. Signal handlers are recorded but never entered, so `rt_sigreturn` and
+signal frames are unsupported. File-backed writable `MAP_SHARED` is unsupported. Futex
+wake returns zero without peers; waits with a mismatched value return `-EAGAIN`, timed
+waits can return `-ETIMEDOUT`, and a blocking wait without a timeout returns `-ENOSYS`.
 
-The filesystems are intentionally small:
+The virtual nodes:
 
-| Mount | Contents and behavior |
+| Path | Contents and behavior |
 | --- | --- |
-| `/tmp` | Ephemeral in-memory files and directories, mutation, metadata, and enumeration |
 | `/dev` | `null`, `zero`, `random`, `urandom`, and descriptor links under `fd` |
 | `/proc` | Guest `self/exe`, `self/maps`, `self/cmdline`, `self/status`, `self/fd`, and AArch64 `cpuinfo` |
+| `/tmp` | `--isolated` only: ephemeral in-memory files and directories. Otherwise the sysroot's or the host's |
 
 No Maxwell, Vulkan, OpenGL, DRM/KMS, display, or graphics service is initialized
-by this runtime. It cannot open arbitrary host paths through guest `openat`.
+by this runtime.
 
 ## Differential validation and fuzzing
 
@@ -110,8 +211,8 @@ random reads, and unsupported-call errors. The PIE suite verifies ET_DYN,
 PC-relative global accesses, and BSS initialization. The optional `libc.c` fixture exercises
 static libc startup, allocation, memory operations, and formatted output.
 The standalone `self_modify.S` fixture must exit 42 after replacing a compiled
-instruction; `fetch_fault.S` must fault after removing the executing page's
-execute permission. These intentional faults should be checked directly rather
+instruction, as must `rewrite.S`, which rewrites code that already ran;
+`fetch_fault.S` must fault after removing the executing page's execute permission. These intentional faults should be checked directly rather
 than passed to the default differential success suite.
 
 Seeded fuzzing generates unsigned integer and memory programs with reproducible

@@ -9,11 +9,16 @@
 #define GNU_PROT_WRITE    2u
 #define GNU_PROT_EXEC     4u
 #define GNU_PAGE_MAPPED   8u
+#define GNU_PAGE_CODE     16u /* writable, and compiled from: the host's copy is read-only until a write (watch_code) */
 #define GNU_ADDRESS_LIMIT UINT64_C(0x100000000)
 typedef struct GnuMemory {
     unsigned char* base;
     unsigned char* pages;
     uint64_t size, mmap_next, brk_base, brk_current, brk_limit;
+    /* called before executable pages are remapped, unmapped or have their permissions changed: the JIT's host code
+       for them must not run again (gnu_jit_invalidate). Set after gnu_memory_init */
+    void (*code_changed)(void* context, uint64_t address, uint64_t length);
+    void* code_context;
 } GnuMemory;
 int gnu_memory_init(GnuMemory* memory);
 void gnu_memory_destroy(GnuMemory* memory);
@@ -27,4 +32,9 @@ int gnu_memory_protect(GnuMemory* memory, uint64_t address, uint64_t length, uns
 int64_t gnu_memory_mmap(GnuMemory* memory, uint64_t address, uint64_t length, unsigned permissions, uint64_t flags);
 uint64_t gnu_memory_brk(GnuMemory* memory, uint64_t requested);
 size_t gnu_memory_maps(GnuMemory* memory, char* destination, size_t capacity);
+/* The JIT compiled code from these writable pages: a write to one of them is seen (gnu_memory_code_written) */
+void gnu_memory_watch_code(GnuMemory* memory, uint64_t address, uint64_t length);
+/* a host write fault at guest address: 1 when it was a watched page, which is writable again and whose code went
+   (code_changed), so the write can be retried */
+int gnu_memory_code_written(GnuMemory* memory, uint64_t address);
 #endif

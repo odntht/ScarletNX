@@ -9,6 +9,7 @@
 #include <sched.h>
 #include <stdarg.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #define MIB (1ull << 20)
 static unsigned checks;
@@ -263,6 +264,12 @@ static void test_mapping_boundary(void) {
     g_gpu_mapping_end = NULL;
 }
 int main(void) {
+    /* guest memory is mapped and protected in the Switch's 4 KiB pages, which a host with bigger ones (16 KiB on
+       Apple silicon) can't do: what plat_posix.c stops the runtime for there (docs/APPLE.md) */
+    if (sysconf(_SC_PAGESIZE) != 4096) {
+        printf("skipped: this host's pages are %ld bytes, and guest memory needs 4 KiB ones\n", sysconf(_SC_PAGESIZE));
+        return 77;
+    }
     mem_init();
     test_heap();
     test_system_resource();

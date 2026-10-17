@@ -4,6 +4,7 @@
    This fork's changes are under GPL-3.0-or-later, the license of the fork as a whole (LICENSE). */
 /* the crash report. It runs in the crash handler: the log is in its crash mode by then (log_crash_mode), and the
    hints aren't saved here, the main loop saves them every few seconds */
+#include "nx/runtime/arm.h"
 #include "nx/runtime/loader.h"
 #include "nx/runtime/main.h"
 #include "nx/hle/kernel/kernel.h"
@@ -71,6 +72,13 @@ void crash_report(void* host_pc, void* fault, int sig) {
         if (best && (u64)(size_t)host_pc - best < 0x100000)
             logf_(0, "  inside the recompiled code of game function %llx (+%llx on the host)\n",
                   (unsigned long long)ga2, (unsigned long long)((u64)(size_t)host_pc - best));
+    }
+    if (g_arm_mod) {
+        u64 offset = 0;
+        u32 block = arm_block_at(host_pc, &offset);
+        if (block)
+            logf_(0, "  inside the recompiled code of the game's %s block %x (+%llx on the host)\n",
+                  block & 1 ? "Thumb" : "A32", block & ~1u, (unsigned long long)offset);
     }
     if (t) {
         logf_(0, "  thread %llu (%s)\n", (unsigned long long)t->id, t->name);

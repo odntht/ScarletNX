@@ -1,21 +1,28 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright 2026 the ScarletNX contributors
 #
-# FFmpeg's libavcodec, libswresample and libavutil as static libraries (targets FFmpeg::avcodec, FFmpeg::swresample
-# and FFmpeg::avutil), built from the release source in cmake/dependencies.cmake with FFmpeg's own configure and make,
-# which it has instead of a CMake build. Only the decoders NVDEC handles are in (H.264, VP8, VP9), and Opus for hwopus
-# (FFmpeg's Opus decoder resamples its SILK layer with libswresample, which is why that library is in): no programs,
-# formats, filters, devices, network or autodetected system libraries, so the result needs nothing but libc and builds
-# the same everywhere. All of it is LGPL (no --enable-gpl). It needs a POSIX shell and make (gmake on the BSDs), and
-# NASM for the x86-64 assembly.
+# FFmpeg's libavcodec, libswresample and libavutil as static libraries (targets FFmpeg::avcodec, FFmpeg::swresample and
+# FFmpeg::avutil), built from the release source in cmake/dependencies.cmake with FFmpeg's own configure and make, which
+# it has instead of a CMake build. NVDEC's VP9 jobs need a change to its VP9 decoder (cmake/ffmpeg-vp9-nvdec.patch), so
+# it builds from a patched copy of the release in the build tree. Only the decoders NVDEC handles are in (H.264, VP8,
+# VP9), and Opus for hwopus (FFmpeg's Opus decoder resamples its SILK layer with libswresample, which is why that
+# library is in): no programs, formats, filters, devices, network or autodetected system libraries, so the result needs
+# nothing but libc and builds the same everywhere. All of it is LGPL (no --enable-gpl). It needs a POSIX shell and make
+# (gmake on the BSDs), and NASM for the x86-64 assembly. macOS and iOS build it with Xcode's Clang and SDK
+# (cmake/apple.cmake), iOS as a cross build.
 # This file is included into the top-level scope: its variables carry the snx_ffmpeg_ prefix.
-set(snx_ffmpeg_src "${FFmpeg_SOURCE_DIR}")
+set(snx_ffmpeg_src "${CMAKE_BINARY_DIR}/_deps/ffmpeg-patched")
 set(snx_ffmpeg_prefix "${CMAKE_BINARY_DIR}/ffmpeg")
 # FFmpeg's configure stops on a source path with a space in it, which would only show at build time
 if(snx_ffmpeg_src MATCHES "[ \t]")
-    message(FATAL_ERROR "FFmpeg can't be built from a path with spaces in it (${snx_ffmpeg_src}). Move the checkout "
-                        "to a path without spaces or set CPM_SOURCE_CACHE to one. FFmpeg is required by the NX runtime.")
+    message(FATAL_ERROR "FFmpeg can't be built from a path with spaces in it (${snx_ffmpeg_src}). Use a build folder "
+                        "whose path has none. FFmpeg is required by the NX runtime.")
 endif()
+set(snx_ffmpeg_patch "${CMAKE_SOURCE_DIR}/cmake/ffmpeg-vp9-nvdec.patch")
+file(SHA256 "${snx_ffmpeg_patch}" snx_ffmpeg_patch_sha256)
+include("${CMAKE_SOURCE_DIR}/cmake/patched_copy.cmake")
+snx_patched_copy(SOURCE "${FFmpeg_SOURCE_DIR}" DEST "${snx_ffmpeg_src}" PATCHES "${snx_ffmpeg_patch}"
+                 FILES libavcodec/vp9.c 69bcc226b8d240fb21ea5cfa071c101ed451409bf80368ec26d5664c9fc2ab6c)
 # sh before bash: on Windows a bash.exe in System32 is WSL's launcher, and w64devkit's sh is the one to use
 find_program(SNX_FFMPEG_SH NAMES sh bash)
 find_program(SNX_FFMPEG_MAKE NAMES gmake make)
@@ -58,13 +65,18 @@ if(WIN32 OR CMAKE_CROSSCOMPILING)
     # architecture AMD64 or ARM64 on Windows, which configure doesn't know
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
         set(snx_ffmpeg_arch x86_64)
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" OR
+           (APPLE AND NOT CMAKE_SYSTEM_PROCESSOR AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"))
+        # an iOS build names its architecture in CMAKE_OSX_ARCHITECTURES, CMAKE_SYSTEM_PROCESSOR being optional there
         set(snx_ffmpeg_arch aarch64)
     else()
         string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" snx_ffmpeg_arch)
     endif()
     if(WIN32)
         set(snx_ffmpeg_os mingw32)
+    elseif(APPLE)
+        # configure's name for macOS and iOS alike: the SDK in the flags below says which
+        set(snx_ffmpeg_os darwin)
     else()
         # configure's names for Linux, Darwin, FreeBSD, Android are CMake's in lower case
         string(TOLOWER "${CMAKE_SYSTEM_NAME}" snx_ffmpeg_os)
@@ -76,6 +88,13 @@ if(ANDROID)
     # a shared library there (src/nx)
     list(APPEND snx_ffmpeg_args --sysroot=${CMAKE_SYSROOT} --extra-cflags=--target=${CMAKE_C_COMPILER_TARGET}
          --extra-ldflags=--target=${CMAKE_C_COMPILER_TARGET} --enable-pic)
+endif()
+if(SNX_APPLE_FLAGS)
+    # the architecture, SDK and oldest system version CMake gives its own compiles (cmake/apple.cmake), which configure
+    # does not get from --cc; on iOS without them it would build for the Mac. Its tests link programs, so the linker
+    # gets them too
+    list(JOIN SNX_APPLE_FLAGS " " snx_ffmpeg_apple_flags)
+    list(APPEND snx_ffmpeg_args "--extra-cflags=${snx_ffmpeg_apple_flags}" "--extra-ldflags=${snx_ffmpeg_apple_flags}")
 endif()
 if(CMAKE_CROSSCOMPILING)
     # configure builds a few helper programs for the machine doing the build, which needs its own C compiler
@@ -100,8 +119,8 @@ endif()
 
 # Built once for every tree that builds it the same way, when SNX_DEPS_CACHE names a folder (cmake/deps_cache.cmake).
 # The install prefix stays out of the key: FFmpeg only quotes it in its configuration string
-snx_deps_cached(ffmpeg snx_ffmpeg_cache "source: ${snx_ffmpeg_sha256}" "configure: ${snx_ffmpeg_args}"
-                "nasm: ${snx_ffmpeg_nasm}")
+snx_deps_cached(ffmpeg snx_ffmpeg_cache "source: ${snx_ffmpeg_sha256}" "patch: ${snx_ffmpeg_patch_sha256}"
+                "configure: ${snx_ffmpeg_args}" "nasm: ${snx_ffmpeg_nasm}")
 if(snx_ffmpeg_cache_FOUND)
     set(snx_ffmpeg_prefix "${snx_ffmpeg_cache_DIR}")
 else()
@@ -113,7 +132,9 @@ else()
     include(ExternalProject)
     ExternalProject_Add(ffmpeg_build
         SOURCE_DIR "${snx_ffmpeg_src}"
-        BINARY_DIR "${CMAKE_BINARY_DIR}/ffmpeg-build"
+        # configure leaves a src link to its source there: a tree that built the release's own folder before would
+        # keep compiling that one
+        BINARY_DIR "${CMAKE_BINARY_DIR}/ffmpeg-build-patched"
         INSTALL_DIR "${snx_ffmpeg_prefix}"
         CONFIGURE_COMMAND "${SNX_FFMPEG_SH}" "${snx_ffmpeg_src}/configure" --prefix=${snx_ffmpeg_prefix}
                           ${snx_ffmpeg_args}

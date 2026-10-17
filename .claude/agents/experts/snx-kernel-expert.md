@@ -17,7 +17,7 @@ object the emulation keeps needs host locking.
   `*_nl` expect it held.
 - Tests: `kernel_mutex`, `kernel_cores`, `memory_accounting` (`ctest --preset default -R NAME`). Behavior the game
   depends on is checked by running it (`snx-run`), and a hang by its `threads.txt` (`snx-crash`).
-- What the SDK expects is read from the game (`tools/disasm.py work/Catherine FUNC`, or the `sdk-scout` agent).
+- What the SDK expects is read from the game (`tools/disasm.py work/<Game> FUNC`, or the `sdk-scout` agent).
   Atmosphère is the normative reference for how the kernel behaves: Mesosphère (`libraries/libmesosphere/`) is a
   close reimplementation of Horizon's kernel, and Stratosphère of its system services. It is GPL-2.0-only, so read
   it for behavior (orderings, result codes, edge cases) and write our own code, never port it. Switchbrew documents

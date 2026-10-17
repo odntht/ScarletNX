@@ -4,6 +4,9 @@
 #ifndef __FreeBSD__
 #define _POSIX_C_SOURCE 200809L
 #endif
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE /* libproc's types, which the POSIX name above hides */
+#endif
 #include "gui/gui_process.h"
 #include <dirent.h>
 #include <errno.h>
@@ -25,6 +28,13 @@
 #include <sys/types.h>
 #include <sys/user.h>
 #endif
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if !TARGET_OS_IPHONE
+#include <libproc.h>
+#include <mach/mach_time.h>
+#endif
+#endif
 
 typedef struct {
     pid_t pid, session;
@@ -35,8 +45,8 @@ typedef struct {
 struct GuiProcess {
     pid_t pid;
     int output, status;
-    bool exited, eof, measured;
-    double previous_time, previous_cpu;
+    bool exited, eof;
+    GuiCpuBase cpu_base;
 };
 static double seconds(void) {
     struct timespec now;
@@ -137,8 +147,36 @@ static Sample* snapshot(size_t* count) {
         }
     free(entries);
     return samples;
+#elif defined(__APPLE__) && !TARGET_OS_IPHONE
+    /* a zombie has no task to describe and is left out, which counts it as gone */
+    int listed = proc_listallpids(NULL, 0);
+    pid_t* pids;
+    mach_timebase_info_data_t timebase;
+    if (listed <= 0 || mach_timebase_info(&timebase)) return NULL;
+    listed += 16; /* room for the processes started since */
+    pids = malloc((size_t)listed * sizeof(*pids));
+    if (!pids) return NULL;
+    listed = proc_listallpids(pids, listed * (int)sizeof(*pids));
+    Sample* samples = listed > 0 ? calloc((size_t)listed, sizeof(*samples)) : NULL;
+    for (int i = 0; samples && i < listed; ++i) {
+        struct proc_taskallinfo info;
+        if (pids[i] <= 0 || proc_pidinfo(pids[i], PROC_PIDTASKALLINFO, 0, &info, sizeof info) != sizeof info) continue;
+        Sample* sample = &samples[(*count)++];
+        sample->pid = pids[i];
+        sample->session = getsid(pids[i]);
+        sample->live = true;
+        sample->resident = info.ptinfo.pti_resident_size;
+        /* the task's times are in Mach ticks, which are not nanoseconds on Apple silicon */
+        sample->cpu = (double)(info.ptinfo.pti_total_user + info.ptinfo.pti_total_system) * timebase.numer /
+                      timebase.denom / 1e9;
+    }
+    free(pids);
+    return samples;
+#elif defined(__APPLE__)
+    /* iOS starts no processes (gui_process_start): there is none to count */
+    return NULL;
 #else
-#error "scarletnx-gui process accounting currently supports Linux, FreeBSD and Windows"
+#error "scarletnx-gui process accounting currently supports Linux, FreeBSD, macOS and Windows"
 #endif
 }
 GuiProcess* gui_process_create(void) {
@@ -156,6 +194,15 @@ bool gui_process_start(GuiProcess* process, const char* const* argv, char* error
         snprintf(error, size, "A driver is already running");
         return false;
     }
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* an iOS app may not start a process: fork fails there. Games are prepared on a computer and played in the app's
+       own process (docs/APPLE.md) */
+    (void)argv;
+    (void)output;
+    (void)failure;
+    snprintf(error, size, "iOS runs no other programs: prepare games on a computer, then copy them to games/");
+    return false;
+#endif
     if (pipe(output) || pipe(failure)) goto failed;
     for (int i = 0; i < 2; ++i)
         if (fcntl(output[i], F_SETFD, FD_CLOEXEC) || fcntl(failure[i], F_SETFD, FD_CLOEXEC)) goto failed;
@@ -278,11 +325,7 @@ GuiUsage gui_process_usage(GuiProcess* process) {
                then into the GUI's counters when the driver is reaped. */
             cpu += samples[i].cpu;
         }
-    if (process->measured && now > process->previous_time && cpu >= process->previous_cpu)
-        usage.cpu_percent = 100 * (cpu - process->previous_cpu) / (now - process->previous_time);
-    process->previous_cpu = cpu;
-    process->previous_time = now;
-    process->measured = true;
+    usage.cpu_percent = gui_cpu_percent(&process->cpu_base, cpu, now);
     free(samples);
     return usage;
 }

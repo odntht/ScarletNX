@@ -38,5 +38,13 @@ IPC requests allow 0x300-byte paths excluding NUL. Host limits also apply.
 - Handles retain node identity across rename; detached nodes live until last close. Removed directory handles return `FS_NOTFOUND`.
 - Live directory cursor: `strcmp` order, last visited name, latched EOF; counts reflect current children.
 - RomFS: prefer indexed `romfs.bin`; otherwise synthesize from `romfs/`.
-- Readonly RAM copies: missing system archives become valid empty images at `system/archives/<16-hex-id>.romfs`; OS fallback at
-  `fonts/SystemFallback.ttf`. No persistent host copy.
+- Readonly RAM copies: missing system archives become valid empty images at `system/archives/<16-hex-id>.romfs`. No
+  persistent host copy.
+
+## Shared fonts
+
+Place `fonts/FontStandard.ttf` inside the game's data directory before starting the game. For the default
+title-ID layout, the full path is `games/<id>/<id>_data/fonts/FontStandard.ttf` under the
+[data folder](USAGE.md#folders). Named or older deployments use their existing `<Game>_data/` directory.
+`FontStandard.bfttf` is also accepted and takes priority over `.ttf`. Both take priority over the built-in
+stand-in fonts. Font substitution can change text weight and spacing.

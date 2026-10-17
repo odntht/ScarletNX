@@ -102,6 +102,18 @@ int main(int argc, char** argv) {
         assert(!snx_write_file(argv[2], "escaped", 7));
         return 0;
     }
+    { /* one CPU busy, looked at every 2 ms on a clock and a CPU count that both step by 15.625 ms, 8 ms apart: its use
+         shows once the clock moves, not lost between looks closer than its steps */
+        GuiCpuBase base = {0};
+        double top = 0;
+        for (unsigned i = 1; i <= 100; ++i) {
+            double ms = 2.0 * i, step = 0.015625;
+            double percent =
+                gui_cpu_percent(&base, (unsigned)((ms + 8) / 15.625) * step, (unsigned)(ms / 15.625) * step);
+            if (percent > top) top = percent;
+        }
+        assert(top > 50 && top < 200);
+    }
     GuiProcess* process = gui_process_create();
     assert(process);
     char* self = snx_executable(argv[0]);
@@ -138,6 +150,9 @@ int main(int argc, char** argv) {
         if (gui_process_finished(process, &status)) break;
         delay(2);
     }
+    if (!(status == 7 && found == 15 && bytes > 409600 && saw_cpu && saw_memory))
+        fprintf(stderr, "gui_process: status %d, found %u of 15, %lu bytes, CPU seen %d, memory seen %d\n", status,
+                found, (unsigned long)bytes, saw_cpu, saw_memory);
     assert(status == 7 && found == 15 && bytes > 409600 && saw_cpu && saw_memory);
     char* temporary = snx_temp_dir(NULL);
     char* marker = snx_path_join(temporary, "must not exist");

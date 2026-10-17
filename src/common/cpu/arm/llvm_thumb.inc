@@ -2,13 +2,15 @@
    Copyright 2026 the ScarletNX contributors */
 /* Included by llvm.c. Thumb16/Thumb32 emission reusing the A32 primitives
    (readmem/writemem/bounds/arithmetic/shift/nz/condition). PC reads are the
-   Thumb pipeline value: instruction address + 4 (the original A57 path
-   retains its existing word alignment; ARM11 aligns only literal/ADR bases). */
+   Thumb pipeline value: instruction address + 4. Literal and ADR bases are
+   Align(PC, 4), which their emitters make (tpcalign). The A57 path used to align
+   every read, and Thumb PIC code's ADD Rd, PC at an address 2 mod 4 got an
+   address 2 bytes off. */
 
 static LLVMValueRef treg(ArmIR* a, unsigned r) {
-    return r == 15 ? c32(a, a->profile == SNX_ARM_PROFILE_ARM11 ? a->pc + 4 : (a->pc + 4) & ~3u)
-                   : get(a, offsetof(SnxArmCPU, r) + r * 4, a->i32);
+    return r == 15 ? c32(a, a->pc + 4) : get(a, offsetof(SnxArmCPU, r) + r * 4, a->i32);
 }
+static LLVMValueRef tpcalign(ArmIR* a) { return c32(a, (a->pc + 4) & ~3u); } /* Align(PC, 4): literals, ADR */
 static LLVMValueRef tpcbase(ArmIR* a) { return c32(a, a->pc + 4); } /* unaligned, for branches */
 
 /* rd = x - y (SUB) or x + y (ADD), with the supplied flag behaviour. */
@@ -28,9 +30,9 @@ static void thumb_ldst(ArmIR* a, const SnxThumb* t) {
     } else {
         offset = c32(a, t->imm);
     }
-    base = treg(a, t->rn);
+    base = t->rn == 15 ? tpcalign(a) : treg(a, t->rn); /* LDR (literal) */
     if (t->flags & TH_SPB) base = treg(a, 13);
-    if (t->flags & TH_PCB) base = c32(a, (a->pc + 4) & ~3u);
+    if (t->flags & TH_PCB) base = tpcalign(a);
     adjusted = (t->flags & TH_UP) ? add(a, base, offset) : sub(a, base, offset);
     if (t->flags & TH_REG) addr = adjusted; /* register-offset forms are non-writeback */
     else if (t->flags & TH_PRE) addr = adjusted;
@@ -42,6 +44,26 @@ static void thumb_ldst(ArmIR* a, const SnxThumb* t) {
         else setreg(a, t->rd, value);
     } else {
         writemem(a, addr, bytes, treg(a, t->rd));
+        transfer_commit(a);
+    }
+    if (t->flags & TH_WB) setreg(a, t->rn, adjusted);
+}
+
+/* LDRD/STRD: any two registers, unlike A32's even pair, and a word-aligned offset up to 1020. Both words are read
+   before either register is written, and both checked before either is stored */
+static void thumb_dual(ArmIR* a, const SnxThumb* t) {
+    LLVMValueRef base = t->rn == 15 ? tpcalign(a) : treg(a, t->rn), adjusted, addr, first, second;
+    adjusted = (t->flags & TH_UP) ? add(a, base, c32(a, t->imm)) : sub(a, base, c32(a, t->imm));
+    addr = (t->flags & TH_PRE) ? adjusted : base;
+    transfer_begin(a, addr, 8, 4, !t->op, 1);
+    if (t->op) {
+        first = readmem(a, addr, 4, 0);
+        second = readmem(a, add(a, addr, c32(a, 4)), 4, 0);
+        setreg(a, t->rd, first);
+        setreg(a, t->rm, second);
+    } else {
+        writemem(a, addr, 4, treg(a, t->rd));
+        writemem(a, add(a, addr, c32(a, 4)), 4, treg(a, t->rm));
         transfer_commit(a);
     }
     if (t->flags & TH_WB) setreg(a, t->rn, adjusted);
@@ -176,25 +198,29 @@ static void thumb_wimm(ArmIR* a, const SnxThumb* t) {
         r = bor(a, band(a, treg(a, t->rd), c32(a, 0xFFFF)), c32(a, t->imm << 16));
         setreg(a, t->rd, r);
     } else { /* ADDW / SUBW */
-        r = taddsub(a, treg(a, t->rn), c32(a, t->imm), t->op == ALU_SUB, 0);
+        r = taddsub(a, t->rn == 15 ? tpcalign(a) : treg(a, t->rn), c32(a, t->imm), t->op == ALU_SUB, 0); /* ADR.W */
         setreg(a, t->rd, r);
     }
 }
 
 static void thumb_wdata(ArmIR* a, const SnxThumb* t) {
-    LLVMValueRef x = treg(a, t->rn), rmv = treg(a, t->rm), y, carry, r = NULL;
+    LLVMValueRef x = treg(a, t->rn), rmv = treg(a, t->rm), y, carry = NULL, r = NULL;
     int flags = !!(t->flags & TH_S);
     int compare = (t->rd == 15 && flags);
-    if (t->flags & TH_MODIMM) y = c32(a, t->imm);
-    else if (t->flags & TH_RSHIFT) y = shift(a, rmv, t->ra, treg(a, t->imm), 0, 0, &carry);
+    /* the shifter's carry, which the logical operations set C to: ThumbExpandImm_C's for a rotated immediate, an
+       unrotated one leaving C as it is */
+    if (t->flags & TH_MODIMM) {
+        y = c32(a, t->imm);
+        if (t->flags & TH_ROTC) carry = c32(a, t->imm >> 31);
+    } else if (t->flags & TH_RSHIFT) y = shift(a, rmv, t->ra, treg(a, t->imm), 0, 0, &carry);
     else y = shift(a, rmv, t->ra, NULL, 1, t->imm, &carry);
     switch (t->op) {
-        case 0: r = band(a, x, y); if (flags) nz(a, r, NULL, NULL); if (!compare) setreg(a, t->rd, r); break; /* AND/TST */
-        case 1: r = band(a, x, LLVMBuildNot(a->b, y, "")); if (flags) nz(a, r, NULL, NULL); setreg(a, t->rd, r); break; /* BIC */
-        case 2: r = t->rn == 15 ? y : bor(a, x, y); if (flags) nz(a, r, NULL, NULL); setreg(a, t->rd, r); break; /* ORR/MOV */
+        case 0: r = band(a, x, y); if (flags) nz(a, r, carry, NULL); if (!compare) setreg(a, t->rd, r); break; /* AND/TST */
+        case 1: r = band(a, x, LLVMBuildNot(a->b, y, "")); if (flags) nz(a, r, carry, NULL); setreg(a, t->rd, r); break; /* BIC */
+        case 2: r = t->rn == 15 ? y : bor(a, x, y); if (flags) nz(a, r, carry, NULL); setreg(a, t->rd, r); break; /* ORR/MOV */
         case 3: r = t->rn == 15 ? LLVMBuildNot(a->b, y, "") : bor(a, x, LLVMBuildNot(a->b, y, ""));
-                if (flags) nz(a, r, NULL, NULL); setreg(a, t->rd, r); break; /* ORN/MVN */
-        case 4: r = bxor(a, x, y); if (flags) nz(a, r, NULL, NULL); if (!compare) setreg(a, t->rd, r); break; /* EOR/TEQ */
+                if (flags) nz(a, r, carry, NULL); setreg(a, t->rd, r); break; /* ORN/MVN */
+        case 4: r = bxor(a, x, y); if (flags) nz(a, r, carry, NULL); if (!compare) setreg(a, t->rd, r); break; /* EOR/TEQ */
         case 8: /* ADD/CMN */
             if (compare) taddsub(a, x, y, 0, 1);
             else { r = taddsub(a, x, y, 0, flags); setreg(a, t->rd, r); }
@@ -305,7 +331,7 @@ static int thumb_instruction(ArmIR* a, const SnxThumb* t) {
             }
             if (t->op == 0) {
                 LLVMValueRef value = add(a, treg(a, t->rn), treg(a, t->rm));
-                if (a->profile == SNX_ARM_PROFILE_ARM11 && t->rd == 15) {
+                if (t->rd == 15) { /* ALUWritePC: a branch, in Thumb state */
                     setreg(a, 15, band(a, value, c32(a, ~1u)));
                     return 1;
                 }
@@ -318,7 +344,7 @@ static int thumb_instruction(ArmIR* a, const SnxThumb* t) {
             return 0;
         case TH_LOAD: case TH_STORE:
             thumb_ldst(a, t);
-            return a->memory == SNX_ARM_MEMORY_CHECKED && t->shape == TH_LOAD && t->rd == 15;
+            return t->shape == TH_LOAD && t->rd == 15; /* LoadWritePC: a branch, which ends the block */
         case TH_ADDR:
             if (t->rd == 13 && t->rn == 13) setreg(a, 13, taddsub(a, treg(a, 13), c32(a, t->imm), t->op == ALU_SUB, 0));
             else setreg(a, t->rd, add(a, t->rn == 15 ? c32(a, (a->pc + 4) & ~3u) : treg(a, t->rn), c32(a, t->imm)));
@@ -332,6 +358,17 @@ static int thumb_instruction(ArmIR* a, const SnxThumb* t) {
         case TH_WDATA: thumb_wdata(a, t); return 0;
         case TH_TABLE: thumb_table(a, t); return 1;
         case TH_IT: case TH_HINT: return 0;
+        case TH_A32: { /* the A32 emitter runs the twin, reading Thumb's PC (ArmIR.thumb) */
+            uint32_t word = a->word;
+            int stop;
+            a->word = t->imm;
+            a->pair = t->ra;
+            stop = instruction(a, (SnxA32Kind)t->op);
+            a->word = word;
+            a->pair = 0;
+            return stop;
+        }
+        case TH_DUAL: thumb_dual(a, t); return 0;
         case TH_BRANCH: {
             unsigned state;
             LLVMValueRef target;
@@ -345,13 +382,14 @@ static int thumb_instruction(ArmIR* a, const SnxThumb* t) {
                     branch_exchange(a, target);
                     if (t->op == BR_BLX_REG) setreg(a, 14, bor(a, c32(a, a->pc + 2), c32(a, 1)));
                     return 1;
-                case BR_B: case BR_BCOND: case BR_CBZ: case BR_CBNZ: {
+                case BR_B: case BR_BCOND: case BR_CBZ: case BR_CBNZ: case BR_BCOND_W: {
                     uint32_t off = t->imm;
                     LLVMValueRef cond = NULL;
                     if (t->op == BR_B) { off <<= 1; if (off & 0x800) off |= 0xFFFFF000u; }
                     if (t->op == BR_BCOND) { off <<= 1; if (off & 0x100) off |= 0xFFFFFE00u; }
+                    if (t->op == BR_BCOND_W) { off <<= 1; if (off & 0x100000) off |= 0xFFE00000u; }
                     target = add(a, tpcbase(a), c32(a, off));
-                    if (t->op == BR_BCOND) cond = condition(a, t->ra);
+                    if (t->op == BR_BCOND || t->op == BR_BCOND_W) cond = condition(a, t->ra);
                     else if (t->op == BR_CBZ) cond = cmp(a, LLVMIntEQ, treg(a, t->rn), c32(a, 0));
                     else if (t->op == BR_CBNZ) cond = cmp(a, LLVMIntNE, treg(a, t->rn), c32(a, 0));
                     if (cond) {
@@ -361,7 +399,7 @@ static int thumb_instruction(ArmIR* a, const SnxThumb* t) {
                         setreg(a, 15, target);
                         LLVMBuildBr(a->b, j);
                         LLVMPositionBuilderAtEnd(a->b, nt);
-                        setreg(a, 15, c32(a, a->pc + 2));
+                        setreg(a, 15, c32(a, a->next)); /* B<c>.W is 4 bytes */
                         LLVMBuildBr(a->b, j);
                         LLVMPositionBuilderAtEnd(a->b, j);
                     } else {
@@ -408,6 +446,7 @@ LLVMValueRef snx_thumb_llvm_block_ex(LLVMModuleRef module, const char* name, con
         LLVMGetNamedFunction(module, name) || LLVMGetNamedGlobal(module, name))
         return NULL;
     if (options) { a.profile = options->profile; a.memory = options->memory; }
+    a.thumb = 1;
     a.ctx = LLVMGetModuleContext(module);
     a.mod = module;
     a.b = LLVMCreateBuilderInContext(a.ctx);
@@ -438,17 +477,21 @@ LLVMValueRef snx_thumb_llvm_block_ex(LLVMModuleRef module, const char* name, con
         unsigned cond = 14;
         int stop;
         if (!len || (len == TH_F32 && used + 1 >= count)) {
+            /* the backend's (SnxArmRt.undefined): a Thumb32 one as hw1 | hw2 << 16, when its second half is here */
+            unsigned units = (hw1 >> 11) >= 0x1D && used + 1 < count ? 2 : 1;
             a.pc = pc + (uint32_t)used * 2;
-            a.word = hw1;
+            a.next = a.pc + units * 2;
+            a.word = units == 2 ? (uint32_t)hw1 | ((uint32_t)hw2 << 16) : hw1;
             setreg(&a, 15, c32(&a, a.pc));
-            instruction_fetch(&a, hw1, 2);
-            trap(&a, SNX_ARM_UNDEFINED, c32(&a, hw1));
-            ++used;
+            instruction_fetch(&a, a.word, units * 2);
+            trap(&a, SNX_ARM_UNDEFINED, c32(&a, a.word));
+            used += units;
             break;
         }
         a.pc = pc + (uint32_t)used * 2;
         a.word = hw1;
         next_pc = a.pc + len * 2;
+        a.next = next_pc;
         setreg(&a, 15, c32(&a, a.pc));
         instruction_fetch(&a, len == TH_F32 ? (uint32_t)hw1 | ((uint32_t)hw2 << 16) : hw1, len * 2);
         if (it_idx < it_len) cond = it_conds[it_idx++];

@@ -1,10 +1,12 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The gamepads (runtime/platform/backend/gamepad.c) on SDL's virtual ones, under its dummy video driver: per-slot and
-   legacy combined input, common layouts, focus behavior, motion sensors, and a waiting pad taking a freed slot */
+/* The gamepads (runtime/platform/backend/gamepad.c) on SDL's virtual ones, under its dummy video driver: the launcher's
+   SDL mappings, per-slot and legacy combined input, common layouts, focus behavior, motion sensors, and a waiting pad
+   taking a freed slot */
 #include "nx/runtime/platform/gamepad.h"
 #include "nx/runtime/options.h"
 #include "nx/runtime/platform/plat.h"
+#include "common/utilities/common.h"
 #include <SDL3/SDL.h>
 #include <string.h>
 #include <stdio.h>
@@ -12,7 +14,7 @@
 #include <math.h>
 
 int g_verbose;
-char g_confdir[1024];
+char g_confdir[1024], g_exedir[1024];
 void logf_(int lvl, const char* fmt, ...) {
     (void)lvl;
     (void)fmt;
@@ -55,7 +57,7 @@ static void pump(void) {
             gamepad_close(e.gdevice.which);
 }
 /* what each pad's motors were last told: low (the heavy one) | high << 16 */
-static Uint32 motors[12];
+static Uint32 motors[16];
 static int pads;
 static bool SDLCALL rumble(void* pad, Uint16 low, Uint16 high) {
     *(Uint32*)pad = low | (Uint32)high << 16;
@@ -142,12 +144,36 @@ int main(void) {
     w = SDL_CreateWindow("gamepad", 64, 64, 0);
     CHECK(w != NULL && SDL_GetKeyboardFocus() == w);
 
-    /* the face buttons as their labels say: A at the bottom on the most common layout */
+    /* the SDL mappings of the launcher whose games/ the game is in, beside its settings.ini: a portable copy's
+       config/gamecontrollerdb.txt. SDL takes a line of a file only with its own platform */
+    {
+        char line[160];
+        char *root = snx_temp_dir(NULL), *copy = snx_path_join(root, ".scarletnx");
+        char *config = snx_path_join(copy, "config"), *game = snx_path_join(copy, "games/0100DA801624E000");
+        char *db = snx_path_join(config, "gamecontrollerdb.txt"), *mapping;
+        snprintf(line, sizeof line, "03000000341200007856000000000000,Odd Stick,a:b0,b:b1,x:b2,y:b3,platform:%s,\n",
+                 SDL_GetPlatform());
+        CHECK(root && !snx_mkdirs(config) && !snx_mkdirs(game) && !snx_write_file(db, line, strlen(line)));
+        snprintf(g_exedir, sizeof g_exedir, "%s/", game);
+        gamepad_scan();
+        mapping = SDL_GetGamepadMappingForGUID(SDL_StringToGUID("03000000341200007856000000000000"));
+        CHECK(mapping && strstr(mapping, "Odd Stick"));
+        SDL_free(mapping);
+        g_exedir[0] = 0;
+        CHECK(!snx_remove_tree(root));
+        free(db);
+        free(game);
+        free(config);
+        free(copy);
+        free(root);
+    }
+
+    /* the face buttons where the console's are, on every pad: A right, B bottom, X top, Y left */
     xbox = attach(XBOX);
-    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == A);
-    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_EAST) == B);
-    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_WEST) == X);
-    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_NORTH) == Y);
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == B);
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_EAST) == A);
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_WEST) == Y);
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_NORTH) == X);
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_START) == PLUS);
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_DPAD_LEFT) == LEFT);
     /* a trigger is ZL or ZR past a quarter of its travel */
@@ -163,7 +189,7 @@ int main(void) {
     CHECK(SDL_GetKeyboardFocus() == NULL);
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == 0);
     CHECK(gamepad_ini("gamepad_background", "1"));
-    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == A);
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == B);
     sticks(xbox, SDL_JOYSTICK_AXIS_MAX, 0, s);
     CHECK(s[0] == 32767);
     sticks(xbox, 0, 0, s);
@@ -193,59 +219,63 @@ int main(void) {
     CHECK(gamepad_ini("gamepad_deadzone", "20"));
     sticks(xbox, 0, 0, s);
 
-    /* the console's own layout, A on the right; the symbols as the letters where they sit on the common one, and the
-       older console's big A in the middle and B on the left */
+    /* every pad the same, by where its buttons sit: the console's own, a PlayStation pad's, the older console's */
     pro = attach(SWITCH);
     CHECK(with(pro, SDL_GAMEPAD_BUTTON_EAST) == A);
     CHECK(with(pro, SDL_GAMEPAD_BUTTON_SOUTH) == B);
     CHECK(with(pro, SDL_GAMEPAD_BUTTON_NORTH) == X);
     CHECK(with(pro, SDL_GAMEPAD_BUTTON_WEST) == Y);
     sony = attach(SONY);
-    CHECK(with(sony, SDL_GAMEPAD_BUTTON_SOUTH) == A);
-    CHECK(with(sony, SDL_GAMEPAD_BUTTON_EAST) == B);
-    CHECK(with(sony, SDL_GAMEPAD_BUTTON_WEST) == X);
-    CHECK(with(sony, SDL_GAMEPAD_BUTTON_NORTH) == Y);
+    CHECK(with(sony, SDL_GAMEPAD_BUTTON_SOUTH) == B);
+    CHECK(with(sony, SDL_GAMEPAD_BUTTON_EAST) == A);
+    CHECK(with(sony, SDL_GAMEPAD_BUTTON_WEST) == Y);
+    CHECK(with(sony, SDL_GAMEPAD_BUTTON_NORTH) == X);
     cube = attach(GAMECUBE);
-    CHECK(with(cube, SDL_GAMEPAD_BUTTON_SOUTH) == A);
-    CHECK(with(cube, SDL_GAMEPAD_BUTTON_WEST) == B);
-    CHECK(with(cube, SDL_GAMEPAD_BUTTON_EAST) == X);
-    CHECK(with(cube, SDL_GAMEPAD_BUTTON_NORTH) == Y);
+    CHECK(with(cube, SDL_GAMEPAD_BUTTON_SOUTH) == B);
+    CHECK(with(cube, SDL_GAMEPAD_BUTTON_WEST) == Y);
+    CHECK(with(cube, SDL_GAMEPAD_BUTTON_EAST) == A);
+    CHECK(with(cube, SDL_GAMEPAD_BUTTON_NORTH) == X);
     /* the game's menu reads them the same: A selects, B goes back */
-    CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_SOUTH) == A);
-    CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_EAST) == B);
+    CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_SOUTH) == B);
+    CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_EAST) == A);
     CHECK(gamepad_button(SDL_GetJoystickID(pro), SDL_GAMEPAD_BUTTON_EAST) == A);
     CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_DPAD_UP) == UP);
     CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_GUIDE) == 0);
 
-    /* gamepad_buttons=0: by position on every pad, as on the console's controller: A right, B bottom, X top, Y left */
-    CHECK(gamepad_ini("gamepad_buttons", "0"));
-    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_EAST) == A);
-    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == B);
+    /* gamepad_swap_ab=1: A and B swapped, X and Y where the console's are; a key that is none of these is no gamepad
+       key, and gamepad_buttons is one no longer (docs/DEPRECATIONS.md) */
+    CHECK(gamepad_ini("gamepad_swap_ab", "1"));
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == A);
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_EAST) == B);
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_NORTH) == X);
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_WEST) == Y);
-    CHECK(with(cube, SDL_GAMEPAD_BUTTON_EAST) == A);
-    CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_SOUTH) == B);
-    CHECK(gamepad_ini("gamepad_buttons", "1") && !gamepad_ini("gamepad", "1"));
+    CHECK(with(cube, SDL_GAMEPAD_BUTTON_EAST) == B);
+    CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_SOUTH) == A);
+    CHECK(gamepad_ini("gamepad_swap_ab", "0") && !gamepad_ini("gamepad", "1") && !gamepad_ini("gamepad_buttons", "1"));
 
-    /* gamepad_buttons=2: the player's map, each control what it names, the others as their labels say (a PlayStation
-       pad's too), a trigger as any button; held controls are told apart from what they send; a map it cannot read
-       leaves the one before */
-    CHECK(gamepad_ini("gamepad_buttons", "2") && gamepad_ini("gamepad_map", "south:B east:A lt:R start:None"));
-    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == B);
-    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_EAST) == A);
-    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_WEST) == X);
-    CHECK(with(sony, SDL_GAMEPAD_BUTTON_SOUTH) == B);
-    CHECK(with(sony, SDL_GAMEPAD_BUTTON_NORTH) == Y);
+    /* gamepad_map: the player's map, each control what it names, the others where the console's are (a PlayStation
+       pad's too), a trigger as any button; held controls are told apart from what they send; A and B swapped over it;
+       a map it cannot read leaves the one before; an empty one is none */
+    CHECK(gamepad_ini("gamepad_map", "south:A east:B lt:R start:None"));
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == A);
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_EAST) == B);
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_WEST) == Y);
+    CHECK(with(sony, SDL_GAMEPAD_BUTTON_SOUTH) == A);
+    CHECK(with(sony, SDL_GAMEPAD_BUTTON_NORTH) == X);
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_START) == 0);
-    CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_EAST) == A);
+    CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_EAST) == B);
     SDL_SetJoystickVirtualAxis(xbox, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MAX);
     CHECK(buttons() == (1ull << 7) && (gamepad_held() & 1u << SNX_PAD_LT)); /* R */
     SDL_SetJoystickVirtualAxis(xbox, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MIN);
     CHECK(buttons() == 0 && !gamepad_held());
-    CHECK(gamepad_ini("gamepad_map", "south:Q"));
+    CHECK(gamepad_ini("gamepad_swap_ab", "1"));
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == B);
-    CHECK(gamepad_ini("gamepad_buttons", "1"));
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_EAST) == A);
+    CHECK(gamepad_ini("gamepad_swap_ab", "0"));
+    CHECK(gamepad_ini("gamepad_map", "south:Q"));
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == A);
+    CHECK(gamepad_ini("gamepad_map", ""));
+    CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == B);
 
     /* the game's vibration on every pad: each motor the stronger of the left and right devices' bands, as strong as
        gamepad_rumble says */
@@ -265,10 +295,10 @@ int main(void) {
 
     /* the legacy combined state merges every pad, and the first stick that is pushed wins */
     SDL_SetJoystickVirtualButton(xbox, SDL_GAMEPAD_BUTTON_SOUTH, true);
-    SDL_SetJoystickVirtualButton(pro, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    SDL_SetJoystickVirtualButton(pro, SDL_GAMEPAD_BUTTON_EAST, true);
     CHECK(buttons() == (A | B));
     SDL_SetJoystickVirtualButton(xbox, SDL_GAMEPAD_BUTTON_SOUTH, false);
-    SDL_SetJoystickVirtualButton(pro, SDL_GAMEPAD_BUTTON_SOUTH, false);
+    SDL_SetJoystickVirtualButton(pro, SDL_GAMEPAD_BUTTON_EAST, false);
     sticks(pro, SDL_JOYSTICK_AXIS_MIN, 0, s);
     CHECK(s[0] <= -32767 && s[1] == 0);
     sticks(pro, 0, 0, s);
@@ -333,9 +363,11 @@ int main(void) {
     gamepad_config()->deadzone = 35;
     gamepad_store(&gamepad_config()->deadzone);
     CHECK(!strcmp(stored, "gamepad_deadzone=35"));
-    gamepad_config()->labels = 0;
-    gamepad_store(&gamepad_config()->labels);
-    CHECK(!strcmp(stored, "gamepad_buttons=0"));
+    gamepad_config()->swap_ab = 1;
+    gamepad_store(&gamepad_config()->swap_ab);
+    CHECK(!strcmp(stored, "gamepad_swap_ab=1"));
+    gamepad_config()->swap_ab = 0;
+    gamepad_store(&gamepad_config()->swap_ab);
     gamepad_config()->background = 1; /* applied at once */
     gamepad_store(&gamepad_config()->background);
     CHECK(!strcmp(stored, "gamepad_background=1") &&
@@ -354,6 +386,55 @@ int main(void) {
         pump();
         CHECK(gamepad_slot_id(1) == SDL_GetJoystickID(extra[4]) && gamepad_slot_id(1) != old_id);
         CHECK(with(extra[4], SDL_GAMEPAD_BUTTON_SOUTH) == B);
+    }
+
+    /* each player its own, as Eden has them: A and B, the map, the vibration, seen or not and the kind the game sees,
+       each over every player's; and the controller it names, which it takes whenever it comes */
+    {
+        SDL_Joystick* first = SDL_GetJoystickFromID(gamepad_slot_id(0));
+        SDL_Joystick* second = SDL_GetJoystickFromID(gamepad_slot_id(1));
+        SDL_Joystick *named, *twin;
+        char guid[40];
+        CHECK(first && second);
+        CHECK(gamepad_ini("gamepad_p1_swap_ab", "1"));
+        CHECK(with(first, SDL_GAMEPAD_BUTTON_SOUTH) == A && with(second, SDL_GAMEPAD_BUTTON_SOUTH) == B);
+        CHECK(gamepad_ini("gamepad_swap_ab", "1") && with(second, SDL_GAMEPAD_BUTTON_SOUTH) == A); /* every player's */
+        CHECK(gamepad_ini("gamepad_p2_swap_ab", "0") && with(second, SDL_GAMEPAD_BUTTON_SOUTH) == B); /* its own */
+        CHECK(gamepad_ini("gamepad_swap_ab", "0") && gamepad_ini("gamepad_p1_swap_ab", "-1") &&
+              gamepad_ini("gamepad_p2_swap_ab", "-1"));
+        CHECK(gamepad_ini("gamepad_p2_map", "south:X"));
+        CHECK(with(second, SDL_GAMEPAD_BUTTON_SOUTH) == X && with(first, SDL_GAMEPAD_BUTTON_SOUTH) == B);
+        CHECK(gamepad_ini("gamepad_p2_map", "south:Q") && with(second, SDL_GAMEPAD_BUTTON_SOUTH) == X); /* kept */
+        CHECK(gamepad_ini("gamepad_p2_map", "") && with(second, SDL_GAMEPAD_BUTTON_SOUTH) == B); /* none: all's */
+        CHECK(gamepad_ini("gamepad_p1_rumble", "0"));
+        gamepad_rumble_slot(0, 0xFFFFu, 0);
+        CHECK(motors[0] == 0);
+        CHECK(gamepad_ini("gamepad_p1_rumble", "-10"));
+        gamepad_rumble_slot(0, 0xFFFFu, 0);
+        CHECK(motors[0] == 0xFFFFu);
+        CHECK(gamepad_player_seen(1) && gamepad_ini("gamepad_p2_connected", "0") && !gamepad_player_seen(1));
+        CHECK(gamepad_ini("gamepad_p1_connected", "0") && gamepad_player_seen(0)); /* player 1 always */
+        CHECK(gamepad_player_kind(1, SNX_PAD_FULL_KEY) == SNX_PAD_FULL_KEY);
+        CHECK(gamepad_ini("gamepad_p2_type", "3") && gamepad_player_kind(1, SNX_PAD_FULL_KEY) == SNX_PAD_JOY_LEFT);
+        CHECK(gamepad_ini("gamepad_p1_connected", "1") && gamepad_ini("gamepad_p2_connected", "1") &&
+              gamepad_ini("gamepad_p2_type", "0"));
+        /* players 1 and 3 free; player 3 names a PlayStation pad's GUID: one plugged in takes it, not 1; a second
+           alike (GUID/2) takes the first free player that names none */
+        SDL_DetachVirtualJoystick(gamepad_slot_id(0));
+        SDL_DetachVirtualJoystick(gamepad_slot_id(2));
+        pump();
+        CHECK(!gamepad_slot_connected(0) && !gamepad_slot_connected(2));
+        named = attach(SONY);
+        CHECK(gamepad_slot_id(0) == SDL_GetJoystickID(named)); /* nobody names it yet: player 1, the first free */
+        SDL_GUIDToString(SDL_GetJoystickGUID(named), guid, sizeof guid);
+        SDL_DetachVirtualJoystick(SDL_GetJoystickID(named));
+        pump();
+        CHECK(gamepad_ini("gamepad_p3_device", guid));
+        named = attach(SONY);
+        CHECK(gamepad_slot_id(2) == SDL_GetJoystickID(named) && !gamepad_slot_connected(0));
+        twin = attach(SONY);
+        CHECK(gamepad_slot_id(0) == SDL_GetJoystickID(twin));
+        CHECK(gamepad_ini("gamepad_p3_device", ""));
     }
 
     SDL_DestroyWindow(w);

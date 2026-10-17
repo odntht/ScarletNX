@@ -24,12 +24,17 @@ static u64 g_start;
 static u64 g_press = 0;
 static int g_press_at = 0, g_press_len = 300; /* ms */
 /* script: "ms:hex,ms:hex,...", parsed each time the option is set (a script= under the .ini's [Other] again on
-   each reload) */
+   each reload). "Nf:hex" presses at present N instead: games that advance one step per presented frame (Catherine)
+   reach a screen at the same present however slow the machine runs, and a press timed in ms can come before it
+   there */
 typedef struct {
     u64 t, mask;
+    int frames; /* t counts presents */
+    u64 began;  /* frames: 1 + the ms it was first due, 0 before */
 } ScriptPress;
 static ScriptPress* g_script;
 static int g_nscript;
+static char* g_script_text;
 
 static void script_parse(const char* v) {
     free(g_script);
@@ -40,6 +45,8 @@ static void script_parse(const char* v) {
     while (*p) {
         char* e;
         u64 t = strtoull(p, &e, 10);
+        int frames = e != p && *e == 'f';
+        if (frames) e++;
         if (e == p || *e != ':') break;
         const char* m0 = e + 1;
         u64 m = strtoull(m0, &e, 16);
@@ -53,10 +60,10 @@ static void script_parse(const char* v) {
             }
             g_script = n;
         }
-        g_script[g_nscript++] = (ScriptPress){t, m};
+        g_script[g_nscript++] = (ScriptPress){t, m, frames, 0};
         p = *e ? e + 1 : e;
     }
-    if (*p) WARN("script: \"%s\" is not ms:hex, so it and the presses after it are ignored\n", p);
+    if (*p) WARN("script: \"%s\" is not ms:hex or Nf:hex, so it and the presses after it are ignored\n", p);
 }
 
 static void shot_set(const IniOpt* o, const char* v) {
@@ -70,7 +77,16 @@ static void press_set(const IniOpt* o, const char* v) {
 }
 static void script_set(const IniOpt* o, const char* v) {
     (void)o;
+    /* An unrelated INI change reapplies script too. Keep the progress of unchanged frame-based presses. */
+    if (g_script_text && !strcmp(g_script_text, v)) return;
+    char* text = strdup(v);
+    if (!text) {
+        WARN("script: out of memory, keeping the current script\n");
+        return;
+    }
     script_parse(v);
+    free(g_script_text);
+    g_script_text = text;
 }
 /* given as --key=value, or read from the .ini's [Other] (none is in its sections, so none is written with help) */
 static const IniOpt INI[] = {{"seconds", NULL, NULL, INI_INT, 0, &g_seconds, 0, INT_MAX, NULL, NULL, NULL, 0, 0},
@@ -93,8 +109,14 @@ int unattended_active(void) { return g_seconds || g_maxframes >= 0; }
 u64 unattended_buttons(void) {
     u64 el = (plat_ns() - g_start) / 1000000ull, b = 0;
     if (g_press && el >= (u64)g_press_at && el < (u64)g_press_at + (u64)g_press_len) b |= g_press;
-    for (int i = 0; i < g_nscript; i++)
-        if (el >= g_script[i].t && el < g_script[i].t + (u64)g_press_len) b |= g_script[i].mask;
+    for (int i = 0; i < g_nscript; i++) {
+        ScriptPress* s = &g_script[i];
+        if (s->frames) {
+            if (!s->began && (u64)__atomic_load_n(&g_frames, __ATOMIC_RELAXED) >= s->t) s->began = el + 1;
+            if (s->began && el < s->began - 1 + (u64)g_press_len) b |= s->mask;
+        } else if (el >= s->t && el < s->t + (u64)g_press_len)
+            b |= s->mask;
+    }
     return b;
 }
 const char* unattended_shot(void) { return g_shot; }
@@ -120,9 +142,7 @@ void unattended_exit(u64 hash, int w, int h) {
     else
         fprintf(stderr, "\nframes=%d hash=%016llx\n", frames, (unsigned long long)hash);
     ini_poll(1); /* what changed in the run since the last poll is saved, as on a quit */
-    save_hints();
-    /* the process ends without shutting the renderer down, so it saves its pipeline cache here */
-    if (g_renderer && g_renderer->save) g_renderer->save();
+    snx_save_before_exit();
     plat_exit_now(0);
 }
 

@@ -46,7 +46,8 @@ enum {
     SNX_AUDREN_WARN_EFFECT = 4,
     SNX_AUDREN_WARN_FORMAT = 8,
     SNX_AUDREN_WARN_COUNTS = 16,
-    SNX_AUDREN_WARN_RANGE = 32
+    SNX_AUDREN_WARN_RANGE = 32,
+    SNX_AUDREN_WARN_MIX_ID = 64
 };
 static void warn_once(ARState* s, u32 bit, const char* what) {
     if (s->warned & bit) return;
@@ -235,8 +236,10 @@ static void take_wave(ARWave* w, const u8* wb, u8 format) {
 
 /* VoiceIn: id 0, is_new 8, in_use 9, play state 0xA, format 0xB, rate 0xC, channels 0x18, pitch 0x1C, volume 0x20,
    biquads 0x24, wave buffer count 0x3C and index 0x40, data 0x48 and size 0x50, mix 0x58, splitter 0x5C, wave
-   buffers 0x60 (0x38 each), channel resources 0x140, flush count 0x159, flags 0x15C, conversion quality 0x15E */
-static void update_voice(ARState* s, ARVoice* v, const u8* vi, u8* vo) {
+   buffers 0x60 (0x38 each), channel resources 0x140, flush count 0x159, flags 0x15C, conversion quality 0x15E.
+   From revision 15 (v2, Eden's VoiceInParameterV2) the biquads hold floats, 0x18 each, and what follows them is 0x18
+   further on: 0x188 a voice */
+static void update_voice(ARState* s, ARVoice* v, const u8* vi, u8* vo, int v2) {
     if (vi[8]) { /* is_new: its buffers start over, and the channels with the first frame */
         memset(v, 0, sizeof *v);
         v->fresh = 1;
@@ -254,19 +257,21 @@ static void update_voice(ARState* s, ARVoice* v, const u8* vi, u8* vo) {
                 break;
             case 2: v->play = SNX_AUDREN_PAUSED; break;
         }
-        if (vi[0x15E] <= 2) v->quality = vi[0x15E];
         v->format = vi[0xB];
         v->rate = rd32(vi + 0xC);
         u32 ch = rd32(vi + 0x18);
         v->channels = (u8)(ch < 1 ? 1 : ch > SNX_AUDREN_CHANNELS ? SNX_AUDREN_CHANNELS : ch);
         v->pitch = rdf(vi + 0x1C);
         v->volume = rdf(vi + 0x20);
-        for (f = 0; f < 2; f++) { /* enabled 0, b 2, a 8 */
-            const u8* bq = vi + 0x24 + f * 0xC;
+        for (f = 0; f < 2; f++) { /* enabled 0, Q14 b 2 and a 8; v2's floats b 4 and a 0x10, never in Q14 */
+            const u8* bq = vi + 0x24 + f * (v2 ? 0x18 : 0xC);
+            int k;
             v->bq_on[f] = bq[0];
-            memcpy(v->bq_b[f], bq + 2, sizeof v->bq_b[f]);
-            memcpy(v->bq_a[f], bq + 8, sizeof v->bq_a[f]);
+            for (k = 0; k < 3; k++) v->bq_b[f][k] = v2 ? rdf(bq + 4 + k * 4) : (i16)rd16(bq + 2 + k * 2) / 16384.0f;
+            for (k = 0; k < 2; k++) v->bq_a[f][k] = v2 ? rdf(bq + 0x10 + k * 4) : (i16)rd16(bq + 8 + k * 2) / 16384.0f;
         }
+        vi += v2 ? 0x18 : 0; /* the rest at the offsets above */
+        if (vi[0x15E] <= 2) v->quality = vi[0x15E];
         v->wave_count = rd32(vi + 0x3C);
         v->wave_index = rd16(vi + 0x40) % SNX_AUDREN_WAVES;
         v->data = rd64(vi + 0x48);
@@ -395,20 +400,27 @@ int audren_state_update(ARState* s, const u8* in, u64 is, u8* out, u64 os) {
                    (unsigned long long)need, (unsigned long long)is);
         return -41;
     }
-    u32 npools = ih[2] / 0x20, nres = ih[4] / 0x70, nvoices = ih[3] / 0x170, neff = ih[5] / 0xC0, nmix = ih[6] / 0x930,
-        nsinks = ih[7] / 0x140;
+    int voice_v2 = revn >= 15; /* 0x188 a voice (update_voice) */
+    u32 voice_size = voice_v2 ? 0x188 : 0x170, npools = s->neffects + s->nvoices * 4, nmix;
     int eff_v2 = revn >= 9;
-    u32 o_mp = npools * 0x10, o_vo = nvoices * 0x10, o_ef = neff * (eff_v2 ? 0x90 : 0x10), o_sk = nsinks * 0x20,
-        o_pf = 0x10, o_bh = 0xB0, o_ri = revn >= 5 ? 0x10 : 0;
+    /* the opened renderer's counts fix both layouts: Eden and Ryubing refuse a section of another size */
+    if (ih[2] != npools * 0x20 || ih[3] != s->nvoices * voice_size || ih[4] != s->nres * 0x70 ||
+        ih[5] != s->neffects * 0xC0 || ih[7] != s->nsinks * 0x140) {
+        WARN_LIMIT(4,
+                   "audren: update sections (pools %lu, voices %lu, resources %lu, effects %lu, sinks %lu bytes) "
+                   "differ from the opened renderer's\n",
+                   (unsigned long)ih[2], (unsigned long)ih[3], (unsigned long)ih[4], (unsigned long)ih[5],
+                   (unsigned long)ih[7]);
+        return -41;
+    }
+    u32 o_mp = npools * 0x10, o_vo = s->nvoices * 0x10, o_ef = s->neffects * (eff_v2 ? 0x90 : 0x10),
+        o_sk = s->nsinks * 0x20, o_pf = 0x10, o_bh = 0xB0, o_ri = revn >= 5 ? 0x10 : 0;
     u64 total = 0x40 + (u64)o_mp + o_vo + o_ef + o_sk + o_pf + o_bh + o_ri;
     if (total > os) {
         WARN_LIMIT(4, "audren: output buffer too small (%llu > %llu)\n", (unsigned long long)total,
                    (unsigned long long)os);
         return -4;
     }
-    if (nvoices > s->nvoices || nres > s->nres || neff > s->neffects || nmix > s->nmix || nsinks > s->nsinks)
-        warn_once(s, SNX_AUDREN_WARN_COUNTS,
-                  "an update holds more voices, effects, mixes or sinks than the renderer opened");
     s->rev = rev;
     const u8* p = in + 0x40 + ih[1];
     const u8* pools = p;
@@ -424,6 +436,21 @@ int audren_state_update(ARState* s, const u8* in, u64 is, u8* out, u64 os) {
     const u8* mixes = p;
     p += ih[6];
     const u8* sinks = p;
+
+    if (revn >= 7) {
+        /* REV7 adds a 32-byte header before dirty-only mix entries; Eden and Ryubing refuse a section without it, an
+           empty one too */
+        nmix = ih[6] >= 0x20 ? rd32(mixes + 4) : 0;
+        if (ih[6] < 0x20 || (u64)ih[6] != 0x20 + (u64)nmix * 0x930) {
+            WARN_LIMIT(4, "audren: REV7 mix section of %lu bytes does not match its entry count\n",
+                       (unsigned long)ih[6]);
+            return -41;
+        }
+        mixes += 0x20;
+    } else {
+        nmix = ih[6] / 0x930;
+    }
+    if (nmix > s->nmix) warn_once(s, SNX_AUDREN_WARN_COUNTS, "an update holds more mixes than the renderer opened");
 
     memset(out, 0, total);
     u32 oh[16] = {0};
@@ -445,40 +472,37 @@ int audren_state_update(ARState* s, const u8* in, u64 is, u8* out, u64 os) {
     }
     q += o_mp;
     /* voice channel resources: id 0, send volumes 4, in_use 0x64 */
-    for (u32 i = 0; i < nres && i < s->nres; i++) {
+    for (u32 i = 0; i < s->nres; i++) {
         const u8* r = res + i * 0x70;
         ARChannel* c = &s->chan[i];
         c->in_use = r[0x64];
         if (c->in_use) memcpy(c->mix, r + 4, sizeof c->mix);
     }
-    for (u32 i = 0; i < nvoices; i++)
-        if (i < s->nvoices) update_voice(s, &s->voice[i], voices + i * 0x170, q + i * 0x10);
+    for (u32 i = 0; i < s->nvoices; i++) update_voice(s, &s->voice[i], voices + i * voice_size, q + i * 0x10, voice_v2);
     q += o_vo;
     /* effects: type 0, is_new 1, enabled 2, mix 4, process order 0x18, the type's parameters from 0x20. Out:
        Used(3) while enabled, Removed(4) */
-    for (u32 i = 0; i < neff; i++) {
+    for (u32 i = 0; i < s->neffects; i++) {
         const u8* ei = effects + i * 0xC0;
-        if (i < s->neffects) {
-            AREffect* e = &s->effect[i];
-            if (e->type != ei[0]) { /* another effect in the slot starts from nothing (Eden's ResetEffect) */
-                memset(e->p, 0, sizeof e->p);
-                e->enabled = 0;
-                e->mix_id = SNX_AUDREN_UNUSED_MIX;
-                memset(e->bq, 0, sizeof e->bq);
-                fx_free(e);
-            }
-            if (ei[1] || e->type != ei[0]) e->fresh = 1;
-            e->type = ei[0];
-            if (stateful_at(e->type))
-                update_stateful(e, ei, stateful_at(e->type));
-            else if (e->type == SNX_AUDREN_EFFECT_COMPRESSOR && !eff_v2) {
-                /* Eden takes no version 1 update for the compressor: it stays unused */
-            } else {
-                e->enabled = ei[2];
-                e->mix_id = rd32(ei + 4);
-                e->order = rd32(ei + 0x18);
-                memcpy(e->p, ei + 0x20, sizeof e->p);
-            }
+        AREffect* e = &s->effect[i];
+        if (e->type != ei[0]) { /* another effect in the slot starts from nothing (Eden's ResetEffect) */
+            memset(e->p, 0, sizeof e->p);
+            e->enabled = 0;
+            e->mix_id = SNX_AUDREN_UNUSED_MIX;
+            memset(e->bq, 0, sizeof e->bq);
+            fx_free(e);
+        }
+        if (ei[1] || e->type != ei[0]) e->fresh = 1;
+        e->type = ei[0];
+        if (stateful_at(e->type))
+            update_stateful(e, ei, stateful_at(e->type));
+        else if (e->type == SNX_AUDREN_EFFECT_COMPRESSOR && !eff_v2) {
+            /* Eden takes no version 1 update for the compressor: it stays unused */
+        } else {
+            e->enabled = ei[2];
+            e->mix_id = rd32(ei + 4);
+            e->order = rd32(ei + 0x18);
+            memcpy(e->p, ei + 0x20, sizeof e->p);
         }
         q[i * (eff_v2 ? 0x90 : 0x10)] = ei[2] ? 3 : 4;
     }
@@ -487,6 +511,11 @@ int audren_state_update(ARState* s, const u8* in, u64 is, u8* out, u64 os) {
     for (u32 i = 0; i < nmix; i++) {
         const u8* mi = mixes + i * 0x930;
         u32 id = rd32(mi + 0x10);
+        /* from REV7 an entry is not mix i: one naming a mix the renderer did not open is skipped */
+        if (id >= s->nmix && revn >= 7) {
+            warn_once(s, SNX_AUDREN_WARN_MIX_ID, "a mix update names a mix the renderer did not open");
+            continue;
+        }
         if (id >= s->nmix) id = i;
         if (id >= s->nmix) continue;
         ARMix* m = &s->mix[id];
@@ -500,15 +529,13 @@ int audren_state_update(ARState* s, const u8* in, u64 is, u8* out, u64 os) {
     }
     /* sinks: type 0, in_use 1, the type's parameters from 0x20. Out: a circular buffer sink's write offset, two
        frames behind where it writes, as Eden's CircularBufferSinkInfo reports last_pos2 */
-    for (u32 i = 0; i < nsinks; i++) {
+    for (u32 i = 0; i < s->nsinks; i++) {
         const u8* si = sinks + i * 0x140;
-        if (i < s->nsinks) {
-            ARSink* k = &s->sink[i];
-            k->type = si[0];
-            k->in_use = si[1];
-            memcpy(k->p, si + 0x20, sizeof k->p);
-            wr32(q + i * 0x20, k->last2);
-        }
+        ARSink* k = &s->sink[i];
+        k->type = si[0];
+        k->in_use = si[1];
+        memcpy(k->p, si + 0x20, sizeof k->p);
+        wr32(q + i * 0x20, k->last2);
     }
     q += o_sk;
     q += o_pf;
@@ -951,11 +978,13 @@ static void effect_mix(ARState* s, ARMix* m, AREffect* e) {
     }
 }
 
-/* Eden's BiquadFilterCommand: doubles from revision 7, integers rounded at bit 14 before */
-static void biquad(float* x, u32 n, const i16* b, const i16* a, ARBiquad* st, int float_processing) {
+/* Eden's BiquadFilterCommand: doubles from revision 7, integers rounded at bit 14 before, when every coefficient
+   came in Q14 and goes back to it exactly */
+static void biquad(float* x, u32 n, const float* b, const float* a, ARBiquad* st, int float_processing) {
     u32 i;
+    i64 qb0, qb1, qb2, qa0, qa1;
     if (float_processing) {
-        double b0 = b[0] / 16384.0, b1 = b[1] / 16384.0, b2 = b[2] / 16384.0, a0 = a[0] / 16384.0, a1 = a[1] / 16384.0;
+        double b0 = b[0], b1 = b[1], b2 = b[2], a0 = a[0], a1 = a[1];
         for (i = 0; i < n; i++) {
             double in = x[i], y = in * b0 + st->x1 * b1 + st->x2 * b2 + st->y1 * a0 + st->y2 * a1;
             x[i] = (float)(i32)(y >= 2147483647.0 ? 2147483647.0 : y <= -2147483648.0 ? -2147483648.0 : y);
@@ -966,12 +995,14 @@ static void biquad(float* x, u32 n, const i16* b, const i16* a, ARBiquad* st, in
         }
         return;
     }
+    qb0 = (i64)(b[0] * 16384.0f), qb1 = (i64)(b[1] * 16384.0f), qb2 = (i64)(b[2] * 16384.0f);
+    qa0 = (i64)(a[0] * 16384.0f), qa1 = (i64)(a[1] * 16384.0f);
     for (i = 0; i < n; i++) {
-        i64 in = sat32(x[i]), acc = in * b[0] + st->s0, y = (acc + (1 << 13)) >> 14;
+        i64 in = sat32(x[i]), acc = in * qb0 + st->s0, y = (acc + (1 << 13)) >> 14;
         y = y > 2147483647 ? 2147483647 : y < -2147483647 - 1 ? -2147483647 - 1 : y;
         x[i] = (float)y;
-        st->s0 = st->s1 + b[1] * in + a[0] * y;
-        st->s1 = b[2] * in + a[1] * y;
+        st->s0 = st->s1 + qb1 * in + qa0 * y;
+        st->s1 = qb2 * in + qa1 * y;
     }
 }
 
@@ -984,21 +1015,15 @@ static i16 q14(float v) {
 /* Eden's BiquadFilterInfo: Q14 before revision 9, floats from it; updating clears the state before revision 6 */
 static u32 biquad_state_at(const ARState* s) { return rev_number(s->rev) >= 9 ? 0x25 : 0x17; }
 static void effect_biquad(ARState* s, ARMix* m, AREffect* e) {
-    int clear, ch;
+    int clear, ch, k;
     const u8* p = e->p;
     int revn = rev_number(s->rev), v2 = revn >= 9;
     i8 channels = (i8)p[v2 ? 0x24 : 0x16];
     u8 state = p[biquad_state_at(s)];
     u32 n = s->frame;
-    i16 b[3], a[2];
-    if (v2) {
-        int k;
-        for (k = 0; k < 3; k++) b[k] = q14(rdf(p + 0x10 + k * 4));
-        for (k = 0; k < 2; k++) a[k] = q14(rdf(p + 0x1C + k * 4));
-    } else {
-        memcpy(b, p + 0xC, sizeof b);
-        memcpy(a, p + 0x12, sizeof a);
-    }
+    float b[3], a[2]; /* in Q14 over 16384: Eden's effect takes its floats to Q14 */
+    for (k = 0; k < 3; k++) b[k] = (v2 ? q14(rdf(p + 0x10 + k * 4)) : (i16)rd16(p + 0xC + k * 2)) / 16384.0f;
+    for (k = 0; k < 2; k++) a[k] = (v2 ? q14(rdf(p + 0x1C + k * 4)) : (i16)rd16(p + 0x12 + k * 2)) / 16384.0f;
     if (channels <= 0 || state > SNX_AUDREN_PARAM_UPDATED) return;
     if (channels > SNX_AUDREN_CHANNELS) channels = SNX_AUDREN_CHANNELS;
     clear = state == SNX_AUDREN_PARAM_INITIALIZED || (state == SNX_AUDREN_PARAM_UPDATING && revn < 6);

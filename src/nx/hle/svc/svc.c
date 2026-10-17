@@ -4,6 +4,7 @@
    This fork's changes are under GPL-3.0-or-later, the license of the fork as a whole (LICENSE). */
 /* the SVC dispatch: each supervisor call the game makes, by number */
 #include "nx/hle/kernel/kernel_int.h"
+#include "nx/runtime/arm.h"
 static void snx_svc_(CPU* c, u32 imm);
 /* svcCreateEvent's writable end: SignalEvent and ClearEvent take it, WaitSynchronization doesn't */
 typedef struct {
@@ -71,7 +72,43 @@ static void wait_stopped_nl(KThread* self, KThread* n) {
 /* svcGetThreadContext3's ThreadContext, as the console's GetUserContext fills it. A thread paused before or after an
    SVC is in the game's code (at the svc instruction, or past it), so every register is its own. One blocked inside an
    SVC shows what the kernel keeps of it: x19-x28 and v8-v15, with pc at the svc instruction */
+/* A 32-bit thread's: its registers where the architecture maps AArch32's onto AArch64's (r0-r12 in x0-x12, SP and LR
+   in x13 and x14, also given as sp and lr), d0-d31 as q0-q15, and FPSCR split into FPSR and FPCR. Blocked inside an
+   SVC, it shows the registers the AArch32 procedure call standard keeps across one: r4-r11 and d8-d15 */
+static void thread_context32_nl(const KThread* n, u8* p) {
+    const SnxArmCPU* a = &n->arm;
+    int inside = n->pause_at == 0;
+    u64 pc = n->pause_at == 2 ? a->r[15] : a->r[15] - (a->cpsr & SNX_ARM_T ? 2 : 4); /* past the svc, or at it */
+    u64 sp = a->r[13], lr = a->r[14];
+    u32 fpsr = a->fpscr & 0xF800009Fu, fpcr = a->fpscr & 0x07FF9F00u;
+    memset(p, 0, 0x320);
+    if (n->state == 2) return;
+    for (int i = inside ? 4 : 0; i < (inside ? 12 : 15); i++) {
+        u64 r = a->r[i];
+        memcpy(p + i * 8, &r, 8);
+    }
+    memcpy(p + 13 * 8, &sp, 8);
+    memcpy(p + 14 * 8, &lr, 8);
+    memcpy(p + 0xF0, &lr, 8);
+    memcpy(p + 0xF8, &sp, 8);
+    memcpy(p + 0x100, &pc, 8);
+    memcpy(p + 0x108, &a->cpsr, 4);
+    if (inside)
+        memcpy(p + 0x110 + 8 * 8, &a->d[8], 8 * 8);
+    else
+        memcpy(p + 0x110, a->d, 32 * 8);
+    memcpy(p + 0x310, &fpcr, 4);
+    memcpy(p + 0x314, &fpsr, 4);
+    {
+        u64 tls = a->tpidrurw;
+        memcpy(p + 0x318, &tls, 8);
+    }
+}
 static void thread_context_nl(const KThread* n, u8* p) {
+    if (g_arm_mod) {
+        thread_context32_nl(n, p);
+        return;
+    }
     const CPU* c = &n->cpu;
     int inside = n->pause_at == 0;
     u64 pc = n->pause_at == 2 ? c->pc : c->pc - 4; /* the generated code sets pc past the svc before calling it */
@@ -120,6 +157,84 @@ void snx_svc(CPU* c, u32 imm) {
              (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)c->pc);
     svc_leave(t);
 }
+/* The 32-bit SVC ABI. The handlers below read and write the 64-bit one's registers (x0-x7), and a 32-bit thread's call
+   puts its values elsewhere only where Switchbrew's SVC tables give it an "Argument32" column: a 64-bit value in a
+   pair of registers (low, high), and arguments moved to free registers. Every other SVC has its values in the same
+   numbered registers, zero-extended on the way in and truncated on the way out */
+#define R32_NONE 0xFF
+typedef struct {
+    u8 x, lo, hi; /* x[x] is r[lo], or r[hi]:r[lo] */
+} Reg32;
+typedef struct {
+    u8 imm, nin, nout;
+    Reg32 in[6], out[3];
+} Svc32;
+static const Svc32 g_svc32[] = {
+    {0x08,
+     5,
+     2,
+     {{1, 1, R32_NONE}, {2, 2, R32_NONE}, {3, 3, R32_NONE}, {4, 0, R32_NONE}, {5, 4, R32_NONE}},
+     {{0, 0, R32_NONE}, {1, 1, R32_NONE}}},                                            /* CreateThread */
+    {0x0B, 1, 0, {{0, 0, 1}}, {{0}}},                                                  /* SleepThread */
+    {0x0E, 1, 3, {{2, 2, R32_NONE}}, {{0, 0, R32_NONE}, {1, 1, R32_NONE}, {2, 2, 3}}}, /* GetThreadCoreMask */
+    {0x0F, 3, 1, {{0, 0, R32_NONE}, {1, 1, R32_NONE}, {2, 2, 3}}, {{0, 0, R32_NONE}}}, /* SetThreadCoreMask */
+    {0x18, 3, 2, {{1, 1, R32_NONE}, {2, 2, R32_NONE}, {3, 0, 3}}, {{0, 0, R32_NONE}, {1, 1, R32_NONE}}}, /* WaitSync */
+    {0x1C, 4, 1, {{0, 0, R32_NONE}, {1, 1, R32_NONE}, {2, 2, R32_NONE}, {3, 3, 4}}, {{0, 0, R32_NONE}}}, /* WaitCV */
+    {0x1E, 0, 1, {{0}}, {{0, 0, 1}}},                                                             /* GetSystemTick */
+    {0x24, 1, 2, {{1, 1, R32_NONE}}, {{0, 0, R32_NONE}, {1, 1, 2}}},                              /* GetProcessId */
+    {0x25, 1, 2, {{1, 1, R32_NONE}}, {{0, 0, R32_NONE}, {1, 1, 2}}},                              /* GetThreadId */
+    {0x29, 3, 2, {{1, 1, R32_NONE}, {2, 2, R32_NONE}, {3, 0, 3}}, {{0, 0, R32_NONE}, {1, 1, 2}}}, /* GetInfo */
+    {0x30, 2, 2, {{1, 1, R32_NONE}, {2, 2, R32_NONE}}, {{0, 0, R32_NONE}, {1, 1, 2}}}, /* GetResourceLimitLimitValue */
+    {0x31, 2, 2, {{1, 1, R32_NONE}, {2, 2, R32_NONE}}, {{0, 0, R32_NONE}, {1, 1, 2}}}, /* ...CurrentValue */
+    {0x34,
+     4,
+     1,
+     {{0, 0, R32_NONE}, {1, 1, R32_NONE}, {2, 2, R32_NONE}, {3, 3, 4}},
+     {{0, 0, R32_NONE}}},                                                              /* WaitForAddress */
+    {0x37, 2, 2, {{1, 1, R32_NONE}, {2, 2, R32_NONE}}, {{0, 0, R32_NONE}, {1, 1, 2}}}, /* ...PeakValue */
+    {0x43,
+     4,
+     2,
+     {{1, 1, R32_NONE}, {2, 2, R32_NONE}, {3, 3, R32_NONE}, {4, 0, 4}},
+     {{0, 0, R32_NONE}, {1, 1, R32_NONE}}}, /* ReplyAndReceive */
+    {0x44,
+     6,
+     2,
+     {{1, 1, R32_NONE}, {2, 2, R32_NONE}, {3, 3, R32_NONE}, {4, 0, R32_NONE}, {5, 4, R32_NONE}, {6, 5, 6}},
+     {{0, 0, R32_NONE}, {1, 1, R32_NONE}}},                                     /* ReplyAndReceiveWithUserBuffer */
+    {0x5D, 3, 1, {{0, 0, R32_NONE}, {1, 2, 3}, {2, 1, 4}}, {{0, 0, R32_NONE}}}, /* InvalidateProcessDataCache */
+    {0x5E, 3, 1, {{0, 0, R32_NONE}, {1, 2, 3}, {2, 1, 4}}, {{0, 0, R32_NONE}}}, /* StoreProcessDataCache */
+    {0x5F, 3, 1, {{0, 0, R32_NONE}, {1, 2, 3}, {2, 1, 4}}, {{0, 0, R32_NONE}}}, /* FlushProcessDataCache */
+    /* GetSystemInfo: Switchbrew gives no 32-bit column, and its signature is GetInfo's (out u64, u32, Handle, u64), from
+       which the SDK's stubs are generated the same way */
+    {0x6F, 3, 2, {{1, 1, R32_NONE}, {2, 2, R32_NONE}, {3, 0, 3}}, {{0, 0, R32_NONE}, {1, 1, 2}}},
+};
+void snx_svc32(SnxArmCPU* a, u32 imm) {
+    KThread* t = kthread_cur();
+    CPU* c = &t->cpu;
+    const Svc32* s = NULL;
+    for (size_t i = 0; i < sizeof g_svc32 / sizeof *g_svc32; i++)
+        if (g_svc32[i].imm == imm) s = &g_svc32[i];
+    if (s)
+        for (int i = 0; i < s->nin; i++) {
+            const Reg32* r = &s->in[i];
+            c->x[r->x] = a->r[r->lo] | (r->hi == R32_NONE ? 0 : (u64)a->r[r->hi] << 32);
+        }
+    else
+        for (int i = 0; i < 8; i++) c->x[i] = a->r[i];
+    c->x[30] = a->r[14]; /* for the SVC log */
+    c->pc = a->r[15];    /* past the svc instruction, as the 64-bit code leaves it */
+    snx_svc(c, imm);
+    if (s)
+        for (int i = 0; i < s->nout; i++) {
+            const Reg32* r = &s->out[i];
+            a->r[r->lo] = (u32)c->x[r->x];
+            if (r->hi != R32_NONE) a->r[r->hi] = (u32)(c->x[r->x] >> 32);
+        }
+    else
+        for (int i = 0; i < 8; i++) a->r[i] = (u32)c->x[i];
+}
+
 static void snx_svc_(CPU* c, u32 imm) {
     KThread* t = kthread_cur();
     u64* x = c->x;

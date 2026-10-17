@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* snx_user_dir and snx_user_path: an installed build's config, state and cache folders (the XDG Base Directory spec),
-   a portable copy's (config/, state/ and cache/ of its .scarletnx), and where a file of a data folder goes in them.
-   tests/data_dir.c has the data folder itself. */
+   a portable copy's (config/, state/ and cache/ of its .scarletnx), and where a file of a data folder goes in them;
+   snx_menu_dir: the launcher's own, for it and for a game of its. tests/data_dir.c has the data folder itself. */
 #define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE   700 /* realpath */
 #include "common/utilities/common.h"
 #include <assert.h>
 #include <stdio.h>
@@ -26,12 +27,25 @@ static void expect_path(const char* path, int kind, const char* expected) {
     assert(moved && !strcmp(moved, expected));
     free(moved);
 }
+static void expect_menu(const char* folder, int kind, const char* expected) {
+    char* dir = snx_menu_dir(folder, kind);
+    assert(dir && !strcmp(dir, expected));
+    free(dir);
+}
 
 int main(void) {
     static const char* const vars[] = {"XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"};
     char *root = snx_temp_dir(NULL), *home, *dir[4], *base, *games, *path;
     int kind;
     assert(root);
+    /* the folder as the functions name it, links resolved: macOS's temporary folder is under /var, a link to
+       /private/var */
+    {
+        char* real = realpath(root, NULL);
+        assert(real);
+        free(root);
+        root = real;
+    }
     home = join(root, "home");
     setenv("HOME", home, 1);
     for (kind = SNX_USER_DATA; kind <= SNX_USER_CACHE; ++kind) unsetenv(vars[kind]);
@@ -158,18 +172,39 @@ int main(void) {
         path = join(root, "portable/.scarletnx-other/games"); /* only that name */
         expect_path(path, SNX_USER_STATE, path);
         free(path);
+        /* the launcher's settings.ini and gamecontrollerdb.txt: its config/, for it and for a game in its games/ */
+        expected = join(copy, "config");
+        expect_menu(copy, SNX_USER_CONFIG, expected);
+        path = join(copy, "games/0100DA801624E000/");
+        expect_menu(path, SNX_USER_CONFIG, expected);
+        free(path);
+        free(expected);
         free(copy);
+    }
+    /* the user's data folder's, and any other folder's (a checkout, an --outdir, a folder of games the player added):
+       the user's config folder */
+    {
+        char* user = snx_user_dir(SNX_USER_CONFIG);
+        assert(user);
+        expect_menu(games, SNX_USER_CONFIG, user);
+        path = join(root, "portable/games/0100DA801624E000");
+        expect_menu(path, SNX_USER_CONFIG, user);
+        free(path);
+        expect_menu(NULL, SNX_USER_CONFIG, user);
+        free(user);
     }
     path = snx_format("%s-other/games", dir[SNX_USER_DATA]);
     expect_path(path, SNX_USER_STATE, path);
     free(path);
     expect_path("games", SNX_USER_CONFIG, "games");
+#ifdef SNX_XDG /* elsewhere the config folder is always the data folder's config/ */
     /* a config folder that is the data folder divides nothing */
     setenv("XDG_CONFIG_HOME", getenv("XDG_DATA_HOME"), 1);
     expect_path(games, SNX_USER_CONFIG, games);
+#endif
 
     puts("snx_user_dir: the XDG variables, their defaults, a relative path ignored; snx_user_path: the installed "
-         "and a portable copy's games/ divided, any other folder kept");
+         "and a portable copy's games/ divided, any other folder kept; snx_menu_dir: the launcher's for its games");
     for (kind = SNX_USER_DATA; kind <= SNX_USER_CACHE; ++kind) free(dir[kind]);
     free(games);
     free(home);

@@ -2,6 +2,10 @@
    Copyright 2026 the ScarletNX contributors */
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE   700
+#ifdef __APPLE__
+/* the POSIX names above would hide Darwin's own (the sysctl and dyld types) */
+#define _DARWIN_C_SOURCE
+#endif
 #include "common/utilities/common.h"
 #include <ctype.h>
 #include <errno.h>
@@ -31,6 +35,9 @@
 #ifdef __FreeBSD__
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
 #endif
 
 void* snx_alloc(size_t size) {
@@ -281,6 +288,15 @@ char* snx_executable(const char* argv0) {
     if (n > 0 && (size_t)n < sizeof(buf) - 1) {
         buf[n] = 0;
         return snx_strdup(buf);
+    }
+#elif defined(__APPLE__)
+    char buf[8192];
+    uint32_t size = sizeof(buf);
+    char* resolved;
+    if (!_NSGetExecutablePath(buf, &size) && (resolved = realpath(buf, NULL)) != NULL) {
+        char* path = snx_strdup(resolved);
+        free(resolved);
+        return path;
     }
 #endif
     return snx_find_tool(argv0);
@@ -622,10 +638,42 @@ SnxU64 snx_free_space(const char* path) {
     return statvfs(path, &st) ? 0 : (SnxU64)st.f_bavail * st.f_frsize;
 #endif
 }
-/* The per-user folder of an installed build, which has no checkout: $XDG_DATA_HOME/scarletnx or
+/* path, or the nearest folder above it that is there */
+static char* existing_folder(const char* path) {
+    char *at = snx_absolute(path), *up;
+    while (at && !snx_is_dir(at)) {
+        up = snx_dirname(at);
+        if (!strcmp(up, at)) {
+            free(up);
+            break;
+        }
+        free(at);
+        at = up;
+    }
+    return at;
+}
+int snx_same_disk(const char* a, const char* b) {
+    char *x = existing_folder(a), *y = existing_folder(b);
+    int same = 0;
+#ifdef _WIN32
+    wchar_t *wx = x ? wide(x) : NULL, *wy = y ? wide(y) : NULL, vx[MAX_PATH + 1], vy[MAX_PATH + 1];
+    same = wx && wy && GetVolumePathNameW(wx, vx, MAX_PATH + 1) && GetVolumePathNameW(wy, vy, MAX_PATH + 1) &&
+           !_wcsicmp(vx, vy);
+    free(wx);
+    free(wy);
+#else
+    struct stat sx, sy;
+    same = x && y && !stat(x, &sx) && !stat(y, &sy) && sx.st_dev == sy.st_dev;
+#endif
+    free(x);
+    free(y);
+    return same;
+}
+/* The per-user data folder, an installed build's and a build tree's: $XDG_DATA_HOME/scarletnx or
    ~/.local/share/scarletnx, ~/Library/Application Support/scarletnx on macOS, %APPDATA%\scarletnx on Windows. These are
-   the folders SDL_GetPrefPath("scarletnx", ...) gives the GUI. NULL when the environment names no home */
-#ifndef _WIN32
+   the folders SDL_GetPrefPath("scarletnx", ...) gives the GUI; the app's Documents on iOS. NULL when the environment
+   names no home */
+#if !defined(_WIN32) && !defined(SNX_IOS)
 /* $var/scarletnx, else ~/fallback/scarletnx: the XDG spec ignores a relative path */
 static char* home_folder(const char* var, const char* fallback) {
     const char* base = var ? getenv(var) : NULL;
@@ -643,6 +691,10 @@ char* snx_user_data_dir(void) {
 #ifdef _WIN32
     const char* base = getenv("APPDATA");
     return base && base[0] ? snx_path_join(base, "scarletnx") : NULL;
+#elif defined(SNX_IOS)
+    /* the app's Documents, which the Files app and the Finder show the user (UIFileSharingEnabled, dist/apple) */
+    const char* home = getenv("HOME");
+    return home && home[0] ? snx_path_join(home, "Documents") : NULL;
 #elif defined(__APPLE__)
     return home_folder(NULL, "Library/Application Support");
 #else
@@ -688,11 +740,9 @@ char* snx_app_kind_dir(const char* app, int kind) {
     if (own) return snx_user_dir(kind);
     return kind == SNX_USER_DATA ? snx_strdup(app) : snx_path_join(app, kind_names[kind]);
 }
-char* snx_user_path(const char* path, int kind) {
-    char *full = kind == SNX_USER_DATA ? NULL : snx_absolute(path), *app = full ? snx_strdup(full) : NULL;
-    char *up, *root = NULL, *moved = NULL;
-    const char* rest;
-    /* the data folder it is in, from its own folder up */
+/* the data folder (snx_app_dir) full, an absolute path, is in, from full itself up; NULL for none */
+static char* app_of(const char* full) {
+    char *app = snx_strdup(full), *up;
     while (app && !snx_app_dir(app)) {
         up = snx_dirname(app);
         if (!strcmp(up, app)) {
@@ -702,6 +752,12 @@ char* snx_user_path(const char* path, int kind) {
         free(app);
         app = up;
     }
+    return app;
+}
+char* snx_user_path(const char* path, int kind) {
+    char *full = kind == SNX_USER_DATA ? NULL : snx_absolute(path), *app = full ? app_of(full) : NULL;
+    char *root = NULL, *moved = NULL;
+    const char* rest;
     if (app) root = snx_app_kind_dir(app, kind);
     /* a config folder that is the data folder divides nothing */
     if (root && !same_folder(root, app)) {
@@ -713,6 +769,13 @@ char* snx_user_path(const char* path, int kind) {
     free(app);
     free(root);
     return moved ? moved : snx_strdup(path);
+}
+char* snx_menu_dir(const char* folder, int kind) {
+    char *full = folder ? snx_absolute(folder) : NULL, *app = full ? app_of(full) : NULL;
+    char* dir = app ? snx_app_kind_dir(app, kind) : snx_user_dir(kind);
+    free(app);
+    free(full);
+    return dir;
 }
 int snx_left_behind(const char* old, const char* now) { return strcmp(old, now) && snx_path_exists(old); }
 int snx_launcher_name(const char* name) {
@@ -733,16 +796,9 @@ char* snx_work_dir(const char* data_dir) {
     free(old);
     return work;
 }
-char* snx_data_dir(const char* checkout, const char* build, const char* program_dir) {
+char* snx_data_dir(const char* program_dir) {
     const char *appimage = getenv("APPIMAGE"), *appdir = getenv("APPDIR");
-    char *path = checkout ? snx_path_join(checkout, "CMakeLists.txt") : NULL, *dir = NULL, *copy;
-    /* a copy installed from that build (cmake --install) is installed, even where the checkout still is */
-    if (path && snx_is_file(path) &&
-        (!build || !program_dir || (snx_is_dir(build) && snx_path_within(program_dir, build)))) {
-        free(path);
-        return snx_strdup(checkout);
-    }
-    free(path);
+    char *dir = NULL, *copy;
     /* an AppImage's programs run from its mount: the copy is the AppImage file. APPIMAGE is inherited, so it counts
        only for a program inside the mount */
     if (appimage && appimage[0] == '/' && appdir && appdir[0] && program_dir && snx_path_within(program_dir, appdir))
@@ -754,6 +810,76 @@ char* snx_data_dir(const char* checkout, const char* build, const char* program_
     if (copy && snx_is_dir(copy)) return copy;
     free(copy);
     return snx_user_data_dir();
+}
+char* snx_checkout(const char* checkout, const char* build, const char* program_dir) {
+    char* path = checkout ? snx_path_join(checkout, "CMakeLists.txt") : NULL;
+    /* a copy installed from that build (cmake --install) has none, even where the checkout still is */
+    int ours = path && snx_is_file(path) &&
+               (!build || !program_dir || (snx_is_dir(build) && snx_path_within(program_dir, build)));
+    free(path);
+    return ours ? snx_strdup(checkout) : NULL;
+}
+const char* const snx_checkout_files[SNX_CHECKOUT_FILES] = {"games", "work", "prod.keys", "title.keys", "linux"};
+char* snx_checkout_now(const char* data, int file) {
+    char* path = snx_path_join(data, snx_checkout_files[file]);
+    char* now;
+    if (strcmp(snx_checkout_files[file], "work")) return path;
+    now = snx_user_path(path, SNX_USER_CACHE);
+    free(path);
+    return now;
+}
+void snx_checkout_left(const char* checkout, const char* data) {
+    char *old, *now;
+    int i;
+    for (i = 0; i < SNX_CHECKOUT_FILES; ++i) {
+        old = snx_path_join(checkout, snx_checkout_files[i]);
+        now = snx_checkout_now(data, i);
+        if (old && now && snx_left_behind(old, now))
+            fprintf(stderr,
+                    "scarletnx: %s was left by an older version: this one keeps it in %s (docs/DEPRECATIONS.md)\n", old,
+                    now);
+        free(old);
+        free(now);
+    }
+}
+char* snx_dump_name(const char* input) {
+    const char *base = input, *p, *end;
+    char* name;
+    size_t n = 0;
+    for (p = input; *p; ++p)
+        if (*p == '/' || *p == '\\') base = p + 1;
+    end = strrchr(base, '.');
+    if (!end || end == base) end = base + strlen(base);
+    name = (char*)snx_alloc((size_t)(end - base) + 1);
+    for (p = base; p < end; ++p)
+        if ((unsigned char)*p >= 128 || isalnum((unsigned char)*p) || *p == '-' || *p == '_' || *p == ' ')
+            name[n++] = *p;
+    while (n && name[n - 1] == ' ') --n;
+    name[n] = 0;
+    if (!n) {
+        free(name);
+        return snx_strdup("Game");
+    }
+    return name;
+}
+const char* snx_folder_unfit(const char* folder, int run) {
+    char* probe;
+#if defined(ST_NOEXEC) && !defined(__ANDROID__) /* there a game's code loads from a copy in the cache */
+    struct statvfs st;
+#endif
+    if (!snx_path_exists(folder)) return "is not there";
+    if (!snx_is_dir(folder)) return "is not a folder";
+    /* made and taken away: the folder's rights, as the system applies them (ACLs, a read-only mount) */
+    probe = snx_temp_dir(folder);
+    if (!probe) return "cannot be written";
+    snx_remove_tree(probe);
+    free(probe);
+#if defined(ST_NOEXEC) && !defined(__ANDROID__)
+    if (run && !statvfs(folder, &st) && (st.f_flag & ST_NOEXEC)) return "is on a disk that runs no programs (noexec)";
+#else
+    (void)run;
+#endif
+    return NULL;
 }
 char* snx_temp_dir(const char* parent) {
     char* path;
@@ -826,7 +952,7 @@ unsigned snx_cpu_count(void) {
     SYSTEM_INFO info;
     GetSystemInfo(&info);
     return info.dwNumberOfProcessors ? info.dwNumberOfProcessors : 1;
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (unsigned)n : 1;
 #elif defined(__FreeBSD__)

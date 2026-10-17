@@ -60,6 +60,7 @@ endif()
 # with its own Configure and make, which cmake/openssl.cmake runs
 # The archives' SHA-256 are also part of their cache keys (cmake/deps_cache.cmake)
 include("${CMAKE_SOURCE_DIR}/cmake/deps_cache.cmake")
+include("${CMAKE_SOURCE_DIR}/cmake/apple.cmake")
 if(SNX_BUILD_NX OR SNX_BUILD_3DS OR SNX_HACTOOL_ONLY)
     set(snx_openssl_sha256 325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9)
     CPMAddPackage(NAME OpenSSL VERSION 4.0.3
@@ -67,6 +68,18 @@ if(SNX_BUILD_NX OR SNX_BUILD_3DS OR SNX_HACTOOL_ONLY)
                   URL_HASH SHA256=${snx_openssl_sha256}
                   DOWNLOAD_ONLY YES)
     include("${CMAKE_SOURCE_DIR}/cmake/openssl.cmake")
+endif()
+
+if((SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY AND NOT SNX_HACTOOL_ONLY) OR SNX_BUILD_3DS)
+    CPMAddPackage(NAME Vulkan-Headers VERSION 1.4.365
+                  URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.365.tar.gz
+                  URL_HASH SHA256=ed832b3292cce324ebba6522fd2d3004bf1b797fa49bfbcad0b302ff23d56abc
+                  EXCLUDE_FROM_ALL YES)
+    # volk.c is compiled into the vk components, VMA is a header
+    CPMAddPackage(NAME volk VERSION 1.4.363
+                  URL https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz
+                  URL_HASH SHA256=1547d8d74395d4048fb3f4a6313da56db626e89b55db238d0d7e8944c8a645f3
+                  DOWNLOAD_ONLY YES)
 endif()
 
 # Extraction-only and tools-only builds do not contain the NX runtime or its graphics/media dependencies.
@@ -79,15 +92,19 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY AND NOT SNX_HACTOOL_ONLY)
                   DOWNLOAD_ONLY YES)
     include("${CMAKE_SOURCE_DIR}/cmake/ffmpeg.cmake")
 
-    CPMAddPackage(NAME Vulkan-Headers VERSION 1.4.365
-                  URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.365.tar.gz
-                  URL_HASH SHA256=ed832b3292cce324ebba6522fd2d3004bf1b797fa49bfbcad0b302ff23d56abc
-                  EXCLUDE_FROM_ALL YES)
-    # volk.c is compiled into the vk component, VMA is a header
-    CPMAddPackage(NAME volk VERSION 1.4.363
-                  URL https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz
-                  URL_HASH SHA256=1547d8d74395d4048fb3f4a6313da56db626e89b55db238d0d7e8944c8a645f3
-                  DOWNLOAD_ONLY YES)
+    # the shared fonts' stand-ins (cmake/shared_fonts.cmake), the two Eden carries: Open Sans 1.101 (Apache 2.0) from
+    # Google's fonts repository, and yuzu's controller button glyphs (GPL-2.0-or-later) in the source file Eden keeps
+    # them in. Single files, not archives
+    CPMAddPackage(NAME OpenSans VERSION 1.101
+                  URL https://raw.githubusercontent.com/google/fonts/4e24bf1805f1526cd1ce3e39447d5f8e6f1f6b67/apache/opensans/OpenSans-Regular.ttf
+                  URL_HASH SHA256=13c03e22a633919beb2847c58c8285fb8a735ee97097d7c48fd403f8294b05f8
+                  DOWNLOAD_ONLY YES DOWNLOAD_NO_EXTRACT YES)
+    CPMAddPackage(NAME YuzuOSSExtension VERSION 2019
+                  URL https://raw.githubusercontent.com/eden-emulator/mirror/2b87305d319f0bd04da36fb96314934f37b12637/src/core/file_sys/system_archive/data/font_nintendo_extended.cpp
+                  URL_HASH SHA256=6fbbf5176ff4fd2024f9d150c889477f6b45ece4ac5e45d51286e32f8b13a6f2
+                  DOWNLOAD_ONLY YES DOWNLOAD_NO_EXTRACT YES)
+    include("${CMAKE_SOURCE_DIR}/cmake/shared_fonts.cmake")
+
     CPMAddPackage(NAME VulkanMemoryAllocator VERSION 3.4.0
                   URL https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/archive/refs/tags/v3.4.0.tar.gz
                   URL_HASH SHA256=822aa850c6ce77346ae96a8a1d351d52e77e85929f35363849a0a4e638e0a2a1
@@ -95,14 +112,14 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY AND NOT SNX_HACTOOL_ONLY)
 endif()
 
 set(SNX_SDL3_FROM_SOURCE OFF)
-if((SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY AND NOT SNX_HACTOOL_ONLY) OR SNX_BUILD_GUI)
+if((SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY AND NOT SNX_HACTOOL_ONLY) OR SNX_BUILD_GUI OR SNX_BUILD_3DS)
     # Prefer a compatible system package. CPM handles the pinned static fallback and user overrides.
     CPMFindPackage(NAME SDL3 VERSION 3.4.18 FIND_PACKAGE_ARGUMENTS CONFIG
                    URL https://github.com/libsdl-org/SDL/archive/refs/tags/release-3.4.18.tar.gz
                    URL_HASH SHA256=c4b08b950bd29d83caae0ab8d884298d27046a9d30700fb42841c50992665c90
                    EXCLUDE_FROM_ALL YES SYSTEM YES
                    OPTIONS "SDL_SHARED OFF" "SDL_STATIC ON" "SDL_TEST_LIBRARY OFF" "SDL_TESTS OFF"
-                           "SDL_EXAMPLES OFF" "SDL_INSTALL OFF")
+                           "SDL_EXAMPLES OFF" "SDL_INSTALL OFF" "SDL_UNIX_CONSOLE_BUILD ON")
     if(SDL3_ADDED)
         set(SNX_SDL3_FROM_SOURCE ON)
         snx_quiet(SDL3-static)
@@ -111,6 +128,19 @@ if((SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY AND NOT SNX_HACTOOL_ONLY) OR SNX_BUILD_G
             set_target_properties(SDL3-static PROPERTIES DISABLE_PRECOMPILE_HEADERS ON)
         endif()
     endif()
+endif()
+
+# The boot splash's drawings are SVGs, drawn at the splash's size by lunasvg (MIT) on plutovg (MIT; its rasterizer and
+# stroker come from FreeType, under the FreeType License, source/FTL.TXT). cmake/splash.cmake builds both
+if(SNX_BUILD_GUI)
+    CPMAddPackage(NAME plutovg VERSION 1.3.3
+                  URL https://github.com/sammycage/plutovg/archive/refs/tags/v1.3.3.tar.gz
+                  URL_HASH SHA256=2b0d17a6e016f47b86f9c00e2cb82600041b1ea1f7d2a00c2d46ae542cbfed3c
+                  DOWNLOAD_ONLY YES)
+    CPMAddPackage(NAME lunasvg VERSION 3.5.0
+                  URL https://github.com/sammycage/lunasvg/archive/refs/tags/v3.5.0.tar.gz
+                  URL_HASH SHA256=1abf1472ee6c4d19797916e8cc3c2e4b628e0d81178ffac60bdb0d457e32c690
+                  DOWNLOAD_ONLY YES)
 endif()
 
 # hactool runs on the machine doing the extraction (--extract), so a cross build leaves it out, but for Android, where

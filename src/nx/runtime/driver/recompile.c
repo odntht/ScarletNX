@@ -12,6 +12,7 @@
 #include "nx/loader/module_llvm.h"
 #include "common/cpu/recompiler/backend.h"
 #include "nx/runtime/driver/toolchain.h"
+#include "common/utilities/build_info.h"
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -22,8 +23,8 @@ static void usage(void) {
     puts("Usage: scarletnx -r INPUT [NAME] [OPTIONS]\n"
          "  INPUT                  Game/ExeFS directory or .nro\n"
          "  -o, --name, --out NAME  Output name (default: the title ID, else the NPDM's or input name)\n"
-         "  --outdir DIR           Where the game's folder goes (default: checkout/games, else ./games)\n"
-         "  -O LEVEL               Optimization: 0,1,2,3,s,z (default: 2)\n"
+         "  --outdir DIR           Where the game's folder goes (default: games/ in the data folder)\n"
+         "  -O LEVEL               Optimization: 0,1,2,3,s,z (default: 3)\n"
          "  --jobs N               Parallel compiles (default: CPU count)");
     puts("  --backend NAME         Code generator: llvm (LLVM-C, the default and the recommended one),\n"
          "                         gcc (libgccjit, optional: for DEC Alpha EV67 hosts; elsewhere use llvm)");
@@ -48,6 +49,8 @@ static unsigned number(const char* text, unsigned max) {
 /* This build's, not the checkout's cpu.h: the modules are laid out as this build's headers say, and an installed
    build has no checkout */
 unsigned snx_game_abi(void) { return snx_module_abi(); }
+/* the commit too: a change to the generator, or to the runtime the game's folder gets a copy of, may keep SNX_ABI */
+char* snx_game_stamp(void) { return snx_format("%u\n%s\n", snx_game_abi(), snx_build_commit()); }
 #ifdef SNX_WITH_RUNTIME
 /* In an AppImage this program is a launcher in its mount, which runs nothing once copied out: the AppImage is the
    runtime, and a copy named after the game runs it. APPIMAGE is inherited, so it counts only inside the mount */
@@ -102,7 +105,9 @@ static char* settings_path(const char* out, const char* title) {
     free(folder);
     return path;
 }
-static SnxU64* read_hints(const char* base, size_t* count) {
+/* the hints file: code addresses the runtime met that the recompiler hadn't found. A64 code is word aligned; an
+   AArch32 address has the Thumb bit (bit 0) for a Thumb block, and A32 ones are word aligned */
+static SnxU64* read_hints(const char* base, int is64, size_t* count) {
     char *path = snx_format("%s.hints", base), line[256], *s;
     FILE* f = snx_fopen(path, "r");
     SnxU64 *hints = NULL, value;
@@ -123,7 +128,7 @@ static SnxU64* read_hints(const char* base, size_t* count) {
                 value = (value << 4) | (SnxU64)(c <= '9' ? c - '0' : c - 'a' + 10);
             }
             while (isspace((unsigned char)*s)) ++s;
-            if (!invalid && digits && !*s && !(value & 3)) {
+            if (!invalid && digits && !*s && (is64 ? !(value & 3) : (value & 3) != 2 && !(value >> 32))) {
                 hints = (SnxU64*)snx_realloc(hints, (n + 1) * sizeof(*hints));
                 hints[n++] = value;
             }
@@ -228,7 +233,7 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
     memset(&gen, 0, sizeof(gen));
     memset(&program, 0, sizeof(program));
     memset(&llvm, 0, sizeof(llvm));
-    compile.opt = "3";
+    compile.opt = "2";
     compile.jobs = snx_cpu_count();
     gen.chunk_instrs = SNX_CHUNK_INSTRUCTIONS;
 #ifdef _WIN32
@@ -329,8 +334,8 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
     if (compile.target_win != host_win) return snx_error("--target: modules are built for this host only");
     gen.abi = snx_game_abi();
     if (snx_load_program(input, &program, error, sizeof(error))) return snx_error("%s", error);
-    if (!program.npdm.is64) {
-        snx_error("AArch32 programs are unsupported");
+    if (!program.npdm.is64 && backend != SNX_BACKEND_LLVM) {
+        snx_error("AArch32 programs are recompiled by the LLVM backend only (--backend=llvm)");
         goto done;
     }
     title = snx_game_shown(name, &program);
@@ -376,7 +381,7 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
         goto done;
     }
     gen.title = title;
-    gen.hints = read_hints(base, &gen.hint_count);
+    gen.hints = read_hints(base, program.npdm.is64, &gen.hint_count);
     if (!compile.quiet) printf("Recompiling %s (%lu modules)\n", title, (unsigned long)program.module_count);
     if (copy_data(&program, data, compile.quiet)) {
         snx_error("cannot stage game data in %s", data);
@@ -418,8 +423,12 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
         llvm.keep_ir = kept;
         i = kept && (snx_is_link(kept) || snx_mkdirs(kept));
         if (i) snx_error("cannot save the generated code in %s", kept);
-        if (!i && backend == SNX_BACKEND_LLVM) i = snx_build_module_llvm(&program, &gen, &llvm);
-        if (!i && backend == SNX_BACKEND_GCC) i = snx_build_module_gccjit(&program, &gen, &llvm);
+        if (!i && !program.npdm.is64)
+            i = snx_build_module_arm(&program, &gen, &llvm);
+        else if (!i && backend == SNX_BACKEND_LLVM)
+            i = snx_build_module_llvm(&program, &gen, &llvm);
+        else if (!i && backend == SNX_BACKEND_GCC)
+            i = snx_build_module_gccjit(&program, &gen, &llvm);
         free(kept);
         if (i) goto done;
     }
@@ -456,11 +465,10 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
         goto done;
     }
     {
-        char* stamp = snx_format("%s.abi", base);
-        char version[32];
-        sprintf(version, "%u\n", gen.abi);
+        char *stamp = snx_format("%s.abi", base), *version = snx_game_stamp();
         i = snx_write_file(stamp, version, strlen(version));
         free(stamp);
+        free(version);
         if (i) {
             snx_error("cannot record the compiled game's ABI");
             goto done;

@@ -93,34 +93,102 @@ void fermi2d_method(GpuChannel* ch, u32 m, u32 v) {
             g_renderer->rt_flush(src.addr);
             g_renderer->rt_flush(dst.addr);
         }
-        for (i32 y = 0; y < dh; y++) {
-            i64 ty = (i64)dy0 + y;
-            if (ty < 0 || ty >= (i64)dst.height) continue;
-            double fy = sy + sdy * y;
-            u32 syy = fy < 0 ? 0 : fy >= src.height ? src.height - 1 : (u32)fy;
-            if (src.linear)
-                gmem_read(src.addr + (u64)syy * src.pitch, srow, swb);
-            else
-                for (u32 xb = 0; xb < swb; xb += 16)
-                    gmem_read(src.addr + sl + bl_offset(xb, syy, sz, swb, src.height, src.bh, sbd), srow + xb,
-                              swb - xb < 16 ? swb - xb : 16);
-            for (i32 x = x0; x < x1; x++) {
-                double fx = sx + sdx * x;
-                u32 sxx = fx < 0 ? 0 : fx >= src.width ? src.width - 1 : (u32)fx;
-                memcpy(drow + (u64)(x - x0) * bpp, srow + (u64)sxx * bpp, bpp);
-            }
-            u32 xb0 = (u32)(dx0 + x0) * bpp, xb1 = (u32)(dx0 + x1) * bpp;
-            if (dst.linear)
-                gmem_write(dst.addr + (u64)ty * dst.pitch + xb0, drow, xb1 - xb0);
-            else
-                for (u32 xb = xb0; xb < xb1;) {
-                    u32 n = 16 - (xb & 15);
-                    if (n > xb1 - xb) n = xb1 - xb;
-                    gmem_write(dst.addr + dl + bl_offset(xb, (u32)ty, dz, dwb, dst.height, dst.bh, dbd),
-                               drow + (xb - xb0), n);
-                    xb += n;
-                }
+        /* bl_offset(x, y, z) is bl_offset(x, 0, 0) + bl_offset(0, y, z): a row's 16 byte runs are a table of column
+           offsets made once and a base per row. A block linear surface is read and written through one host pointer
+           when it is contiguous (as DMA does), else run by run, and the renderer's hooks run once over the span the
+           blit reads and the span it writes, as I2M does (gpu.c), not for each run: they look through every render
+           target. Each destination pixel's source column is the same on every row */
+        u32 xb0 = (u32)(dx0 + x0) * bpp, xb1 = (u32)(dx0 + x1) * bpp, nsrun = (swb + 15) / 16, ndrun = 0;
+        for (u32 xb = xb0; xb < xb1; xb = (xb | 15) + 1) ndrun++;
+        u32* sxs = malloc((size_t)(x1 - x0) * sizeof *sxs);
+        u64* scol = malloc((size_t)nsrun * sizeof *scol);
+        u64* dcol = malloc((size_t)(ndrun ? ndrun : 1) * sizeof *dcol);
+        if (!sxs || !scol || !dcol) {
+            WARN("gpu: no memory for a 2D blit of %dx%d\n", dw, dh);
+            free(sxs);
+            free(scol);
+            free(dcol);
+            free(srow);
+            free(drow);
+            return;
         }
+        for (i32 x = x0; x < x1; x++) {
+            double fx = sx + sdx * x;
+            sxs[x - x0] = (fx < 0 ? 0 : fx >= src.width ? src.width - 1 : (u32)fx) * bpp;
+        }
+        if (!src.linear)
+            for (u32 k = 0; k < nsrun; k++) scol[k] = bl_offset(k * 16, 0, 0, swb, src.height, src.bh, sbd);
+        if (!dst.linear) {
+            u32 k = 0;
+            for (u32 xb = xb0; xb < xb1; xb = (xb | 15) + 1)
+                dcol[k++] = bl_offset(xb, 0, 0, dwb, dst.height, dst.bh, dbd);
+        }
+        u64 sspan = 0, dspan = 0, shi = 0, dhi = 0;
+        u8* spp = src.linear ? NULL : bl_span_ptr(src.addr + sl, swb, src.height, src.bh, sz, sbd, &sspan);
+        u8* dpp = dst.linear ? NULL : bl_span_ptr(dst.addr + dl, dwb, dst.height, dst.bh, dz, dbd, &dspan);
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass) {
+                if (!src.linear && !spp) gmem_need(src.addr + sl, shi);
+                if (!dst.linear) gmem_before_write(dst.addr + dl, dhi);
+            }
+            for (i32 y = 0; y < dh; y++) {
+                i64 ty = (i64)dy0 + y;
+                if (ty < 0 || ty >= (i64)dst.height) continue;
+                double fy = sy + sdy * y;
+                u32 syy = fy < 0 ? 0 : fy >= src.height ? src.height - 1 : (u32)fy;
+                u64 sbase = src.linear ? 0 : bl_offset(0, syy, sz, swb, src.height, src.bh, sbd);
+                u64 dbase = dst.linear ? 0 : bl_offset(0, (u32)ty, dz, dwb, dst.height, dst.bh, dbd);
+                if (!pass) {
+                    /* the last run of a row is its highest byte, and the last row's the blit's (block linear) */
+                    if (!src.linear && sbase + scol[nsrun - 1] + (swb - (nsrun - 1) * 16) > shi)
+                        shi = sbase + scol[nsrun - 1] + (swb - (nsrun - 1) * 16);
+                    if (!dst.linear && ndrun) {
+                        u32 last = ((xb1 - 1) & ~15u) > xb0 ? (xb1 - 1) & ~15u : xb0;
+                        if (dbase + dcol[ndrun - 1] + (xb1 - last) > dhi) dhi = dbase + dcol[ndrun - 1] + (xb1 - last);
+                    }
+                    continue;
+                }
+                if (src.linear)
+                    gmem_read(src.addr + (u64)syy * src.pitch, srow, swb);
+                else
+                    for (u32 k = 0; k < nsrun; k++) {
+                        u32 n = swb - k * 16 < 16 ? swb - k * 16 : 16;
+                        u64 o = sbase + scol[k];
+                        /* a whole run is one 16-byte move rather than a call: the game's blits come every frame */
+                        if (spp && o + n <= sspan && n == 16)
+                            memcpy(srow + k * 16, spp + o, 16);
+                        else if (spp && o + n <= sspan)
+                            memcpy(srow + k * 16, spp + o, n);
+                        else
+                            gmem_read_raw(src.addr + sl + o, srow + k * 16, n);
+                    }
+                if (bpp == 4)
+                    for (i32 x = 0; x < x1 - x0; x++) memcpy(drow + (u64)x * 4, srow + sxs[x], 4);
+                else
+                    for (i32 x = 0; x < x1 - x0; x++) memcpy(drow + (u64)x * bpp, srow + sxs[x], bpp);
+                if (dst.linear)
+                    gmem_write(dst.addr + (u64)ty * dst.pitch + xb0, drow, xb1 - xb0);
+                else {
+                    u32 k = 0;
+                    for (u32 xb = xb0; xb < xb1; k++) {
+                        u32 n = 16 - (xb & 15);
+                        if (n > xb1 - xb) n = xb1 - xb;
+                        u64 o = dbase + dcol[k];
+                        if (dpp && o + n <= dspan && n == 16)
+                            memcpy(dpp + o, drow + (xb - xb0), 16);
+                        else if (dpp && o + n <= dspan)
+                            memcpy(dpp + o, drow + (xb - xb0), n);
+                        else
+                            gmem_write_raw(dst.addr + dl + o, drow + (xb - xb0), n);
+                        xb += n;
+                    }
+                }
+            }
+        }
+        if (!dst.linear) gpu_mem_written(dst.addr + dl, dhi);
+        free(sxs);
+        free(scol);
+        free(dcol);
         free(srow);
         free(drow);
         if (g_renderer_up) g_renderer->rt_reload(dst.addr);

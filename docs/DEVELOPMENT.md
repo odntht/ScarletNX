@@ -2,36 +2,55 @@
 <!-- Copyright 2026 the ScarletNX contributors -->
 # Development
 
-[Architecture](ARCHITECTURE.md) · [build/toolchains](BUILD.md) · [usage](USAGE.md) · [agent rules](../CLAUDE.md).
+[Architecture](ARCHITECTURE.md) · [build/toolchains](BUILD.md) · [usage](USAGE.md) · [agent rules](../CLAUDE.md) · [contributing](../CONTRIBUTING.md).
 Run from checkout. POSIX examples: Windows uses `python`, `.exe`, PowerShell env syntax.
+The build tree's drivers work in the user's data folder, as an installed copy does ([Folders](USAGE.md#folders));
+the examples name its folders on Linux, and `--repo DIR` keeps a run's files in DIR instead:
+
+```sh
+games=~/.local/share/scarletnx/games work=~/.cache/scarletnx/work
+```
 
 ## Rebuild / checks
 
 ```sh
 cmake --build build
-./build/scarletnx -r work/Game Game --jobs 8
+./build/scarletnx -r "$work/Game" Game --jobs 8
 ctest --test-dir build --output-on-failure
 scripts/format.sh --check
 python3 tests/run_filesystem_tree.py --cc clang --sanitize
 clang -fsyntax-only -Wall -fno-strict-aliasing -fwrapv -I src src/common/cpu/aarch64/cpu_helpers.c
 ```
 
-Runtime relink deploys to `games/` by default. Recompiler/`src/common/cpu/aarch64/` edits require `-r`.
+Runtime relink deploys to the data folder's `games/` by default (`SNX_GAMES_DIR`). Recompiler/`src/common/cpu/aarch64/` edits require `-r`.
 Avoid builds during timing runs. Formatting: clang-format 23 + `uv`/pinned Ruff; omit `--check` to write.
 FS tests use production tree/HLE + synthetic temp data; `--only tree|service` selects a suite.
 
-CI: Linux/Windows builds, ABI syntax, native tool/FS regressions, optional Python diagnostics. Formatting is checked locally (`scripts/format.sh --check`).
+CI: Linux/Windows builds, ABI syntax, native tool/FS regressions, optional Python diagnostics, the Linux AppImages
+and the Windows zip (each then run as installed), the Android APK, and [edenprobe](EDENPROBE.md)'s probes on lavapipe
+against the cases that passed before (`scripts/edenprobe.py`). `.github/workflows/publish.yml` publishes what
+builds everywhere, each said on Discord (`scripts/publish-builds.py`): a version tag pushed (`v1.0.0`; `v1.0.0-rc1` a
+prerelease) as this repository's release of it, the latest, its notes listing the changes since the version before;
+each push to `main` as a release of [scarletnx/nightly](https://github.com/scarletnx/nightly/releases), the newest 30
+kept (this repository's `nightly` prerelease shows the latest's notes); each pull request as a prerelease there,
+`pr-<number>`. The notes and the messages link each download with its size and list what changed (a pull request's
+commits). A fork's pull request is published once someone of the team labels it `publish builds`, after each
+push. `.github/workflows/cards.yml` keeps a Discord card for each pull request, each issue and each push to `main`
+(`scripts/discord-cards.py`): posted when it comes, edited at each push, edit, label, review and comment (the latest
+shown) and as each package of its build ends (`cards-watch.yml`), its id kept on scarletnx/nightly's `discord-cards`
+branch. The secrets: `NIGHTLY_TOKEN` (writes that repository's contents), `DISCORD_WEBHOOK_RELEASES`,
+`DISCORD_WEBHOOK_NIGHTLY`, `DISCORD_WEBHOOK_PRS` and `DISCORD_WEBHOOK_ISSUES`. Formatting is checked locally (`scripts/format.sh --check`).
 Verify affected scenes manually, repeat intermittent failures, record evidence/scope.
 Test guest semantics + malformed IPC with synthetic cases.
 
 ## Run / diagnose
 
 ```sh
-(cd games && ./Game --seconds=60 --script=15000:400,16000:1 --press_len=300 --shot=out)
-python3 tools/run_game.py Game --runs 5 --seconds 60 --dump work/Game --script ""
-python3 tools/symbols.py work/Game cf34380
-python3 tools/disasm.py work/Game NvRmStreamFlushSync
-python3 tools/disasm.py work/Game cf34240 cf343c0
+(cd "$games/<id>" && ./<id> --seconds=60 --script=15000:400,16000:1 --press_len=300 --shot=out)
+python3 tools/run_game.py <id> --runs 5 --seconds 60 --dump "$work/Game" --script ""
+python3 tools/symbols.py "$work/Game" cf34380
+python3 tools/disasm.py "$work/Game" NvRmStreamFlushSync
+python3 tools/disasm.py "$work/Game" cf34240 cf343c0
 ```
 
 - Runtime: `--seconds=N` / `--frames=N`; `--shot=out` → CWD `out.ppm`; `--shot_every=N` → every N frames.
@@ -47,7 +66,7 @@ python3 tools/disasm.py work/Game cf34240 cf343c0
 ## Shaders
 
 ```sh
-SNX_SHADER_CORPUS=corpus games/Game/Game
+SNX_SHADER_CORPUS=corpus "$games/Game/Game"
 build/snx-shaderc corpus --validate --out translated
 ```
 

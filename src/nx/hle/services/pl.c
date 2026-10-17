@@ -15,9 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* pl:u shared fonts. We don't ship Nintendo's: use GAME_data/fonts/<Name>.bfttf|.ttf if there, else a system TTF
-   (Arial, Segoe UI or Tahoma on Windows, DejaVu Sans or FreeSans elsewhere). The shared memory holds each font as
-   plain TTF behind the 8 byte obfuscated header the SDK reads its size from (a .bfttf is decrypted into it). */
+/* pl:u shared fonts. We don't ship the console's: use GAME_data/fonts/<Name>.bfttf|.ttf if there, else the stand-ins
+   compiled in (cmake/shared_fonts.cmake), as Eden carries them: Open Sans for every slot but FontNintendoExtended,
+   which takes the controller button glyphs yuzu drew. The shared memory holds each font as plain TTF behind the 8
+   byte obfuscated header the SDK reads its size from (a .bfttf is decrypted into it). */
 static const char* g_font_names[6] = {
     "FontStandard", "FontChineseSimplified", "FontExtendedChineseSimplified", "FontChineseTraditional",
     "FontKorean",   "FontNintendoExtended"};
@@ -34,74 +35,14 @@ static u8* read_indexed_font(const char* path, u64* size) {
     }
     return d;
 }
-/* OS fonts are support assets imported once when the indexed game fonts are missing. */
-static u8* read_host_font(const char* path, u64* size) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (n <= 0) {
-        fclose(f);
-        return NULL;
-    }
-    u8* d = malloc((size_t)n);
-    if (!d || fread(d, 1, (size_t)n, f) != (size_t)n) {
-        fclose(f);
-        free(d);
-        return NULL;
-    }
-    fclose(f);
-    *size = (u64)n;
-    return d;
-}
 static u32 bswap32_(u32 v) { return (v >> 24) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | (v << 24); }
-static u8* font_fallback(u64* size) {
-    const char* path = "fonts/SystemFallback.ttf";
-    u8* indexed = read_indexed_font(path, size);
-    if (indexed) return indexed;
-    const char* cands[8];
-    int n = 0;
-    char w1[512], w2[512], w3[512];
-#if defined(_WIN32)
-    const char* wd = getenv("WINDIR");
-    if (!wd) wd = "C:\\Windows";
-    snprintf(w1, sizeof w1, "%s\\Fonts\\arial.ttf", wd);
-    snprintf(w2, sizeof w2, "%s\\Fonts\\segoeui.ttf", wd);
-    snprintf(w3, sizeof w3, "%s\\Fonts\\tahoma.ttf", wd);
-    cands[n++] = w1;
-    cands[n++] = w2;
-    cands[n++] = w3;
-#else
-    (void)w1;
-    (void)w2;
-    (void)w3;
-    cands[n++] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-    cands[n++] = "/usr/share/fonts/TTF/DejaVuSans.ttf";
-    cands[n++] = "/usr/share/fonts/truetype/freefont/FreeSans.ttf";
-#endif
-    for (int i = 0; i < n; i++) {
-        u8* d = read_host_font(cands[i], size);
-        if (d) {
-            /* One indexed copy backs all six shared-font slots. */
-            if (fs_add_virtual_file(path, d, *size)) {
-                WARN("pl: could not index the system fallback font\n");
-                free(d);
-                return NULL;
-            }
-            LOG("pl: system font -> %s\n", cands[i]);
-            return d;
-        }
-    }
-    return NULL;
-}
+extern const unsigned char snx_font_standard[], snx_font_extended[];
+extern const size_t snx_font_standard_size, snx_font_extended_size;
 static void fonts_fill(u8* shm, u64 cap) {
     const u32 RESULT = 0x7f9a0218u, MAGIC = 0x36f81a1eu;
     u32 key = bswap32_(RESULT ^ MAGIC);
     u64 off = 0;
-    u8* fb = NULL;
-    u64 fbs = 0;
-    u32 fb_off = 0, fb_size = 0;
+    u32 std_off = 0, std_size = 0; /* the stand-in Open Sans, once in the shared memory for every slot it backs */
     for (int i = 0; i < 6; i++) {
         char p[1200];
         u64 sz = 0;
@@ -114,19 +55,15 @@ static void fonts_fill(u8* shm, u64 cap) {
             snprintf(p, sizeof p, "fonts/%s.ttf", g_font_names[i]);
             d = read_indexed_font(p, &sz);
         }
-        if (!d) { /* one fallback font for every slot */
-            if (fb_size) {
-                pl.font_off[i] = fb_off;
-                pl.font_size[i] = fb_size;
+        int builtin = !d, ext = i == 5;
+        if (builtin) {
+            if (!ext && std_size) {
+                pl.font_off[i] = std_off;
+                pl.font_size[i] = std_size;
                 continue;
             }
-            if (!fb) fb = font_fallback(&fbs);
-            if (!fb) {
-                WARN("pl: no TTF font found, so system text will not be shown\n");
-                return;
-            }
-            d = fb;
-            sz = fbs;
+            d = (u8*)(ext ? snx_font_extended : snx_font_standard);
+            sz = ext ? snx_font_extended_size : snx_font_standard_size;
         } else
             LOG("pl: %s <- %s\n", g_font_names[i], p);
         if (is_bfttf && sz < 8) { /* not even the header */
@@ -137,7 +74,7 @@ static void fonts_fill(u8* shm, u64 cap) {
         u64 words = (sz + 3) / 4;
         if (off + 8 + words * 4 > cap) {
             WARN("pl: font %s does not fit\n", g_font_names[i]);
-            if (d != fb) free(d);
+            if (!builtin) free(d);
             continue;
         }
         u32 h0 = bswap32_(MAGIC), h1 = bswap32_((u32)(words * 4)) ^ key;
@@ -164,14 +101,13 @@ static void fonts_fill(u8* shm, u64 cap) {
             pl.font_off[i] = (u32)off + 8;
             pl.font_size[i] = (u32)sz;
         }
-        if (d == fb) {
-            fb_off = pl.font_off[i];
-            fb_size = pl.font_size[i];
+        if (builtin && !ext) {
+            std_off = pl.font_off[i];
+            std_size = pl.font_size[i];
         }
         off = (off + 8 + words * 4 + 0xF) & ~0xFull;
-        if (d != fb) free(d);
+        if (!builtin) free(d);
     }
-    if (fb) free(fb);
 }
 /* the font shared memory, filled the first time a game asks for anything */
 static KShmem* font_shm(void) {
