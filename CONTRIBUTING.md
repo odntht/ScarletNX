@@ -28,7 +28,8 @@ regression tests, and the programs and libraries they run or link, with ASan and
 is not deployed.
 
 A build is not a test. A runtime change is verified by running the game through the scene it affects, and the commit
-says what was run. [DEVELOPMENT.md](docs/DEVELOPMENT.md) has the run and diagnose commands.
+says what was run. [DEVELOPMENT.md](docs/DEVELOPMENT.md) has the run and diagnose commands, and
+[TESTING.md](docs/TESTING.md) the form a test report takes: the build, the machine, the scene, the runs and the result.
 
 ## Commits
 

@@ -12,6 +12,7 @@ New here? Start with [Build](./BUILD.md), then [Usage](./USAGE.md).
 - **[PowerPC64](./PPC64.md)**
 - **[RISC-V and LoongArch](./RISCV-LOONGARCH.md)**
 - **[Development](./DEVELOPMENT.md)** - tests and diagnostics
+  - **[Testing and reporting](./TESTING.md)** - how to test a build, and the form a report takes
   - **[edenprobe](./EDENPROBE.md)** - hardware probes CI runs against a baseline
 - **[Deprecations](./DEPRECATIONS.md)** - what an older version used, and how it goes away
 - **[Status and roadmap](./ROADMAP.md)**
