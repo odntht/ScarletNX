@@ -12,6 +12,8 @@
 *.nso
 *.npdm
 *.zip
+*.7z
+*.rar
 *.keys
 *.tik
 *.cert
@@ -39,6 +41,9 @@ vkshader_*.glsl
 /build*/
 # what ctest writes when it runs in the checkout
 /Testing/
+# Profiles of a running game: its memory and symbols
+perf.data*
+heaptrack.*
 __pycache__/
 *.o
 *.so

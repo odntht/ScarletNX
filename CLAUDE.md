@@ -36,7 +36,7 @@ get wrong and points to the skills that carry the procedures.
   command line contains the pattern (twice that killed the session's own shell). List with `pgrep -a NAME` (or
   `pgrep -x cc1`, by process name), then `kill PID` with the numbers in a separate command. The same goes for waiting:
   `until ! pgrep -f PATTERN` matches its own shell and never ends. Wait on a file the job writes, or `pgrep -x NAME`.
-- Don't build while a timing-sensitive test runs: the build deploys a new runtime into `games/` and loads the CPU.
+- Don't build while a timing-sensitive test runs: the build deploys a new runtime into the data folder's `games/` and loads the CPU.
 - No `sudo` and no system packages: the user installs those.
 - Context is scarce. Never print a whole log (a game's `<id>.log` grows to megabytes), a whole disassembly or a
   ninja log. Use `grep -n`, `tail`, `tools/disasm.py` on one function.
@@ -45,11 +45,11 @@ get wrong and points to the skills that carry the procedures.
 
 | Task | Command |
 | --- | --- |
-| Build the runtime (hactool inside its driver) and the third-party libraries (deploys to every game in `games/`) | `cmake --preset default -B build && cmake --build build` (Windows: `scripts\bootstrap.ps1` once, `Set-ExecutionPolicy -Scope Process Bypass` and `. scripts\env.ps1` per window) |
+| Build the runtime (hactool inside its driver) and the third-party libraries (deploys to every game in the data folder's `games/`, `~/.local/share/scarletnx/` on Linux: `SNX_GAMES_DIR`) | `cmake --preset default -B build && cmake --build build` (Windows: `scripts\bootstrap.ps1` once, `Set-ExecutionPolicy -Scope Process Bypass` and `. scripts\env.ps1` per window) |
 | Cross-build for Windows (llvm-mingw on PATH) | `cmake --preset windows-cross && cmake --build --preset windows-cross` |
 | Extract a dump | `build/scarletnx -x "Game.xci" --name Game [--update u.nsp]` |
-| Recompile a game (into `games/<id>/`, named by its title ID, or by a name given after the folder) | `build/scarletnx -r work/Game` |
-| Run with scripted input and a screenshot | `cd games/<id> && ./<id> --seconds=60 --shot=/path/out --script=ms:hexbuttons,...` |
+| Recompile a game (into the data folder's `games/<id>/`, named by its title ID, or by a name given after the folder) | `build/scarletnx -r work/Game` |
+| Run with scripted input and a screenshot | `cd ~/.local/share/scarletnx/games/<id> && ./<id> --seconds=60 --shot=/path/out --script=ms:hexbuttons,...` |
 | Name addresses / disassemble game code | `tools/symbols.py work/Game ADDR...` / `tools/disasm.py work/Game FUNC` |
 | Summarize a log (a player's too) / the game reports on GitHub | `build/scarletnx --scan-log LOG [--format markdown]` / `scripts/game-reports.py index [--title-id ID]`; the `scarletnx` MCP server (`build/scarletnx --mcp`, `.mcp.json`) has both and the game's code |
 | Run the tests | `ctest --test-dir build` (`-R swipc` for the IPC generator) |
@@ -69,7 +69,7 @@ silently. Bumping `SNX_ABI` makes the runtime refuse every module built before i
 
 | Area | Files |
 | --- | --- |
-| C90 host driver (`src/nx/runtime/driver/`) | `driver.c` (dispatch), `extract.c` (XCI/NSP), `recompile.c` (AOT workflow/data), `toolchain.c` (runtime deploy build, shader prebuild); `src/nx/loader/loader.c` (NSO/NRO, metadata), `src/common/cpu/recompiler/codegen.c` (functions, and their C for the interpreter and gnuabi) + `src/common/cpu/aarch64/a64.c` + `a64_templates.inc` (the instructions' C), `src/common/utilities/common.c` (host APIs); the LLVM backend: `src/common/cpu/recompiler/llvm/` (IR emitters, ELF/COFF linkers, `rtlib.c`, `code_loader.c` loading objects into an in-process code arena, `jit_service.c` compiling missed guest code at run time) + `src/nx/loader/module_llvm.c` |
+| C90 host driver (`src/nx/runtime/driver/`) | `driver.c` (dispatch), `extract.c` (XCI/NSP), `recompile.c` (AOT workflow/data), `toolchain.c` (runtime deploy build); `src/nx/loader/loader.c` (NSO/NRO, metadata), `src/common/cpu/recompiler/codegen.c` (functions, and their C for the interpreter and gnuabi) + `src/common/cpu/aarch64/a64.c` + `a64_templates.inc` (the instructions' C), `src/common/utilities/common.c` (host APIs); the LLVM backend: `src/common/cpu/recompiler/llvm/` (IR emitters, ELF/COFF linkers, `rtlib.c`, `code_loader.c` loading objects into an in-process code arena, `jit_service.c` compiling missed guest code at run time) + `src/nx/loader/module_llvm.c` |
 | Generated-code ABI | `src/common/cpu/aarch64/`: `cpu.h` (with `SNX_ABI`), `cpu_helpers.c` (compiled into each game module, with the topic files it includes from `helpers/`: `fp.c`, `integer.c`, `simd.c`, `crypto.c`, `simd_mem.c`) |
 | The recompiler as a library (`docs/LIBRARY.md`, #171) | `src/common/cpu/recompiler/snx_recompiler.h` (the interface), `library.c` (code in memory through the LLVM backend and `llvm/link.c`, a small descriptor instead of the NX `SnxModule`, loaded from memory), `CMakeLists.txt` (`scarletnx-recompiler`, one archive of the backend's objects, installed with a CMake package), `tests/recompiler_library.c` |
 | 32-bit games (A32/Thumb) | `src/common/cpu/arm/` (the block compiler, `README.md`; `rt_helpers.c`, what blocks leave to the backend), `src/nx/loader/module_arm.c` (block discovery, the `SnxArmModule`), `src/nx/runtime/arm.c` (thread loop, block tables, run-time compiles and hints, the NX `SnxArmRt`), `snx_svc32` in `hle/svc/svc.c` (the 32-bit SVC registers, generated from `hos.svc`), `mem_layout32` in `memory/mem.c`; `tests/nx_arm32_smoke.py` runs a synthetic one |
