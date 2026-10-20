@@ -1,0 +1,19 @@
+<!--
+SPDX-License-Identifier: GPL-3.0-or-later
+Copyright 2026 the ScarletNX contributors
+The title is `[area] an imperative sentence`, like the commits' (`[gpu] Set the threads making new pipelines`).
+Delete these comments before you open the pull request.
+-->
+What was wrong or missing, and what this changes, in a few lines. Name the game or the system when there is one.
+
+- `[area] commit subject`: why, one bullet for each commit. A pull request of one commit can skip this list.
+
+Testing: what you ran and what it showed. A test that fails without the change is the best proof. For a runtime change, the game, the scene and how many runs.
+Not tested: what you did not check. Leave the line out if there is nothing.
+
+Fixes #
+<!-- `Part of #n` when this is one step of several. -->
+
+- [ ] No keys, dumps, game files or saves in the commits or the description.
+- [ ] A new file starts with `SPDX-License-Identifier: GPL-3.0-or-later` and the project's copyright line.
+- [ ] Code ported from another project keeps its copyright lines, names where it came from and is listed in `docs/CREDITS.md`.
