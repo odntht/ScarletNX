@@ -575,18 +575,35 @@ static void layout_for(u64 size) {
         g_layout.stack_size = GIB;
         g_layout.kern = 11 * GIB;
     } else {
-        /* under 12 GiB: a 512 MiB alias region from 1 GiB, which leaves the code that room (an SDK that manages
-           its address space with svcMapPhysicalMemory aborts without one), the heap region after it, then a 256 MiB
-           stack and the kernel's 256 MiB */
+        /* under 12 GiB: no alias region (as a 32-bit layout without one), the heap region from 1 GiB, which leaves
+           the code that room, then a 256 MiB stack and the kernel's 256 MiB */
         g_layout.alias = GIB;
-        g_layout.alias_size = GIB / 2;
-        g_layout.heap = GIB + GIB / 2;
-        g_layout.heap_size = size - 2 * GIB;
+        g_layout.alias_size = 0;
+        g_layout.heap = GIB;
+        g_layout.heap_size = size - GIB - GIB / 2;
         g_layout.stack = g_layout.heap + g_layout.heap_size;
         g_layout.stack_size = GIB / 4;
         g_layout.kern = size - GIB / 4;
     }
     g_layout.kern_end = size;
+}
+/* A game with a system resource size manages its address space itself (nn::os's VammManager): it takes the alias region
+   the kernel reports and asks for 12 GiB of it, mapping pages in with svcMapPhysicalMemory as it grows. The console
+   reports 64 GiB. Here the region is reported at that size and backed as far as the address space reaches: a game that
+   maps past that is refused, and it has no more memory than the app is allowed in any case. Under 12 GiB the heap
+   region (which that game never sets) shrinks to make the room, the alias region taking all that is left above the code */
+void mem_layout_vamm(void) {
+    if (g_as_size >= 64 * GIB) return;
+    if (g_as_size < 12 * GIB) {
+        g_layout.alias = GIB / 2;
+        g_layout.kern = g_as_size - GIB / 4;
+        g_layout.stack = g_layout.kern - GIB / 4;
+        g_layout.stack_size = GIB / 4;
+        g_layout.heap = g_layout.stack - GIB / 4;
+        g_layout.heap_size = GIB / 4;
+        g_layout.alias_size = g_layout.heap - g_layout.alias;
+    }
+    g_layout.alias_virtual = 64 * GIB;
 }
 #ifdef __APPLE__
 #include <mach/mach.h>
