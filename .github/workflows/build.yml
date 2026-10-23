@@ -7,6 +7,17 @@ on:
     branches: [main]
     tags: ['v*'] # a version's release (publish.yml)
   pull_request:
+    # skipped when the change is only in files that no build or test reads. tracked_material.py reads them all and runs
+    # on its own (tracked-material.yml). docs/ARCHITECTURE.md, DEPRECATIONS.md and GUI.md are test inputs: they build
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!.claude/**'
+      - '!.gitignore'
+      - '!.github/ISSUE_TEMPLATE/**'
+      - 'docs/ARCHITECTURE.md'
+      - 'docs/DEPRECATIONS.md'
+      - 'docs/GUI.md'
   workflow_dispatch:
 
 # Jobs only read the repository. A push to main that builds everywhere becomes a nightly, and a pull request's run a
