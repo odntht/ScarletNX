@@ -70,17 +70,21 @@ pick into `dumps/`, then makes the game in `recompiled/`. Pick them from whereve
 
 1. **Install the app.** Take `ScarletNX-ios-arm64-<commit>.ipa` from a CI run, or build it (`cmake --preset ios`,
    [Building](#building)), and install it with a sideloading tool that signs it with an Apple ID: iloader or
-   SideStore. A free account signs an app for 7 days, up to three apps at a time (the app, SideStore and StikDebug).
+   SideStore. A free account signs an app for 7 days. iOS lets a device hold three apps with a free profile at a time,
+   whichever Apple IDs signed them, so a second account adds no room. The app, SideStore and StikDebug fill them, and a
+   fourth install fails with "maximum number of installed apps using a free developer profile".
 2. **Set up JIT once.** iOS makes memory executable only for an app with a debugger attached. Install StikDebug and
    LocalDevVPN, give StikDebug the pairing file (SideStore keeps one: *Storage Explorer*,
    `ALTPairingFile.mobiledevicepairing`), hold ScarletNX in StikDebug's list and *Assign Script* `universal.js`. The
-   runtime checks for the debugger first and says what to enable when there is none.
+   runtime checks for the debugger first and says what to enable when there is none. Reinstalling StikDebug removes its data,
+   assignments included, so assign the script again.
 3. **Add your keys.** Open ScarletNX, *Install Keys*, and pick the `prod.keys` of your Switch.
 4. **Prepare the game.** In *Games*, pick the `.nsp` or `.xci` and prepare it. The app extracts it and writes
    `recompiled/<id>/` with `<id>_code.snxobj` and `<id>_data/`. 64-bit games only. Keep the app in the foreground
    until it ends: iOS stops its GPU and its threads in the background.
 5. **Play.** *Enable JIT* for ScarletNX in StikDebug, open ScarletNX, *Games*, and pick the game. Do this before each
-   run, and do not leave the app while the game runs.
+   run, and do not leave the app while the game runs. Keep StikDebug open too: when it is closed, the debugger goes
+   with it and the game loses JIT.
 
 The folders the app makes in *On My iPhone > ScarletNX* are `dumps/` (your games' dumps), `keys/`, `recompiled/` (the
 games it made) and `logs/` (what to send when a run fails). Reinstalling the app can remove them with some tools.
