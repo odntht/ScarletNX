@@ -52,6 +52,12 @@
 #if defined(APPLE_JIT) || defined(IOS_JIT)
 #define APPLE_THREADS 1
 #endif
+#if defined(__APPLE__) && TARGET_OS_IOS
+/* what the code arenas asked of the debugger so far: memory the game's own pool does not have (none in the simulator,
+   which makes its code memory itself) */
+static size_t g_ios_arena_bytes;
+size_t snx_ios_code_arena_bytes(void) { return __atomic_load_n(&g_ios_arena_bytes, __ATOMIC_RELAXED); }
+#endif
 #if defined(__linux__) && defined(__aarch64__)
 /* <linux/membarrier.h>'s commands (Linux 4.16), by number for C libraries whose headers predate them */
 #define MEMBARRIER_SYNC_CORE          (1 << 5) /* MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE */
@@ -197,9 +203,6 @@ __attribute__((noinline, optnone, naked)) static void* ios_jit_prepare(void* add
 /* The debugger answers a request only while its script runs, and a game that maps tens of thousands of files can
    take a minute and a half to ask again (the JIT's own arena, the GPU macros' after it). So the first arena also asks
    for the regions the later ones are, while the debugger is there, and a later arena of that size takes one of them */
-/* what the code arenas asked of the debugger so far: memory the game's own pool does not have */
-static size_t g_ios_arena_bytes;
-size_t snx_ios_code_arena_bytes(void) { return __atomic_load_n(&g_ios_arena_bytes, __ATOMIC_RELAXED); }
 #define IOS_SPARES 2
 #define IOS_SPARE_SIZE ((size_t)1 << 27)
 static struct {
