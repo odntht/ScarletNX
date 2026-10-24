@@ -139,6 +139,12 @@ setting Resolution scale
     default-if SNX_IOS 0.25
     startup
     help The scale of the game's 3D rendering, 0.25 to 4: 1 = the console's, 2 = double, 0.5 = half
+setting Show stats
+    key show_stats
+    int 0 1
+    default 0
+    words Off|On
+    help The frame rate, the memory, the processor's share and the heat in a corner of the picture. The in-game menu turns it on and off
 setting Shadows
     key shadows
     int 0 1

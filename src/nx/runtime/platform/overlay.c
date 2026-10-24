@@ -60,7 +60,6 @@ static const char* const PADS[P_COUNT] = {SNX_GAMEPAD_PLAYERS,
                                           SNX_GAMEPAD_MAP,
                                           "Back"};
 static int shown, page, focus, top; /* top: the first item showing */
-static int hud;                     /* the frame rate and the memory in a corner, on or off */
 /* the scales the resolution steps through: it is read as a game starts, so the one chosen counts from the next */
 static const float RES_STEPS[] = {0.25f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f};
 enum { RES_COUNT = (int)(sizeof RES_STEPS / sizeof *RES_STEPS) };
@@ -138,7 +137,7 @@ static void label(int i, char* text, size_t size, char* value, size_t vsize) {
         snprintf(text, size, "%s", main_items[i]);
         if (i == M_CONTROLS || i == M_PADS) snprintf(value, vsize, ">");
         if (i == M_RES) snprintf(value, vsize, "< %gx >", (double)RES_STEPS[res_index()]);
-        if (i == M_HUD) snprintf(value, vsize, "%s", hud ? "On" : "Off");
+        if (i == M_HUD) snprintf(value, vsize, "%s", g_settings.show_stats ? "On" : "Off");
         return;
     }
     if (page == PAGE_BUTTONS) {
@@ -294,7 +293,8 @@ static int act(int i, int step) {
             return OVERLAY_NONE;
         }
         if (i == M_HUD) {
-            hud = !hud;
+            g_settings.show_stats = !g_settings.show_stats;
+            vpad_store_text("show_stats", g_settings.show_stats ? "1" : "0");
             return OVERLAY_NONE;
         }
         if (step) return OVERLAY_NONE;
@@ -690,7 +690,7 @@ void overlay_draw(SnxUiList* l, int sw, int sh) {
     char text[VISIBLE][OVERLAY_COLS_MAX + 1], value[VISIBLE][OVERLAY_COLS_MAX + 1], pads[OVERLAY_COLS_MAX];
     Dialog d;
     DialogDrawn at;
-    if (hud) hud_draw(l, sw, sh);
+    if (g_settings.show_stats) hud_draw(l, sw, sh);
     if (!shown) return;
     if (page == PAGE_MAP) {
         map_draw(l, sw, sh);
