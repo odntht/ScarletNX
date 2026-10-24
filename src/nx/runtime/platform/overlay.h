@@ -71,4 +71,7 @@ void overlay_error_draw(SnxUiList* l, int sw, int sh, SnxOverlayError* e);
 /* 1 when x, y falls in r, an empty one taking nothing */
 int overlay_error_hit(const SnxOverlayRect* r, float x, float y);
 
+/* the stats corner's GPU line, set by the renderer when it starts: device memory held, what its caches keep, and the
+   GPU thread's time waiting for the GPU so far. NULL without one */
+extern void (*g_overlay_gpu_stats)(u64* device_bytes, u64* cache_bytes, u64* wait_ns);
 #endif

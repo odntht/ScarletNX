@@ -19,10 +19,17 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/gpu/vk/vk.h"
+#include "nx/runtime/platform/overlay.h"
 #include "nx/memory/mem.h"
 #include "nx/memory/own.h"
 #include "nx/gpu/vk/pending_pages.h"
 #include "nx/gpu/renderer.h"
+#ifdef __APPLE__
+#include <dlfcn.h>
+#include <unistd.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
+#endif
 
 static VkSemaphore g_acquired[VK_FRAMES];
 /* the CPU fallback's image, and the last presented frame for screenshots */
@@ -85,8 +92,65 @@ static void vkr_mapping_end(void) {
 }
 
 /* 0 when Vulkan can't run here */
+#ifdef __APPLE__
+/* test build: a Metal capture of SNX_MTL_CAPTURE_PRESENTS presents (1 by default) when the file SNX_MTL_CAPTURE names
+   appears, written beside it as a .gputrace for Xcode. The process needs MTL_CAPTURE_ENABLED=1 */
+static void mtl_capture_poll(void) {
+    static int state;
+    static u32 until;
+    static id mgr;
+    static u64 checked;
+    const char* trig = getenv("SNX_MTL_CAPTURE");
+    if (!trig || state == 2) return;
+    if (state == 1) {
+        if (g_vk_present < until) return;
+        ((void (*)(id, SEL))objc_msgSend)(mgr, sel_registerName("stopCapture"));
+        LOG("vulkan: Metal capture stopped at present %u\n", g_vk_present);
+        state = 0;
+        return;
+    }
+    if (plat_ns() - checked < 500000000u) return;
+    checked = plat_ns();
+    if (access(trig, F_OK)) return;
+    unlink(trig);
+    {
+        void* metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY);
+        id (*create)(void) = metal ? (id (*)(void))dlsym(metal, "MTLCreateSystemDefaultDevice") : NULL;
+        id dev = create ? create() : NULL, desc, str, url, err = NULL;
+        const char* n = getenv("SNX_MTL_CAPTURE_PRESENTS");
+        char out[1100];
+        BOOL ok;
+        if (!dev) {
+            LOG("vulkan: Metal capture: no device\n");
+            return;
+        }
+        mgr = ((id (*)(Class, SEL))objc_msgSend)(objc_getClass("MTLCaptureManager"),
+                                                 sel_registerName("sharedCaptureManager"));
+        if (!((BOOL (*)(id, SEL, long))objc_msgSend)(mgr, sel_registerName("supportsDestination:"), 2L)) {
+            LOG("vulkan: Metal capture: no GPU trace documents (MTL_CAPTURE_ENABLED=1 missing?)\n");
+            state = 2;
+            return;
+        }
+        snprintf(out, sizeof out, "%s-%u.gputrace", trig, g_vk_present);
+        desc = ((id (*)(Class, SEL))objc_msgSend)(objc_getClass("MTLCaptureDescriptor"), sel_registerName("new"));
+        ((void (*)(id, SEL, id))objc_msgSend)(desc, sel_registerName("setCaptureObject:"), dev);
+        ((void (*)(id, SEL, long))objc_msgSend)(desc, sel_registerName("setDestination:"), 2L);
+        str = ((id (*)(Class, SEL, const char*))objc_msgSend)(objc_getClass("NSString"),
+                                                              sel_registerName("stringWithUTF8String:"), out);
+        url = ((id (*)(Class, SEL, id))objc_msgSend)(objc_getClass("NSURL"), sel_registerName("fileURLWithPath:"), str);
+        ((void (*)(id, SEL, id))objc_msgSend)(desc, sel_registerName("setOutputURL:"), url);
+        ok = ((BOOL (*)(id, SEL, id, id*))objc_msgSend)(mgr, sel_registerName("startCaptureWithDescriptor:error:"), desc,
+                                                       &err);
+        until = g_vk_present + (u32)(n && atoi(n) > 0 ? atoi(n) : 1);
+        state = ok ? 1 : 0;
+        LOG("vulkan: Metal capture %s at present %u into %s\n", ok ? "started" : "failed", g_vk_present, out);
+    }
+}
+#endif
+static void vkr_hud_stats(u64* device_bytes, u64* cache_bytes, u64* wait_ns);
 static int vkr_start(void) {
     if (!vk_init()) return 0;
+    g_overlay_gpu_stats = vkr_hud_stats;
     g_vk_scale = g_settings.resolution_scale;       /* the .ini keeps resolution within 0.25 to 4 (options.c) */
     g_vk_anisotropy = g_settings.anisotropic_filtering; /* the sampler table keeps what it makes: anisotropy applies at start */
     if (g_vk_anisotropy > 1 && !g_vk.feat.samplerAnisotropy)
@@ -347,6 +411,62 @@ static void gpu_memory_plots(void) {
 }
 #endif
 
+/* each heap's use, VMA's memory by type and what the caches hold (the periodic statistics, and cmd.c's ring report) */
+void vk_mem_report(void) {
+    {
+        /* each memory heap's use and the driver's budget for it (VK_EXT_memory_budget), and our own memory in
+           it (VMA's blocks): past the budget the driver moves memory, and the heap the CPU maps (the BAR window)
+           is the one to watch. NVIDIA counts the whole system's use of the window as ours, and budgets what
+           is left of it (cmd.c bar_room) */
+        VmaBudget b[VK_MAX_MEMORY_HEAPS];
+        const VkPhysicalDeviceMemoryProperties* mp;
+        char line[256];
+        size_t at = 0;
+        vmaGetHeapBudgets(g_vk.vma, b);
+        vmaGetMemoryProperties(g_vk.vma, &mp);
+        for (u32 q = 0; q < mp->memoryHeapCount && at < sizeof line; q++)
+            at += (size_t)snprintf(line + at, sizeof line - at, "%s heap %u %llu of %llu MB (%llu ours)",
+                                   q ? "," : "", q, (unsigned long long)(b[q].usage >> 20),
+                                   (unsigned long long)(b[q].budget >> 20),
+                                   (unsigned long long)(b[q].statistics.blockBytes >> 20));
+        LOG("vulkan: memory used and budgeted:%s\n", line);
+        {
+            /* what VMA holds, by memory type: where a heap's megabytes are when the caches hold few */
+            VmaTotalStatistics* t = calloc(1, sizeof *t);
+            if (t) {
+                vmaCalculateStatistics(g_vk.vma, t);
+                for (u32 q = 0; q < mp->memoryTypeCount; q++) {
+                    const VmaDetailedStatistics* d = &t->memoryType[q];
+                    if (!d->statistics.blockCount) continue;
+                    LOG("vulkan:   memory type %u (heap %u, flags %x): %u blocks %llu MB, %u allocations %llu MB, "
+                        "largest %llu MB, largest free %llu MB\n",
+                        q, mp->memoryTypes[q].heapIndex, (unsigned)mp->memoryTypes[q].propertyFlags,
+                        d->statistics.blockCount, (unsigned long long)(d->statistics.blockBytes >> 20),
+                        d->statistics.allocationCount, (unsigned long long)(d->statistics.allocationBytes >> 20),
+                        (unsigned long long)(d->allocationSizeMax >> 20),
+                        (unsigned long long)(d->unusedRangeSizeMax >> 20));
+                }
+                free(t);
+            }
+        }
+    }
+    {
+        /* what the caches hold, which vk_mem_trim keeps within the budget */
+        u32 nrt, ntex, nbuf, parked, none;
+        u64 brt, btex, bbuf, usage, budget, trimmed;
+        vk_surf_stats(VK_LRU_RT, &nrt, &brt, &parked);
+        vk_surf_stats(VK_LRU_TEX, &ntex, &btex, &none);
+        vk_buf_stats(&nbuf, &bbuf);
+        vk_mem_use(&usage, &budget);
+        trimmed = vk_mem_trimmed();
+        LOG("vulkan: caches: %u render targets (%llu MB, %u parked), %u textures (%llu MB), %u buffers (%llu "
+            "MB); %llu of %llu MB in use as they count it, %llu MB freed for the budget so far\n",
+            nrt, (unsigned long long)(brt >> 20), parked, ntex, (unsigned long long)(btex >> 20), nbuf,
+            (unsigned long long)(bbuf >> 20), (unsigned long long)(usage >> 20),
+            (unsigned long long)(budget >> 20), (unsigned long long)(trimmed >> 20));
+    }
+}
+
 /* The window's image: src's g_last_ rectangle (a frame of fw x fh, flipped by transform) letterboxed on black, or
    black alone, with the on-screen controls and the game's menu over it; then the frame's commands are submitted and
    the image presented. A game's frame (game) also moves the per-present bookkeeping, and without src shows nothing.
@@ -542,39 +662,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
                         (unsigned long long)early_made, (unsigned long long)early_hits,
                         (unsigned long long)early_left);
             }
-            {
-                /* each memory heap's use and the driver's budget for it (VK_EXT_memory_budget), and our own memory in
-                   it (VMA's blocks): past the budget the driver moves memory, and the heap the CPU maps (the BAR window)
-                   is the one to watch. NVIDIA counts the whole system's use of the window as ours, and budgets what
-                   is left of it (cmd.c bar_room) */
-                VmaBudget b[VK_MAX_MEMORY_HEAPS];
-                const VkPhysicalDeviceMemoryProperties* mp;
-                char line[256];
-                size_t at = 0;
-                vmaGetHeapBudgets(g_vk.vma, b);
-                vmaGetMemoryProperties(g_vk.vma, &mp);
-                for (u32 q = 0; q < mp->memoryHeapCount && at < sizeof line; q++)
-                    at += (size_t)snprintf(line + at, sizeof line - at, "%s heap %u %llu of %llu MB (%llu ours)",
-                                           q ? "," : "", q, (unsigned long long)(b[q].usage >> 20),
-                                           (unsigned long long)(b[q].budget >> 20),
-                                           (unsigned long long)(b[q].statistics.blockBytes >> 20));
-                LOG("vulkan: memory used and budgeted:%s\n", line);
-            }
-            {
-                /* what the caches hold, which vk_mem_trim keeps within the budget */
-                u32 nrt, ntex, nbuf, parked, none;
-                u64 brt, btex, bbuf, usage, budget, trimmed;
-                vk_surf_stats(VK_LRU_RT, &nrt, &brt, &parked);
-                vk_surf_stats(VK_LRU_TEX, &ntex, &btex, &none);
-                vk_buf_stats(&nbuf, &bbuf);
-                vk_mem_use(&usage, &budget);
-                trimmed = vk_mem_trimmed();
-                LOG("vulkan: caches: %u render targets (%llu MB, %u parked), %u textures (%llu MB), %u buffers (%llu "
-                    "MB); %llu of %llu MB in use as they count it, %llu MB freed for the budget so far\n",
-                    nrt, (unsigned long long)(brt >> 20), parked, ntex, (unsigned long long)(btex >> 20), nbuf,
-                    (unsigned long long)(bbuf >> 20), (unsigned long long)(usage >> 20),
-                    (unsigned long long)(budget >> 20), (unsigned long long)(trimmed >> 20));
-            }
+            vk_mem_report();
             LOG("vulkan: %llu draws sampled a target they render to in place (%llu barriers in passes, %llu passes "
                 "begun again), %llu through a copy\n",
                 (unsigned long long)g_vk_fb_draws, (unsigned long long)g_vk_fb_barriers,
@@ -588,6 +676,9 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
     /* Offscreen frames still submit and advance the frame ring. g_last remains available for readback. */
     vk_submit(wait, VK_PIPELINE_STAGE_2_CLEAR_BIT, signal);
     if (game) vk_renderdoc_present(g_vk_present);
+#ifdef __APPLE__
+    mtl_capture_poll();
+#endif
     vk_frame_next(); /* every show used this frame's slot and acquire semaphore, the menu's own too */
     if (signal) {
         /* after the frame's submission, whose semaphore it waits on, without waiting for its recording */
@@ -765,6 +856,22 @@ static void vk_report_stall(void) {
          (unsigned long long)gsub, (unsigned long long)cdone, (unsigned long long)csub,
          (unsigned long long)vk_rec_behind());
 }
+/* the stats corner's GPU line (g_overlay_gpu_stats) */
+static void vkr_hud_stats(u64* device_bytes, u64* cache_bytes, u64* wait_ns) {
+    VmaBudget b[VK_MAX_MEMORY_HEAPS];
+    u32 n, parked;
+    u64 rt = 0, tex = 0, buf = 0;
+    *device_bytes = *cache_bytes = 0;
+    *wait_ns = __atomic_load_n(&g_vk_wait_ns, __ATOMIC_RELAXED);
+    if (!g_vk.vma) return;
+    vmaGetHeapBudgets(g_vk.vma, b);
+    *device_bytes = b[vk_mem_heap()].statistics.blockBytes;
+    vk_surf_stats(VK_LRU_RT, &n, &rt, &parked);
+    vk_surf_stats(VK_LRU_TEX, &n, &tex, &parked);
+    vk_buf_stats(&n, &buf);
+    *cache_bytes = rt + tex + buf;
+}
+
 const Renderer vk_renderer = {
     .name = "Vulkan",
     .start = vkr_start,

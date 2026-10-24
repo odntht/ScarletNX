@@ -8,6 +8,9 @@
    submit would reset them mid-draw, and wait for the GPU at every submit. */
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include "nx/runtime/platform/log.h"
 #include "nx/gpu/gpu.h"
 #include "nx/gpu/vk/vk.h"
@@ -54,6 +57,7 @@ typedef struct {
     Dead* dead;
     int ndead, capdead;
     u64 dead_bytes; /* device memory evicted cache entries among them release (vk_defer_bytes) */
+    u64 ring_bytes; /* rings made in this use of the slot: they and the ones they replace live until it is reused */
     /* descriptor pools, reset when the frame is reused and kept */
     VkDescriptorPool pool_d[64];
     int npool, ipool; /* pool_d[ipool] is the one allocating; the ones after it are reset and waiting */
@@ -68,6 +72,15 @@ typedef struct {
 
 static Frame g_fr[VK_FRAMES];
 static u64 g_dead_bytes; /* every frame's dead_bytes */
+u64 g_vk_wait_ns;       /* the GPU thread's time in timeline_wait, for the stats corner */
+/* what each submission holds, for the report of a long wait: draws and their vertices, dispatches and their groups */
+u32 g_vk_sub_draws, g_vk_sub_disp;
+int g_vk_draw_log; /* draws to log by shader, set by a wait of a second or more */
+u64 g_vk_sub_verts, g_vk_sub_groups;
+static struct {
+    u64 value, ns, verts, groups;
+    u32 draws, disp;
+} g_subrec[512];
 static u32 g_cur;
 static u32 g_cb_begun = 1; /* command buffers begun, so a command buffer's state is told from an earlier one's */
 static u64 g_frame_id;
@@ -250,11 +263,47 @@ static void timeline_wait(u64 value) {
     VkSemaphoreWaitInfo wi = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_gsem, .pValues = &value};
     SNX_ZONE_C(z_wait, "vk timeline wait", 0xb05252);
+    u64 t0 = plat_ns(), done0 = 0;
+    vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done0);
     gpu_wait_note("a graphics submission", value);
     SNX_ZONE_V(z, "timeline wait", value);
     VK_OK(vkWaitSemaphores(g_vk.dev, &wi, UINT64_MAX));
     SNX_ZONE_END(z);
     gpu_wait_note(NULL, 0);
+    __atomic_add_fetch(&g_vk_wait_ns, plat_ns() - t0, __ATOMIC_RELAXED);
+    {
+        static int armed;
+        if (plat_ns() - t0 >= 1000000000u && armed < 2) {
+            armed++;
+            g_vk_draw_log = 300;
+        }
+    }
+    if (plat_ns() - t0 >= 30000000u) {
+        u32 n = 0, draws = 0, disp = 0;
+        u64 verts = 0, groups = 0, oldest = 0, worst = 0, worst_v = 0;
+        for (u64 v = done0 + 1; v <= value && n < 512; v++, n++) {
+            u32 k = (u32)(v % 512);
+            if (g_subrec[k].value != v) continue;
+            draws += g_subrec[k].draws;
+            disp += g_subrec[k].disp;
+            verts += g_subrec[k].verts;
+            groups += g_subrec[k].groups;
+            if (!oldest) oldest = g_subrec[k].ns;
+            if (g_subrec[k].groups + g_subrec[k].verts > worst) {
+                worst = g_subrec[k].groups + g_subrec[k].verts;
+                worst_v = v;
+            }
+        }
+        LOG_LIMIT(300,
+                  "vulkan: waited %llu ms for submission %llu: %u pending (the oldest sent %llu ms before), %u draws "
+                  "(%llu vertices), %u dispatches (%llu groups); the biggest %llu: %u draws %llu vertices, %u "
+                  "dispatches %llu groups\n",
+                  (unsigned long long)((plat_ns() - t0) / 1000000), (unsigned long long)value, n,
+                  (unsigned long long)(oldest ? (t0 - oldest) / 1000000 : 0), draws, (unsigned long long)verts, disp,
+                  (unsigned long long)groups, (unsigned long long)worst_v, g_subrec[worst_v % 512].draws,
+                  (unsigned long long)g_subrec[worst_v % 512].verts, g_subrec[worst_v % 512].disp,
+                  (unsigned long long)g_subrec[worst_v % 512].groups);
+    }
 }
 /* the storage results of every submission up to value, which has finished, land in guest memory, in order */
 static void land_through(u64 value) {
@@ -278,6 +327,7 @@ static void frame_recycle(Frame* f) {
     dead_free(f);
     g_dead_bytes -= f->dead_bytes;
     f->dead_bytes = 0;
+    f->ring_bytes = 0;
     vkResetCommandPool(g_vk.dev, f->pool, 0);
     /* the pools stay, reset: a frame's draws fill several, and making them again every frame costs */
     for (int i = 0; i < f->npool; i++) vkResetDescriptorPool(g_vk.dev, f->pool_d[i], 0);
@@ -394,12 +444,97 @@ static u8* ring_alloc(Frame* f, Ring* r, u64 size, u64 align, VkBufferUsageFlags
         r->ptr = info.pMappedData;
         r->cap = cap;
         at = 0;
+        f->ring_bytes += cap;
     }
     r->used = at + size;
     *buf = r->buf;
     *off = at;
     if (mem) *mem = r->mem;
     return r->ptr + at;
+}
+
+/* who asks for ring memory: the callers' bytes since the last report, by return address */
+static struct {
+    void* pc;
+    u64 bytes, n, big;
+} g_site[24];
+static u64 g_site_ns;
+/* events counted by caller between reports: what ends passes and frames, and how often the GPU gets work */
+static const char* const g_ev_name[] = {"pass ends", "submits", "slot changes for 128 submits",
+                                        "slot changes for pools or sets", "slot changes for rings"};
+static struct {
+    void* pc;
+    u32 kind, n;
+} g_ev[96];
+static u32 g_ev_present;
+void vk_note_event(u32 kind, void* pc) {
+    u32 i;
+    for (i = 0; i < 96 && g_ev[i].n && (g_ev[i].pc != pc || g_ev[i].kind != kind); i++) {}
+    if (i == 96) return;
+    g_ev[i].pc = pc;
+    g_ev[i].kind = kind;
+    g_ev[i].n++;
+}
+static void ev_report(void) {
+    u32 presents = g_vk_present - g_ev_present, k, i;
+    g_ev_present = g_vk_present;
+    LOG("vulkan: events in the last %.1f s, %u presents:\n", (double)(plat_ns() - g_site_ns) / 1e9, presents);
+    for (k = 0; k < 5; k++) {
+        u32 total = 0;
+        for (i = 0; i < 96 && g_ev[i].n; i++)
+            if (g_ev[i].kind == k) total += g_ev[i].n;
+        if (!total) continue;
+        LOG("vulkan:   %u %s\n", total, g_ev_name[k]);
+        for (i = 0; i < 96 && g_ev[i].n; i++) {
+            const char* sym = "?";
+            unsigned long long at = (unsigned long long)(uintptr_t)g_ev[i].pc;
+            if (g_ev[i].kind != k || g_ev[i].n * 20 < total) continue;
+#ifndef _WIN32
+            Dl_info di;
+            if (dladdr(g_ev[i].pc, &di)) {
+                if (di.dli_sname) sym = di.dli_sname;
+                at -= (unsigned long long)(uintptr_t)di.dli_fbase;
+            }
+#endif
+            LOG("vulkan:     %u from %s (+0x%llx)\n", g_ev[i].n, sym, at);
+        }
+    }
+    memset(g_ev, 0, sizeof g_ev);
+}
+static void site_note(void* pc, u64 size) {
+    u32 i;
+    for (i = 0; i < 24 && g_site[i].pc && g_site[i].pc != pc; i++) {}
+    if (i == 24) i = 23;
+    g_site[i].pc = pc;
+    g_site[i].bytes += size;
+    g_site[i].n++;
+    if (size > g_site[i].big) g_site[i].big = size;
+}
+static void site_report(const char* why) {
+    u64 total = 0;
+    for (u32 i = 0; i < 24 && g_site[i].pc; i++) total += g_site[i].bytes;
+    if (total >= (32ull << 20)) {
+        LOG("vulkan: %s: %llu MB asked of the rings since the last report\n", why, (unsigned long long)(total >> 20));
+        for (u32 i = 0; i < 24 && g_site[i].pc; i++) {
+            if (g_site[i].bytes < (1ull << 20)) continue;
+            const char* sym = "?";
+            unsigned long long at = (unsigned long long)(uintptr_t)g_site[i].pc;
+#ifndef _WIN32
+            Dl_info di;
+            if (dladdr(g_site[i].pc, &di)) {
+                if (di.dli_sname) sym = di.dli_sname;
+                at -= (unsigned long long)(uintptr_t)di.dli_fbase;
+            }
+#endif
+            LOG("vulkan:   %llu MB in %llu requests (largest %llu KB) from +0x%llx (%s)\n",
+                (unsigned long long)(g_site[i].bytes >> 20), (unsigned long long)g_site[i].n,
+                (unsigned long long)(g_site[i].big >> 10), at, sym);
+        }
+    }
+    if (total >= (32ull << 20)) vk_mem_report();
+    ev_report();
+    memset(g_site, 0, sizeof g_site);
+    g_site_ns = plat_ns();
 }
 
 static u8* stage_alloc(u64 size, u64 align, VkBuffer* buf, u64* off, VmaAllocation* mem, int output)
@@ -418,11 +553,13 @@ static u8* stage_alloc(u64 size, u64 align, VkBuffer* buf, u64* off, VmaAllocati
 }
 u8* vk_stage_output(u64 size, u64 align, VkBuffer* buf, u64* off, VmaAllocation* mem)
 {
+	site_note(__builtin_return_address(0), size);
 	return stage_alloc(size, align, buf, off, mem, 1);
 }
 
 u8* vk_stage(u64 size, u64 align, VkBuffer* buf, u64* off)
 {
+	site_note(__builtin_return_address(0), size);
 	return stage_alloc(size, align, buf, off, NULL, 1);
 }
 
@@ -431,6 +568,7 @@ u8* vk_stage(u64 size, u64 align, VkBuffer* buf, u64* off)
  * snapshots in host memory; stable buffers get their own device-local copies. */
 u8* vk_stage_upload(u64 size, u64 align, VkBuffer* buf, u64* off)
 {
+	site_note(__builtin_return_address(0), size);
 	return stage_alloc(size, align, buf, off, NULL, 0);
 }
 
@@ -447,6 +585,7 @@ u8* vk_stage_back(u64 size, VkBuffer* buf, u64* off, VmaAllocation* mem) {
 
 /* the frame's commands submitted, waiting for xw and signaling xs besides the graphics timeline (one each at most) */
 static void submit(const VkSemaphoreSubmitInfo* xw, const VkSemaphoreSubmitInfo* xs) {
+    vk_note_event(1, __builtin_return_address(0));
     SNX_ZONE(z_submit, "vk submit");
     vk_render_end();
     Frame* f = &g_fr[g_cur];
@@ -480,6 +619,17 @@ static void submit(const VkSemaphoreSubmitInfo* xw, const VkSemaphoreSubmitInfo*
     vk_rec_submit(cb, w, nw, s, xs ? 2u : 1u);
     memset(g_after, 0, sizeof g_after);
     __atomic_store_n(&g_gval, g_gval + 1, __ATOMIC_RELAXED); /* read by the stall report too */
+    {
+        u32 k = (u32)(g_gval % 512);
+        g_subrec[k].value = g_gval;
+        g_subrec[k].ns = plat_ns();
+        g_subrec[k].draws = g_vk_sub_draws;
+        g_subrec[k].disp = g_vk_sub_disp;
+        g_subrec[k].verts = g_vk_sub_verts;
+        g_subrec[k].groups = g_vk_sub_groups;
+        g_vk_sub_draws = g_vk_sub_disp = 0;
+        g_vk_sub_verts = g_vk_sub_groups = 0;
+    }
     g_sub_ns = plat_ns();
     f->recording = 0;
     f->icb++;
@@ -534,10 +684,23 @@ void vk_frame_next(void) {
    their storage results sooner, so the pending results a draw's buffers are looked up in stay fewer. 2 ms and 0.5 ms
    were both slower. The limit on submissions leaves room for these in a slow frame: one that reaches it records
    the rest in the other slot, and its present then waits for this one's work */
+/* Rings a frame may make before it ends: a loading screen's uploads without a present held every full ring until the
+   next one, and the GPU memory grew by 800 MB in seconds until iOS killed the app */
+#define FRAME_RINGS (4 * g_vk.alloc_cap)
 void vk_frame_check(void) {
     const Frame* f = &g_fr[g_cur];
-    if (f->icb >= 128 || f->ipool >= 32 || vk_rec_frame_sets(g_cur) >= 32 * 1024)
+    if (f->ring_bytes >= FRAME_RINGS) {
+        vk_note_event(4, __builtin_return_address(0));
+        LOG("vulkan: a frame ends after %llu MB of new rings (present %u)\n", (unsigned long long)(f->ring_bytes >> 20),
+            g_vk_present);
+        site_report("the frame's rings");
         vk_frame_next();
+    } else if (f->icb >= 128 || f->ipool >= 32 || vk_rec_frame_sets(g_cur) >= 32 * 1024) {
+        vk_note_event(f->icb >= 128 ? 2 : 3, __builtin_return_address(0));
+        vk_frame_next();
+    }
+    else if (plat_ns() - g_site_ns >= 2000000000ull)
+        site_report("2 s");
     else if (f->recording && plat_ns() - g_sub_ns >= SUBMIT_EVERY_NS)
         submit(NULL, NULL);
 }

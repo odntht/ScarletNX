@@ -1438,6 +1438,8 @@ rebind:
     rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->p);
     rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk_playout, 0, 1, &set, 0, NULL);
     rec_CmdDispatch(cb, gx, gy, gz);
+    g_vk_sub_disp++;
+    g_vk_sub_groups += (u64)gx * gy * gz;
     if (resident) {
         vk_all_barrier(cb); /* its writes before what reads them next */
         for (int i = 0; i < ng; i++) {

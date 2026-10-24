@@ -45,6 +45,8 @@ void present_pace(u32 interval) {
     next = g_pace_last + period;
     /* a schedule more than a refresh behind (a load, a pause) starts again from now: no burst to catch up */
     if (!g_pace_last || now > next + refresh) next = now;
+    /* a number of frames a second is a ceiling: a frame that ran long is not caught up with a burst */
+    if (fps != SNX_FPS_GAME && now > next) next = now;
     g_pace_last = next;
     pm_unlock(&g_pace_lock);
     if (next > now) plat_sleep_ns((i64)(next - now));

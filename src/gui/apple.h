@@ -13,6 +13,8 @@ void gui_apple_log_start(void);
 /* iOS: one line of what the app uses now (memory it is charged for and may still take, CPU time, thermal state, power
    mode), for the log every few seconds of a run */
 void gui_apple_stats(char* out, size_t size);
+/* iOS: the game's software keyboard, an alert with a text field; 0 with the text in out, 1 for Cancel */
+int gui_apple_text_input(char* out, size_t cap, const char* initial);
 int gui_apple_thermal(void); /* the system's thermal state: 0 nominal, 1 fair, 2 serious, 3 critical */
 /* iOS: the working folder is the app's Documents (the data folder, which the Files app shows), with its games/ */
 void gui_apple_start(void);

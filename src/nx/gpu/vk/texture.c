@@ -766,6 +766,18 @@ static Surf* tex_from_tic(const u32* tic, int raw) {
         levels = maxl >= base ? maxl - base + 1 : 1;
         if (levels > glevels - base) levels = glevels - base;
     }
+    /* Texture detail: the most detailed levels left out, the next one as the base, as for a header's base level. Only
+       mipmapped 2D textures of 128 texels or more: one level and small ones are often read texel by texel (lookup
+       tables, fonts), and a shader that asks for a size sees the smaller one */
+    for (u32 cut = (u32)g_settings.texture_detail; bl && cut && levels > 1 && vt != VK_IMAGE_VIEW_TYPE_3D &&
+                                                   (w >> 1) >= 64 && (h >> 1) >= 64 && type != 6;
+         cut--) {
+        gva += bl_level_size(w, h, d3, &f, bh, bd, 0, NULL, NULL);
+        bl_level_blocks(h, d3, &f, bh, bd, 1, &bh, &bd);
+        w >>= 1;
+        h >>= 1;
+        levels--;
+    }
     /* no more levels than the size has (Vulkan requires it) */
     u32 maxdim = w > h ? w : h, maxlev = 1;
     if (d3 > maxdim) maxdim = d3;
@@ -818,6 +830,11 @@ texture_from_memory:
     if (!format_samples(f.vk)) return NULL;
     Surf* t = tex_create(gva, w, h, layers, d3, levels, vt, f, fkey, bl, bh, bd, pitch, stride);
     if (!t) return NULL;
+    if (stride * layers >= (1ull << 20))
+        LOG_LIMIT(60, "vulkan: texture %ux%u, %u layers, %u of %u levels (base %u), block-linear %d, %ux%u blocks, view %d, "
+                      "%llu KB\n",
+                  w, h, layers, levels, glevels, base, bl, (u32)f.bw, (u32)f.bh, (int)vt,
+                  (unsigned long long)(stride * layers >> 10));
     /* this texture's levels in one layer; the layers before the last one take their whole stride */
     u64 sz = 0;
     for (u32 l = 0; l < levels; l++) sz += bl ? bl_level_size(w, h, d3, &f, bh, bd, l, NULL, NULL) : stride;

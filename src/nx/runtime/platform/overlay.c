@@ -647,10 +647,12 @@ int gui_apple_thermal(void); /* apple.m: the system's thermal state, 0 nominal t
 #endif
 /* the frame rate, the app's memory, the processor's share and the heat, over the last second or more, in two lines
    away from the screen's rounded corner */
+void (*g_overlay_gpu_stats)(u64* device_bytes, u64* cache_bytes, u64* wait_ns);
 static void hud_draw(SnxUiList* l, int sw, int sh) {
-    static u64 at, cpu_was;
-    static int frames_was, rate10, cpu_percent;
-    char line[2][48];
+    static u64 at, cpu_was, wait_was;
+    static int frames_was, rate10, cpu_percent, wait_percent;
+    u64 gpu_bytes = 0, cache_bytes = 0, wait = 0;
+    char line[3][48];
     int px, py, s, i, now_frames = __atomic_load_n(&g_frames, __ATOMIC_RELAXED);
     u64 now = plat_ns();
     float cw, ch, x, y, w = 0;
@@ -660,10 +662,20 @@ static void hud_draw(SnxUiList* l, int sw, int sh) {
             rate10 = (int)((double)(now_frames - frames_was) * 1e10 / (double)(now - at));
             cpu_percent = (int)((double)(cpu - cpu_was) * 100.0 / (double)(now - at) / (double)snx_cpu_count());
         }
+        if (g_overlay_gpu_stats) {
+            g_overlay_gpu_stats(&gpu_bytes, &cache_bytes, &wait);
+            if (at) wait_percent = (int)((double)(wait - wait_was) * 100.0 / (double)(now - at));
+            wait_was = wait;
+        }
         at = now;
         frames_was = now_frames;
         cpu_was = cpu;
     }
+    /* the GPU memory the renderer holds, what its caches keep of it, and the GPU thread's share of time waiting for
+       the GPU (high when the GPU is the limit) */
+    if (g_overlay_gpu_stats) g_overlay_gpu_stats(&gpu_bytes, &cache_bytes, &wait);
+    snprintf(line[2], sizeof line[2], "gpu %d MiB  cache %d  wait %d%%", (int)(gpu_bytes >> 20),
+             (int)(cache_bytes >> 20), wait_percent);
 #ifdef SNX_IOS
     {
         static const char* const heat[] = {"cool", "warm", "hot", "critical"};
@@ -680,10 +692,10 @@ static void hud_draw(SnxUiList* l, int sw, int sh) {
     ch = 16.0f * (float)s;
     x = (float)sw / 14.0f; /* a phone's corner is rounded: in from it, and down from the camera's side */
     y = (float)sh / 10.0f;
-    for (i = 0; i < 2; ++i)
+    for (i = 0; i < 3; ++i)
         if ((float)strlen(line[i]) * cw > w) w = (float)strlen(line[i]) * cw;
-    ui_fill(l, x, y, w + 2 * cw, 2 * ch, INK);
-    for (i = 0; i < 2; ++i) ui_text(l, x + cw, y + ch * (float)i, s, line[i], LIGHT);
+    ui_fill(l, x, y, w + 2 * cw, 3 * ch, INK);
+    for (i = 0; i < 3; ++i) ui_text(l, x + cw, y + ch * (float)i, s, line[i], LIGHT);
 }
 void overlay_draw(SnxUiList* l, int sw, int sh) {
     static DialogRows rows_of; /* the renderer's */

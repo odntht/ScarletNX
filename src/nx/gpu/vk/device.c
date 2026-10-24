@@ -508,6 +508,13 @@ static int create_device(void) {
         g_vk.has_feedback && has_feedback_dynamic && qloop_dyn.attachmentFeedbackLoopDynamicState;
     g_vk.has_local_read = g_vk.has_feedback && g_vk.has_local_read && qlocal.dynamicRenderingLocalRead;
     g_shader_maximal_reconvergence = has_reconvergence && qreconv.shaderMaximalReconvergence;
+    { /* test build: SNX_STRUCTURED=1 translates as if the device reconverged (no subgroup dispatch loop) */
+        const char* e = getenv("SNX_STRUCTURED");
+        if (e && *e == '1') {
+            g_shader_maximal_reconvergence = 1;
+            LOG("vulkan: shaders translated structured (SNX_STRUCTURED), the device's reconvergence aside\n");
+        }
+    }
     g_shader_clock_scopes =
         has_shader_clock ? (qclock.shaderSubgroupClock ? 1 : 0) | (qclock.shaderDeviceClock ? 2 : 0) : 0;
     g_vk.has_divisor = g_vk.has_divisor && fdiv.vertexAttributeInstanceRateDivisor;

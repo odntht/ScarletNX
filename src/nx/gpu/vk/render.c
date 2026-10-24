@@ -38,6 +38,7 @@ u64 g_vk_fb_draws, g_vk_fb_barriers, g_vk_fb_restarts, g_vk_rt_copies;
 void vk_render_end(void) {
     if (!g_rp.open) return;
     g_rp.open = 0;
+    vk_note_event(0, __builtin_return_address(0));
     VkCommandBuffer cb = vk_cmd();
     vk_query_pass_end(cb); /* a query begun in the pass ends in it */
     rec_CmdEndRendering(cb);
@@ -3012,7 +3013,85 @@ retry:
         rec_CmdBindTransformFeedbackBuffersEXT(cb, 0, xcount, xbuf, xoff, xsize);
         rec_CmdBeginTransformFeedbackEXT(cb, 0, xcount, from, counter_offs);
     }
-    pred_begin(cb, ch->render_pred);
+    /* test build: the draws of a long frame by shader, and SNX_SKIP_FS (hex hashes, commas) leaves those draws out */
+    {
+        static u64 skip[64], read_ns;
+        static u32 nskip;
+        u64 fh = fs ? fs->hash : 0, vh = vs ? vs->hash : 0;
+        if (plat_ns() - read_ns >= 1000000000u) { /* the file SNX_SKIP_FS names, read again each second */
+            const char* path = getenv("SNX_SKIP_FS");
+            FILE* f = path ? fopen(path, "r") : NULL;
+#ifdef SNX_IOS
+            if (!f) { /* no environment on the phone: the file in the app's Documents */
+                const char* home = getenv("HOME");
+                char at[1024];
+                snprintf(at, sizeof at, "%s/Documents/skip.txt", home ? home : "");
+                f = fopen(at, "r");
+            }
+#endif
+            u32 was = nskip;
+            read_ns = plat_ns();
+            nskip = 0;
+            if (f) {
+                unsigned long long h;
+                while (nskip < 64 && fscanf(f, "%llx", &h) == 1) skip[nskip++] = h;
+                fclose(f);
+            }
+            if (nskip != was) LOG("vulkan: %u fragment shaders skipped\n", nskip);
+        }
+        for (u32 i = 0; i < nskip; i++)
+            if (fh == skip[i] || vh == skip[i]) {
+                pred_end(cb, ch->render_pred);
+                goto skipped;
+            }
+    }
+    {
+        /* each pair of shaders drawn, once, with the vertices of its first draw */
+        static u64 seen[2048];
+        u64 key = (fs ? fs->hash : 0) * 31 ^ (vs ? vs->hash : 0), k = key ? key : 1;
+        u32 h = (u32)(k % 2048), probe;
+        for (probe = 0; probe < 2048 && seen[h] && seen[h] != k; probe++) h = (h + 1) % 2048;
+        if (probe < 2048 && !seen[h]) {
+            seen[h] = k;
+            LOG("vulkan: draw vs %016llx fs %016llx, %llu vertices (present %u)\n",
+                (unsigned long long)(vs ? vs->hash : 0), (unsigned long long)(fs ? fs->hash : 0),
+                (unsigned long long)(indexed ? icount : count) * instances, g_vk_present);
+        }
+    }
+    if (vs && vs->hash == 0x1435acfd968107cbull) { /* test build: what one game's slow draws transform */
+        static u32 logged, at_present;
+        if (logged < 60 && at_present != g_vk_present) {
+            u32 a0 = r[0x458], st = a0 & 31, off = (a0 >> 7) & 0x3FFF;
+            u64 sa = ((u64)r[0x701 + st * 4] << 32) | r[0x702 + st * 4];
+            u32 stride = r[0x700 + st * 4] & 0xFFF;
+            float m[2][16], v[3][3];
+            u64 cbs[2] = {ch->cbind[0][5], ch->cbind[0][10]};
+            at_present = g_vk_present;
+            logged++;
+            for (int k = 0; k < 2; k++)
+                for (int i = 0; i < 16; i++) {
+                    u32 w = cbs[k] ? gmem_r32(cbs[k] + 4u * (u32)i) : 0;
+                    memcpy(&m[k][i], &w, 4);
+                }
+            for (int j = 0; j < 3; j++)
+                for (int i = 0; i < 3; i++) {
+                    u32 w = sa ? gmem_r32(sa + (u64)(first + (u32)j) * stride + off + 4u * (u32)i) : 0;
+                    memcpy(&v[j][i], &w, 4);
+                }
+            LOG("vulkan: slow draw at present %u: %s %u vertices x %u, attr0 %08x (stream %u at %llx stride %u offset %u), "
+                "c5 %llx c10 %llx\n",
+                g_vk_present, indexed ? "indexed" : "linear", indexed ? icount : count, instances, a0, st,
+                (unsigned long long)sa, stride, off, (unsigned long long)cbs[0], (unsigned long long)cbs[1]);
+            for (int k = 0; k < 2; k++)
+                LOG("vulkan:   c%d: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n", k ? 10 : 5, m[k][0],
+                    m[k][1], m[k][2], m[k][3], m[k][4], m[k][5], m[k][6], m[k][7], m[k][8], m[k][9], m[k][10],
+                    m[k][11], m[k][12], m[k][13], m[k][14], m[k][15]);
+            LOG("vulkan:   first vertices (as floats from %u): %g %g %g | %g %g %g | %g %g %g\n", first, v[0][0], v[0][1],
+                v[0][2], v[1][0], v[1][1], v[1][2], v[2][0], v[2][1], v[2][2]);
+        }
+    }
+    g_vk_sub_draws++;
+    g_vk_sub_verts += (u64)(indexed ? icount : count) * instances;
     if (indexed) {
         rec_CmdBindIndexBuffer(cb, ibuf, ioff, itype);
         /* quads made from guest indices keep the base vertex, quads made from vertex numbers have it in them */
@@ -3021,6 +3100,7 @@ retry:
     } else
         rec_CmdDraw(cb, count, instances, first, base_instance);
     pred_end(cb, ch->render_pred);
+skipped:
     if (xcount) {
         rec_CmdEndTransformFeedbackEXT(cb, 0, xcount, counters, counter_offs);
         ch->xfb_started = (u8)((ch->xfb_started | xbound) & 15);

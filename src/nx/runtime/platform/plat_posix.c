@@ -1043,7 +1043,12 @@ int plat_replace_file(const char* tmp, const char* dst) {
 }
 
 /* ================================================================ text entry */
-#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+int gui_apple_text_input(char* out, size_t cap, const char* initial); /* apple.m: an alert with a text field */
+int plat_text_input(char* out, size_t cap, const char* initial) {
+    return gui_apple_text_input(out, cap, initial);
+}
+#elif defined(__ANDROID__)
 int plat_text_input(char* out, size_t cap, const char* initial) {
     (void)out;
     (void)cap;

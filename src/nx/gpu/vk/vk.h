@@ -139,7 +139,8 @@ void vk_image_destroy(VkImage img, VmaAllocation mem);
 void vk_mem_track(VmaAllocation a);
 void vk_mem_untrack(VmaAllocation a);
 #else
-static inline void vk_mem_track(VmaAllocation a) { (void)a; }
+void vk_mem_note(VmaAllocation a, const char* file, int line);
+#define vk_mem_track(a) vk_mem_note((a), __FILE__, __LINE__)
 static inline void vk_mem_untrack(VmaAllocation a) { (void)a; }
 #endif
 /* The caches of textures, render targets and buffers are kept within the driver's budget for the heap images go to
@@ -152,6 +153,12 @@ static inline void vk_mem_untrack(VmaAllocation a) { (void)a; }
 void vk_mem_use(u64* usage, u64* budget);
 int vk_mem_heap(void); /* that heap's index */
 void vk_mem_present(void);
+extern u32 g_vk_sub_draws, g_vk_sub_disp; /* cmd.c: what the submission being recorded holds */
+extern u64 g_vk_sub_verts, g_vk_sub_groups;
+extern int g_vk_draw_log;
+extern u64 g_vk_wait_ns; /* cmd.c: time spent waiting for graphics submissions */
+void vk_mem_report(void);
+void vk_note_event(u32 kind, void* pc); /* cmd.c: 0 a pass ends, 1 a submit (counted by caller) */ /* renderer.c: the heaps, VMA's memory types and the caches, in the log */
 u32 vk_present_before(u64 ago_ns, u32 presents);
 
 /* cmd.c */

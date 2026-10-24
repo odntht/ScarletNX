@@ -145,6 +145,16 @@ setting Show stats
     default 0
     words Off|On
     help The frame rate, the memory, the processor's share and the heat in a corner of the picture. The in-game menu turns it on and off
+setting Texture detail
+    key texture_detail
+    int 0 3
+    default 0
+    default-if SNX_IOS 1
+    startup
+    words Full|Half|Quarter|Eighth
+    help Textures with mipmaps of at least 128 texels are loaded from a smaller level: 1 = half their width and height,
+    help a quarter of their memory, 2 = a quarter, 3 = an eighth. 0 = the game's own sizes. Saves GPU memory and
+    help upload time at the cost of blurrier surfaces
 setting Shadows
     key shadows
     int 0 1
@@ -192,6 +202,13 @@ setting Memory (GB)
     startup
     help The memory the game sees: below 6 the console's 3.2 GB, 6 = 4.8 GB, 8 = 6.8 GB. A game that runs out on
     help the console's amount needs 6
+setting Phone RAM (MB)
+    key ios_memory_mb
+    int 0 8192
+    default 0
+    startup
+    help iOS only: the memory the game is told it has, in MB. 0 = what the app's limit leaves. The system ends an app
+    help well under its stated limit when the phone's memory runs short, so a game that grows to what it is told needs less
 setting Heap limit (MB)
     key heap_max_mb
     text 32

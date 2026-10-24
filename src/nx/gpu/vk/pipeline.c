@@ -1449,6 +1449,7 @@ static void pf_key(char* out, size_t n, size_t* guest) {
     size_t len = strlen(commit);
     char exe[64] = "", uuid[33];
     u32 caps[] = {(u32)g_vk.has_divisor,
+                  (u32)g_shader_maximal_reconvergence, /* the translator's structure (spirv_translate.c) */
                   (u32)g_vk.has_dynamic_stride,
                   (u32)g_vk.has_shader_draw_parameters,
                   (u32)g_vk.has_feedback,

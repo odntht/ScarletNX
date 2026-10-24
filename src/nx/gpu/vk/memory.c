@@ -42,6 +42,17 @@ void vk_mem_untrack(VmaAllocation a) {
     if (a) SNX_MEM_FREE((const void*)a, "gpu");
 }
 #endif
+#if !defined(SNX_TRACY)
+/* a big allocation says who asked for it: what a heap's megabytes were spent on, at the moment they were */
+void vk_mem_note(VmaAllocation a, const char* file, int line) {
+    VmaAllocationInfo info;
+    if (!a) return;
+    vmaGetAllocationInfo(g_vk.vma, a, &info);
+    if (info.size >= (16ull << 20))
+        LOG("vulkan: allocation of %llu MB, memory type %u%s, from %s:%d\n", (unsigned long long)(info.size >> 20),
+            info.memoryType, info.pMappedData ? " (mapped)" : "", file, line);
+}
+#endif
 
 void vk_mem_init(int sparse_queue) {
     VkPhysicalDeviceMaintenance3Properties m3 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES};

@@ -599,7 +599,10 @@ static void layout_for(u64 size) {
 #define IOS_OTHER_MEMORY   ((u64)700 << 20) /* the least that goes to the rest */
 #define IOS_GRAPHICS_MARGIN ((u64)256 << 20) /* the graphics' first allocations */
 static u64 g_ios_budget;
-u64 mem_ios_budget(void) { return g_ios_budget; }
+u64 mem_ios_budget(void) {
+    u64 set = (u64)g_settings.phone_ram_mb << 20;
+    return set ? set : g_ios_budget;
+}
 /* what the rest takes: the app's footprint now, the code arenas (a large game's pack is large) and a margin for the
    graphics, never less than IOS_OTHER_MEMORY, which was what one game's run measured */
 static u64 ios_other_memory(void) {
