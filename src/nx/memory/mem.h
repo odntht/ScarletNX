@@ -21,9 +21,9 @@ typedef struct {
     u64 base, end; /* what the game may map in */
     u64 heap, heap_size;
     u64 alias, alias_size;
-    u64 alias_virtual; /* the alias region's size GetInfo reports when it is larger than the host backs: 0, alias_size */
     u64 stack, stack_size;
     u64 kern, kern_end; /* the kernel's own pages (TLS) */
+    u64 alias_virtual; /* the alias region's size GetInfo reports when it is larger than the host backs: 0, alias_size */
 } MemLayout;
 #define AS_BASE    (g_layout.base)
 #define AS_END     (g_layout.end)
