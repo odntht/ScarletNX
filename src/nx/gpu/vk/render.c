@@ -210,11 +210,21 @@ static int render_begin_empty(void) {
 }
 
 /* Transform feedback's byte counters, a word for each of the 4 buffers: where a capture's end left each buffer, which
-   the next draw's capture resumes from (3D 0x1D1; made at the first capture) */
+   the next draw's capture resumes from (3D 0x1D1; made at the first capture). Without the extension the CPU keeps
+   them (end, in bytes from each buffer's start offset): a draw in vertex order captures as many vertices as it has,
+   in whole primitives, while they fit in every buffer */
 static struct {
     VkBuffer buf;
     VmaAllocation mem;
+    u32 end[4];
 } g_xfb;
+/* transform feedback buffer b's registers (0xE0 + 8 * b: enable, address, size, start offset): its address from the
+   start offset on, and size its size (not enabled: 0) */
+static u64 xfb_buffer(const u32* r, u32 b, i32* size) {
+    const u32* t = &r[0xE0 + 8 * b];
+    *size = t[0] ? (i32)t[3] : 0;
+    return (((u64)(t[1] & 0xFF) << 32) | t[2]) + t[4];
+}
 static int xfb_counters(void) {
     if (g_xfb.buf) return 1;
     VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -233,10 +243,6 @@ static int xfb_wanted(const u32* r) {
     return g_vk.has_xfb ? xfb_counters() : g_shader_xfb_stores;
 }
 
-/* Transform feedback by stores (g_shader_xfb_stores): where a capture's end left each buffer, in bytes from its start
-   offset, which the next draw's capture resumes from as the extension's counters hold it. The CPU knows it: a draw in
-   vertex order captures as many vertices as it has, in whole primitives, while they fit in every buffer */
-static u32 g_xfb_end[4];
 /* a draw's capture by stores: the vertex stage's bindings (SNX_VKB_XFB_PARAMS, SNX_VKB_XFB + i), the buffers it
    captures into and where their capture ends */
 typedef struct {
@@ -247,39 +253,45 @@ typedef struct {
     u32 end[4];
 } XfbBind;
 /* x for a draw of vs with transform feedback (vs->si.xfb, the registers' layout) by stores, in the order the hardware
-   writes it: a list of points, lines or triangles drawn in vertex order. Others capture nothing (logged once). 0 when
-   a buffer can't be had */
+   writes it: a list of points, lines or triangles drawn in vertex order. Others capture nothing (logged once). A draw
+   the render enable decides on the GPU (render_pred) is taken as drawn. 0 when a buffer can't be had */
 static int xfb_bind(GpuChannel* ch, const VkSh* vs, int indexed, u32 topology, u32 first, u32 count,
                     u32 base_instance, u32 instances, XfbBind* x) {
     const u32* r = ch->r3d;
     const ShXfb* key = &vs->si.xfb;
     u32 per = topology == 0 ? 1 : topology == 1 ? 2 : topology == 4 ? 3 : 0; /* vertices a primitive */
-    u32 n = per && !indexed ? count - count % per : 0, start[4] = {0}, b;
-    u64 limit = (u64)n * instances;
+    u32 n = per && !indexed ? count - count % per : 0, start[4] = {0}, last[4] = {0}, b;
+    u64 limit = (u64)n * instances, addr[4] = {0};
     memset(x, 0, sizeof *x);
     if (vs->si.ngbuf > SNX_XFB_GBUF_MAX) { /* the program was translated without stores */
         LOG_LIMIT(1, "vulkan: a vertex program with %d global buffers can't store what transform feedback captures\n",
                   vs->si.ngbuf);
         return 1;
     }
-    if (!n)
+    if (!per || indexed)
         LOG_LIMIT(4, "vulkan: transform feedback of %s topology %u isn't captured without the extension\n",
                   indexed ? "an indexed" : "a", topology);
+    if (limit > UINT32_MAX) { /* the program's vertex places are 32-bit */
+        LOG_LIMIT(1, "vulkan: a transform feedback draw of %llu vertices isn't captured\n", (unsigned long long)limit);
+        limit = 0;
+    }
     for (b = 0; b < 4; b++) {
-        const u32* t = &r[0xE0 + 8 * b];
-        u32 stride = key->stride[b], words = key->count[b], size = (u32)t[3];
+        u32 stride = key->stride[b], words = key->count[b], size;
+        i32 enabled;
         if (!words || stride < 4 || (stride & 3)) continue; /* xfb_write stores nothing there */
         x->declared |= 1u << b;
-        if (!t[0] || (i32)size <= 0) {
-            LOG_LIMIT(1, "vulkan: transform feedback into a buffer that isn't enabled (nothing captured)\n");
-            limit = 0;
+        addr[b] = xfb_buffer(r, b, &enabled);
+        size = (u32)enabled;
+        if (enabled <= 0) {
+            /* not written, as the extension's path leaves it: the others still capture */
+            LOG_LIMIT(1, "vulkan: transform feedback into a buffer that isn't enabled (that buffer gets nothing)\n");
             continue;
         }
-        if (ch->xfb_started & ~ch->xfb_reload & (1u << b)) start[b] = g_xfb_end[b] < size ? g_xfb_end[b] : size;
+        if (ch->xfb_started & ~ch->xfb_reload & (1u << b)) start[b] = g_xfb.end[b] < size ? g_xfb.end[b] : size;
         /* the vertices that fit from there: each takes stride bytes, the last at least its words */
-        u32 room = size - start[b], last = words * 4 > stride ? words * 4 : stride;
-        u64 fit = room >= last ? (room - last) / stride + 1 : 0;
-        if (fit > room / stride) fit = room / stride;
+        u32 room = size - start[b];
+        last[b] = words * 4 > stride ? words * 4 : stride;
+        u64 fit = room >= last[b] ? (room - last[b]) / stride + 1 : 0;
         fit -= per ? fit % per : 0;
         if (fit < limit) limit = fit;
         x->bound |= 1u << b;
@@ -293,10 +305,8 @@ static int xfb_bind(GpuChannel* ch, const VkSh* vs, int indexed, u32 topology, u
     x->size[4] = sizeof params;
     for (b = 0; b < 4; b++) {
         if (!(x->declared >> b & 1)) continue;
-        const u32* t = &r[0xE0 + 8 * b];
-        u64 a = (((u64)(t[1] & 0xFF) << 32) | t[2]) + t[4] + start[b];
-        u32 stride = key->stride[b], last = key->count[b] * 4 > stride ? key->count[b] * 4 : stride;
-        u64 used = limit ? (limit - 1) * stride + last : 0;
+        u32 stride = key->stride[b];
+        u64 used = limit ? (limit - 1) * stride + last[b] : 0;
         if (!(x->bound >> b & 1) || !used) { /* nothing stored: a buffer for the binding */
             x->bound &= ~(1u << b);
             if (!vk_buf_copy(0, 16, &x->buf[b], &x->off[b])) return 0;
@@ -305,17 +315,16 @@ static int xfb_bind(GpuChannel* ch, const VkSh* vs, int indexed, u32 topology, u
         }
         /* from where the capture starts, a writable copy of guest memory, which lands there and which later draws
            read on the GPU until then (vk_buf_copy_writable) */
-        if (!vk_buf_copy_writable(a, (u32)used, &x->buf[b], &x->off[b])) return 0;
+        if (!vk_buf_copy_writable(addr[b] + start[b], (u32)used, &x->buf[b], &x->off[b])) return 0;
         x->size[b] = used;
         x->end[b] = start[b] + (u32)limit * stride;
     }
-    if (!limit) x->bound = 0;
     return 1;
 }
 /* after the draw: each buffer's capture resumes from where it ended, until its write pointer is loaded again */
 static void xfb_bind_done(GpuChannel* ch, const XfbBind* x) {
     for (u32 b = 0; b < 4; b++)
-        if (x->bound >> b & 1) g_xfb_end[b] = x->end[b];
+        if (x->bound >> b & 1) g_xfb.end[b] = x->end[b];
     ch->xfb_started = (u8)((ch->xfb_started | x->bound) & 15);
     ch->xfb_reload = (u8)(ch->xfb_reload & ~x->bound);
 }
@@ -2075,7 +2084,7 @@ static int draw_kept(const GpuChannel* ch, u32 topology, u32 epoch) {
         if (!vertex_regs_hold(ch->r3d, s)) return 0;
         g_draw.pend &= ~pend;
     }
-    if (s->xfb_on != xfb_wanted(ch->r3d)) return 0; /* the counters were made since */
+    if (s->xfb_on != xfb_wanted(ch->r3d)) return 0; /* capturing began or ended since, or its counters were made */
     const VkSh* used[6] = {s->vs, s->tcs, s->tes, s->gs, s->fs0, g_draw.fs};
     for (int i = 0; i < 6; i++)
         if (used[i] && used[i]->cbr.n && !vk_shader_cb_hold(ch, used[i])) return 0;
@@ -2882,10 +2891,9 @@ retry:
     VkDeviceSize xoff[4], xsize[4];
     u32 xbound = 0;
     for (int i = 0; i < 4 && xfb_on && g_vk.has_xfb; i++) {
-        const u32* t = &r[0xE0 + 8 * i];
-        i32 size = (i32)t[3];
-        u64 a = (((u64)(t[1] & 0xFF) << 32) | t[2]) + t[4];
-        if (!t[0] || size <= 0 || (!r[0x1C1 + 4 * i] && !r[0x1C2 + 4 * i])) continue;
+        i32 size;
+        u64 a = xfb_buffer(r, (u32)i, &size);
+        if (size <= 0 || (!r[0x1C1 + 4 * i] && !r[0x1C2 + 4 * i])) continue;
         if (!vk_buf_copy_writable(a, (u32)size, &xbuf[i], &xoff[i])) {
             draw_images_discard(&images);
             g_vk_skipped++;

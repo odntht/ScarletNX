@@ -4715,13 +4715,12 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
         c->gbuf_pointer = spv_emit_type_storage_pointer(&c->emit, c->u32_type);
     }
     if (ngbuf) {
-        u32 structure = gbuf_struct;
         for (int i = 0; i < ngbuf; i++) {
-            c->gbuf[i] = spv_emit_storage_buffer(&c->emit, structure, shader_vk_set(stage), SNX_VKB_SSBO + (u32)i);
+            c->gbuf[i] = spv_emit_storage_buffer(&c->emit, gbuf_struct, shader_vk_set(stage), SNX_VKB_SSBO + (u32)i);
             interfaces[count++] = c->gbuf[i];
         }
         if (stage != ST_CS) {
-            c->smap = spv_emit_storage_buffer(&c->emit, structure, shader_vk_set(stage), SNX_VKB_SMAP);
+            c->smap = spv_emit_storage_buffer(&c->emit, gbuf_struct, shader_vk_set(stage), SNX_VKB_SMAP);
             interfaces[count++] = c->smap;
         }
     }
