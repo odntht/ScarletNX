@@ -44,7 +44,7 @@ static const char* xfb_stores_path;
 static const char* passthrough_paths[6];
 static const char* structured_paths[2];
 static const char* fswzadd_path;
-static char* fixture_paths[93];
+static char* fixture_paths[94];
 static size_t fixture_count;
 
 static const char* fixture_path(const char* directory, const char* name) {
