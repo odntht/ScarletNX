@@ -85,7 +85,8 @@ typedef struct {
     int has_vertex_robustness2; /* exact zero/default components for out-of-range mesh fetches */
     int has_calibrated_host; /* VK_EXT_calibrated_timestamps with CLOCK_MONOTONIC_RAW: the GPU's clock goes next to
                                 the client's, one driver call (gpuprof.c's calibration) */
-    int has_xfb;          /* VK_EXT_transform_feedback: draws capture their outputs into guest memory */
+    int has_xfb;          /* VK_EXT_transform_feedback: draws capture their outputs into guest memory (without it,
+                             g_shader_xfb_stores: vertex programs store them) */
     int has_border_color; /* VK_EXT_custom_border_color */
     u32 border_color_max; /* maxCustomBorderColorSamplers: past it, samplers take the nearest built-in color */
     int has_mirror_clamp; /* samplerMirrorClampToEdge: VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE */

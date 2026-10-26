@@ -528,6 +528,10 @@ static int create_device(void) {
         has_shader_clock ? (qclock.shaderSubgroupClock ? 1 : 0) | (qclock.shaderDeviceClock ? 2 : 0) : 0;
     g_vk.has_divisor = g_vk.has_divisor && fdiv.vertexAttributeInstanceRateDivisor;
     g_vk.has_xfb = g_vk.has_xfb && fxfb.transformFeedback;
+    /* without the extension (MoltenVK) a capture's vertex program stores its words itself, which vertex stores allow */
+    g_shader_xfb_stores = !g_vk.has_xfb && want->vertexPipelineStoresAndAtomics;
+    if (g_shader_xfb_stores)
+        LOG("vulkan: no VK_EXT_transform_feedback: vertex programs store what transform feedback captures\n");
     g_vk.has_border_color = g_vk.has_border_color && fbc.customBorderColors && fbc.customBorderColorWithoutFormat;
     if (g_vk.has_border_color) { /* how many samplers may have a custom border color: as few as 32 */
         VkPhysicalDeviceCustomBorderColorPropertiesEXT cbp = {

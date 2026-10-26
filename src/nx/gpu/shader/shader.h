@@ -120,6 +120,13 @@ typedef struct {
 #define SNX_VKB_TEXDEPTH (SNX_VKB_TEXFUNCS + 1)    /* their depth views */
 #define SNX_VKB_TEXMAP   (SNX_VKB_TEXDEPTH + 1)    /* table and element to compact descriptor index */
 #define SNX_VKB_END      (SNX_VKB_TEXMAP + 1)      /* one past the last binding */
+/* Transform feedback by storage buffer stores (g_shader_xfb_stores): a vertex program with SNX_XFB_GBUF_MAX global
+   buffers or fewer takes the global buffer slots after them, its draw's capture parameters (4 words: the first vertex,
+   the first instance, the vertices an instance captures and the vertices the draw captures in all) at
+   SNX_VKB_XFB_PARAMS, then each of the 4 buffers from where the draw's capture starts at SNX_VKB_XFB + i */
+#define SNX_XFB_GBUF_MAX   11
+#define SNX_VKB_XFB_PARAMS (SNX_VKB_SSBO + SNX_XFB_GBUF_MAX)
+#define SNX_VKB_XFB        (SNX_VKB_XFB_PARAMS + 1)
 /* An indexed texture loads its handle with an LDC whose address has a register in it: one of SNX_TEX_ARRAY handles
    from cbuf_off on, each (1 << shift) bytes after the last, with the shift in bits 4-7 of ShTex.flags. */
 #define SNX_TEX_ARRAY    256
@@ -140,6 +147,10 @@ extern int g_shader_geometry;
 extern int g_shader_float16;
 /* the Tessellation capability, which also gives a fragment program PrimitiveId without Geometry */
 extern int g_shader_tessellation;
+/* transform feedback without the TransformFeedback capability (no VK_EXT_transform_feedback, but
+   vertexPipelineStoresAndAtomics): the vertex program stores the words captured itself, into storage buffers
+   (SNX_VKB_XFB). 0 offline */
+extern int g_shader_xfb_stores;
 /* VK_KHR_shader_clock's scopes: bit 0 subgroup, bit 1 device */
 extern int g_shader_clock_scopes;
 /* VK_KHR_shader_maximal_reconvergence: a structured program's lanes reconverge where its constructs merge, so one

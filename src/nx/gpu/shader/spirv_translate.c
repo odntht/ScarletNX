@@ -72,6 +72,7 @@ int g_shader_float16 = 1;
 int g_shader_tessellation = 1;
 int g_shader_clock_scopes;
 int g_shader_maximal_reconvergence;
+int g_shader_xfb_stores;
 
 /* the Function variable of a register, predicate or flag (z, s, c, o) */
 static u32 var_of(const DirectCtx* c, u32 v) {
@@ -998,14 +999,80 @@ static void vertex_depth_fix(DirectCtx* c, u32 position, u32 push, u32 push_poin
     spv_emit_label(&c->emit, merge);
 }
 
-/* Transform feedback: each captured output's private vec4 (ShaderInfo.xfb) copied into its component outputs, the
-   variables that carry the capture's offsets, before the program ends or emits a vertex */
-static void xfb_store(DirectCtx* c, u32 vec4, const u32* output_attrs, const u8* attr_private, u32 (*components)[4]) {
+/* What a program's transform feedback writes at each exit or emitted vertex (xfb_store) */
+typedef struct {
+    int stores; /* by storage buffer stores (g_shader_xfb_stores), else by the extension's decorations */
+    const ShXfb* key;
+    u32 vec4, position;
+    const u32* output_attrs;
+    /* the extension's: the captured outputs' private vec4s and their component outputs */
+    const u8* attr_private;
+    u32 (*components)[4];
+    /* the stores': the parameters' and the buffers' storage buffers (SNX_VKB_XFB_PARAMS, SNX_VKB_XFB), a pointer to
+       one of their words, VertexIndex and InstanceIndex */
+    u32 params, buffer[4], pointer, vertex_index, instance_index;
+    const u8* outputs_used;
+    int position_used;
+} XfbOut;
+
+/* A captured attribute word's value (ShXfb.layout) as bits, 0 for one the program has no output for (left as it is
+   in the buffer, as the extension leaves it) */
+static u32 xfb_word(DirectCtx* c, const XfbOut* x, u32 word) {
+    u32 var = 0, component = word & 3;
+    if (word >= 28 && word < 32 && x->position_used)
+        var = x->position;
+    else if (word >= 32 && word < 160 && x->outputs_used[(word - 32) >> 2])
+        var = x->output_attrs[(word - 32) >> 2];
+    if (!var) return 0;
+    u32 value = spv_emit_vec4_extract(&c->emit, c->f32_type, spv_emit_load(&c->emit, x->vec4, var), component);
+    return spv_emit_bitcast(&c->emit, c->u32_type, value);
+}
+
+/* Transform feedback by stores: the vertex's place in the draw's order of vertices (VertexIndex - first vertex +
+   (InstanceIndex - first instance) * the vertices an instance captures), and below the draw's captured vertices, each
+   word of a buffer's layout into that buffer at place * stride / 4 + its index there. The renderer binds each buffer
+   from where the draw's capture starts, and counts the vertices that fit in all of them */
+static void xfb_write(DirectCtx* c, const XfbOut* x) {
+    SpvEmitter* e = &c->emit;
+    u32 u = c->u32_type, p[4];
+    for (u32 i = 0; i < 4; i++)
+        p[i] = spv_emit_load(
+            e, u, spv_emit_storage_access_u32(e, x->pointer, x->params, c->zero, spv_emit_constant_u32(e, u, i)));
+    u32 vertex = spv_emit_isub_u32(e, u, spv_emit_load(e, u, x->vertex_index), p[0]);
+    u32 instance = spv_emit_isub_u32(e, u, spv_emit_load(e, u, x->instance_index), p[1]);
+    u32 place = spv_emit_iadd_u32(e, u, vertex, spv_emit_imul_u32(e, u, instance, p[2]));
+    u32 in = spv_emit_bool_binary(e, c->bool_type, 0, spv_emit_u_less(e, c->bool_type, vertex, p[2]), /* and */
+                                  spv_emit_u_less(e, c->bool_type, place, p[3]));
+    u32 yes = spv_emit_id(e), done = spv_emit_id(e);
+    spv_emit_selection_merge(e, done);
+    spv_emit_branch_conditional(e, in, yes, done);
+    spv_emit_label(e, yes);
+    for (u32 b = 0; b < 4; b++) {
+        if (!x->buffer[b]) continue;
+        u32 base = spv_emit_imul_u32(e, u, place, spv_emit_constant_u32(e, u, x->key->stride[b] / 4u));
+        for (u32 w = 0; w < x->key->count[b] && w < 128; w++) {
+            u32 value = xfb_word(c, x, x->key->layout[b][w]);
+            if (!value) continue;
+            u32 at = spv_emit_iadd_u32(e, u, base, spv_emit_constant_u32(e, u, w));
+            spv_emit_store(e, spv_emit_storage_access_u32(e, x->pointer, x->buffer[b], c->zero, at), value);
+        }
+    }
+    spv_emit_branch(e, done);
+    spv_emit_label(e, done);
+}
+
+/* Transform feedback before the program ends or emits a vertex: the stores, or each captured output's private vec4
+   copied into its component outputs, the variables that carry the extension's offsets */
+static void xfb_store(DirectCtx* c, const XfbOut* x) {
+    if (x->stores) {
+        xfb_write(c, x);
+        return;
+    }
     for (u32 i = 0; i < 32; i++) {
-        if (!attr_private[i]) continue;
-        u32 value = spv_emit_load(&c->emit, vec4, output_attrs[i]);
+        if (!x->attr_private[i]) continue;
+        u32 value = spv_emit_load(&c->emit, x->vec4, x->output_attrs[i]);
         for (u32 k = 0; k < 4; k++)
-            spv_emit_store(&c->emit, components[i][k], spv_emit_vec4_extract(&c->emit, c->f32_type, value, k));
+            spv_emit_store(&c->emit, x->components[i][k], spv_emit_vec4_extract(&c->emit, c->f32_type, value, k));
     }
 }
 
@@ -4324,7 +4391,8 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
     u8 xfb_buf[160], attr_private[32] = {0};
     u16 xfb_off[160] = {0};
     u32 xfb_components[32][4] = {{0}};
-    int xfb_on = 0;
+    int xfb_on = 0, xfb_stores = 0;
+    XfbOut xo = {0};
     memset(xfb_buf, 0xFF, sizeof xfb_buf);
     u32 clip_output = 0, clip_count = 0;
     u32 depth_output = 0, interfaces[384], count = 0;
@@ -4399,12 +4467,18 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
                     xfb_off[word] = (u16)(w * 4);
                     xfb_on = 1;
                 }
+        /* without the extension a vertex program stores what is captured itself (xfb_write), in global buffer slots
+           its own don't take */
+        if (xfb_on && g_shader_xfb_stores) {
+            xfb_stores = stage == ST_VS && ngbuf <= SNX_XFB_GBUF_MAX;
+            xfb_on = xfb_stores;
+        }
         if (position_used) {
             position = per_vertex ? spv_emit_interface_variable(&c->emit, 3, vec4, c->u32_type, per_vertex, 0, 0, 0)
                                   : spv_emit_position_output(&c->emit, vec4);
             interfaces[count++] = position;
             /* the position is a built-in: captured only whole, its four words in order in one buffer */
-            if (xfb_buf[28] != 0xFF && xfb_buf[29] == xfb_buf[28] && xfb_buf[30] == xfb_buf[28] &&
+            if (!xfb_stores && xfb_buf[28] != 0xFF && xfb_buf[29] == xfb_buf[28] && xfb_buf[30] == xfb_buf[28] &&
                 xfb_buf[31] == xfb_buf[28] && xfb_off[29] == xfb_off[28] + 4 && xfb_off[30] == xfb_off[28] + 8 &&
                 xfb_off[31] == xfb_off[28] + 12)
                 spv_emit_xfb_capture(&c->emit, position, xfb_buf[28], si->xfb.stride[xfb_buf[28]], xfb_off[28]);
@@ -4414,7 +4488,7 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
                 u32 k;
                 int captured = 0;
                 for (k = 0; k < 4; k++) captured |= xfb_buf[32 + 4 * i + k] != 0xFF;
-                if (captured) {
+                if (captured && !xfb_stores) {
                     /* a captured output is written to a private vec4 and copied out a component a variable
                        (xfb_store), so that each captured component has an offset of its own: the next stage's vec4
                        input takes the four at its location */
@@ -4555,7 +4629,7 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
         if (stage == ST_FS) spv_emit_flat(&c->emit, c->subgroup_lane_input);
         interfaces[count++] = c->subgroup_lane_input;
     }
-    if (needs_instance) {
+    if (needs_instance || xfb_stores) {
         instance_index = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 43);
         vertex_index = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 42);
         interfaces[count++] = instance_index;
@@ -4634,10 +4708,14 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
             image_info.img[i].kind == 1 ? 33 : 0, &c->image_type[i]);
         interfaces[count++] = c->image[i];
     }
-    if (ngbuf) {
+    u32 gbuf_struct = 0;
+    if (ngbuf || xfb_stores) {
         u32 array = spv_emit_type_runtime_array(&c->emit, c->u32_type, 4);
-        u32 structure = spv_emit_type_struct_one(&c->emit, array);
+        gbuf_struct = spv_emit_type_struct_one(&c->emit, array);
         c->gbuf_pointer = spv_emit_type_storage_pointer(&c->emit, c->u32_type);
+    }
+    if (ngbuf) {
+        u32 structure = gbuf_struct;
         for (int i = 0; i < ngbuf; i++) {
             c->gbuf[i] = spv_emit_storage_buffer(&c->emit, structure, shader_vk_set(stage), SNX_VKB_SSBO + (u32)i);
             interfaces[count++] = c->gbuf[i];
@@ -4646,6 +4724,28 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
             c->smap = spv_emit_storage_buffer(&c->emit, structure, shader_vk_set(stage), SNX_VKB_SMAP);
             interfaces[count++] = c->smap;
         }
+    }
+    /* what the program's transform feedback writes (xfb_store): with stores, the buffers it stores into */
+    xo = (XfbOut){.stores = xfb_stores,
+                  .key = &si->xfb,
+                  .vec4 = vec4,
+                  .position = position,
+                  .output_attrs = output_attrs,
+                  .attr_private = attr_private,
+                  .components = xfb_components,
+                  .pointer = c->gbuf_pointer,
+                  .vertex_index = vertex_index,
+                  .instance_index = instance_index,
+                  .outputs_used = outputs_used,
+                  .position_used = position_used};
+    if (xfb_stores) {
+        xo.params = spv_emit_storage_buffer(&c->emit, gbuf_struct, shader_vk_set(stage), SNX_VKB_XFB_PARAMS);
+        interfaces[count++] = xo.params;
+        for (u32 b = 0; b < 4; b++)
+            if (si->xfb.count[b] && si->xfb.stride[b] >= 4 && !(si->xfb.stride[b] & 3)) {
+                xo.buffer[b] = spv_emit_storage_buffer(&c->emit, gbuf_struct, shader_vk_set(stage), SNX_VKB_XFB + b);
+                interfaces[count++] = xo.buffer[b];
+            }
     }
     u32 shared_array = 0, shared_element_pointer = 0, shared_words = 0;
     if (needs_shared) {
@@ -4662,7 +4762,7 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
         interfaces[count++] = push;
     }
     spv_emit_entry_str(&c->emit, (SpvShaderStage)stage, fn, "main", interfaces, count); /* ST_ is SPIR-V's model */
-    if (xfb_on) {
+    if (xfb_on && !xfb_stores) {
         spv_emit_capability(&c->emit, 53);               /* TransformFeedback */
         spv_emit_execution_mode(&c->emit, fn, 11, 0, 0); /* Xfb */
     }
@@ -4912,7 +5012,7 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
                 geometry_passthrough(c, si, in_vertices, vec4, position, position_in, output_attrs, inputs, point_size,
                                      layer_output, i32_type, clip_output, clip_count, primitive_id, primitive_id_out,
                                      depth_fix, push, push_pointer);
-            if (xfb_on && stage != ST_GS) xfb_store(c, vec4, output_attrs, attr_private, xfb_components);
+            if (xfb_on && stage != ST_GS) xfb_store(c, &xo);
             if (depth_fix && stage != ST_GS) vertex_depth_fix(c, position, push, push_pointer, vec4);
             spv_emit_return(&c->emit);
             se.open = 0;
@@ -5271,7 +5371,7 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
                 if (B(w, 39, 1)) {
                     if (depth_fix) vertex_depth_fix(c, position, push, push_pointer, vec4);
                     spv_emit_store(&c->emit, primitive_id_out, spv_emit_load(&c->emit, c->u32_type, primitive_id));
-                    if (xfb_on) xfb_store(c, vec4, output_attrs, attr_private, xfb_components);
+                    if (xfb_on) xfb_store(c, &xo);
                     spv_emit_emit_vertex(&c->emit);
                     /* outputs are undefined after it: the next vertex gets the default point size, unless the
                        program writes its own */
@@ -7925,7 +8025,7 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
                 geometry_passthrough(c, si, in_vertices, vec4, position, position_in, output_attrs, inputs, point_size,
                                      layer_output, i32_type, clip_output, clip_count, primitive_id, primitive_id_out,
                                      depth_fix, push, push_pointer);
-            if (xfb_on && stage != ST_GS) xfb_store(c, vec4, output_attrs, attr_private, xfb_components);
+            if (xfb_on && stage != ST_GS) xfb_store(c, &xo);
             if (depth_fix && stage != ST_GS) { /* a geometry program's vertices are fixed as it emits them */
                 vertex_depth_fix(c, position, push, push_pointer, vec4);
             } else if (stage == ST_FS) {
@@ -8019,7 +8119,7 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
             geometry_passthrough(c, si, in_vertices, vec4, position, position_in, output_attrs, inputs, point_size,
                                  layer_output, i32_type, clip_output, clip_count, primitive_id, primitive_id_out,
                                  depth_fix, push, push_pointer);
-        if (xfb_on && stage != ST_GS) xfb_store(c, vec4, output_attrs, attr_private, xfb_components);
+        if (xfb_on && stage != ST_GS) xfb_store(c, &xo);
         if (depth_fix && stage != ST_GS) vertex_depth_fix(c, position, push, push_pointer, vec4);
         spv_emit_return(&c->emit);
     }
@@ -8043,6 +8143,7 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
     next.attr_sint_mask = si->attr_sint_mask;
     next.clip_enable = si->clip_enable;
     memcpy(next.gp_skip_mask, si->gp_skip_mask, sizeof next.gp_skip_mask);
+    if (xfb_stores) next.xfb = si->xfb; /* the renderer binds the buffers the stores name */
     next.uses_clip_mask = clip_used;
     next.writes_viewport = viewport_used;
     next.rt_int_mask = si->rt_int_mask;
