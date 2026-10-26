@@ -29,7 +29,7 @@
    is the 1 GiB the kernel's own pages (TLS) need. The alias region starts at 4 GiB, which leaves the code below it
    up to 3.9 GiB, as the end of the code isn't known yet when the layout is made */
 MemLayout g_layout = {0x8000000ull,  AS_MAX,      0x1100000000ull, 8 * GIB, 0x100000000ull, 64 * GIB,
-                      0x1300000000ull, 2 * GIB, 0x1380000000ull, 0x13C0000000ull};
+                      0x1300000000ull, 2 * GIB, 0x1380000000ull, 0x13C0000000ull, 0};
 u64 g_as_size = AS_MAX;
 u8* g_mem;
 u64 g_heap_size, g_phys_mapped, g_heap_max, g_code_memory, g_main_stack_size;
@@ -594,6 +594,19 @@ static void layout_for(u64 size) {
    region (which that game never sets) shrinks to make the room, the alias region taking all that is left above the code */
 void mem_layout_vamm(void) {
     if (g_as_size >= 64 * GIB) return;
+    if (g_as_size >= 24 * GIB) {
+        /* room for the 12 GiB it asks: an alias region of 16 GiB, reported as it is, so the block it maps at the
+           region's top lies inside the address space */
+        g_layout.alias = 4 * GIB;
+        g_layout.alias_size = 16 * GIB;
+        g_layout.heap = g_layout.alias + g_layout.alias_size;
+        g_layout.heap_size = 4 * GIB;
+        g_layout.stack = g_layout.heap + g_layout.heap_size;
+        g_layout.stack_size = 2 * GIB;
+        g_layout.kern = g_as_size - GIB;
+        g_layout.alias_virtual = 0;
+        return;
+    }
     if (g_as_size < 12 * GIB) {
         g_layout.alias = GIB / 2;
         g_layout.kern = g_as_size - GIB / 4;
