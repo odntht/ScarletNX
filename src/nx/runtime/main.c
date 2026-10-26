@@ -427,6 +427,15 @@ static void say_old_layout(void) {
 
 static u32 rd32le(const u8* p) { return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24; }
 
+/* whether exefs/main.npdm names a system resource size, which read_npdm sets up later: the layout needs it before */
+static int npdm_system_resource(void) {
+    u64 size = 0;
+    u8* d = fs_read_file("exefs/main.npdm", &size);
+    int r = d && size >= 0x80 && size <= 0x4000 && !memcmp(d, "META", 4) && rd32le(d + 0x14);
+    free(d);
+    return r;
+}
+
 /* exefs/main.npdm: the system resource size (newer SDKs set up their memory allocator only with one) and the cores
    and priorities its kernel capabilities allow, from the first ThreadInfo one (svcGetInfo 0 and 1, svcCreateThread's
    checks) */
@@ -917,6 +926,7 @@ int snx_main(int argc, char** argv) {
 #ifdef MODULE_PACK
     g_settings.log_level = 2; /* a phone's log is the only way to see what a run did: everything, until it is steadier */
 #endif
+    if (npdm_system_resource()) mem_layout_vamm();
     mem_init();
     if (g_settings.memory_fit) { /* before the game allocates: what the process holds is the runtime's alone */
         SnxU64 available = 0, footprint = snx_footprint();
