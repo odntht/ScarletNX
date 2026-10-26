@@ -926,7 +926,7 @@ int snx_main(int argc, char** argv) {
 #ifdef MODULE_PACK
     g_settings.log_level = 2; /* a phone's log is the only way to see what a run did: everything, until it is steadier */
 #endif
-    if (npdm_system_resource()) mem_layout_vamm();
+    if (!g_arm_mod && npdm_system_resource()) mem_layout_vamm();
     mem_init();
     if (g_settings.memory_fit) { /* before the game allocates: what the process holds is the runtime's alone */
         SnxU64 available = 0, footprint = snx_footprint();

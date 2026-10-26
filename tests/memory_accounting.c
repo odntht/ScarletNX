@@ -473,6 +473,32 @@ static void test_shared_memory(void) {
     kshmem_destroy(&s->o);
 }
 
+/* a game with a system resource size (VAMM) on each tier: from 24 GiB to 64 GiB an alias region that holds its table's
+   GiB, its 12 GiB block at the next GiB and a GiB after, reported as it is, and every region inside the address space
+   with none over another; other tiers keep their layout */
+static void test_vamm_layouts(void) {
+    static const u64 tiers[] = {64, 48, 32, 24, 16, 12, 8, 5};
+    unsigned i;
+    for (i = 0; i < sizeof tiers / sizeof *tiers; i++) {
+        MemLayout before;
+        refuse_above = tiers[i] << 30;
+        mem_reserve();
+        CHECK(g_mem && g_as_size == tiers[i] << 30);
+        before = g_layout;
+        mem_layout_vamm();
+        if (tiers[i] < 24 || tiers[i] >= 64)
+            CHECK(!memcmp(&before, &g_layout, sizeof before));
+        else
+            CHECK(g_layout.alias_size >= 14ull << 30 && info(3) == g_layout.alias_size);
+        CHECK(g_layout.base <= g_layout.alias && g_layout.alias + g_layout.alias_size <= g_layout.heap);
+        CHECK(g_layout.heap + g_layout.heap_size <= g_layout.stack);
+        CHECK(g_layout.stack + g_layout.stack_size <= g_layout.kern && g_layout.kern < g_layout.kern_end);
+        CHECK(g_layout.kern_end == g_layout.end && g_layout.end == g_as_size);
+        CHECK(munmap(reservation, reservation_size) == 0);
+        g_mem = NULL;
+    }
+}
+
 int main(void) {
     hle_init();
     /* this host's pages, then those of hosts with larger ones (16 KiB: Apple silicon, some Android kernels; 64 KiB:
@@ -514,6 +540,7 @@ int main(void) {
           g_layout.kern == 23ull << 30 && g_layout.kern_end == 24ull << 30);
     CHECK(munmap(reservation, reservation_size) == 0);
     g_mem = NULL;
+    test_vamm_layouts();
     refuse_above = 0;
     return 0;
 }

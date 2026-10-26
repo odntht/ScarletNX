@@ -23,7 +23,6 @@ typedef struct {
     u64 alias, alias_size;
     u64 stack, stack_size;
     u64 kern, kern_end; /* the kernel's own pages (TLS) */
-    u64 alias_virtual; /* the alias region's size GetInfo reports when it is larger than the host backs: 0, alias_size */
 } MemLayout;
 #define AS_BASE    (g_layout.base)
 #define AS_END     (g_layout.end)
@@ -88,7 +87,8 @@ void mem_layout32(unsigned aspace);
 /* The guest's address space reserved now, the largest tier the system gives from the console's 128 GiB down to 5 GiB,
    each refused one said: before the game's code takes a share of a small one. mem_init finds it kept */
 void mem_reserve(void);
-/* the layout of a game with a system resource size (VAMM), once the program's metadata says so: before mem_init */
+/* the layout of a 64-bit game with a system resource size (VAMM), once the program's metadata says so: after
+   mem_reserve, before mem_init */
 void mem_layout_vamm(void);
 void mem_init(void);
 int mem_map(u64 addr, u64 size, u32 state, u32 perm); /* 0, MEM_BADSTATE when it isn't free, MEM_NOMEM */

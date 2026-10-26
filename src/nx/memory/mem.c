@@ -29,7 +29,7 @@
    is the 1 GiB the kernel's own pages (TLS) need. The alias region starts at 4 GiB, which leaves the code below it
    up to 3.9 GiB, as the end of the code isn't known yet when the layout is made */
 MemLayout g_layout = {0x8000000ull,  AS_MAX,      0x1100000000ull, 8 * GIB, 0x100000000ull, 64 * GIB,
-                      0x1300000000ull, 2 * GIB, 0x1380000000ull, 0x13C0000000ull, 0};
+                      0x1300000000ull, 2 * GIB, 0x1380000000ull, 0x13C0000000ull};
 u64 g_as_size = AS_MAX;
 u8* g_mem;
 u64 g_heap_size, g_phys_mapped, g_heap_max, g_code_memory, g_main_stack_size;
@@ -588,35 +588,21 @@ static void layout_for(u64 size) {
     g_layout.kern_end = size;
 }
 /* A game with a system resource size manages its address space itself (nn::os's VammManager): it takes the alias region
-   the kernel reports and asks for 12 GiB of it, mapping pages in with svcMapPhysicalMemory as it grows. The console
-   reports 64 GiB. A layout of 24 GiB or more gets a 16 GiB alias region, reported as it is. A smaller one reports 64 GiB,
-   backed as far as the address space reaches (a map past that is refused), and under 12 GiB the heap region, which
-   that game never sets, shrinks to leave the alias region all that is left above the code */
+   the kernel reports, keeps its table in the region's first GiB and places its blocks upward from there, the first
+   12 GiB at the next GiB boundary, mapping pages in with svcMapPhysicalMemory as it grows. The console reports 64 GiB.
+   A layout of 24 GiB to 64 GiB gets an alias region that holds the table, that block and a GiB or more after it (14 GiB
+   at 24 GiB, 16 GiB above), with the heap and stack regions after it and the kernel's pages in the last GiB. A smaller
+   layout keeps its own: the block can't fit, and the game's first map past the region aborts it */
 void mem_layout_vamm(void) {
-    if (g_as_size >= 64 * GIB) return;
-    if (g_as_size >= 24 * GIB) {
-        /* room for the 12 GiB it asks: an alias region of 16 GiB, reported as it is, so the block it maps at the
-           region's top lies inside the address space */
-        g_layout.alias = 4 * GIB;
-        g_layout.alias_size = 16 * GIB;
-        g_layout.heap = g_layout.alias + g_layout.alias_size;
-        g_layout.heap_size = 4 * GIB;
-        g_layout.stack = g_layout.heap + g_layout.heap_size;
-        g_layout.stack_size = 2 * GIB;
-        g_layout.kern = g_as_size - GIB;
-        g_layout.alias_virtual = 0;
-        return;
-    }
-    if (g_as_size < 12 * GIB) {
-        g_layout.alias = GIB / 2;
-        g_layout.kern = g_as_size - GIB / 4;
-        g_layout.stack = g_layout.kern - GIB / 4;
-        g_layout.stack_size = GIB / 4;
-        g_layout.heap = g_layout.stack - GIB / 4;
-        g_layout.heap_size = GIB / 4;
-        g_layout.alias_size = g_layout.heap - g_layout.alias;
-    }
-    g_layout.alias_virtual = 64 * GIB;
+    u64 as = g_as_size;
+    if (as < 24 * GIB || as >= 64 * GIB) return;
+    g_layout.alias = 4 * GIB;
+    g_layout.alias_size = as >= 32 * GIB ? 16 * GIB : 14 * GIB;
+    g_layout.heap = g_layout.alias + g_layout.alias_size;
+    g_layout.heap_size = as >= 32 * GIB ? 8 * GIB : 4 * GIB;
+    g_layout.stack = g_layout.heap + g_layout.heap_size;
+    g_layout.stack_size = as >= 32 * GIB ? 2 * GIB : GIB;
+    g_layout.kern = as - GIB;
 }
 #ifdef __APPLE__
 #include <mach/mach.h>
