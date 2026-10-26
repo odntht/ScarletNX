@@ -20,7 +20,7 @@ char* gui_game_kind_dir(const char* folder, const char* name, int kind) {
     if (kind < SNX_USER_CONFIG || kind > SNX_USER_CACHE ||
         snx_path_format(record, sizeof record, "%s/%s.folders", folder, name))
         return NULL;
-    recorded = snx_ini_value(record, keys[kind - SNX_USER_CONFIG]);
+    recorded = snx_ini_path(record, keys[kind - SNX_USER_CONFIG]);
     if (recorded && snx_is_dir(recorded)) return recorded;
     free(recorded);
     /* the runtime makes its user path; where it could not, the files stay beside the game */

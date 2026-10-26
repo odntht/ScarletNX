@@ -94,12 +94,18 @@ done:
     free(out);
     return rc;
 }
+char* snx_ini_path(const char* path, const char* key) {
+    char* value = snx_ini_value(path, key);
+    char* opened = value ? snx_path_open(value) : NULL;
+    free(value);
+    return opened;
+}
 char* snx_game_source(const char* folder, const char* name, int* recorded) {
-    char *ini = snx_game_ini(folder, name), *source = snx_ini_value(ini, "source"), path[SNX_PATH_SIZE];
+    char *ini = snx_game_ini(folder, name), *source = snx_ini_path(ini, "source"), path[SNX_PATH_SIZE];
     free(ini);
     if (!source) { /* a console driver's, in the folder: the user's config folder is elsewhere (snx_user_path) */
         ini = snx_format("%s/%s.ini", folder, name);
-        source = snx_ini_value(ini, "source");
+        source = snx_ini_path(ini, "source");
         free(ini);
     }
     if (recorded) *recorded = source != NULL;
@@ -109,8 +115,9 @@ char* snx_game_source(const char* folder, const char* name, int* recorded) {
     return snx_strdup(path);
 }
 int snx_record_source(const char* folder, const char* name, const char* dump) {
-    char* ini = snx_game_ini(folder, name);
-    int rc = snx_ini_record(ini, "source", dump);
+    char *ini = snx_game_ini(folder, name), *kept = snx_path_keep(dump);
+    int rc = snx_ini_record(ini, "source", kept);
+    free(kept);
     free(ini);
     return rc;
 }

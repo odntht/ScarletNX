@@ -85,6 +85,14 @@ char* snx_temp_root(void);
    and its RomFS is read from when the game's data folder has none. NULL for a title ID that is no game's own */
 char* snx_tmpfs_work(SnxU64 title);
 char* snx_user_data_dir(void);
+/* An iOS app's container gets a new ID whenever the app is installed again, so a path inside it kept in a file (a game's
+   source=, <name>.folders) would name a folder that is gone. It is kept as ~/..., what follows the app's HOME (the
+   container's root), and read back against the HOME the app has then, as app.ini's empty folders are. Elsewhere, and for a
+   path outside HOME, both return the path as it is. Owned. snx_path_open_into does the reading into a buffer instead: 1
+   when path begins with ~/ and was opened there, else 0 and out is untouched */
+char* snx_path_keep(const char* path);
+char* snx_path_open(const char* path);
+int snx_path_open_into(const char* path, char* out, size_t size);
 /* Systems that follow the XDG Base Directory spec, where settings, state and caches have folders of their own */
 #if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
 #define SNX_XDG 1

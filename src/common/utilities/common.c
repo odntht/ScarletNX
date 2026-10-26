@@ -332,6 +332,50 @@ int snx_path_is_full(const char* path) {
     return path[0] == '/';
 #endif
 }
+/* the length of HOME (or its resolved form: /var is /private/var on iOS) path begins with, else 0 */
+#ifdef SNX_IOS
+static size_t home_prefix(const char* path) {
+    const char* home = getenv("HOME");
+    char real[PATH_MAX];
+    size_t n;
+    if (!path || !home || !home[0]) return 0;
+    n = strlen(home);
+    if (!strncmp(path, home, n) && (path[n] == '/' || !path[n])) return n;
+    if (realpath(home, real)) {
+        n = strlen(real);
+        if (!strncmp(path, real, n) && (path[n] == '/' || !path[n])) return n;
+    }
+    return 0;
+}
+#endif
+char* snx_path_keep(const char* path) {
+#ifdef SNX_IOS
+    size_t n = home_prefix(path);
+    if (n && path[n] == '/') return snx_format("~%s", path + n);
+#endif
+    return path ? snx_strdup(path) : NULL;
+}
+int snx_path_open_into(const char* path, char* out, size_t size) {
+#ifdef SNX_IOS
+    const char* home = getenv("HOME");
+    if (path && path[0] == '~' && path[1] == '/' && home && home[0]) {
+        int n = snprintf(out, size, "%s%s", home, path + 1);
+        return n > 0 && (size_t)n < size;
+    }
+#else
+    (void)path;
+    (void)out;
+    (void)size;
+#endif
+    return 0;
+}
+char* snx_path_open(const char* path) {
+#ifdef SNX_IOS
+    char buffer[PATH_MAX];
+    if (snx_path_open_into(path, buffer, sizeof buffer)) return snx_strdup(buffer);
+#endif
+    return path ? snx_strdup(path) : NULL;
+}
 char* snx_absolute(const char* path) {
 #ifdef _WIN32
     wchar_t *p = wide(path), *result, *final_path;

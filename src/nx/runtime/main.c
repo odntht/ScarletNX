@@ -324,6 +324,7 @@ static void game_dirs(void) {
     static const char* const keys[] = {"config", "state", "cache"};
     char path[sizeof g_exedir + sizeof g_exename + 16], why[256], *text, *key, *value, *full;
     char* recorded[SNX_USER_CACHE + 1] = {NULL}; /* in text */
+    char opened[SNX_USER_CACHE + 1][SNX_PATH_SIZE]; /* a recorded ~/... opened against this app's HOME */
     const char* record;
     SnxIni ini;
     size_t size;
@@ -338,7 +339,7 @@ static void game_dirs(void) {
         for (kind = SNX_USER_CONFIG; kind <= SNX_USER_CACHE && strcmp(key, keys[kind - SNX_USER_CONFIG]); ++kind)
             continue;
         if (kind <= SNX_USER_CACHE)
-            recorded[kind] = value;
+            recorded[kind] = snx_path_open_into(value, opened[kind], sizeof opened[kind]) ? opened[kind] : value;
         else
             WARN("%s: %s=%s is none of config=, state= and cache=, the folders the game reads from it\n", record, key,
                  value);

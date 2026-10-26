@@ -11,6 +11,8 @@
 char* snx_game_ini(const char* folder, const char* name);
 /* key's value in the .ini at path, the last one's, malloc'd: NULL for none, an empty one or no such file */
 char* snx_ini_value(const char* path, const char* key);
+/* the same for a value that is a path: one kept as ~/... (snx_path_keep) is opened against this app's HOME */
+char* snx_ini_path(const char* path, const char* key);
 /* key=value in [Game] of the .ini at path, every older key= taken out and the file made when there is none, left as
    it is when it has the value already. value has no line break. 0, or nonzero with a line saying why */
 int snx_ini_record(const char* path, const char* key, const char* value);

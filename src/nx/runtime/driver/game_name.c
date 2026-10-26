@@ -60,7 +60,9 @@ int snx_record_folders(const char* folder, const char* name) {
                 rc = snx_error("cannot create %s, the folder of the game's %s files", moved,
                                keys[kind - SNX_USER_CONFIG]);
             else {
-                line = snx_format("%s%s=%s\n", text, keys[kind - SNX_USER_CONFIG], moved);
+                char* kept = snx_path_keep(moved); /* an iOS container has a new ID after each install */
+                line = snx_format("%s%s=%s\n", text, keys[kind - SNX_USER_CONFIG], kept);
+                free(kept);
                 free(text);
                 text = line;
             }

@@ -138,7 +138,7 @@ static void dump_open(const char* keys, const char* title_keys) {
         extracted = snx_is_dir(at);
         free(at);
         own = snx_format("%s%s.ini", g_confdir, g_exename);
-        addon = extracted ? NULL : snx_ini_value(own, "source");
+        addon = extracted ? NULL : snx_ini_path(own, "source");
         if (!extracted && (!addon || !snx_is_file(addon)))
             fatal("The update %s can't be read: its settings %s name %s. Play its dump again to record it", g_exename,
                   own, addon ? "a dump that is not there" : "no dump (source=)");
@@ -237,7 +237,7 @@ static void dlcs_open(const char* keys, const char* title_keys) {
         snx_title_text(ids[i].id, text);
         image = snx_format("%s%s_%s_data/system/archives/%s.romfs", g_exedir, g_gamename, text, text);
         ini = snx_format("%s%s_%s.ini", g_confdir, g_gamename, text);
-        dump = snx_is_file(image) ? NULL : snx_ini_value(ini, "source");
+        dump = snx_is_file(image) ? NULL : snx_ini_path(ini, "source");
         if (snx_is_file(image)) {
             LOG("fs: the DLC %s from its extraction\n", text);
             g_hle.fs.dlcs[g_hle.fs.ndlcs++] = ids[i].id;
