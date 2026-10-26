@@ -3041,7 +3041,7 @@ int main(int argc, char** argv) {
             structured_paths[i] = fixture_path(argv[1], name);
         }
         fswzadd_path = fixture_path(argv[1], "fswzadd");
-        if (fixture_count != 93) {
+        if (fixture_count != sizeof fixture_paths / sizeof *fixture_paths) {
             fprintf(stderr, "failed to allocate fixture paths\n");
             return 2;
         }
