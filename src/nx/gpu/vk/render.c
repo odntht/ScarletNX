@@ -1604,6 +1604,7 @@ static VkDescriptorSet stage_set_(GpuChannel* ch, int stage, VkSh* s, Surf** rt,
         ShTex* st = &s->si.tex[i];
         if (st->flags & SNX_TEX_INDEXED) continue;
         ShTex plain;
+        int compare = st->shadow; /* a depth compare, in the sampler or in the shader */
         if (st->shadow && (s->si.tex_dc_color_mask >> i & 1)) { /* compared in the shader: a plain sampler and view */
             plain = *st;
             plain.shadow = 0;
@@ -1658,6 +1659,7 @@ static VkDescriptorSet stage_set_(GpuChannel* ch, int stage, VkSh* s, Surf** rt,
         } else
             view = vk_tex_bind_view(t, want, x->tic, x->tsc, num);
         const Surf* sampled = view ? t : NULL; /* the texture whose own view is bound, for the sampler */
+        if (compare && sampled && t->f.depth) t->shadow_map = 1;
         if (view && depth_ro) {
             *zt_ro = 1; /* render_begin moves it to the read-only layout */
             layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
@@ -2486,14 +2488,11 @@ retry:
         g_vk_skipped++;
         return;
     }
-    static u32 last_cw, last_ch; /* the size of the last color target drawn to */
-    if (n && rt[0]) {
-        last_cw = rt[0]->w;
-        last_ch = rt[0]->h;
-    }
-    if (!g_settings.shadows && !n && zt && (zt->w != last_cw || zt->h != last_ch)) {
-        /* shadows=0: depth-only passes at another size (shadow maps) are skipped, and the map is cleared to far once
-           a frame so it reads as fully lit */
+    if (!g_settings.shadows && !n && zt && zt->shadow_map) {
+        /* shadows=0: depth-only passes into a depth target some draw compared against (a shadow map) are skipped, and
+           the map is cleared to far once a frame so it reads as fully lit. Not by its size against the last color
+           target: that also caught one game's depth prepass and depth pyramid, and its floors and models
+           vanished */
         static u32 cleared_frame = ~0u;
         static Surf* cleared;
         if (cleared_frame != g_vk_present || cleared != zt) {
