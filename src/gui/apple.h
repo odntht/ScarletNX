@@ -28,4 +28,6 @@ void gui_apple_play(const char* const* argv);
 /* What gui_apple_play kept, NULL when no game was picked; argc gets the count. Owned by apple.m, which keeps it until
    the process ends, as the runtime does with its argv */
 char** gui_apple_played(int* argc);
+/* iOS: the game's software keyboard, an alert with a text field; 0 with the text in out, 1 for Cancel */
+int gui_apple_text_input(char* out, size_t cap, const char* initial);
 #endif

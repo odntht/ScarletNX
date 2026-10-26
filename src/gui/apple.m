@@ -217,3 +217,51 @@ char** gui_apple_played(int* argc) {
     *argc = played_count;
     return played_count ? played : NULL;
 }
+
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+/* the game's software keyboard: an alert with a text field over the topmost view controller, the game's thread waiting
+   for the answer. 0 with the text in out, 1 for Cancel */
+int gui_apple_text_input(char* out, size_t cap, const char* initial) {
+    __block int cancelled = 1;
+    NSString* start = [NSString stringWithUTF8String:initial ? initial : ""];
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController* top = nil;
+        for (UIScene* sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:UIWindowScene.class]) continue;
+            for (UIWindow* w in ((UIWindowScene*)sc).windows)
+                if (w.isKeyWindow || !top) top = w.rootViewController;
+        }
+        while (top.presentedViewController) top = top.presentedViewController;
+        if (!top) {
+            dispatch_semaphore_signal(done);
+            return;
+        }
+        UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Enter text"
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [a addTextFieldWithConfigurationHandler:^(UITextField* f) {
+            f.text = start;
+        }];
+        [a addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:^(UIAlertAction* x) {
+                                                dispatch_semaphore_signal(done);
+                                            }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction* x) {
+                                                const char* t = a.textFields.firstObject.text.UTF8String;
+                                                if (t && strlen(t) < cap) {
+                                                    strcpy(out, t);
+                                                    cancelled = 0;
+                                                }
+                                                dispatch_semaphore_signal(done);
+                                            }]];
+        [top presentViewController:a animated:YES completion:nil];
+    });
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    return cancelled;
+}
+#endif
