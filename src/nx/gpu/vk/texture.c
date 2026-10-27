@@ -708,7 +708,8 @@ static Surf* tex_check(Surf* t, u64 gva) {
             g_bud_frame = g_vk_present;
             g_bud = 24 << 20;
         }
-        if (tex_settled(t) && (i32)(g_vk_present - t->tfull) < 120) {
+        int small = t->size <= (4u << 20); /* a font atlas: new glyphs fall between the samples */
+        if (!small && tex_settled(t) && (i32)(g_vk_present - t->tfull) < 120) {
             t->checked = g_vk_present;
             if (vk_sample_hash(gva, t->size) == t->shash) {
                 t->next_check = g_vk_present + 20 + ((u32)(gva >> 9) & 7);
@@ -720,7 +721,8 @@ static Surf* tex_check(Surf* t, u64 gva) {
             t->checked = g_vk_present;
             g_bud -= (i64)(t->size >> (t->size > 65536 ? 1 : 0));
             tex_settle(t, gva, tex_rehash(t), 1);
-            t->next_check = g_vk_present + (t->stable < 4 ? 4 : t->stable < 12 ? 8 : 20) + ((u32)(gva >> 9) & 3);
+            t->next_check =
+                g_vk_present + (t->stable < 4 || small ? 4 : t->stable < 12 ? 8 : 20) + ((u32)(gva >> 9) & 3);
         }
     }
     return t->upload_valid ? t : NULL;
