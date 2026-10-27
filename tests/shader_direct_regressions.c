@@ -2490,9 +2490,8 @@ static int has_binding(const u32* code, size_t words, u32 binding) {
     }
     return 0;
 }
-/* Transform feedback without the extension (g_shader_xfb_stores, MoltenVK): the same capture is stored by the vertex
-   program into storage buffers, its parameters and each buffer captured into bound after its global buffers, with no
-   TransformFeedback capability. The key stays in the program's info, for the renderer to bind what it names */
+/* without the extension (MoltenVK) the vertex program stores the capture into storage buffers after its global
+   buffers, with no TransformFeedback capability, and keeps the key for the renderer */
 static void transform_feedback_stores(void) {
     const u64 instructions[] = {mov32i(0, 0x3f800000), mov32i(1, 0x40000000), mov32i(2, 0x40400000),
                                 mov32i(3, 0x40800000), 0xeff000000007ff00ull | (0x80ull << 20) | (3ull << 47)};

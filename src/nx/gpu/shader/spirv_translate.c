@@ -1008,15 +1008,13 @@ typedef struct {
     /* the extension's: the captured outputs' private vec4s and their component outputs */
     const u8* attr_private;
     u32 (*components)[4];
-    /* the stores': the parameters' and the buffers' storage buffers (SNX_VKB_XFB_PARAMS, SNX_VKB_XFB), a pointer to
-       one of their words, VertexIndex and InstanceIndex */
+    /* the stores': their storage buffers, a word pointer type, VertexIndex and InstanceIndex */
     u32 params, buffer[4], pointer, vertex_index, instance_index;
     const u8* outputs_used;
     int position_used;
 } XfbOut;
 
-/* A captured attribute word's value (ShXfb.layout) as bits, 0 for one the program has no output for (left as it is
-   in the buffer, as the extension leaves it) */
+/* a captured word's bits (ShXfb.layout), 0 for one with no output (left as it is, as the extension does) */
 static u32 xfb_word(DirectCtx* c, const XfbOut* x, u32 word) {
     u32 var = 0, component = word & 3;
     if (word >= 28 && word < 32 && x->position_used)
@@ -1028,10 +1026,8 @@ static u32 xfb_word(DirectCtx* c, const XfbOut* x, u32 word) {
     return spv_emit_bitcast(&c->emit, c->u32_type, value);
 }
 
-/* Transform feedback by stores: the vertex's place in the draw's order of vertices (VertexIndex - first vertex +
-   (InstanceIndex - first instance) * the vertices an instance captures), and below the draw's captured vertices, each
-   word of a buffer's layout into that buffer at place * stride / 4 + its index there. The renderer binds each buffer
-   from where the draw's capture starts, and counts the vertices that fit in all of them */
+/* Transform feedback by stores: a vertex's place is VertexIndex - first + (InstanceIndex - first instance) * the
+   vertices an instance captures, and below the draw's count each layout word goes to place * stride / 4 + its index */
 static void xfb_write(DirectCtx* c, const XfbOut* x) {
     SpvEmitter* e = &c->emit;
     u32 u = c->u32_type, p[4];
@@ -1061,8 +1057,8 @@ static void xfb_write(DirectCtx* c, const XfbOut* x) {
     spv_emit_label(e, done);
 }
 
-/* Transform feedback before the program ends or emits a vertex: the stores, or each captured output's private vec4
-   copied into its component outputs, the variables that carry the extension's offsets */
+/* transform feedback at an exit or emitted vertex: the stores, or the private vec4s copied into the outputs the
+   extension's offsets decorate */
 static void xfb_store(DirectCtx* c, const XfbOut* x) {
     if (x->stores) {
         xfb_write(c, x);
@@ -4467,8 +4463,7 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
                     xfb_off[word] = (u16)(w * 4);
                     xfb_on = 1;
                 }
-        /* without the extension a vertex program stores what is captured itself (xfb_write), in global buffer slots
-           its own don't take */
+        /* without the extension the vertex program stores the capture (xfb_write) */
         if (xfb_on && g_shader_xfb_stores) {
             xfb_stores = stage == ST_VS && ngbuf <= SNX_XFB_GBUF_MAX;
             xfb_on = xfb_stores;

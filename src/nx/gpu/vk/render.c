@@ -218,8 +218,7 @@ static struct {
     VmaAllocation mem;
     u32 end[4];
 } g_xfb;
-/* transform feedback buffer b's registers (0xE0 + 8 * b: enable, address, size, start offset): its address from the
-   start offset on, and size its size (not enabled: 0) */
+/* buffer b's address from its start offset, and its size (0 when disabled), from registers 0xE0 + 8 * b */
 static u64 xfb_buffer(const u32* r, u32 b, i32* size) {
     const u32* t = &r[0xE0 + 8 * b];
     *size = t[0] ? (i32)t[3] : 0;
@@ -236,15 +235,13 @@ static int xfb_counters(void) {
     vk_mem_track(g_xfb.mem);
     return 1;
 }
-/* whether a draw with registers r captures its vertices (3D 0x1D1): with the extension once its counters are made,
-   or by the vertex program's stores */
+/* whether a draw captures its vertices (0x1D1): by the extension once its counters exist, or by stores */
 static int xfb_wanted(const u32* r) {
     if (!r[0x1D1]) return 0;
     return g_vk.has_xfb ? xfb_counters() : g_shader_xfb_stores;
 }
 
-/* a draw's capture by stores: the vertex stage's bindings (SNX_VKB_XFB_PARAMS, SNX_VKB_XFB + i), the buffers it
-   captures into and where their capture ends */
+/* a draw's capture by stores: the vertex stage's bindings and where each buffer's capture ends */
 typedef struct {
     VkBuffer buf[5]; /* [4] the parameters */
     u64 off[5], size[5];
@@ -252,9 +249,8 @@ typedef struct {
     u32 bound;    /* those of them the draw captures into */
     u32 end[4];
 } XfbBind;
-/* x for a draw of vs with transform feedback (vs->si.xfb, the registers' layout) by stores, in the order the hardware
-   writes it: a list of points, lines or triangles drawn in vertex order. Others capture nothing (logged once). A draw
-   the render enable decides on the GPU (render_pred) is taken as drawn. 0 when a buffer can't be had */
+/* x for a capture by stores, in the hardware's order: point, line and triangle lists only (others are logged and
+   skipped). A draw predicated on the GPU counts as drawn. 0 when a buffer can't be had */
 static int xfb_bind(GpuChannel* ch, const VkSh* vs, int indexed, u32 topology, u32 first, u32 count,
                     u32 base_instance, u32 instances, XfbBind* x) {
     const u32* r = ch->r3d;
@@ -313,8 +309,7 @@ static int xfb_bind(GpuChannel* ch, const VkSh* vs, int indexed, u32 topology, u
             x->size[b] = 16;
             continue;
         }
-        /* from where the capture starts, a writable copy of guest memory, which lands there and which later draws
-           read on the GPU until then (vk_buf_copy_writable) */
+        /* a writable copy of guest memory from the capture's start, which later draws read (vk_buf_copy_writable) */
         if (!vk_buf_copy_writable(addr[b] + start[b], (u32)used, &x->buf[b], &x->off[b])) return 0;
         x->size[b] = used;
         x->end[b] = start[b] + (u32)limit * stride;
