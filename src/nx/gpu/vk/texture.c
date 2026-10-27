@@ -632,7 +632,9 @@ static VkImageViewType tic_view_type(u32 type, u32 d) {
 
 static u32 g_bud_frame;
 static i64 g_bud;
-/* a texture that stayed the same over its last 40 frames' checks: the schedule below checks it by samples */
+#define TEX_WHOLE_MAX (4u << 20) /* up to this size a texture is always hashed whole: samples miss sparse CPU writes */
+/* a texture that stayed the same over its last 40 frames' checks: the schedule below checks it by samples, unless it
+   is small (TEX_WHOLE_MAX) */
 static int tex_settled(const Surf* t) { return t->stable >= 40 && t->size >= 16384; }
 /* a whole-texture check's outcome (tex_rehash's) in its stability: a change starts it over, an unchanged texture
    counts once a frame (count: its first check in this one). Settling, it takes its samples' hash */
@@ -641,7 +643,7 @@ static void tex_settle(Surf* t, u64 gva, int changed, int count) {
         t->stable = 0;
     else if (count && t->stable < 100000)
         t->stable++;
-    if (count && t->stable >= 39 && t->size >= 16384) {
+    if (count && t->stable >= 39 && t->size >= 16384 && t->size > TEX_WHOLE_MAX) {
         t->shash = vk_sample_hash(gva, t->size);
         t->tfull = g_vk_present;
     }
@@ -708,7 +710,7 @@ static Surf* tex_check(Surf* t, u64 gva) {
             g_bud_frame = g_vk_present;
             g_bud = 24 << 20;
         }
-        int small = t->size <= (4u << 20); /* a font atlas: new glyphs fall between the samples */
+        int small = t->size <= TEX_WHOLE_MAX;
         if (!small && tex_settled(t) && (i32)(g_vk_present - t->tfull) < 120) {
             t->checked = g_vk_present;
             if (vk_sample_hash(gva, t->size) == t->shash) {
@@ -719,7 +721,7 @@ static Surf* tex_check(Surf* t, u64 gva) {
         }
         if (g_bud > 0 || t->stable < 4) {
             t->checked = g_vk_present;
-            g_bud -= (i64)(t->size >> (t->size > 65536 ? 1 : 0));
+            g_bud -= (i64)(small ? t->size : t->size >> (t->size > 65536 ? 1 : 0));
             tex_settle(t, gva, tex_rehash(t), 1);
             t->next_check =
                 g_vk_present + (t->stable < 4 || small ? 4 : t->stable < 12 ? 8 : 20) + ((u32)(gva >> 9) & 3);
