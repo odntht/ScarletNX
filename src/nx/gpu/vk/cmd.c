@@ -347,9 +347,9 @@ static int stage_rotate(Frame* f)
 		f->stage_spare[f->nstage++] = (Ring){0};
 	}
 	previous = f->stage;
-	f->ring_bytes += f->stage_spare[f->istage].cap;
 	f->stage = f->stage_spare[f->istage];
 	f->stage_spare[f->istage++] = previous;
+	f->ring_bytes += f->stage->cap;
 	return 1;
 }
 
