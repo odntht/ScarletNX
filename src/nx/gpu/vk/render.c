@@ -1658,8 +1658,8 @@ static VkDescriptorSet stage_set_(GpuChannel* ch, int stage, VkSh* s, Surf** rt,
         } else
             view = vk_tex_bind_view(t, want, x->tic, x->tsc, num);
         const Surf* sampled = view ? t : NULL; /* the texture whose own view is bound, for the sampler */
-        if (s->si.tex[i].shadow && x->t && x->t->f.depth) { /* compared, in the sampler or in the shader */
-            Surf* z = vk_rt_find(x->t->gva); /* the depth target, also under a crop, a snapshot or a copy */
+        if (s->si.tex[i].shadow && x->t && x->t->f.depth) { /* a depth compare */
+            Surf* z = vk_rt_find(x->t->gva); /* the target, also behind a crop, snapshot or copy */
             if (z && !z->shadow_map) z->shadow_map = 1;
         }
         if (view && depth_ro) {
@@ -2490,9 +2490,7 @@ retry:
         g_vk_skipped++;
         return;
     }
-    /* shadows=0: depth-only passes into a depth target some draw compared against (a shadow map) are skipped, and the
-       map is cleared to far once a frame so it reads as fully lit. A new map draws whole until its first compare. A
-       depth target drawn with color targets is the scene's, never a map, even if compared against */
+    /* shadows=0 skips depth-only passes into a shadow map (shadow_map) and clears it to far once a frame, fully lit */
     if (n && zt) zt->shadow_map = -1;
     if (!g_settings.shadows && !n && zt && zt->shadow_map == 1) {
         static u32 cleared_frame = ~0u;

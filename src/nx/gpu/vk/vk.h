@@ -470,8 +470,7 @@ typedef struct Surf {
     struct Surf *lru_prev, *lru_next;
     u64 bytes;
     int took_drawn; /* textures: pixels copied from render targets since the last upload (memory may not have them) */
-    /* depth targets: 1 once sampled with a depth compare and never drawn with color targets, which shadows=0 takes
-       for a shadow map; -1 once drawn with color targets (render.c) */
+    /* depth targets: 1 a shadow map (sampled with a depth compare), -1 the scene's (drawn with color targets) */
     int shadow_map;
     /* depth targets: undefined but for draws and clears predicated on the GPU, which may not have run, so they count
        as no draw (render.c zt_written) */
