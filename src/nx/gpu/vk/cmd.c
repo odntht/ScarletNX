@@ -54,6 +54,7 @@ typedef struct {
     Dead* dead;
     int ndead, capdead;
     u64 dead_bytes; /* device memory evicted cache entries among them release (vk_defer_bytes) */
+    u64 ring_bytes; /* bytes of ring blocks this use of the slot filled (vk_frame_check) */
     /* descriptor pools, reset when the frame is reused and kept */
     VkDescriptorPool pool_d[64];
     int npool, ipool; /* pool_d[ipool] is the one allocating; the ones after it are reset and waiting */
@@ -278,6 +279,7 @@ static void frame_recycle(Frame* f) {
     dead_free(f);
     g_dead_bytes -= f->dead_bytes;
     f->dead_bytes = 0;
+    f->ring_bytes = 0;
     vkResetCommandPool(g_vk.dev, f->pool, 0);
     /* the pools stay, reset: a frame's draws fill several, and making them again every frame costs */
     for (int i = 0; i < f->npool; i++) vkResetDescriptorPool(g_vk.dev, f->pool_d[i], 0);
@@ -345,6 +347,7 @@ static int stage_rotate(Frame* f)
 		f->stage_spare[f->nstage++] = (Ring){0};
 	}
 	previous = f->stage;
+	f->ring_bytes += f->stage_spare[f->istage].cap;
 	f->stage = f->stage_spare[f->istage];
 	f->stage_spare[f->istage++] = previous;
 	return 1;
@@ -394,6 +397,7 @@ static u8* ring_alloc(Frame* f, Ring* r, u64 size, u64 align, VkBufferUsageFlags
         r->ptr = info.pMappedData;
         r->cap = cap;
         at = 0;
+        f->ring_bytes += cap;
     }
     r->used = at + size;
     *buf = r->buf;
@@ -533,6 +537,8 @@ void vk_frame_next(void) {
 }
 /* the GPU thread's recording time a submission holds at most */
 #define SUBMIT_EVERY_NS 1000000
+/* the ring blocks at the allocation cap a frame fills before it ends: the slot keeps the staging blocks it took */
+#define FRAME_RING_BLOCKS 2
 /* A frame that goes long without a present (a loading screen) still has to hand its pools and rings back: one with
    many submissions or descriptor pools ends here, at the start of a draw or dispatch, before anything is set up.
    Otherwise what was recorded goes to the GPU once it holds a millisecond of the GPU thread's work. Submissions came
@@ -541,10 +547,13 @@ void vk_frame_next(void) {
    waited for that frame's fence before submitting the next (34.7 fps, 40.3 with these). Earlier submissions also land
    their storage results sooner, so the pending results a draw's buffers are looked up in stay fewer. 2 ms and 0.5 ms
    were both slower. The limit on submissions leaves room for these in a slow frame: one that reaches it records
-   the rest in the other slot, and its present then waits for this one's work */
+   the rest in the other slot, and its present then waits for this one's work. So does one whose rings filled
+   FRAME_RING_BLOCKS blocks at the allocation cap. A slot just made current still holds its last use's counts */
 void vk_frame_check(void) {
     const Frame* f = &g_fr[g_cur];
-    if (f->icb >= 128 || f->ipool >= 32 || vk_rec_frame_sets(g_cur) >= 32 * 1024)
+    if (f->fresh) return;
+    if (f->ring_bytes >= FRAME_RING_BLOCKS * g_vk.alloc_cap || f->icb >= 128 || f->ipool >= 32 ||
+        vk_rec_frame_sets(g_cur) >= 32 * 1024)
         vk_frame_next();
     else if (f->recording && plat_ns() - g_sub_ns >= SUBMIT_EVERY_NS)
         submit(NULL, NULL, 1);
