@@ -4,7 +4,7 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/measure-cross-path] # measure: this branch only
     tags: ['v*'] # a version's release (publish.yml)
   pull_request:
     # a draft builds and tests as much as a pull request ready for review, so leaving draft starts nothing
