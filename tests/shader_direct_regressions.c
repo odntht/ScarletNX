@@ -2966,6 +2966,28 @@ static int has_binding(const u32* code, size_t words, u32 binding) {
     }
     return 0;
 }
+/* how many OpBitwiseAnd take the constant value as their second operand */
+static int ands_with(const u32* code, size_t words, u32 value) {
+    int found = 0;
+    for (size_t i = 5; i < words;) {
+        u32 width = code[i] >> 16;
+        if (!width || i + width > words) return 0;
+        if ((code[i] & 0xffff) == 199 && width == 5 && is_constant_value(code, words, code[i + 4], value)) found++;
+        i += width;
+    }
+    return found;
+}
+/* how many OpCompositeExtract take this single index */
+static int extracts_of(const u32* code, size_t words, u32 index) {
+    int found = 0;
+    for (size_t i = 5; i < words;) {
+        u32 width = code[i] >> 16;
+        if (!width || i + width > words) return 0;
+        if ((code[i] & 0xffff) == 81 && width == 5 && code[i + 4] == index) found++;
+        i += width;
+    }
+    return found;
+}
 /* without the extension (MoltenVK) the vertex program stores the capture into storage buffers after its global
    buffers, with no TransformFeedback capability, and keeps the key for the renderer */
 static void transform_feedback_stores(void) {
@@ -2996,8 +3018,33 @@ static void transform_feedback_stores(void) {
                   has_binding(spv, words, SNX_VKB_XFB + 1) && !has_binding(spv, words, SNX_VKB_XFB + 2),
               "a capture by stores binds its parameters and the buffers it captures into");
         check(info.xfb.count[0] == 2 && info.xfb.count[1] == 1, "a capture by stores keeps its layout in its info");
+        check(ands_with(spv, words, 1) >= 1 && ands_with(spv, words, 2) >= 1 && ands_with(spv, words, 4) == 0,
+              "a capture by stores stores into a buffer only when its bit is set in the bound mask");
         save_fixture(xfb_stores_path, spv, words);
     }
+    free(spv);
+}
+
+/* the fog coordinate (0x2e8, a legacy varying) moves to component 0 of its generic: a capture by stores of it takes
+   that component, not the one of its own address (2) */
+static void transform_feedback_stores_fog(void) {
+    const u64 instructions[] = {mov32i(0, 0x3f800000), 0xeff000000007ff00ull | (0x2e8ull << 20)};
+    ShaderInfo info;
+    size_t slots, words = 0;
+    u64* code = guest_program(instructions, 2, NULL, &slots);
+    if (!code) return;
+    memset(&info, 0, sizeof info);
+    info.xfb.layout[0][0] = 0x2e8 / 4;
+    info.xfb.count[0] = 1;
+    info.xfb.stride[0] = 4;
+    g_shader_xfb_stores = 1;
+    u32* spv = spirv_of(code, slots * sizeof *code, ST_VS, &info, &words, 0, 1, 1, 1);
+    g_shader_xfb_stores = 0;
+    free(code);
+    check_translated(spv, &info, "a transform feedback capture of the fog coordinate by stores translates");
+    if (spv)
+        check(extracts_of(spv, words, 0) >= 1 && extracts_of(spv, words, 2) == 0,
+              "a capture by stores of the fog coordinate takes component 0 of its generic");
     free(spv);
 }
 
@@ -4110,6 +4157,7 @@ int main(int argc, char** argv) {
     layered_surface_loads();
     transform_feedback();
     transform_feedback_stores();
+    transform_feedback_stores_fog();
     nro_shader_modes();
     issue126_shader_modes();
     between_stages();

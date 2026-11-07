@@ -377,21 +377,17 @@ static int xfb_counters(void) {
 static u64 xfb_counter_offset(u32 owner) { return ((u64)(owner & 0x7fffffff) + (owner >> 31 ? GPU_CHANNELS : 0)) * 16; }
 int vk_render_xfb_control(u32 owner_id, u64 control, u32 what, u32 stride, DrawOwner* owner) {
     if ((owner_id & 0x7fffffff) >= GPU_CHANNELS) return 0;
-    if (!g_vk.has_xfb && g_shader_xfb_stores) {
+    if (g_vk.has_xfb) {
+        if (!xfb_counters()) return 0;
+        vk_render_end(); /* counter transfers occur outside rendering */
+        if (!vk_xfb_control_buffer(g_xfb.buf, xfb_counter_offset(owner_id), control, what, stride)) return 0;
+    } else if (g_shader_xfb_stores) {
         /* capture by stores: a begin starts every buffer at 0 again, and a resume goes on from the CPU's ends
            (g_xfb.end). The control memory gets no byte counts, so a draw of them (DrawAuto) still does nothing */
-        if (!what) {
-            owner->xfb_started = 0;
-            owner->xfb_reload = 15;
-        } else if (what == 3 && control) {
-            owner->xfb_started = 15;
-            owner->xfb_reload = 0;
-        }
-        return 1;
+        if (!what) memset(g_xfb.end[xfb_counter_offset(owner_id) / 16], 0, sizeof g_xfb.end[0]);
+    } else {
+        return 0;
     }
-    if (!g_vk.has_xfb || !xfb_counters()) return 0;
-    vk_render_end(); /* counter transfers occur outside rendering */
-    if (!vk_xfb_control_buffer(g_xfb.buf, xfb_counter_offset(owner_id), control, what, stride)) return 0;
     if (!what) {
         owner->xfb_started = 0;
         owner->xfb_reload = 15;
@@ -416,21 +412,27 @@ typedef struct {
     u32 end[4];
     u32 slot; /* the owner's place in g_xfb.end */
 } XfbBind;
-/* x for a capture by stores, in the hardware's order: direct point, line and triangle lists only (others are logged
-   and skipped). A draw predicated on the GPU counts as drawn. 0 when a buffer can't be had */
-static int xfb_bind(const DsState* ds, const DrawOwner* o, const VkSh* vs, int indexed, int indirect, u32 topology,
-                    u32 first, u32 count, u32 base_instance, u32 instances, XfbBind* x) {
+/* x (zeroed by the caller) for a capture by stores, in the hardware's order: direct point, line and triangle lists
+   only (others are logged and skipped). A draw predicated on the GPU counts as drawn. A buffer that meets a writable
+   global buffer of the draw, other than as the same range, captures nothing: the two would be separate copies
+   (vk_buf_copy_writable shares only an exact range). 0 when a buffer can't be had, or the owner has no ends */
+static int xfb_bind(const DsState* ds, const DrawOwner* o, const VkSh* vs, const VkDrawStorage* storage, int indexed,
+                    int indirect, u32 topology, u32 first, u32 count, u32 base_instance, u32 instances, XfbBind* x) {
     const ShXfb* key = &vs->si.xfb;
     u32 per = topology == 0 ? 1 : topology == 1 ? 2 : topology == 4 ? 3 : 0; /* vertices a primitive */
-    u32 n = per && !indexed && !indirect ? count - count % per : 0, start[4] = {0}, last[4] = {0}, b;
+    u32 n = per && !indexed && !indirect ? count - count % per : 0, start[4] = {0}, last[4] = {0};
     u64 limit = (u64)n * instances, addr[4] = {0};
-    memset(x, 0, sizeof *x);
-    x->slot = (u32)(xfb_counter_offset(ds->owner) / 16);
     if (vs->si.ngbuf > SNX_XFB_GBUF_MAX) { /* the program was translated without stores */
         LOG_LIMIT(1, "vulkan: a vertex program with %d global buffers can't store what transform feedback captures\n",
                   vs->si.ngbuf);
         return 1;
     }
+    x->slot = (u32)(xfb_counter_offset(ds->owner) / 16);
+    if (x->slot >= GPU_CHANNELS * 2) { /* no place for its ends */
+        LOG_LIMIT(1, "vulkan: transform feedback of draw owner %08x isn't captured\n", ds->owner);
+        return 0;
+    }
+    /* shortcut: indexed, strip, fan, loop and indirect draws capture nothing and leave g_xfb.end as it was */
     if (!per || indexed || indirect)
         LOG_LIMIT(4, "vulkan: transform feedback of %s topology %u isn't captured without the extension\n",
                   indexed ? "an indexed" : indirect ? "an indirect" : "a", topology);
@@ -438,11 +440,7 @@ static int xfb_bind(const DsState* ds, const DrawOwner* o, const VkSh* vs, int i
         LOG_LIMIT(1, "vulkan: a transform feedback draw of %llu vertices isn't captured\n", (unsigned long long)limit);
         limit = 0;
     }
-    if (x->slot >= GPU_CHANNELS * 2) { /* no place for its counters */
-        LOG_LIMIT(1, "vulkan: transform feedback of draw owner %08x isn't captured\n", ds->owner);
-        limit = 0;
-    }
-    for (b = 0; b < 4; b++) {
+    for (u32 b = 0; b < 4; b++) {
         u32 stride = key->stride[b], words = key->count[b], size;
         if (!words || stride < 4 || (stride & 3)) continue; /* xfb_write stores nothing there */
         x->declared |= 1u << b;
@@ -464,16 +462,20 @@ static int xfb_bind(const DsState* ds, const DrawOwner* o, const VkSh* vs, int i
         x->bound |= 1u << b;
     }
     if (!x->declared) return 1;
-    u32 params[4] = {first, base_instance, n, (u32)limit};
-    u8* p = vk_stage(sizeof params, vk_stage_align(), &x->buf[4], &x->off[4]);
-    if (!p) return 0;
-    memcpy(p, params, sizeof params);
-    snx_le32_array(p, 4);
-    x->size[4] = sizeof params;
-    for (b = 0; b < 4; b++) {
+    for (u32 b = 0; b < 4; b++) {
         if (!(x->declared >> b & 1)) continue;
         u32 stride = key->stride[b];
-        u64 used = limit ? (limit - 1) * stride + last[b] : 0;
+        u64 used = limit ? (limit - 1) * stride + last[b] : 0, at = addr[b] + start[b];
+        for (int s = 0; used && (x->bound >> b & 1) && s < VK_DRAW_STAGES; s++)
+            for (int i = 0; i < storage->n[s]; i++) {
+                const VkDrawGbuf* g = &storage->b[s][i];
+                if (!g->writable || (g->addr == at && g->size == used) || g->addr >= at + used ||
+                    at >= g->addr + g->size)
+                    continue;
+                LOG_LIMIT(4, "vulkan: transform feedback buffer %u meets a writable global buffer (not captured)\n", b);
+                x->bound &= ~(1u << b);
+                break;
+            }
         if (!(x->bound >> b & 1) || !used) { /* nothing stored: a buffer for the binding */
             x->bound &= ~(1u << b);
             if (!vk_buf_copy(0, 16, &x->buf[b], &x->off[b])) return 0;
@@ -481,10 +483,17 @@ static int xfb_bind(const DsState* ds, const DrawOwner* o, const VkSh* vs, int i
             continue;
         }
         /* a writable copy of guest memory from the capture's start, which later draws read (vk_buf_copy_writable) */
-        if (!vk_buf_copy_writable(addr[b] + start[b], (u32)used, &x->buf[b], &x->off[b], 1)) return 0;
+        if (!vk_buf_copy_writable(at, (u32)used, &x->buf[b], &x->off[b], 1)) return 0;
         x->size[b] = used;
         x->end[b] = start[b] + (u32)limit * stride;
     }
+    /* the bound mask last: xfb_write stores only into those, the others being 16-byte placeholders */
+    u32 params[5] = {first, base_instance, n, (u32)limit, x->bound};
+    u8* p = vk_stage(sizeof params, vk_stage_align(), &x->buf[4], &x->off[4]);
+    if (!p) return 0;
+    memcpy(p, params, sizeof params);
+    snx_le32_array(p, 5);
+    x->size[4] = sizeof params;
     return 1;
 }
 /* after the draw: each buffer's capture resumes from where it ended, until its write pointer is loaded again */
@@ -2019,10 +2028,14 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
     if (s->si.ngbuf)
         dw_buffer(&d, set, SNX_VKB_SMAP, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, draw->map_buf[stage], draw->map_off[stage],
                   draw->map_size[stage]);
-    for (u32 b = 0; xfb && xfb->declared && b < 5; b++)
-        if (b == 4 || xfb->declared >> b & 1)
-            dw_buffer(&d, set, b == 4 ? SNX_VKB_XFB_PARAMS : SNX_VKB_XFB + b, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                      xfb->buf[b], xfb->off[b], xfb->size[b]);
+    if (xfb && xfb->declared) {
+        dw_buffer(&d, set, SNX_VKB_XFB_PARAMS, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, xfb->buf[4], xfb->off[4],
+                  xfb->size[4]);
+        for (u32 b = 0; b < 4; b++)
+            if (xfb->declared >> b & 1)
+                dw_buffer(&d, set, SNX_VKB_XFB + b, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, xfb->buf[b], xfb->off[b],
+                          xfb->size[b]);
+    }
     VkBuffer cb;
     u64 co;
     if (stage == 4 && frame_consts(&cb, &co))
@@ -3473,7 +3486,7 @@ retry:
     /* transform feedback without the extension: the buffers the vertex program stores into */
     XfbBind xfb_stores = {0};
     if (xfb_on && !g_vk.has_xfb &&
-        !xfb_bind(ds, o, vs, indexed, dc->indirect != 0, topology, first, count, base_instance, instances,
+        !xfb_bind(ds, o, vs, &storage, indexed, dc->indirect != 0, topology, first, count, base_instance, instances,
                   &xfb_stores)) {
         g_vk_skipped++;
         return;

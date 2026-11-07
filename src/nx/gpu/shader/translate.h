@@ -427,7 +427,6 @@ typedef struct {
     u32 layer_output;
     u32 layer_input;
     u32 viewport_output;
-    u8* attr_private;
     const XfbOut* xfb_out;
     int xfb_on;
     u32 clip_output;

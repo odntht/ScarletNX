@@ -176,6 +176,7 @@ static inline void shader_query_hint_unpack(const u32 words[SH_QUERY_WORDS], u8 
 #define SNX_XFB_GBUF_MAX   11
 #define SNX_VKB_XFB_PARAMS (SNX_VKB_SSBO + SNX_XFB_GBUF_MAX)
 #define SNX_VKB_XFB        (SNX_VKB_XFB_PARAMS + 1)
+typedef char snx_vkb_xfb_fits[SNX_VKB_XFB + 4 <= SNX_VKB_TEX ? 1 : -1]; /* the 4 buffers end before the textures */
 /* An indexed texture loads its handle with an LDC whose address has a register in it: one of SNX_TEX_ARRAY handles
    from cbuf_off on, each (1 << shift) bytes after the last, with the shift in bits 4-7 of ShTex.flags. */
 #define SNX_TEX_ARRAY    256

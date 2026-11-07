@@ -262,7 +262,6 @@ void emit_flow(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
     u32* output_attrs = t->output_attrs;
     u32 point_size = t->point_size;
     u32 layer_output = t->layer_output;
-    u8* attr_private = t->attr_private;
     int xfb_on = t->xfb_on;
     u32 clip_output = t->clip_output;
     u32 clip_count = t->clip_count;
