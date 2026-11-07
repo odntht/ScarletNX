@@ -247,9 +247,11 @@ static void own_land(const OwnRange* r, u8* const* dst, u32 n) {
         VkResult sr = vkQueueSubmit2(queue, 1, &si, g_owned.fence);
         if (apart) vk_queue_unlock(queue);
         if (!VK_OK(sr)) fatal("vulkan: could not submit ownership readback");
-        gpu_wait_note("GPU-owned memory readback", 0);
+        u64 t0 = plat_ns();
+        int mine = gpu_wait_note("GPU-owned memory readback", 0);
         int ok = VK_OK(vkWaitForFences(g_vk.dev, 1, &g_owned.fence, VK_TRUE, UINT64_MAX));
         gpu_wait_note(NULL, 0);
+        if (mine) vk_wait_site(__FILE__, __LINE__, plat_ns() - t0);
         if (!ok || !VK_OK(vmaInvalidateAllocation(g_vk.vma, g_owned.mem, 0, total)))
             fatal("vulkan: could not complete ownership readback");
         for (j = 0; j < np; j++) memcpy(pc[j].dst, g_owned.ptr + pc[j].at, pc[j].size);

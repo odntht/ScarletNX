@@ -282,9 +282,57 @@ static int bar_room(const VmaBudget* b, u64 add, int back) {
     return budget >= use + (add ? add + size / 16 : 0);
 }
 
+int vk_site_add(VkSite* t, u32 cap, const char* file, int line, u64 ns) {
+    for (u32 i = 0; i < cap; i++) {
+        if (!t[i].file) {
+            t[i].file = file;
+            t[i].line = line;
+        }
+        if (t[i].file == file && t[i].line == line) {
+            t[i].n++;
+            t[i].ns += ns;
+            return 1;
+        }
+    }
+    return 0;
+}
+const VkSite* vk_site_take(VkSite* t, u32 cap, u64* n, u64* ns) {
+    u32 best = cap;
+    for (u32 i = 0; i < cap && t[i].file; i++)
+        if (t[i].n && (best == cap || t[i].n > t[best].n)) best = i;
+    if (best == cap) return NULL;
+    *n = t[best].n;
+    *ns = t[best].ns;
+    t[best].n = t[best].ns = 0;
+    return &t[best];
+}
+
+/* the GPU thread's alone (gpu_wait_note's), which writes them: the waits since the last stats, by site */
+#define WAIT_SITES 64
+static VkSite g_wait_sites[WAIT_SITES];
+static u64 g_wait_sites_lost; /* waits of sites past a full table */
+void vk_wait_site(const char* file, int line, u64 ns) {
+    if (g_settings.log_level >= 2 && !vk_site_add(g_wait_sites, WAIT_SITES, file, line, ns)) g_wait_sites_lost++;
+}
+void vk_waits_log(void) {
+    u64 n, ns, total = 0;
+    const VkSite* w;
+    if (g_settings.log_level < 2) return;
+    for (u32 k = 0; k < 8 && (w = vk_site_take(g_wait_sites, WAIT_SITES, &n, &ns)); k++) {
+        const char* f = strrchr(w->file, '/');
+        LOG("vulkan:   %llu waits for the GPU, %.1f ms, at %s:%d\n", (unsigned long long)n, (double)ns / 1e6,
+            f ? f + 1 : w->file, w->line);
+    }
+    while (vk_site_take(g_wait_sites, WAIT_SITES, &n, &ns)) total += n; /* the rest, zeroed */
+    if (total || g_wait_sites_lost)
+        LOG("vulkan:   %llu waits for the GPU at other sites, %llu at sites past the table\n",
+            (unsigned long long)total, (unsigned long long)g_wait_sites_lost);
+    g_wait_sites_lost = 0;
+}
+
 u64 g_vk_wait_ns[VK_WAIT_N], g_vk_waits[VK_WAIT_N]; /* the GPU thread's alone, which writes them */
-/* kind: VK_WAIT_*, for the statistics */
-static void timeline_wait(u64 value, int kind) {
+/* kind: VK_WAIT_*, for the statistics. file and line: the caller's site, for vk_wait_site */
+static void timeline_wait(u64 value, int kind, const char* file, int line) {
     VkSemaphoreWaitInfo wi = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_gsem, .pValues = &value};
     u64 t0 = plat_ns(), done = 0;
@@ -298,8 +346,10 @@ static void timeline_wait(u64 value, int kind) {
     SNX_ZONE_END(z);
     gpu_wait_note(NULL, 0);
     if (mine) {
-        g_vk_wait_ns[kind] += plat_ns() - t0;
+        u64 ns = plat_ns() - t0;
+        g_vk_wait_ns[kind] += ns;
         g_vk_waits[kind]++;
+        vk_wait_site(file, line, ns);
     }
 }
 /* the storage results of every submission up to value, which has finished, land in guest memory, in order */
@@ -316,7 +366,7 @@ static void frame_recycle(Frame* f) {
     u64 done = f->last > f->hold ? f->last : f->hold;
     SNX_ZONE(z, "vk frame recycle");
     if (done) {
-        timeline_wait(done, VK_WAIT_RECYCLE);
+        timeline_wait(done, VK_WAIT_RECYCLE, __FILE__, __LINE__); /* one site: any vk_cmd */
         land_through(done);
         f->last = 0;
         f->hold = 0;
@@ -787,11 +837,11 @@ void vk_submit_after(VkSemaphore sem, u64 wait, u64 signal) {
 }
 
 u64 g_vk_finishes, g_vk_finish_ns;
-void vk_finish(void) {
+void vk_finish_at(const char* file, int line) {
     u64 t0 = plat_ns();
     SNX_ZONE(z_finish, "vk finish");
     submit_why(VK_NULL_HANDLE, 0, VK_NULL_HANDLE, VK_SUB_FINISH);
-    timeline_wait(g_gval, VK_WAIT_FINISH);
+    timeline_wait(g_gval, VK_WAIT_FINISH, file, line);
     land_through(g_gval);
     g_vk_finishes++;
     g_vk_finish_ns += plat_ns() - t0;
@@ -866,7 +916,7 @@ void vk_submit_progress(u64* submitted, u64* done) {
     *done = 0;
     if (g_gsem) VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, done));
 }
-void vk_wait_submit(u64 value) { timeline_wait(value, VK_WAIT_SUBMIT); }
+void vk_wait_submit_at(u64 value, const char* file, int line) { timeline_wait(value, VK_WAIT_SUBMIT, file, line); }
 void vk_land_through(u64 value) { land_through(value < g_gval ? value : g_gval); }
 u64 vk_frame_id(void) { return g_frame_id; }
 void vk_frame_hold(u64 frame_id) {

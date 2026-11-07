@@ -82,7 +82,8 @@ void vk_submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSemaphore s
     (void)wait, (void)wait_stage, (void)signal;
     g.recording++;
 }
-void vk_wait_submit(u64 value) {
+void vk_wait_submit_at(u64 value, const char* file, int line) {
+    (void)file, (void)line;
     if (value > g.done) {
         g.waits++;
         g.done = value;

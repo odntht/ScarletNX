@@ -77,42 +77,22 @@ static void rp_record(void) {
     }
 }
 
-/* the passes ended since the last stats, by the call site that ended them (a site is its file's literal and a line),
-   under the GPU thread as vk_render_end_at is */
+/* the passes ended since the last stats, by the call site that ended them, under vk_lock as vk_render_end_at is (the
+   GPU thread's, and the main thread's refresh and screenshots) */
 #define PASS_SITES 64
-static struct {
-    const char* file;
-    int line;
-    u64 n;
-} g_pass_ends[PASS_SITES];
-static void pass_end_count(const char* file, int line) {
-    for (u32 i = 0; i < PASS_SITES; i++) {
-        if (!g_pass_ends[i].file) {
-            g_pass_ends[i].file = file;
-            g_pass_ends[i].line = line;
-        }
-        if (g_pass_ends[i].file == file && g_pass_ends[i].line == line) {
-            g_pass_ends[i].n++;
-            return;
-        }
-    }
-}
+static VkSite g_pass_ends[PASS_SITES];
+static void pass_end_count(const char* file, int line) { vk_site_add(g_pass_ends, PASS_SITES, file, line, 0); }
 void vk_pass_ends_log(void) {
-    u64 total = 0;
+    u64 total = 0, n, ns;
+    const VkSite* p;
     for (u32 i = 0; i < PASS_SITES && g_pass_ends[i].file; i++) total += g_pass_ends[i].n;
     if (!total) return;
-    for (u32 k = 0; k < 8; k++) {
-        u32 best = PASS_SITES;
-        for (u32 i = 0; i < PASS_SITES && g_pass_ends[i].file; i++)
-            if (g_pass_ends[i].n && (best == PASS_SITES || g_pass_ends[i].n > g_pass_ends[best].n)) best = i;
-        if (best == PASS_SITES) break;
-        const char* f = strrchr(g_pass_ends[best].file, '/');
-        LOG("vulkan:   %llu passes (%.0f%%) ended at %s:%d\n", (unsigned long long)g_pass_ends[best].n,
-            100.0 * (double)g_pass_ends[best].n / (double)total, f ? f + 1 : g_pass_ends[best].file,
-            g_pass_ends[best].line);
-        g_pass_ends[best].n = 0;
+    for (u32 k = 0; k < 8 && (p = vk_site_take(g_pass_ends, PASS_SITES, &n, &ns)); k++) {
+        const char* f = strrchr(p->file, '/');
+        LOG("vulkan:   %llu passes (%.0f%%) ended at %s:%d\n", (unsigned long long)n, 100.0 * (double)n / (double)total,
+            f ? f + 1 : p->file, p->line);
     }
-    for (u32 i = 0; i < PASS_SITES && g_pass_ends[i].file; i++) g_pass_ends[i].n = 0;
+    while (vk_site_take(g_pass_ends, PASS_SITES, &n, &ns)) {} /* the rest, zeroed */
 }
 
 void vk_render_end_at(const char* file, int line) {

@@ -349,7 +349,10 @@ void vk_submit_recorded(void);
 /* the next submission waits for a timeline semaphore of someone else's (FFmpeg's picture's) at one value and signals
    it at another: whichever submit comes next takes them, so commands recorded from now on never run before the wait */
 void vk_submit_after(VkSemaphore sem, u64 wait, u64 signal);
-void vk_finish(void); /* submits and waits until the GPU has done everything, and lands every result */
+/* submits and waits until the GPU has done everything, and lands every result. The caller's file and line name the
+   wait in the stats at log=2 (vk_waits_log) */
+void vk_finish_at(const char* file, int line);
+#define vk_finish() vk_finish_at(__FILE__, __LINE__)
 /* a save state's load (Renderer.reset): every surface, buffer and sample counter kept of the old guest memory goes */
 void vk_surf_forget_all(void);
 void vk_buf_forget_all(void);
@@ -393,7 +396,23 @@ void vk_frame_hold(u64 frame_id);
 u64 vk_last_submit(void);          /* the last submission's number, which its completion signals */
 VkSemaphore vk_gfx_timeline(void); /* the timeline those numbers are values of: another queue can wait for one */
 void vk_submit_progress(u64* submitted, u64* done); /* the last submission and the last done (any thread) */
-void vk_wait_submit(u64 value); /* until the GPU has done that submission (any thread, without vk_lock) */
+/* until the GPU has done that submission (any thread, without vk_lock). The site as vk_finish's */
+void vk_wait_submit_at(u64 value, const char* file, int line);
+#define vk_wait_submit(value) vk_wait_submit_at(value, __FILE__, __LINE__)
+/* The call sites that count something since the last stats (a site is its file's literal and a line): each table has
+   one writer at a time. vk_site_add adds to the site's entry, and gives 0 once the table is full. vk_site_take gives
+   the entry with the largest n (NULL for none) and zeroes its count, so each call gives the next one */
+typedef struct {
+    const char* file;
+    int line;
+    u64 n, ns;
+} VkSite;
+int vk_site_add(VkSite* t, u32 cap, const char* file, int line, u64 ns);
+const VkSite* vk_site_take(VkSite* t, u32 cap, u64* n, u64* ns);
+/* the GPU thread's blocking waits for the GPU (graphics, compute, an ownership readback) by call site, counted and
+   logged with the stats at log=2 only */
+void vk_wait_site(const char* file, int line, u64 ns);
+void vk_waits_log(void);
 /* Flush recorded work without frame recycling or guest result callbacks, under
    vk_lock, before an ownership readback uses the graphics queue directly. */
 void vk_submit_for_readback(void);
@@ -1248,6 +1267,9 @@ void vk_release_events(void);
 #define VK_PRED_EQUAL 0x80000000u
 int vk_render_predicate(u64 a, int equal, u32* pred);
 void vk_render_predicate_drop(u32 pred);
+/* the cases of vk_render_predicate since the last stats, counted under vk_lock and logged at log=2 only. A "CPU" case
+   is a -1: the caller (nvn_draw.c, maxwell/engines.c) reads the counts, and waits for them to land */
+void vk_render_predicate_log(void);
 void vk_release_retire(u32 id);
 void vk_release_drain(void);
 /* query.c: the samples-passed counter with occlusion queries (renderer.h samples_*), under vk_lock. vk_query_draw before
@@ -1513,7 +1535,9 @@ void vk_dispatch(const DispatchState* d);
 void vk_compute_land(void); /* pending compute results into guest memory, now */
 /* the compute results so far, submitted and put aside to land later: the batch to wait for (0: none pending) */
 u64 vk_compute_put_aside(void);
-void vk_compute_wait(u64 value);                     /* until the compute batch is done (any thread, without vk_lock) */
+/* until the compute batch is done (any thread, without vk_lock). The site as vk_finish's */
+void vk_compute_wait_at(u64 value, const char* file, int line);
+#define vk_compute_wait(value) vk_compute_wait_at(value, __FILE__, __LINE__)
 void vk_compute_progress(u64* submitted, u64* done); /* the last batch and the last done (any thread) */
 void vk_compute_land_through(u64 value);             /* the batches up to it, done, land (vk_lock) */
 void vk_compute_before_write(u64 gva, u64 size);     /* gpu.c's g_gpu_before_write */

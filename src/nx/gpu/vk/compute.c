@@ -330,7 +330,8 @@ static void cs_submit(void) {
         VK_OK(vkSignalSemaphore(g_vk.dev, &ss));
     }
 }
-static void cs_wait(u64 value) {
+/* file and line: the caller's site, for vk_wait_site */
+static void cs_wait(u64 value, const char* file, int line) {
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
                               .semaphoreCount = 1,
                               .pSemaphores = &g_vk_csem,
@@ -338,10 +339,12 @@ static void cs_wait(u64 value) {
     u64 t0 = plat_ns();
     SNX_ZONE_C(z, "vk compute wait", 0xb05252);
     SNX_ZONE_VALUE(z, value);
-    gpu_wait_note("a compute batch", value);
+    int mine = gpu_wait_note("a compute batch", value);
     VK_OK(vkWaitSemaphores(g_vk.dev, &wi, UINT64_MAX));
     gpu_wait_note(NULL, 0);
-    __atomic_add_fetch(&g_vk_cs_wait_ns, plat_ns() - t0, __ATOMIC_RELAXED);
+    u64 ns = plat_ns() - t0;
+    __atomic_add_fetch(&g_vk_cs_wait_ns, ns, __ATOMIC_RELAXED);
+    if (mine) vk_wait_site(file, line, ns);
 }
 /* the arena's results that changed, into guest memory, after its batch is done */
 static void cs_write_back(VmaAllocation mem, const u8* ar, const u8* org, const CsOut* out, int nout) {
@@ -370,7 +373,7 @@ static void cs_any_update(void) {
 static void cs_land_oldest(void) {
     CsBatch* b = &g_pend[g_ptail % CS_PENDING];
     int was = g_landing;
-    cs_wait(b->cval);
+    cs_wait(b->cval, __FILE__, __LINE__);
     g_landing = 1;
 #if defined(SNX_TRACY)
     cs_times(b->qpool, b->q0, b->q1, b->ep);
@@ -463,7 +466,7 @@ static void cs_land(void) {
     if (!g_recording && !g_inflight) return;
     g_landing = 1;
     cs_submit();
-    cs_wait(g_cval);
+    cs_wait(g_cval, __FILE__, __LINE__);
     g_inflight = 0;
 #if defined(SNX_TRACY)
     cs_times(g_cqpool, g_cq0, g_cq1, g_cq0 ? g_cq_ep : 0);
@@ -558,8 +561,8 @@ u64 vk_compute_put_aside(void) {
     vk_unlock();
     return gate;
 }
-void vk_compute_wait(u64 value) {
-    if (value) cs_wait(value);
+void vk_compute_wait_at(u64 value, const char* file, int line) {
+    if (value) cs_wait(value, file, line);
 }
 void vk_compute_progress(u64* submitted, u64* done) {
     *submitted = __atomic_load_n(&g_cval, __ATOMIC_RELAXED);

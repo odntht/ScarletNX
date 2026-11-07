@@ -1110,16 +1110,17 @@ static u64 newest_out(u64 cpu, u64 n) {
     return 0;
 }
 /* until the GPU has done that submit, its writes landed through it: the one being recorded is submitted first */
-static void wait_out(u64 sub) {
+static void wait_out_at(u64 sub, const char* file, int line) {
     if (!sub) return;
     g_uma.out_waits++;
     if (sub > vk_last_submit())
-        vk_finish();
+        vk_finish_at(file, line);
     else {
-        vk_wait_submit(sub);
+        vk_wait_submit_at(sub, file, line);
         vk_land_through(sub);
     }
 }
+#define wait_out(sub) wait_out_at(sub, __FILE__, __LINE__) /* the caller names the wait */
 /* The writes in place pending in the regions over guest memory [lo, hi) done, before their pages change or move back:
    a region's buffer is the guest's memory until then, and its readers are waited for by nobody (quiesce), as the buffer
    keeps the bytes they read; a write landing after the change would land in the buffer alone (vk_lock held) */

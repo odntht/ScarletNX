@@ -772,8 +772,8 @@ static int flush_record(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at, const
     vk_bl_barrier(cb, 0);
     return 1;
 }
-/* the copies recorded so far done, and their bytes readable by the host */
-static void flush_wait(VkCommandBuffer cb) {
+/* the copies recorded so far done, and their bytes readable by the host. file and line: the caller's, for the wait */
+static void flush_wait_at(VkCommandBuffer cb, const char* file, int line) {
     /* the copy's writes made visible to the host reads below (the fence wait alone doesn't) */
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                            .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -782,9 +782,10 @@ static void flush_wait(VkCommandBuffer cb) {
                            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     rec_CmdPipelineBarrier2(cb, &di);
-    vk_finish();
+    vk_finish_at(file, line);
     vk_readback_ready();
 }
+#define flush_wait(cb) flush_wait_at(cb, __FILE__, __LINE__)
 /* A write-back keeps what the CPU wrote over a target after its draws. On the console the GPU's writes reached memory
    as it drew, and a game reuses that memory once its sync wait says the GPU is done: the CPU's bytes there are newer
    than the pixels. The renderer holds the pixels until something needs them, by then over the CPU's bytes. One game
