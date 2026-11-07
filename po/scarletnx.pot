@@ -845,6 +845,10 @@ msgid "Press [ESC] to abort and return to menu"
 msgstr ""
 
 #: src/gui/main.c
+msgid "No games yet. In the Menu, Load Switch NSP/XCI/NRO and pick a game to prepare it."
+msgstr ""
+
+#: src/gui/main.c
 msgid "No games in recompiled/, dumps/ or the libraries of Settings > App > Folders."
 msgstr ""
 

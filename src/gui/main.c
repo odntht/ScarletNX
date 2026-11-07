@@ -886,7 +886,11 @@ static const char* entry_text(int item) { return ui_menu_texts + ui_menu_items[G
 #define SAY_FILE_WAIT    SNX_TR_NOOP("Pick or drop a file")
 #define SAY_DONE         SNX_TR_NOOP("Press [ESC] to return to menu")
 #define SAY_ABORT        SNX_TR_NOOP("Press [ESC] to abort and return to menu")
+#ifdef SDL_PLATFORM_IOS /* Dumps off (ios): a dump is prepared from the Menu */
+#define SAY_NO_GAMES SNX_TR_NOOP("No games yet. In the Menu, Load Switch NSP/XCI/NRO and pick a game to prepare it.")
+#else
 #define SAY_NO_GAMES     SNX_TR_NOOP("No games in recompiled/, dumps/ or the libraries of Settings > App > Folders.")
+#endif
 #define SAY_EDITOR       SNX_TR_KEYS("Up/Down: key. Left/Right: change. Enter: edit. Ctrl+S: save. ESC: back.")
 #define SAY_PICKER       SNX_TR_KEYS("Up/Down: row. Left/Right: step 1. PgUp/PgDn: step 16. Enter: OK. ESC: cancel.")
 #define SAY_SETTINGS     SNX_TR_KEYS("Up/Down: setting. Left/Right: change. Enter: type. ESC: back.")
@@ -15612,6 +15616,12 @@ static void games_scan(App* app, GuiGames* games, char* message, size_t size) {
     if (by_last_opened(app) && !gui_games_by_last_opened(games) && !message[0])
         snprintf(message, size, "%s", snx_tr("Not enough memory to sort the games by the last opened: by title."));
     made_free(&made);
+#ifdef SDL_PLATFORM_IOS
+    fprintf(stderr, "games: %zu listed from %s\n", games->count, app->games_dir ? app->games_dir : "(no folder)");
+    for (size_t k = 0; k < games->count; ++k) /* a phone shows no log: what the list holds, in the console log */
+        fprintf(stderr, "  game %zu: %s (%s)\n", k, games->shown[k] ? games->shown[k] : "-",
+                games->paths[k] ? games->paths[k] : "-");
+#endif
     free(dumps);
 }
 /* gui_browser_key_skip's skip on Games: a group's heading */
