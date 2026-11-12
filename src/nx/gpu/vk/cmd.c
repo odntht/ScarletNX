@@ -70,6 +70,7 @@ typedef struct {
     int recording, fresh; /* fresh: just ended up current, not yet reset for its new use */
     Ring ring[FRAME_RINGS]; /* by XRING_ index */
     u64 filled;             /* bytes of the chunks its rings filled in this use, and of its big buffers */
+    u64 made_at;            /* g_cmd.made when this use began: the chunks and big buffers made since are its own */
     /* destroyed once this frame's work is done */
     Dead* dead;
     int ndead, capdead;
@@ -126,6 +127,10 @@ static struct {
     u64 stream_since; /* the bytes it handed out since the last submit (frame_check) */
     u64 submits[VK_SUB_N]; /* submissions since the start, by why (statistics, tests) */
     u32 stage_told; /* the staging ring's memory type is in the log */
+    /* log level 2: the requests for big buffers since the last report, the bytes they asked and the size classes
+       they took, the smallest and the largest asked */
+    u64 big_n, big_asked, big_given, big_min, big_max;
+    u64 room, room_made; /* vk_mem_staging_room as read when made was room_made (frame_check) */
 } g_cmd;
 
 static Frame g_fr[VK_FRAMES];
@@ -859,6 +864,7 @@ static void pool_recycle(Frame* f) {
     memset(f->ring, 0, sizeof f->ring);
     f->filled = 0;
     stream_trim();
+    f->made_at = g_cmd.made;
 }
 
 /* size bytes of the frame's ring at *off of *buf, the chunk's memory in *mem: the chunk, NULL when none could be had.
@@ -876,6 +882,13 @@ static const Chunk* ring_take(Frame* f, u32 ring, u64 size, u64 align, VkBuffer*
         if (!big) return NULL;
         g_cmd.took[g_cmd.itook][ring][1]++;
         c = &g_cmd.chunk[big - 1];
+        if (g_settings.log_level >= 2) {
+            g_cmd.big_n++;
+            g_cmd.big_asked += size;
+            g_cmd.big_given += c->size;
+            if (!g_cmd.big_min || size < g_cmd.big_min) g_cmd.big_min = size;
+            if (size > g_cmd.big_max) g_cmd.big_max = size;
+        }
         chunk_written(c);
         f->filled += c->size;
         at = 0;
@@ -1201,6 +1214,13 @@ void vk_finishes_log(void) {
     if (fences)
         LOG("vulkan:   %llu waits for a fence (%.1f ms): sparse binds, the mirror's granules and landings\n",
             (unsigned long long)fences, (double)fence_ns / 1e6);
+    if (g_cmd.big_n)
+        LOG("vulkan:   %llu requests for big buffers asked %llu MiB and took %llu MiB of size classes (each %llu KiB to "
+            "%llu KiB)\n",
+            (unsigned long long)g_cmd.big_n, (unsigned long long)(g_cmd.big_asked >> 20),
+            (unsigned long long)(g_cmd.big_given >> 20), (unsigned long long)(g_cmd.big_min >> 10),
+            (unsigned long long)(g_cmd.big_max >> 10));
+    g_cmd.big_n = g_cmd.big_asked = g_cmd.big_given = g_cmd.big_min = g_cmd.big_max = 0;
 }
 
 /* A present ends the frame: the next one records in the other slot, once that slot's previous use is done. What the
@@ -1261,11 +1281,24 @@ static void frame_check(void) {
     /* the cap that the stream's bytes are held to counts them too: they are memory the caches budget as the rings
        are, and a frame whose bytes all go through the stream has rings below the two chunks that ask the budget */
     u64 rings = frame_rings(f), cap = frame_ring_cap(rings + g_cmd.stream_since);
+    /* the headroom, read again only when the rings made memory: a pooled chunk adds nothing to the usage. A frame that
+       made some while the headroom is low ends, so the next one waits for the other slot and takes its rings back from
+       the pool instead of making more (a phone's level load held 1.4 GiB in its two slots and the system ended it) */
+    if (g_cmd.made != g_cmd.room_made) {
+        g_cmd.room = vk_mem_staging_room();
+        g_cmd.room_made = g_cmd.made;
+    }
+    int low = g_cmd.made > f->made_at && vk_staging_low(g_cmd.room, rings, g_vk.alloc_cap, VK_FRAMES);
     if (rings >= cap) {
         LOG_LIMIT(
             4,
             "vulkan: frame %llu ends before a present: %llu MiB written to its rings, which end a frame at %llu MiB\n",
             (unsigned long long)g_frame_id, (unsigned long long)(rings >> 20), (unsigned long long)(cap >> 20));
+        vk_frame_next();
+    } else if (low) {
+        LOG_LIMIT(4, "vulkan: frame %llu ends before a present: %llu MiB in its rings, %llu MiB of headroom left\n",
+                  (unsigned long long)g_frame_id, (unsigned long long)(rings >> 20),
+                  (unsigned long long)(g_cmd.room >> 20));
         vk_frame_next();
     } else if (f->icb >= 128 || f->ipool >= 32 || vk_rec_frame_sets(g_cur) >= 32 * 1024 || !vk_descriptors_room(g_cur))
         vk_frame_next();

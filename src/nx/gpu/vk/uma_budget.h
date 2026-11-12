@@ -29,5 +29,13 @@ static inline uint64_t vk_uma_ring_cap(uint64_t caps, uint64_t budget, uint64_t 
 /* iOS: os_proc_available_memory is already what this app can still take before jetsam ends it, not the system's free
    memory, so the reserve is a fixed margin above that limit, not a share of the machine */
 #define VK_UMA_RESERVE_IOS (250ull << 20)
+/* what is left of a budget: 0 once the usage passed it. The live budget is read once a second and the usage at once,
+   so the usage can pass it, and an unsigned difference then gave the most room in the crash it had to stop */
+static inline uint64_t vk_uma_room(uint64_t usage, uint64_t budget) { return budget > usage ? budget - usage : 0; }
+/* whether a frame that holds held bytes of rings ends before its present: with less room left than one allocation for
+   each of the frames in flight, once it holds one allocation (less, and it could not make progress) */
+static inline int vk_staging_low(uint64_t room, uint64_t held, uint64_t alloc_cap, uint64_t frames) {
+    return held >= alloc_cap && room < frames * alloc_cap;
+}
 
 #endif
