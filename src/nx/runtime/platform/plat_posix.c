@@ -1153,8 +1153,106 @@ int plat_vm_commit(u8* p, u64 size) {
     wp_let(p, size, WP_MAPPED, !r);
     return r;
 }
+/* The file slots (plat_vm_files): set once in mem_init, before the game's threads, and kept to the end */
+#define FILE_SLOT (1ull << 30)
+/* what a SIGBUS in the file slots says: past the write tracking and the freeze, it is a page in or out that failed */
+#define FILES_IO  "guest memory: a page of the game's memory files could not be read or written (the disk may be full)"
+static u8* g_files_base;
+static u64 g_files_size;
+static int* g_files_fd;
+int plat_vm_files_slot(const u8* p, int* fd, u64* off) {
+    if (!g_files_fd || p < g_files_base || p >= g_files_base + g_files_size) return 0;
+    u64 at = (u64)(p - g_files_base);
+    if (fd) *fd = g_files_fd[at / FILE_SLOT];
+    if (off) *off = at % FILE_SLOT;
+    return 1;
+}
+#if defined(__APPLE__)
+static int files_punch(int fd, u64 off, u64 len) {
+    fpunchhole_t ph = {0};
+    ph.fp_offset = (off_t)off;
+    ph.fp_length = (off_t)len;
+    return fcntl(fd, F_PUNCHHOLE, &ph);
+}
+/* one unlinked file of len bytes in dir at p, PROT_NONE: its descriptor, or -1 with errno */
+static int files_slot(u8* p, u64 len, const char* dir, int probe) {
+    char path[PATH_MAX];
+    int fd, e;
+    if (snprintf(path, sizeof path, "%s/snx-guest-XXXXXX", dir) >= (int)sizeof path) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    fd = mkstemp(path);
+    if (fd < 0) return -1;
+    unlink(path);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    /* the size first: Darwin gives SIGBUS on a mapped page past a file's end. The probe asks the disk for the punch
+       that every decommit needs, so a disk without it keeps anonymous memory instead of ending the game later */
+    if (ftruncate(fd, (off_t)len) || (probe && (pwrite(fd, "", 1, 0) != 1 || files_punch(fd, 0, plat_vm_page()))) ||
+        mmap(p, (size_t)len, PROT_NONE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) {
+        e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+#endif
+int plat_vm_files(u8* base, u64 size, const char* dir) {
+#if defined(__APPLE__)
+    u64 n = (size + FILE_SLOT - 1) / FILE_SLOT, i;
+    int* fd = (int*)calloc((size_t)n, sizeof *fd);
+    int e, cls;
+    if (!fd) return -1;
+    for (i = 0; i < n; i++) {
+        u64 len = size - i * FILE_SLOT < FILE_SLOT ? size - i * FILE_SLOT : FILE_SLOT;
+        fd[i] = files_slot(base + i * FILE_SLOT, len, dir, i == 0);
+        if (fd[i] < 0) break;
+    }
+    if (i < n) {
+        e = errno;
+        while (i--) close(fd[i]);
+        mmap(base, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+        free(fd);
+        errno = e;
+        return -1;
+    }
+    cls = fcntl(fd[0], F_GETPROTECTIONCLASS);
+    if (cls < 0)
+        LOG("memory: the guest files have no data protection class: %s\n", strerror(errno));
+    else
+        LOG("memory: the guest files have data protection class %d\n", cls);
+    g_files_base = base; /* mem_init, before any other thread */
+    g_files_size = size;
+    g_files_fd = fd;
+    return 0;
+#else
+    (void)base;
+    (void)size;
+    (void)dir;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
 void plat_vm_decommit(u8* p, u64 size) {
     wp_hold(p, size, 0);
+#if defined(__APPLE__)
+    if (plat_vm_files_slot(p, NULL, NULL)) {
+        /* the file mapping stays: fresh anonymous pages would count against the app's limit again. The punch frees
+           the range's blocks and pages, so it reads zero when committed next */
+        for (u64 at = (u64)(p - g_files_base), end = at + size, hi; at < end; at = hi) {
+            hi = (at / FILE_SLOT + 1) * FILE_SLOT;
+            if (hi > end) hi = end;
+            if (files_punch(g_files_fd[at / FILE_SLOT], at % FILE_SLOT, hi - at))
+                fatal("Could not free %llu KiB of the game's memory files (error %d)",
+                      (unsigned long long)((hi - at) >> 10), errno);
+        }
+        mprotect(p, (size_t)size, PROT_NONE);
+        wp_let(p, size, 0, 1);
+        return;
+    }
+#endif
 #if defined(__linux__)
     madvise(p, (size_t)size, MADV_DONTNEED);
     mprotect(p, (size_t)size, PROT_NONE);
@@ -2137,6 +2235,12 @@ static void fault_signal(int sig, siginfo_t* si, void* ctx) {
         errno = saved;
         return;
     }
+    /* past the tracking and the freeze, a SIGBUS in the file slots is the disk's: a page in or out failed */
+    if (sig == SIGBUS && plat_vm_files_slot((const u8*)si->si_addr, NULL, NULL)) {
+        static const char m[] = FILES_IO "\n";
+        ssize_t w = write(STDERR_FILENO, m, sizeof m - 1);
+        (void)w;
+    }
     signal(sig, SIG_DFL);
 }
 static int g_fault_handler; /* plat_install_crash_handler's, or fault_signal, catches SIGSEGV and SIGBUS */
@@ -2278,6 +2382,8 @@ static void crash_signal(int sig, siginfo_t* si, void* ctx) {
     sigaction(SIGALRM, &dfl, NULL);
     alarm(3);
     log_crash_mode();
+    /* past the tracking and the freeze, a SIGBUS in the file slots is the disk's: a page in or out failed */
+    if (sig == SIGBUS && plat_vm_files_slot((const u8*)si->si_addr, NULL, NULL)) logf_(0, "*** " FILES_IO " ***\n");
     /* for SIGILL and SIGFPE si_addr is the instruction, not an address it touched */
     fault = sig == SIGSEGV || sig == SIGBUS ? si->si_addr : NULL;
     nce_crash_context(ctx, fault); /* the guest's registers, when the native code of the game crashed */
