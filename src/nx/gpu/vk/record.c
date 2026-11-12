@@ -400,6 +400,16 @@ VkResult vk_rec_present_result(void) {
    binds it made. A new shader's compile, 60 to 400 ms on one driver, stalled the frame it first appeared in */
 static int g_rec_unbound;
 static u64 g_rec_dropped, g_rec_skipped;
+/* the same for the commands made at once (vk_record=0, the GPU thread's): a stand-in whose pipeline failed bound
+   nothing, and the draws after it reached the driver with the last pipeline or none, which a driver may crash on
+   (Lichii fe6a388 saw Mesa's ANV crash in vkCmdDraw) */
+static int g_direct_unbound;
+static u64 g_direct_dropped;
+static int direct_drop_draw(void) {
+    if (!g_direct_unbound) return 0;
+    if (!g_direct_dropped++) WARN("vulkan: a pipeline couldn't be made: its draws are dropped\n");
+    return 1;
+}
 typedef struct {
     VkCommandBuffer cb;
     VkPipelineBindPoint bp;
@@ -416,6 +426,7 @@ static void bind_pipeline_run(const void* p) {
 void rec_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p) {
     if (!rec_on(cb)) {
         VkPipeline pipe = vk_pipeline_resolve(p);
+        if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) g_direct_unbound = !pipe;
         if (pipe) vkCmdBindPipeline(cb, bp, pipe);
         return;
     }
@@ -443,7 +454,7 @@ static void draw_run(const void* p) {
 }
 void rec_CmdDraw(VkCommandBuffer cb, u32 vertices, u32 instances, u32 first_vertex, u32 first_instance) {
     if (!rec_on(cb)) {
-        vkCmdDraw(cb, vertices, instances, first_vertex, first_instance);
+        if (!direct_drop_draw()) vkCmdDraw(cb, vertices, instances, first_vertex, first_instance);
         return;
     }
     DrawArgs* x = rec_push(draw_run, sizeof *x);
@@ -463,7 +474,7 @@ static void draw_indexed_run(const void* p) {
 void rec_CmdDrawIndexed(VkCommandBuffer cb, u32 indices, u32 instances, u32 first_index, i32 vertex_offset,
                         u32 first_instance) {
     if (!rec_on(cb)) {
-        vkCmdDrawIndexed(cb, indices, instances, first_index, vertex_offset, first_instance);
+        if (!direct_drop_draw()) vkCmdDrawIndexed(cb, indices, instances, first_index, vertex_offset, first_instance);
         return;
     }
     DrawIndexedArgs* x = rec_push(draw_indexed_run, sizeof *x);
@@ -495,7 +506,7 @@ void rec_CmdDrawIndirect(VkCommandBuffer cb, int indexed, VkBuffer buf, VkDevice
     DrawIndirectArgs a = {cb, buf, count_buf, off, count_off, (indexed ? 1u : 0u) | (count_buf ? 2u : 0u), max,
                           stride};
     if (!rec_on(cb)) {
-        draw_indirect_now(&a);
+        if (!direct_drop_draw()) draw_indirect_now(&a);
         return;
     }
     DrawIndirectArgs* x = rec_push(draw_indirect_run, sizeof *x);
