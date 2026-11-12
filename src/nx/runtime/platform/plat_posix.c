@@ -2375,6 +2375,12 @@ static void crash_signal(int sig, siginfo_t* si, void* ctx) {
     /* one report at a time: it ends the process, so a second crashing thread just waits for that */
     if (!__atomic_compare_exchange_n(&g_crash_reporting, &idle, 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
         for (;;) pause();
+    /* the report calls dladdr, backtrace and file writes, which can wait for a lock the crashed thread held: after
+       3 s SIGALRM's default action ends the process, so a crash never turns into a hang (d2r-mobile's idea) */
+    struct sigaction dfl = {0};
+    dfl.sa_handler = SIG_DFL;
+    sigaction(SIGALRM, &dfl, NULL);
+    alarm(3);
     log_crash_mode();
     /* for SIGILL and SIGFPE si_addr is the instruction, not an address it touched */
     fault = sig == SIGSEGV || sig == SIGBUS ? si->si_addr : NULL;
