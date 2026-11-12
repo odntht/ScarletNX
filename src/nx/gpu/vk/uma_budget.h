@@ -26,5 +26,8 @@ static inline uint64_t vk_uma_ring_cap(uint64_t caps, uint64_t budget, uint64_t 
     uint64_t share = budget / 8 > floor ? budget / 8 : floor;
     return share < caps ? share : caps;
 }
+/* iOS: os_proc_available_memory is already what this app can still take before jetsam ends it, not the system's free
+   memory, so the reserve is a fixed margin above that limit, not a share of the machine */
+#define VK_UMA_RESERVE_IOS (250ull << 20)
 
 #endif
