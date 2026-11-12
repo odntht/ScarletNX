@@ -23,5 +23,9 @@ int main(void) {
     assert(trims(1700 * MB, vk_uma_budget(driver, 1700 * MB, 1500 * MB, reserve)));
     /* plenty left (a 16 GB device with 14 GB free): the driver's budget stands */
     assert(vk_uma_budget(driver, 1000 * MB, 14000 * MB, vk_uma_reserve(16384 * MB)) == driver);
+    /* iOS: the available memory is the app's own room before jetsam. With 1200 MB in the caches and 300 MB of room,
+       the caches trim; with 2 GB of room they do not */
+    assert(trims(1200 * MB, vk_uma_budget(driver, 1200 * MB, 300 * MB, VK_UMA_RESERVE_IOS)));
+    assert(!trims(1200 * MB, vk_uma_budget(driver, 1200 * MB, 2048 * MB, VK_UMA_RESERVE_IOS)));
     return 0;
 }

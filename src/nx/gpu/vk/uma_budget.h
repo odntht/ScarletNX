@@ -17,5 +17,8 @@ static inline uint64_t vk_uma_budget(uint64_t driver, uint64_t usage, uint64_t a
 /* the system's memory kept free of the caches: an eighth of it, 1390 of that phone's 11122 MB, where the low memory
    killer ended background apps from 1925 MB available and the game at 683 */
 static inline uint64_t vk_uma_reserve(uint64_t system) { return system / 8; }
+/* iOS: os_proc_available_memory is already what this app can still take before jetsam ends it, not the system's free
+   memory, so the reserve is a fixed margin above that limit, not a share of the machine */
+#define VK_UMA_RESERVE_IOS (250ull << 20)
 
 #endif
