@@ -40,5 +40,15 @@ int main(void) {
        the caches trim; with 2 GB of room they do not */
     assert(trims(1200 * MB, vk_uma_budget(driver, 1200 * MB, 300 * MB, VK_UMA_RESERVE_IOS)));
     assert(!trims(1200 * MB, vk_uma_budget(driver, 1200 * MB, 2048 * MB, VK_UMA_RESERVE_IOS)));
+    /* the frame rings' headroom: none once the usage passed the budget, the underflow of a phone's level load where
+       the live budget was a second old */
+    assert(vk_uma_room(100 * MB, 300 * MB) == 200 * MB);
+    assert(vk_uma_room(300 * MB, 300 * MB) == 0);
+    assert(vk_uma_room(400 * MB, 300 * MB) == 0);
+    /* a frame ends with less room than one 256 MiB allocation for each of two frames, once it holds one */
+    assert(!vk_staging_low(UINT64_MAX, 900 * MB, 256 * MB, 2));
+    assert(vk_staging_low(511 * MB, 256 * MB, 256 * MB, 2));
+    assert(!vk_staging_low(512 * MB, 256 * MB, 256 * MB, 2));
+    assert(!vk_staging_low(0, 255 * MB, 256 * MB, 2));
     return 0;
 }

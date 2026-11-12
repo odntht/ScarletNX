@@ -444,6 +444,8 @@ int vk_uma_migrate(int on);
    g_vk_present moved. vk_present_before: the present before which an entry last used then has gone unused for at
    least ago_ns and at least `presents` presents (0: none has) */
 void vk_mem_use(u64* usage, u64* budget);
+/* what the frame rings may still take before the budget's headroom ends: UINT64_MAX without a live budget (memory.c) */
+u64 vk_mem_staging_room(void);
 int vk_mem_heap(void); /* that heap's index */
 u64 vk_mem_budget_cap(u64 bytes); /* vk_budget_mb's cap set to bytes (0: none), the one it had back */
 /* that heap's use by this process and its budget as the driver tells them (VK_EXT_memory_budget), for the stats box;

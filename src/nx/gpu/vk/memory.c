@@ -1504,6 +1504,15 @@ void vk_mem_use(u64* usage, u64* budget) {
     }
 #endif
 }
+/* what the frame rings may still take: the live budget's headroom (0 past it), or no limit without a live budget */
+u64 vk_mem_staging_room(void) {
+#if defined(UMA_LIVE_BUDGET)
+    u64 usage, budget;
+    vk_mem_use(&usage, &budget); /* first: it sets the reserve at its first call, and clears it when a read fails */
+    if (g_uma_budget.reserve) return vk_uma_room(usage, budget);
+#endif
+    return UINT64_MAX;
+}
 
 /* the present clock: a present and its time every quarter second at most, seventeen minutes back */
 #define CLOCK_N 4096
