@@ -53,6 +53,9 @@
 	<dict/>
 	<key>UIRequiresFullScreen</key>
 	<true/>
+	<!-- on an iPhone with ProMotion, without this key the system caps each layer at 60 Hz -->
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
 	<key>UIStatusBarHidden</key>
 	<true/>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
