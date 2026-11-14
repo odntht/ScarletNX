@@ -85,3 +85,5 @@ __pycache__/
 .claude/worktrees/
 
 edenprobe-run/
+# Metal frame captures (renderdoc= on iOS): they hold the game's textures and buffers
+*.gputrace

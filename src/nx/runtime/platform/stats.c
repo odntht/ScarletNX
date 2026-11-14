@@ -212,10 +212,15 @@ static void notes_make(StatsNotes* s, size_t room) {
     s->n = 0;
     s->longest = 0;
     if (g_stats.capture.ready) {
+#if defined(SNX_IOS)
+        const char* name = "Metal capture"; /* renderdoc.c takes Metal's captures there */
+#else
+        const char* name = "RenderDoc";
+#endif
         if (*g_settings.render_doc_capture_shortcut)
-            snprintf(lead, sizeof lead, "RenderDoc: %s captures", g_settings.render_doc_capture_shortcut);
+            snprintf(lead, sizeof lead, "%s: %s captures", name, g_settings.render_doc_capture_shortcut);
         else
-            snprintf(lead, sizeof lead, "RenderDoc: Capture frame in the menu");
+            snprintf(lead, sizeof lead, "%s: Capture frame in the menu", name);
         note(s, GUI_ICON_IMAGE, UI_PAGE, room, lead, "");
     }
     if (g_stats.capture.failed) {

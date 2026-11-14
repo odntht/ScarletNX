@@ -253,6 +253,12 @@ games from running:
 - **Preparing on Windows or Linux.** Their x86 builds carry x86's code generator alone, to keep their size, so
   `--target ios` fails there. The iPhone prepares games itself now.
 - **JIT without StikDebug.** The app still needs a debugger attached, which StikDebug gives ([#598](https://github.com/scarletnx/ScarletNX/issues/598)).
+- **A Metal capture on iOS.** Metal reads `MTL_CAPTURE_ENABLED` (or `MetalCaptureEnabled` in the app's Info.plist)
+  only when the process makes its first Metal device. The menu makes that device before a game starts, so a `setenv`
+  in `vk_renderdoc_load` comes too late. The capture then fails with "Metal made a device before MTL_CAPTURE_ENABLED
+  was set". The capture layer must be on from the start of the app. With the layer on, a heavy game closed during its
+  load (about 2 minutes at 0 fps after the first frame) in 3 of 3 runs. Without the layer, the same game went past
+  its load and its first cutscene.
 - **The 3DS, Vita and Linux drivers** are not built for iOS (`SNX_BUILD_3DS`, `SNX_BUILD_VITA`, `SNX_BUILD_GNUABI`),
   nor the Linux one for macOS.
 

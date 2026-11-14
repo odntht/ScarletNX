@@ -295,6 +295,12 @@ if(APPLE AND NOT IOS) # plat_posix.c's power source: IOKit's notifications on Co
 endif()
 # the build is part of the key of the shader files, .vkshaders and .vkshipped (gpu/vk/pipeline.c)
 target_link_libraries(snx_vk PRIVATE snx_build_info FFmpeg::avutil) # vk/nvdec.c: FFmpeg's Vulkan device and pictures
+# iOS: renderdoc.c's captures are Metal's (gpu/vk/capture_metal.m), where the top CMakeLists.txt enables OBJC
+if(IOS AND (NOT DEFINED SNX_BUILD_GUI OR SNX_BUILD_GUI))
+    target_sources(snx_vk PRIVATE gpu/vk/capture_metal.m)
+    set_source_files_properties(gpu/vk/capture_metal.m PROPERTIES COMPILE_OPTIONS -fobjc-arc)
+    target_link_libraries(snx_vk PUBLIC "-framework Metal" "-framework Foundation")
+endif()
 # the game's menu in YoRHa's colours, from src/gui/themes/yorha/theme.ini (cmake/gui_themes.cmake), and the shader
 # loading screen's when the launcher's theme can't be read
 target_include_directories(snx_platform PRIVATE "${PROJECT_BINARY_DIR}/generated")

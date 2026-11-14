@@ -43,12 +43,23 @@ int vk_renderdoc_capture(int ask) {
 void vk_renderdoc_present(u64 present) { (void)present; }
 #else
 #include "renderdoc_app.h"
+#if defined(SNX_IOS)
+#include "nx/gpu/vk/capture_metal.h"
+/* the name the notices and the stats box give the captures: on iOS Metal takes them (capture_metal.m) */
+#define RD_NAME "Metal capture"
+#else
+#define RD_NAME "RenderDoc"
+#endif
 
 #define RD_FRAMES      64                     /* frames to capture at most */
 #define RD_PROGRESS_NS (5ull * 1000000000ull) /* while RenderDoc writes a capture, how often the log says so */
 /* over the game as a capture is asked or RenderDoc starts its own: RenderDoc writes it inside the present that ends
    it, the game stopped meanwhile (70 s for a frame of 1.4 GB). A notice's line, OVERLAY_COLS_MAX letters at most */
-#define RD_CAPTURING   "RenderDoc: capturing; the game stops while it writes (a minute if large)"
+#if defined(SNX_IOS)
+#define RD_CAPTURING "Metal capture: capturing. The game stops while it writes"
+#else
+#define RD_CAPTURING "RenderDoc: capturing; the game stops while it writes (a minute if large)"
+#endif
 
 typedef struct {
     u64 at;   /* the present, or the time in ms; 0 once taken */
@@ -70,10 +81,42 @@ static struct {
     PMutex lock;
     unsigned writing, writes;
     u64 since;
+    int ready; /* a capture can be taken: RenderDoc is in the process, or (iOS) renderdoc= names a usable stem */
+    /* iOS: the captures written this run, the stem renderdoc= gives under Documents, and the running capture's bundle */
+    unsigned metal_n;
+    char metal_stem[STATS_PATH];
+    char metal_path[STATS_PATH];
 } g_renderdoc = {.lock = PMUTEX_INIT};
 
 void vk_renderdoc_load(void) {
     const char *prefix = g_settings.render_doc_captures, *frames = g_settings.render_doc_frames, *p;
+#if defined(SNX_IOS)
+    /* no RenderDoc on iOS: Metal takes the captures, into renderdoc='s stem, under Documents where it is relative */
+    if (!*prefix) return;
+    if (snx_path_is_full(prefix)) {
+        if (strlen(prefix) > sizeof g_renderdoc.metal_stem - 32) {
+            WARN("renderdoc: renderdoc=%s: the path is too long, no frame is captured\n", prefix);
+            return;
+        }
+        snprintf(g_renderdoc.metal_stem, sizeof g_renderdoc.metal_stem, "%s", prefix);
+    } else {
+        char* d = snx_user_data_dir();
+        char* j = d ? snx_path_join(d, prefix) : NULL;
+        if (!j || strlen(j) > sizeof g_renderdoc.metal_stem - 32) {
+            WARN("renderdoc: renderdoc=%s: %s, no frame is captured\n", prefix,
+                 j ? "the path is too long" : "no folder for the captures");
+            free(d);
+            free(j);
+            return;
+        }
+        snprintf(g_renderdoc.metal_stem, sizeof g_renderdoc.metal_stem, "%s", j);
+        free(d);
+        free(j);
+    }
+    /* Metal's capture layer wraps each Metal call while it is on, so it is on only with renderdoc= set. Metal reads
+       this when the first device is made, which MoltenVK does with the instance, after this */
+    if (plat_setenv("MTL_CAPTURE_ENABLED", "1")) WARN("renderdoc: couldn't enable Metal's capture layer\n");
+#else
     pRENDERDOC_GetAPI get_api;
     /* RenderDoc's program started the game: its library is in the process, and renderdoc= needn't load it */
     void* lib = plat_dl_loaded(SNX_VK_RENDERDOC_LIBRARY);
@@ -98,6 +141,7 @@ void vk_renderdoc_load(void) {
     /* no overlay in the captured frames, and nothing taken but the presents asked for: F12 is the stats' key */
     rd->MaskOverlayBits(eRENDERDOC_Overlay_None, eRENDERDOC_Overlay_None);
     rd->SetCaptureKeys(NULL, 0);
+#endif
     for (p = frames; *p && g_renderdoc.nframes < RD_FRAMES;) {
         RdFrame* f = &g_renderdoc.frames[g_renderdoc.nframes];
         char* e;
@@ -113,19 +157,30 @@ void vk_renderdoc_load(void) {
         WARN("renderdoc: renderdoc_frames: \"%s\" is no frame (N, or Ns for seconds): it captures the %d "
              "before it\n",
              p, g_renderdoc.nframes);
+#if defined(SNX_IOS)
+    LOG("renderdoc: Metal capture, %s%sthe menu's Capture frame captures a frame, %d frame(s) listed, to %s\n",
+        g_settings.render_doc_capture_shortcut, *g_settings.render_doc_capture_shortcut ? " or " : "",
+        g_renderdoc.nframes, g_renderdoc.metal_stem);
+#else
     LOG("renderdoc: %s, %s%sthe menu's Capture frame captures a frame, %d frame(s) listed, to %s\n",
         started ? "in the process (RenderDoc's program started the game)" : "loaded",
         g_settings.render_doc_capture_shortcut, *g_settings.render_doc_capture_shortcut ? " or " : "",
         g_renderdoc.nframes, *prefix ? prefix : rd->GetCaptureFilePathTemplate());
-    __atomic_store_n(&g_renderdoc.api, rd, __ATOMIC_RELEASE); /* the main thread's capture key reads it */
+    __atomic_store_n(&g_renderdoc.api, rd, __ATOMIC_RELAXED); /* ready's release below publishes it */
+#endif
+    __atomic_store_n(&g_renderdoc.ready, 1, __ATOMIC_RELEASE); /* the main thread's capture key reads it */
     stats_capture(&(SnxStatsCapture){.ready = 1});
 }
 
 int vk_renderdoc_capture(int ask) {
-    if (!__atomic_load_n(&g_renderdoc.api, __ATOMIC_ACQUIRE)) {
+    if (!__atomic_load_n(&g_renderdoc.ready, __ATOMIC_ACQUIRE)) {
         if (ask)
+#if defined(SNX_IOS)
+            LOG("renderdoc: no frame is captured: renderdoc= is empty or not usable (see the log above)\n");
+#else
             LOG("renderdoc: no frame is captured: RenderDoc isn't in the process (renderdoc= is empty, and "
                 "RenderDoc's program didn't start the game)\n");
+#endif
         return 0;
     }
     if (ask) {
@@ -169,47 +224,34 @@ static u64 rd_write_end(void) {
     pm_unlock(&g_renderdoc.lock);
     return secs;
 }
-/* a file's size as the notices say it, ? where there is no file */
-static void rd_size(const char* path, char* out, size_t n) {
-    u64 b = snx_is_file(path) ? snx_file_size(path) : 0;
-    if (!snx_is_file(path))
+/* a capture's size as the notices say it, ? where it isn't known */
+static void rd_size(u64 bytes, int sized, char* out, size_t n) {
+    if (!sized)
         snprintf(out, n, "?");
-    else if (b < 1024)
-        snprintf(out, n, "%llu bytes", (unsigned long long)b);
-    else if (b < 1024 * 1024)
-        snprintf(out, n, "%llu KiB", (unsigned long long)(b >> 10));
-    else if (b < 1024ull * 1024 * 1024)
-        snprintf(out, n, "%.1f MiB", (double)b / (1024.0 * 1024));
+    else if (bytes < 1024)
+        snprintf(out, n, "%llu bytes", (unsigned long long)bytes);
+    else if (bytes < 1024 * 1024)
+        snprintf(out, n, "%llu KiB", (unsigned long long)(bytes >> 10));
+    else if (bytes < 1024ull * 1024 * 1024)
+        snprintf(out, n, "%.1f MiB", (double)bytes / (1024.0 * 1024));
     else
-        snprintf(out, n, "%.1f GiB", (double)b / (1024.0 * 1024 * 1024));
+        snprintf(out, n, "%.1f GiB", (double)bytes / (1024.0 * 1024 * 1024));
 }
-/* capture n (from 1) written in secs, what it holds (present N, or RenderDoc's own): its path and size in the log, its
-   file's name and size over the game, a name too long for the notice's line keeping its end after "...", and the
-   stats box told */
-static void rd_written(RENDERDOC_API_1_1_2* rd, unsigned n, u64 secs, const char* what) {
-    SnxStatsCapture shown = {.ready = 1};
-    char size[32] = "?", lead[48], line[OVERLAY_COLS_MAX + 1];
+/* capture n (from 1) written in secs to path ("" where it isn't known), of bytes when sized: its name and size over
+   the game, a name too long for the notice's line keeping its end after "...", and the stats box told. The name is
+   the path's leaf by this loop, not snx_path_leaf: the host test has its own snx_is_file and snx_file_size, which
+   common.c, snx_path_leaf's file, also defines */
+static void rd_shown(const char* path, u64 bytes, int sized, unsigned n, u64 secs) {
+    SnxStatsCapture shown = {.ready = 1, .taken = n};
+    char size[32], lead[48], line[OVERLAY_COLS_MAX + 1];
     const char *name = "?", *c;
     size_t room, len;
-    u32 path_len = 0;
-    /* GetCapture writes the whole path, unbounded: its length first */
-    int told = n && rd->GetCapture(n - 1, NULL, &path_len, NULL);
-    shown.taken = n;
-    if (told && path_len < sizeof shown.path && rd->GetCapture(n - 1, shown.path, NULL, NULL)) {
-        rd_size(shown.path, size, sizeof size);
+    snprintf(shown.path, sizeof shown.path, "%s", path);
+    if (*shown.path)
         for (name = c = shown.path; *c; ++c)
             if (*c == '/' || *c == '\\') name = c + 1;
-        LOG("renderdoc: %s written in %llu s to %s (%s)\n", what, (unsigned long long)secs, shown.path, size);
-    } else if (told) {
-        shown.path[0] = 0;
-        LOG("renderdoc: %s written in %llu s, capture %u, to a path of %u bytes, past the %zu kept\n", what,
-            (unsigned long long)secs, n, path_len, sizeof shown.path);
-    } else {
-        shown.path[0] = 0;
-        LOG("renderdoc: %s written in %llu s, capture %u, to a path RenderDoc doesn't give\n", what,
-            (unsigned long long)secs, n);
-    }
-    snprintf(lead, sizeof lead, "RenderDoc: written in %llu s: ", (unsigned long long)secs);
+    rd_size(bytes, sized, size, sizeof size);
+    snprintf(lead, sizeof lead, RD_NAME ": written in %llu s: ", (unsigned long long)secs);
     room = OVERLAY_COLS_MAX - strlen(lead) - strlen(size) - 3; /* " (" and ")" */
     len = strlen(name);
     if (len <= room)
@@ -219,16 +261,44 @@ static void rd_written(RENDERDOC_API_1_1_2* rd, unsigned n, u64 secs, const char
     overlay_notice(line);
     stats_capture(&shown);
 }
-/* a capture that wrote no file after secs, what it held: in the log with what to read, over the game, the stats box
-   told */
-static void rd_failed(RENDERDOC_API_1_1_2* rd, u64 secs, const char* what) {
+/* a capture that wrote no file after secs, what it held, n captures written before it: in the log with what to read,
+   over the game, the stats box told. why is the back end's reason, or NULL where RenderDoc's own log has it */
+static void rd_failed(unsigned n, u64 secs, const char* what, const char* why) {
     char line[OVERLAY_COLS_MAX + 1];
-    WARN("renderdoc: %s failed after %llu s: RenderDoc wrote no file (its own log says why)\n", what,
-         (unsigned long long)secs);
-    snprintf(line, sizeof line, "RenderDoc: capture failed after %llu s, no file written (see its log)",
+    if (why) {
+        WARN("renderdoc: %s failed after %llu s: " RD_NAME " wrote no file: %s\n", what, (unsigned long long)secs,
+             why);
+        snprintf(line, sizeof line, RD_NAME ": no file written: %s", why);
+    } else {
+        WARN("renderdoc: %s failed after %llu s: RenderDoc wrote no file (its own log says why)\n", what,
              (unsigned long long)secs);
+        snprintf(line, sizeof line, "RenderDoc: capture failed after %llu s, no file written (see its log)",
+                 (unsigned long long)secs);
+    }
     overlay_notice(line);
-    stats_capture(&(SnxStatsCapture){.ready = 1, .taken = rd->GetNumCaptures(), .failed = 1});
+    stats_capture(&(SnxStatsCapture){.ready = 1, .taken = n, .failed = 1});
+}
+#if !defined(SNX_IOS)
+/* capture n (from 1) written in secs, what it holds (present N, or RenderDoc's own): its path and size in the log,
+   and rd_shown's notice */
+static void rd_written(RENDERDOC_API_1_1_2* rd, unsigned n, u64 secs, const char* what) {
+    char size[32], path[STATS_PATH];
+    u32 path_len = 0;
+    /* GetCapture writes the whole path, unbounded: its length first */
+    int told = n && rd->GetCapture(n - 1, NULL, &path_len, NULL);
+    if (told && path_len < sizeof path && rd->GetCapture(n - 1, path, NULL, NULL)) {
+        rd_size(snx_file_size(path), snx_is_file(path), size, sizeof size);
+        LOG("renderdoc: %s written in %llu s to %s (%s)\n", what, (unsigned long long)secs, path, size);
+        rd_shown(path, snx_file_size(path), snx_is_file(path), n, secs);
+        return;
+    }
+    if (told)
+        LOG("renderdoc: %s written in %llu s, capture %u, to a path of %u bytes, past the %zu kept\n", what,
+            (unsigned long long)secs, n, path_len, sizeof path);
+    else
+        LOG("renderdoc: %s written in %llu s, capture %u, to a path RenderDoc doesn't give\n", what,
+            (unsigned long long)secs, n);
+    rd_shown("", 0, 0, n, secs);
 }
 /* RenderDoc's own capture, seen at an earlier present, which it writes in the present that ends it: written once
    its count grew, failed once it stopped without a new one */
@@ -239,9 +309,10 @@ static void rd_theirs(RENDERDOC_API_1_1_2* rd) {
         rd_written(rd, n, rd_write_end(), "RenderDoc's own capture");
     } else if (!rd->IsFrameCapturing()) {
         g_renderdoc.theirs = 0;
-        rd_failed(rd, rd_write_end(), "RenderDoc's own capture");
+        rd_failed(n, rd_write_end(), "RenderDoc's own capture", NULL);
     }
 }
+#endif
 
 /* whether the frame after this present is one to capture (each is taken once) */
 static int rd_wanted(u64 present) {
@@ -256,31 +327,89 @@ static int rd_wanted(u64 present) {
     }
     return want;
 }
+#if defined(SNX_IOS)
+/* bytes as MiB, or ? where the system didn't say */
+static void rd_mib(int known, SnxU64 bytes, char* out, size_t n) {
+    if (known)
+        snprintf(out, n, "%llu", (unsigned long long)(bytes >> 20));
+    else
+        snprintf(out, n, "?");
+}
+/* the capture of the frame after present starts, into the first free <stem>_capture[_N].gputrace: whether it runs */
+static int rd_metal_start(u64 present) {
+    char what[48], why[256], room_mib[24], mem_mib[24], *folder;
+    SnxU64 room = 0, total = 0, mem = 0;
+    unsigned i;
+    snprintf(what, sizeof what, "the capture of present %llu", (unsigned long long)(present + 1));
+    for (i = 1; i <= 999; i++) {
+        if (i == 1)
+            snprintf(g_renderdoc.metal_path, sizeof g_renderdoc.metal_path, "%s_capture.gputrace",
+                     g_renderdoc.metal_stem);
+        else
+            snprintf(g_renderdoc.metal_path, sizeof g_renderdoc.metal_path, "%s_capture_%u.gputrace",
+                     g_renderdoc.metal_stem, i);
+        if (!snx_path_exists(g_renderdoc.metal_path)) break;
+    }
+    if (i > 999) {
+        rd_failed(g_renderdoc.metal_n, 0, what, "no free name");
+        return 0;
+    }
+    folder = snx_dirname(g_renderdoc.metal_path);
+    rd_mib(folder && !snx_disk_room(folder, &room, &total), room, room_mib, sizeof room_mib);
+    free(folder);
+    rd_mib(snx_memory_available(&mem), mem, mem_mib, sizeof mem_mib);
+    LOG("renderdoc: Metal capture of present %llu to %s: %s MiB free, %s MiB of memory\n",
+        (unsigned long long)(present + 1), g_renderdoc.metal_path, room_mib, mem_mib);
+    if (!vk_metal_capture_start(g_renderdoc.metal_path, why, sizeof why)) {
+        rd_failed(g_renderdoc.metal_n, 0, what, why);
+        return 0;
+    }
+    return 1;
+}
+#endif
 /* at the present that ends frame `present`, after its last submit and before the swapchain present, under vk_lock: the
    capture of this frame ends here, and the next frame's starts */
 void vk_renderdoc_present(u64 present) {
-    RENDERDOC_API_1_1_2* rd = __atomic_load_n(&g_renderdoc.api, __ATOMIC_ACQUIRE);
-    void* dev;
     int want;
-    if (!rd || !g_vk.instance) return;
-    dev = RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(g_vk.instance);
+    if (!__atomic_load_n(&g_renderdoc.ready, __ATOMIC_ACQUIRE) || !g_vk.instance) return;
+#if !defined(SNX_IOS)
+    RENDERDOC_API_1_1_2* rd = __atomic_load_n(&g_renderdoc.api, __ATOMIC_RELAXED);
+    void* dev = RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(g_vk.instance);
     if (g_renderdoc.theirs) rd_theirs(rd);
+#endif
     want = rd_wanted(present) || g_renderdoc.armed; /* listed once: it takes the frame it answers for */
     g_renderdoc.armed = __atomic_exchange_n(&g_renderdoc.asked, 0, __ATOMIC_ACQ_REL);
     if (g_renderdoc.open || want) vk_rec_sync(); /* the frame's commands are recorded within the capture */
-    if (g_renderdoc.open) {                      /* RenderDoc writes it here, the game stopped */
+    if (g_renderdoc.open) {                      /* the back end writes it here, the game stopped */
         char what[48];
         u64 secs;
-        int ok;
         g_renderdoc.open = 0;
         snprintf(what, sizeof what, "the capture of present %llu", (unsigned long long)present);
         rd_write_begin();
-        ok = (int)rd->EndFrameCapture(dev, NULL);
+#if defined(SNX_IOS)
+        uint64_t bytes = 0;
+        SnxU64 mem = 0;
+        char why[256], size[32], mem_mib[24];
+        int ok = vk_metal_capture_end(&bytes, why, sizeof why);
+        secs = rd_write_end();
+        rd_mib(snx_memory_available(&mem), mem, mem_mib, sizeof mem_mib);
+        LOG("renderdoc: %s MiB of memory after the capture\n", mem_mib);
+        if (ok) {
+            g_renderdoc.metal_n++;
+            rd_size(bytes, 1, size, sizeof size);
+            LOG("renderdoc: %s written in %llu s to %s (%s)\n", what, (unsigned long long)secs, g_renderdoc.metal_path,
+                size);
+            rd_shown(g_renderdoc.metal_path, bytes, 1, g_renderdoc.metal_n, secs);
+        } else {
+            rd_failed(g_renderdoc.metal_n, secs, what, why);
+        }
+#else
+        int ok = (int)rd->EndFrameCapture(dev, NULL);
         secs = rd_write_end();
         if (ok)
             rd_written(rd, rd->GetNumCaptures(), secs, what);
         else
-            rd_failed(rd, secs, what);
+            rd_failed(rd->GetNumCaptures(), secs, what, NULL);
     } else if (!g_renderdoc.theirs && rd->IsFrameCapturing()) {
         /* RenderDoc's own, its program's: it writes it in the swapchain's present that ends the frame */
         g_renderdoc.theirs = 1;
@@ -289,10 +418,15 @@ void vk_renderdoc_present(u64 present) {
         LOG("renderdoc: RenderDoc's own capture runs, from present %llu: the game stops while it writes\n",
             (unsigned long long)present);
         rd_write_begin();
+#endif
     }
+#if defined(SNX_IOS)
+    if (want) g_renderdoc.open = rd_metal_start(present);
+#else
     if (want) {
         rd->StartFrameCapture(dev, NULL);
         g_renderdoc.open = 1;
     }
+#endif
 }
 #endif

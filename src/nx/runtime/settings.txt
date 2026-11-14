@@ -828,7 +828,8 @@ setting RenderDoc capture shortcut
     label RenderDoc capture
     set hotkey_set
     help The key that captures the next frame with RenderDoc while RenderDoc is in the game (renderdoc), as
-    help hotkey_help's
+    help hotkey_help's.
+    help On iOS, Metal makes the capture: a .gputrace bundle in Documents. Open it in Xcode.
 setting Mouse shortcut
     key hotkey_mouse
     text 64
@@ -1394,14 +1395,16 @@ setting RenderDoc captures
     startup
     help The path's stem of RenderDoc captures (RenderDoc's library is loaded before the Vulkan instance): the capture
     help key's (hotkey_capture) and the game's menu's of the next frame, and the presents RenderDoc frames names. Empty:
-    help RenderDoc isn't loaded, and a game RenderDoc's program started captures where that program says
+    help RenderDoc isn't loaded, and a game RenderDoc's program started captures where that program says.
+    help On iOS, Metal makes the capture: a .gputrace bundle in Documents. Open it in Xcode.
 setting RenderDoc frames
     key renderdoc_frames
     text 512
     default ""
     startup
     help The presents RenderDoc captures takes, a comma between: N is the Nth present, Ns the first after N seconds of
-    help the scripted input's clock. Empty: none
+    help the scripted input's clock. Empty: none.
+    help On iOS, Metal makes the capture: a .gputrace bundle in Documents. Open it in Xcode.
 needs tracy
 setting Tracy profiler
     key tracy_profiler

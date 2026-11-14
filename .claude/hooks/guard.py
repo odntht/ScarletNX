@@ -20,9 +20,9 @@ import sys
 
 # Files that belong to the game's owner or are made from them: never staged, uploaded or edited
 GAME_EXT = re.compile(
-    r'\.(keys|xci|nsp|nsz|xcz|nca|nro|nso|npdm|tik|cert|snxs|spv|ppm|vkshaders|vkshipped|vkscan|jitcache)$', re.I
+    r'\.(keys|xci|nsp|nsz|xcz|nca|nro|nso|npdm|tik|cert|snxs|spv|ppm|vkshaders|vkshipped|vkscan|jitcache|gputrace)$', re.I
 )
-GAME_DIR = re.compile(r'(^|/)(games|work|deps|keys|dumps|exefs|romfs|shader_cache)(/|$)')
+GAME_DIR = re.compile(r'(^|/)(games|work|deps|keys|dumps|exefs|romfs|shader_cache|[^/]*\.(?i:gputrace))(/|$)')
 
 # Generated or third-party trees: change the source that produces them instead. Not anchored at the start, so a
 # worktree's games/ (.claude/worktrees/NAME/games/) is covered too
