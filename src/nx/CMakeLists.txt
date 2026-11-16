@@ -50,15 +50,24 @@ snx_svcgen(snx_kernel)
 snx_component(hle hle/services/services.c hle/services/audren.c hle/services/audren_dsp.c hle/services/sm.c hle/services/am.c hle/services/gsv.c hle/services/native_video.c hle/services/native_video_core.c hle/services/native_video_decoder.c hle/services/set.c  hle/services/acc.c hle/services/users.c hle/services/audio.c
               hle/services/misc.c hle/services/ldr.c hle/services/network/bsd.c hle/services/network/dns.c
               hle/services/network/nifm.c hle/services/network/ssl.c hle/services/network/ldn.c hle/services/network/room.c hle/filesystem/fs.c hle/services/hid.c hle/services/hid_motion.c hle/services/hid_touch.c hle/services/vi.c hle/services/nvdrv.c
-              hle/hook/hook.c hle/hook/libc.c hle/hook/diag.c hle/hook/codec.c hle/hook/audio_stream.c hle/hook/verify.c hle/hook/version.c
+              hle/hook/hook.c hle/hook/family.c hle/hook/jump.c hle/hook/ext_skyline.c hle/hook/libc.c hle/hook/alloc.c hle/hook/sync.c hle/hook/os_sync.c hle/hook/libc_std.c hle/hook/libc_wide.c hle/hook/libc_fmt.c hle/hook/libcxx_string.c hle/hook/gs.c hle/hook/diag.c hle/hook/codec.c hle/hook/audio_stream.c hle/hook/verify.c hle/hook/version.c
               nn/ro.c nn/fs.c nn/time.c nn/pl.c nn/pl_font.c nn/pctl.c nn/nsd.c nn/ngc.c nn/prepo.c
               nn/audio.c nn/audio_renderer.c nn/codec.c)
 # the shared fonts' stand-ins (cmake/shared_fonts.cmake), which nn/pl.c hands out
 target_sources(snx_hle PRIVATE "${PROJECT_BINARY_DIR}/generated/shared_fonts.c")
+if(APPLE)
+    # the media engine's AV1 decoder (hle/services/native_video_vt.c): VideoToolbox decodes and hands back CVPixelBuffers,
+    # which is a macOS or iOS library, and no other build has the file
+    target_sources(snx_hle PRIVATE hle/services/native_video_vt.c)
+    target_link_libraries(snx_hle PUBLIC "-framework VideoToolbox" "-framework CoreMedia" "-framework CoreVideo")
+endif()
 # the hooks' adapters and table, generated from hle/hook/hooks.hook and the game patches' address hooks
 # (patches/*.hook), whose handlers are the .c files beside them
 include("${PROJECT_SOURCE_DIR}/cmake/hookgen.cmake")
 snx_hookgen(snx_hle A32_MARKED)
+# the native hooks of mods' trampolines (hle/hook/ext_skyline.hooks), a table of their own for ext_skyline.c
+snx_hookgen(snx_hle SPEC "${CMAKE_CURRENT_SOURCE_DIR}/hle/hook/ext_skyline.hooks" PREFIX skyline
+            NAME hle/hook/ext_skyline.hooks)
 file(GLOB snx_patch_handlers CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/patches/*.c")
 target_sources(snx_hle PRIVATE ${snx_patch_handlers})
 # the IPC interfaces of the services (docs/platforms/nx/ipc.md): their dispatchers are generated, the handlers are in the services'
@@ -94,6 +103,7 @@ set(platform runtime/platform/log.c runtime/platform/plat_sdl.c runtime/platform
              runtime/platform/help.c runtime/platform/hotkeys.c runtime/platform/hud.c runtime/platform/overlay.c
              runtime/platform/stats.c
              runtime/platform/touch.c
+             runtime/platform/audio_denoise.c
              runtime/platform/ui.c runtime/platform/vpad.c
              runtime/platform/fatal_screen.c
              runtime/platform/prepare_screen.c runtime/platform/gpu_driver_load.c runtime/platform/resources.c)
@@ -101,6 +111,13 @@ if(WIN32)
     list(APPEND platform runtime/platform/plat_win32.c runtime/platform/profiler_win32.c)
 else()
     list(APPEND platform runtime/platform/plat_posix.c)
+endif()
+if(APPLE)
+    # the activity a title takes so App Nap leaves it alone (runtime/platform/plat_apple.m), which is Objective-C
+    enable_language(OBJC)
+    list(APPEND platform runtime/platform/plat_apple.m)
+    # under ARC, as gui/apple.m is: the global that holds the activity's token keeps it
+    set_source_files_properties(runtime/platform/plat_apple.m PROPERTIES COMPILE_OPTIONS -fobjc-arc)
 endif()
 if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
     # a GPU driver package loaded in place of the system's driver (runtime/platform/gpu_driver_load.c), on the
@@ -112,6 +129,8 @@ if(SNX_TRACY)
     list(APPEND platform runtime/platform/tracy_conn.cpp)
 endif()
 snx_component(platform ${platform})
+# the microphone's neural noise reduction (runtime/platform/audio_denoise.c), from cmake/dependencies.cmake
+target_link_libraries(snx_platform PRIVATE snx_rnnoise)
 # the tracy-capture a capture needs (tracy.c), the client's release (cmake/dependencies.cmake)
 target_compile_definitions(snx_platform PRIVATE SNX_TRACY_VERSION="${SNX_TRACY_VERSION}")
 
@@ -130,14 +149,11 @@ snx_decodetree(snx_shader OUTPUT decode-sm53.inc DECODE "${CMAKE_CURRENT_SOURCE_
                OPTIONS -w 16 --static-decode=decode_sm53)
 snx_decodetree(snx_shader OUTPUT decode-sm86.inc DECODE "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shader/sm86.decode"
                OPTIONS -w 16 --static-decode=decode_sm86)
-# the drivers known to break an extension or feature, compiled in from gpu/vk/extension_bans.txt
-include("${PROJECT_SOURCE_DIR}/cmake/vk_extension_bans.cmake")
 snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/descriptors.c gpu/vk/descriptor_heaps.c gpu/vk/descriptor_objects.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
                  gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/writelog.c gpu/vk/mirror.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/xfb.c gpu/vk/display.c gpu/vk/compute.c
-                 gpu/vk/pending_pages.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/memory.c gpu/vk/ledger.c gpu/vk/pagespace.c gpu/vk/range_shape.c gpu/vk/tex_census.c gpu/vk/tex_report.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/bc7_cache.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/vk/hdr_swapchain.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/devmem.c gpu/vk/space.c gpu/vk/gpuprof.c gpu/vk/uma.c
-                 gpu/vk/ftz_probe.c gpu/vk/vertex_input.c gpu/vk/pipeline_parts.c gpu/vk/extension_bans.c
-                 "${PROJECT_BINARY_DIR}/generated/vk_extension_bans_text.c"
-                 gpu/vk/draw_texture.c gpu/vk/draw_texture_shader.c gpu/vk/tess_passthrough.c gpu/vk/varying_geometry.c gpu/vk/present_quad.c gpu/vk/capture.c gpu/vk/depth_shadow.c
+                 gpu/vk/pending_pages.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/upscale.c gpu/vk/memory.c gpu/vk/ledger.c gpu/vk/pagespace.c gpu/vk/range_shape.c gpu/vk/tex_census.c gpu/vk/tex_report.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/bc7_cache.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/vk/hdr_swapchain.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/devmem.c gpu/vk/space.c gpu/vk/gpuprof.c gpu/vk/uma.c
+                 gpu/vk/ftz_probe.c gpu/vk/vertex_input.c gpu/vk/pipeline_parts.c gpu/vk/cb_fold.c
+                 gpu/vk/draw_texture.c gpu/vk/draw_texture_shader.c gpu/vk/tess_passthrough.c gpu/vk/varying_geometry.c gpu/vk/present_quad.c gpu/vk/capture.c gpu/vk/depth_shadow.c gpu/vk/predraw.c
                  "${volk_SOURCE_DIR}/volk.c")
 # the ASTC decoder's, the block linear deswizzle and swizzle's, the texture conversions', the VIC composition's and
 # the render enable predicates' SPIR-V, compiled from their GLSL at build time (cmake/glsl.cmake). The VIC shader is
@@ -146,7 +162,31 @@ snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/descriptors.c gpu/vk/d
 include("${PROJECT_SOURCE_DIR}/cmake/glsl.cmake")
 # vk_hash (gpu/vk/cmd.c); the device setup the 3DS and the Vita share (src/common/gpu/vk); the shader file's units
 # (gpu/vk/pipeline_file.c)
-target_link_libraries(snx_vk PUBLIC snx_xxhash snx_vk_common PRIVATE snx_zstd)
+target_link_libraries(snx_vk PUBLIC snx_xxhash snx_vk_common snx_fsr2 PRIVATE snx_zstd)
+# the vk_ext_* table (g_vk_extension_settings) its device takes (gpu/vk/device.c, common/gpu/vk/device_settings.h)
+target_link_libraries(snx_vk PUBLIC snx_settings_runtime)
+# AMD FidelityFX Super Resolution 2.2.1 (cmake/dependencies.cmake): AMD's library and Vulkan backend as they are
+# (C++, third-party flags, gpu/vk/fsr2/fsr2_compat.h before them for the MSVC names they use), with our shader blobs
+# (gpu/vk/fsr2/fsr2_blobs.c over the passes cmake/fsr2_shaders.cmake compiles) and C interface (gpu/vk/fsr2/fsr2.cpp)
+set(snx_fsr2_spv "${PROJECT_BINARY_DIR}/generated/spirv/fsr2_spv.c")
+file(GLOB snx_fsr2_shader_sources CONFIGURE_DEPENDS "${snx_fsr2_api_dir}/shaders/*.glsl" "${snx_fsr2_api_dir}/shaders/*.h")
+add_custom_command(OUTPUT "${snx_fsr2_spv}"
+    COMMAND "${CMAKE_COMMAND}" "-DGLSLANG=${SNX_GLSLANG}" "-DSPIRV_OPT=$<TARGET_FILE:snx-spirv-opt>"
+            "-DSPIRV_VAL=$<TARGET_FILE:snx-spirv-val>"
+            "-DSHADERS=${snx_fsr2_api_dir}/shaders" "-DWORK=${PROJECT_BINARY_DIR}/generated/spirv/fsr2"
+            "-DOUT=${snx_fsr2_spv}" -P "${PROJECT_SOURCE_DIR}/cmake/fsr2_shaders.cmake"
+    DEPENDS "${PROJECT_SOURCE_DIR}/cmake/fsr2_shaders.cmake" ${snx_fsr2_shader_sources} snx-spirv-opt snx-spirv-val
+    COMMENT "Compiling FSR 2.2.1's passes to SPIR-V"
+    VERBATIM)
+set(snx_fsr2_amd "${snx_fsr2_api_dir}/ffx_fsr2.cpp" "${snx_fsr2_api_dir}/ffx_assert.cpp"
+                 "${snx_fsr2_api_dir}/vk/ffx_fsr2_vk.cpp")
+add_library(snx_fsr2 STATIC ${snx_fsr2_amd} gpu/vk/fsr2/fsr2_blobs.c gpu/vk/fsr2/fsr2.cpp "${snx_fsr2_spv}")
+set_target_properties(snx_fsr2 PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+target_compile_definitions(snx_fsr2 PRIVATE VK_NO_PROTOTYPES FFX_GCC)
+target_include_directories(snx_fsr2 PRIVATE "${snx_fsr2_api_dir}" "${PROJECT_SOURCE_DIR}/src")
+set_source_files_properties(${snx_fsr2_amd} PROPERTIES COMPILE_OPTIONS
+                            "${snx_third_party_flags};-include;${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/fsr2/fsr2_compat.h")
+target_link_libraries(snx_fsr2 PUBLIC snx_vk_common)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc.comp NAME astc_spv HEADER nx/gpu/texture/astc_spv.h)
 # ASTC blocks straight into BC7 blocks, for a GPU that samples BC7 and not ASTC (gpu/vk/astc.c), in the encoder's
 # builds: the full one; the fast one, every mode only where mode 6 is not close, for large levels; mode 6 alone for the
@@ -179,6 +219,14 @@ snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc_bc7.comp NAME astc_bc7_mode6_dot_s
                TARGET vulkan1.3 DEFINES SNX_BC7_FAST=2 SNX_BC7_DOT=1)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc_bc7.comp NAME astc_bc7_quick_dot_spv HEADER nx/gpu/texture/astc_bc7_spv.h
                TARGET vulkan1.3 DEFINES SNX_BC7_FAST=3 SNX_BC7_DOT=1)
+# ASTC blocks straight into BC1, BC4 or BC5 blocks, for the textures whose blocks hold no more than one of them
+# (gpu/texture/astc_kind.h, gpu/vk/astc.c): one build each
+snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc_bcn.comp NAME astc_bc1_spv HEADER nx/gpu/texture/astc_bcn_spv.h
+               DEFINES SNX_BCN_KIND=1)
+snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc_bcn.comp NAME astc_bc4_spv HEADER nx/gpu/texture/astc_bcn_spv.h
+               DEFINES SNX_BCN_KIND=4)
+snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc_bcn.comp NAME astc_bc5_spv HEADER nx/gpu/texture/astc_bcn_spv.h
+               DEFINES SNX_BCN_KIND=5)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/blocklinear.comp NAME blocklinear_spv HEADER nx/gpu/texture/blocklinear_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_spv HEADER nx/gpu/texture/texconv_spv.h)
 # its ETC2 build: BCn encoded again as ETC2 and EAC, for a GPU that samples those and not BCn (gpu/vk/texconv.c)
@@ -194,10 +242,41 @@ snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_astc_b_spv HE
                DEFINES SNX_TC_ASTC SNX_ASTC_ENC=1 SNX_ASTC_PASS=2)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_astc_c_spv HEADER nx/gpu/texture/texconv_spv.h
                DEFINES SNX_TC_ASTC SNX_ASTC_ENC=1 SNX_ASTC_PASS=3)
+# and its second and third passes with the encoder of the GPU's vendor (gpu/texture/texconv.glsl's SNX_ASTC_VENDOR,
+# which gpu/vk/texconv.c picks by the device's vendor): Mali's (gpu/texture/astc_encode_arm.glsl, 1) and Adreno's
+# (astc_encode_qcom.glsl, 2). Each again with SPIR-V's packed dot product (bc7_encode.glsl's SNX_BC7_DOT, Vulkan 1.3's
+# shaderIntegerDotProduct) for the GPUs of theirs that say they have an instruction for it: the fitter's inner loop is
+# dot products of packed bytes
+foreach(vendor IN ITEMS arm qcom)
+    if(vendor STREQUAL "arm")
+        set(snx_astc_vendor 1)
+    else()
+        set(snx_astc_vendor 2)
+    endif()
+    foreach(pass IN ITEMS b c)
+        if(pass STREQUAL "b")
+            set(snx_astc_pass 2)
+        else()
+            set(snx_astc_pass 3)
+        endif()
+        snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_astc_${vendor}_${pass}_spv
+                       HEADER nx/gpu/texture/texconv_spv.h
+                       DEFINES SNX_TC_ASTC SNX_ASTC_ENC=1 SNX_ASTC_PASS=${snx_astc_pass}
+                               SNX_ASTC_VENDOR=${snx_astc_vendor})
+        snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_astc_${vendor}_${pass}_dot_spv
+                       HEADER nx/gpu/texture/texconv_spv.h TARGET vulkan1.3
+                       DEFINES SNX_TC_ASTC SNX_ASTC_ENC=1 SNX_ASTC_PASS=${snx_astc_pass}
+                               SNX_ASTC_VENDOR=${snx_astc_vendor} SNX_BC7_DOT=1)
+    endforeach()
+endforeach()
 # and its conversion build: the blits that convert between pixel formats, which a driver's compiler refused inside the
 # plain build (gpu/vk/texconv.c)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_convert_spv HEADER nx/gpu/texture/texconv_spv.h
                DEFINES SNX_TC_CONVERT)
+# and its NV12 build: a CPU decoded picture's chroma interleaved, which a movie's first picture needs and the plain
+# build is a long compile for on a slow GPU (gpu/vk/texconv.c)
+snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_nv12_spv HEADER nx/gpu/texture/texconv_spv.h
+               DEFINES SNX_TC_NV12)
 snx_glsl_spirv(snx_vk SOURCE gpu/video/vic.comp NAME vic_spv HEADER nx/gpu/video/vic_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/video/vic.comp NAME vic_unaligned_spv HEADER nx/gpu/video/vic_spv.h
                DEFINES VIC_UNALIGNED)
@@ -286,12 +365,12 @@ endif()
 include("${PROJECT_SOURCE_DIR}/cmake/window_icon.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/build_info.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/pad_sdl.cmake")
-target_link_libraries(snx_platform PRIVATE SDL3::SDL3 snx_window_icon snx_build_info snx_pad_sdl snx_splash)
+target_link_libraries(snx_platform PRIVATE SDL3::SDL3 snx_window_icon snx_build_info snx_pad_sdl snx_splash snx_notice)
 if(WIN32)
     target_link_libraries(snx_platform PUBLIC synchronization powrprof) # plat_wait_word's WaitOnAddress, the power notification
 endif()
 if(APPLE AND NOT IOS) # plat_posix.c's power source: IOKit's notifications on CoreFoundation's run loop
-    target_link_libraries(snx_platform PUBLIC "-framework IOKit" "-framework CoreFoundation")
+    target_link_libraries(snx_platform PUBLIC "-framework IOKit" "-framework CoreFoundation" "-framework Foundation")
 endif()
 # the build is part of the key of the shader files, .vkshaders and .vkshipped (gpu/vk/pipeline.c)
 target_link_libraries(snx_vk PRIVATE snx_build_info FFmpeg::avutil) # vk/nvdec.c: FFmpeg's Vulkan device and pictures

@@ -54,14 +54,15 @@ env:
 
 # Linux jobs run in Arch Linux, which has the same Clang 23 and clang-format 23 as development, and its LLVM 23 for the
 # recompiler's code generator (required, cmake/llvm.cmake). Windows uses MSYS2 CLANG64 so Clang, the MinGW/UCRT runtime
-# and LLVM's development libraries come from one compatible toolchain. FFmpeg, OpenSSL, Vulkan and SDL3 are built from
-# the pinned CPM sources, with MSYS2 providing the shell, GNU make and NASM needed by FFmpeg and the Perl OpenSSL's
-# Configure runs on. Downloads are cached in .cache/cpm: one cache for the jobs that fetch the same sources (a Linux
-# architecture's jobs, the four cross builds, Windows, Apple, Android), named by cmake/dependencies.cmake's hash, with
-# the name before the hash as a restore key, so a bump downloads only the packages it changed. Compiles go through
-# ccache, whose .cache/ccache each compiling job restores from the newest one a push saved; a push saves it again,
-# trimmed to what the run used, and a pull request's run saves none: it reads main's (the linux job says why).
-# The artifacts are what `cmake --install` puts in place: the binaries with the licenses that go with them.
+# and LLVM's development libraries come from one compatible toolchain. FFmpeg, OpenSSL, Vulkan, SDL3 and SPIRV-Tools'
+# spirv-opt and spirv-val (cmake/spirv_tools.cmake) are built from the sources cpmfile.json pins, with MSYS2 providing
+# the shell, GNU make and NASM needed by FFmpeg and the Perl OpenSSL's Configure runs on. Downloads are cached in
+# .cache/cpm: one cache for the jobs that fetch the same sources (a Linux architecture's jobs, the four cross builds,
+# Windows, Apple, Android), named by cpmfile.json's hash, with the name before the hash as a restore key, so a bump
+# downloads only the packages it changed. Compiles go through ccache, whose .cache/ccache each compiling job restores
+# from the newest one a push saved; a push saves it again, trimmed to what the run used, and a pull request's run saves
+# none: it reads main's (the linux job says why). The artifacts are what `cmake --install` puts in place: the binaries
+# with the licenses that go with them.
 jobs:
   # A scheduled run of a commit that has its nightly already: the run cancels itself, this job with it, which fails
   # nothing
@@ -115,7 +116,8 @@ jobs:
           path: /var/cache/pacman/pkg
           key: pacman-linux-${{ matrix.arch }}-${{ steps.week.outputs.week }}
           restore-keys: pacman-linux-${{ matrix.arch }}-
-      # jdk21-openjdk: javac and jni.h, which the Android app driver (src/android) builds with
+      # jdk21-openjdk: javac and jni.h, which the Android app driver (src/android) builds with. meson: dav1d's build
+      # (cmake/dav1d.cmake), FFmpeg's AV1 decoder; without it AV1 movies play black
       # llvm: llvm-config and LLVM-C for the recompiler (llvm-libs alone has no headers). gdb: the gdbserver gdbstub_native drives. jq: scripts/pr-builds.sh, which pr_builds tests. Mirrors drop a connection now
       # and then (pkgforge's for aarch64 most), so each pacman install is tried 3 times, 5 s apart. -Syuu, not -Syu: an
       # image can be built ahead of its repo (pkgforge's of 2026-11-12 had openssl 4 against Arch Linux ARM's 3.6.5,
@@ -123,7 +125,7 @@ jobs:
       - name: Install tools
         run: |
           for try in 1 2 3; do
-            pacman -Syuu --noconfirm --needed cmake ninja make patch nasm perl python git clang lld llvm qemu-user pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast vulkan-validation-layers ccache gdb jq glslang spirv-tools jdk21-openjdk && break
+            pacman -Syuu --noconfirm --needed cmake ninja meson make patch nasm perl python git clang lld llvm qemu-user pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast vulkan-validation-layers ccache gdb jq glslang jdk21-openjdk && break
             [ "$try" = 3 ] && exit 1
             sleep 5
           done
@@ -153,18 +155,19 @@ jobs:
       - uses: actions/cache@v5
         with:
           path: .cache/cpm
-          key: cpm-linux-${{ matrix.arch }}-${{ hashFiles('cmake/dependencies.cmake') }}
-          restore-keys: cpm-linux-${{ matrix.arch }}-
-      # ccache under every compile, FFmpeg's and OpenSSL's too, from the newest cache of this job on this branch, else
-      # on main: a pull request has none of its own, so it reads main's. Each cmake gets it as its launcher: from the
-      # environment CMake would run its configure checks through it, and they only miss
+          key: cpmutil-linux-${{ matrix.arch }}-${{ hashFiles('cpmfile.json') }}
+          restore-keys: cpmutil-linux-${{ matrix.arch }}-
+      # ccache under every compile, FFmpeg's, OpenSSL's and SPIRV-Tools' too, from the newest cache of this job on this
+      # branch, else on main: a pull request has none of its own, so it reads main's. Each cmake gets it as its
+      # launcher: from the environment CMake would run its configure checks through it, and they only miss
       - uses: actions/cache/restore@v5
         with:
           path: .cache/ccache
           key: ccache-${{ github.job }}-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-${{ github.job }}-${{ matrix.arch }}-
-      # FFmpeg's and OpenSSL's builds (cmake/deps_cache.cmake), from the newest cache of this job on this branch, else
-      # on main. The key named here is never saved: a run saves its own below, named after the builds it used
+      # FFmpeg's, OpenSSL's and SPIRV-Tools' builds (cmake/deps_cache.cmake), from the newest cache of this job on this
+      # branch, else on main. The key named here is never saved: a run saves its own below, named after the builds it
+      # used
       - uses: actions/cache/restore@v5
         id: deps
         with:
@@ -199,8 +202,8 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build --preset default --parallel "$(getconf _NPROCESSORS_ONLN)"
           cmake --install build/default --prefix stage
-      # The fallback is CMake's (cmake/dependencies.cmake pins SDL3) and the Windows job builds the same SDL3 from
-      # source: a pull request that changes no CMake file and not this workflow skips it, a push always builds it
+      # The fallback is CMake's (cpmfile.json pins SDL3) and the Windows job builds the same SDL3 from source: a pull
+      # request that changes no CMake file, no pin and not this workflow skips it, a push always builds it
       - name: Look for CMake changes
         id: cmake-changed
         if: github.event_name == 'pull_request'
@@ -209,7 +212,7 @@ jobs:
           # (cmake/commit.cmake) and build_info_commit after it must see it the same way
           changed=$(git -c safe.directory="$GITHUB_WORKSPACE" diff --name-only HEAD^1 HEAD)
           printf '%s\n' "$changed"
-          if grep -qE '(^|/)CMakeLists\.txt$|\.cmake$|^CMakePresets\.json$|^\.github/workflows/build\.yml$' <<<"$changed"; then
+          if grep -qE '(^|/)CMakeLists\.txt$|\.cmake$|^CMakePresets\.json$|^cpmfile\.json$|^\.github/workflows/build\.yml$' <<<"$changed"; then
             echo "yes=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Build the SDL3 fallback without a system package
@@ -258,7 +261,7 @@ jobs:
       # As many at a time as the runner has cores, as each run keeps its shaders and frames in a folder of its own
       # (tests/vulkan_headless.c)
       - name: Test headless Vulkan and NX runtime
-        run: &headless-tests ctest --test-dir build/headless -R '^(vulkan_headless|vulkan_headless_options|vulkan_headless_vic_validation|vulkan_headless_pipeline_library_whole|vulkan_headless_pipeline_library_linked|vulkan_headless_libraries_off|vulkan_headless_vk12|vulkan_headless_descriptor_buffers|vulkan_headless_vertex_input_off|vulkan_headless_uma|vulkan_headless_hot|vulkan_recorder|vulkan_tex_partial|vulkan_video_av1|nx_runtime_homebrew|nx_runtime_homebrew_64k_pages|vulkan_storage_buffer_keep|vulkan_nvn_savestate|vulkan_owned_page_reads|vulkan_owned_page_reads_protection)$' --output-on-failure --parallel "$(getconf _NPROCESSORS_ONLN)"
+        run: &headless-tests ctest --test-dir build/headless -R '^(vulkan_headless|vulkan_headless_options|vulkan_headless_vic_validation|vulkan_headless_pipeline_library_whole|vulkan_headless_pipeline_library_linked|vulkan_headless_libraries_off|vulkan_headless_vk12|vulkan_headless_descriptor_buffers|vulkan_headless_vertex_input_off|vulkan_headless_uma|vulkan_headless_hot|vulkan_recorder|vulkan_tex_partial|vulkan_video_av1|nx_runtime_homebrew|nx_runtime_homebrew_64k_pages|vulkan_storage_buffer_keep|vulkan_nvn_savestate|vulkan_owned_page_reads|vulkan_owned_page_reads_protection|astc_vulkan_sync|astc_vulkan_encode_dot)$' --output-on-failure --parallel "$(getconf _NPROCESSORS_ONLN)"
       # The game modules compile src/common/cpu/aarch64/cpu_helpers.c, which no CMake target does
       - name: Check the ABI helpers compile
         run: &abi-helpers clang -fsyntax-only -Wall -I src src/common/cpu/aarch64/cpu_helpers.c
@@ -363,7 +366,7 @@ jobs:
       - name: Install tools
         run: |
           for try in 1 2 3; do
-            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang lld llvm qemu-user pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast vulkan-validation-layers ccache gdb jq glslang spirv-tools jdk21-openjdk && break
+            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang lld llvm qemu-user pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast vulkan-validation-layers ccache gdb jq glslang jdk21-openjdk && break
             [ "$try" = 3 ] && exit 1
             sleep 5
           done
@@ -371,8 +374,8 @@ jobs:
       - uses: actions/cache/restore@v5
         with:
           path: .cache/cpm
-          key: cpm-linux-x86_64-${{ hashFiles('cmake/dependencies.cmake') }}
-          restore-keys: cpm-linux-x86_64-
+          key: cpmutil-linux-x86_64-${{ hashFiles('cpmfile.json') }}
+          restore-keys: cpmutil-linux-x86_64-
       - uses: actions/cache/restore@v5
         with:
           path: .cache/deps
@@ -413,9 +416,10 @@ jobs:
 
   # x86-64 with ASan and UBSan (SNX_TEST_SANITIZERS): every test, and the programs and libraries of ours it runs or
   # links, built with them (runtime_architecture names any left out), so our code reading memory after it was freed or
-  # past its end fails on every run, not only where it happens to crash. A report stops the program that made it, a
-  # code generator of the build or a test, and fails the job, printed whole. Its own compiler cache; the linux job's
-  # CPM sources and FFmpeg and OpenSSL builds, which the sanitizers leave as they are, are read and never saved here
+  # past its end fails on every run, not only where it happens to crash. A report stops the program that made it, a code
+  # generator of the build or a test, and fails the job, printed whole. Its own compiler cache; the linux job's CPM
+  # sources and FFmpeg, OpenSSL and SPIRV-Tools builds, which the sanitizers leave as they are, are read and never saved
+  # here
   linux-sanitizers:
     name: Linux (x86_64, ASan + UBSan)
     runs-on: ubuntu-26.04
@@ -442,10 +446,11 @@ jobs:
           path: /var/cache/pacman/pkg
           key: pacman-linux-x86_64-${{ steps.week.outputs.week }}
           restore-keys: pacman-linux-x86_64-
+      # meson: dav1d's build (cmake/dav1d.cmake), as in the linux job
       - name: Install tools
         run: |
           for try in 1 2 3; do
-            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang lld llvm qemu-user pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast vulkan-validation-layers ccache gdb jq glslang spirv-tools jdk21-openjdk && break
+            pacman -Syu --noconfirm --needed cmake ninja meson make patch nasm perl python git clang lld llvm qemu-user pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast vulkan-validation-layers ccache gdb jq glslang jdk21-openjdk && break
             [ "$try" = 3 ] && exit 1
             sleep 5
           done
@@ -464,8 +469,8 @@ jobs:
       - uses: actions/cache/restore@v5
         with:
           path: .cache/cpm
-          key: cpm-linux-x86_64-${{ hashFiles('cmake/dependencies.cmake') }}
-          restore-keys: cpm-linux-x86_64-
+          key: cpmutil-linux-x86_64-${{ hashFiles('cpmfile.json') }}
+          restore-keys: cpmutil-linux-x86_64-
       - uses: actions/cache/restore@v5
         with:
           path: .cache/deps
@@ -555,8 +560,8 @@ jobs:
       - uses: actions/cache/restore@v5
         with:
           path: .cache/cpm
-          key: cpm-linux-${{ matrix.arch }}-${{ hashFiles('cmake/dependencies.cmake') }}
-          restore-keys: cpm-linux-${{ matrix.arch }}-
+          key: cpmutil-linux-${{ matrix.arch }}-${{ hashFiles('cpmfile.json') }}
+          restore-keys: cpmutil-linux-${{ matrix.arch }}-
       # ccache, set up as in the linux job
       - uses: actions/cache/restore@v5
         with:
@@ -584,20 +589,21 @@ jobs:
       # The action pins its own setup script only: the tools that script downloads are pinned here to a commit of
       # Anylinux-AppImages, and checked against their SHA-256 below
       - name: Install the packaging tools
-        uses: pkgforge-dev/anylinux-setup-action@b2d1ce4216f71162e00ae58fa11ee9aeb723d0d5 # v5
+        uses: pkgforge-dev/anylinux-setup-action@ba7321e11074f9e387a0634e653d09b115d576cd # v6
         env:
-          QUICK_SHARUN: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/quick-sharun.sh
-          DEBLOATED_PACKAGES: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/get-debloated-pkgs.sh
-          MAKE_AUR_PACKAGE: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/make-aur-package.sh
+          QUICK_SHARUN: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/ab06090c5b7946beb6efb04b9feea39362f6898e/useful-tools/quick-sharun.sh
+          DEBLOATED_PACKAGES: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/ab06090c5b7946beb6efb04b9feea39362f6898e/useful-tools/get-debloated-pkgs.sh
+          MAKE_AUR_PACKAGE: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/ab06090c5b7946beb6efb04b9feea39362f6898e/useful-tools/make-aur-package.sh
       - name: Check the packaging tools
         run: |
           sha256sum -c <<'EOF'
-          4ce6946b8d6c9d0f472d41ad533e920132de66ec58d1e3445ea4f1d27376eec7  /usr/local/bin/quick-sharun
-          c8880a7e2f0a47b68ed5ae34e1b7aeecc2e5b3a55f3583b0b43d9818a15dbe8b  /usr/local/bin/get-debloated-pkgs
+          0aea2f589658e5db1659a6ccb8d29546c4e03028f1e29b37c6450cece917249a  /usr/local/bin/quick-sharun
+          d215f7676785f1a1bb8784e69085d66c1df81488ef31f1ba7198325a5be05130  /usr/local/bin/get-debloated-pkgs
           86afbf5045b78020c93fcd35bf0f642765a8dc339bb2dce534a0461ce3d3508d  /usr/local/bin/make-aur-package
           EOF
       # llvm: Clang's own, and the opt of the LLVM settings; the runtime links LLVM's libraries statically (below).
-      # jdk21-openjdk: javac and jni.h, which the Android app driver (src/android) builds with.
+      # jdk21-openjdk: javac and jni.h, which the Android app driver (src/android) builds with. meson: dav1d's build
+      # (cmake/dav1d.cmake), as in the linux job.
       # get-debloated-pkgs reads its release from api.github.com: unauthenticated, a runner's shared address gets
       # GitHub's 60 requests an hour and the script's 403, so it takes the job's token for those requests. Pinning its
       # release would still read api.github.com, and its own wait on a 403 ends after 5 tries
@@ -606,7 +612,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           for try in 1 2 3; do
-            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python clang llvm sdl3 libx11 mesa vulkan-icd-loader ccache glslang spirv-tools jdk21-openjdk && break
+            pacman -Syu --noconfirm --needed cmake ninja meson make patch nasm perl python clang llvm sdl3 libx11 mesa vulkan-icd-loader ccache glslang jdk21-openjdk && break
             [ "$try" = 3 ] && exit 1
             sleep 5
           done
@@ -772,12 +778,12 @@ jobs:
     timeout-minutes: 180
     continue-on-error: true
     env:
-      QUICK_SHARUN: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/quick-sharun.sh
-      QUICK_SHARUN_SHA: 4ce6946b8d6c9d0f472d41ad533e920132de66ec58d1e3445ea4f1d27376eec7
-      APPIMAGETOOL_URL: https://github.com/pkgforge-dev/appimagetool/releases/download/0.5.3/appimagetool-full-x86_64-linux
-      APPIMAGETOOL_SHA: 9a6fd46ee6bc5910e7acfa68f9d8090f3751e956840b90304ef57d64321a530d
-      DEBLOATED_PACKAGES: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/get-debloated-pkgs.sh
-      DEBLOATED_PACKAGES_SHA: c8880a7e2f0a47b68ed5ae34e1b7aeecc2e5b3a55f3583b0b43d9818a15dbe8b
+      QUICK_SHARUN: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/ab06090c5b7946beb6efb04b9feea39362f6898e/useful-tools/quick-sharun.sh
+      QUICK_SHARUN_SHA: 0aea2f589658e5db1659a6ccb8d29546c4e03028f1e29b37c6450cece917249a
+      APPIMAGETOOL_URL: https://github.com/pkgforge-dev/appimagetool/releases/download/0.5.6/appimagetool-full-x86_64-linux
+      APPIMAGETOOL_SHA: a92214d831d234d1be31699657c572799e5c8417c9abf129e2f748cc9c612f85
+      DEBLOATED_PACKAGES: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/ab06090c5b7946beb6efb04b9feea39362f6898e/useful-tools/get-debloated-pkgs.sh
+      DEBLOATED_PACKAGES_SHA: d215f7676785f1a1bb8784e69085d66c1df81488ef31f1ba7198325a5be05130
     strategy:
       fail-fast: false
       # A pull request builds big-endian ppc64's alone; ppc64le, riscv64 and loongarch64 build where a nightly can
@@ -808,17 +814,13 @@ jobs:
         with:
           name: ScarletNX-llvm-qemu-reference-${{ steps.commit.outputs.short }}
           path: reference
-      # The four cross builds run on x86-64 and fetch the same sources, SDL3's from the pinned archive among them
-      # (the linux job takes it from its package). ppc64 has no GUI, so no miniz: one cache either way only costs the
-      # others that package. The first to finish saves it, and the second restore key reads the caches from before
-      # this one
+      # The four cross builds run on x86-64 and fetch the same sources (SDL3 is the system root's package, as the linux
+      # job's is), so they share one cache. The first to finish saves it
       - uses: actions/cache@v5
         with:
           path: .cache/cpm
-          key: cpm-linux-cross-${{ hashFiles('cmake/dependencies.cmake') }}
-          restore-keys: |
-            cpm-linux-cross-
-            cpm-appimage-cross-
+          key: cpmutil-linux-cross-${{ hashFiles('cpmfile.json') }}
+          restore-keys: cpmutil-linux-cross-
       # ccache and the dependency builds, as in the linux job. The container builds as root: what it makes in them
       # goes back to the runner's user before each is saved
       - uses: actions/cache/restore@v5
@@ -902,7 +904,7 @@ jobs:
             -e LINUX_ONLY -e GITHUB_TOKEN target sh -s <<'EOF'
           set -eu
           libraries="patchelf binutils"
-          [ -n "$LINUX_ONLY" ] || libraries="$libraries libx11 mesa vulkan-icd-loader vulkan-radeon vulkan-swrast
+          [ -n "$LINUX_ONLY" ] || libraries="$libraries sdl3 libx11 mesa vulkan-icd-loader vulkan-radeon vulkan-swrast
             libxext libxcursor libxfixes libxi libxinerama libxrandr libxrender libxss libxtst libxkbcommon wayland
             wayland-protocols libdecor alsa-lib libpulse libpipewire hidapi libusb"
           retry() { for try in 1 2 3; do "$@" && return; [ "$try" = 3 ] && return 1; sleep 5; done; }
@@ -921,8 +923,8 @@ jobs:
           [ -n "$LINUX_ONLY" ] || debloated="mesa-nano $debloated"
           get-debloated-pkgs $debloated
           EOF
-      # The build machine's packaging tool: quick-sharun makes the AppImage, and this appimagetool compresses natively
-      # and takes the target's runtime from APPIMAGE_ARCH
+      # The build machine's packaging tool: quick-sharun makes the AppImage, and this appimagetool compresses natively,
+      # takes the target's runtime from APPIMAGE_ARCH, and resolves mkdwarfs for this machine rather than the target's
       - name: Install the packaging tools
         run: |
           docker exec -i -e QUICK_SHARUN -e QUICK_SHARUN_SHA -e APPIMAGETOOL_URL -e APPIMAGETOOL_SHA build sh -s <<'EOF'
@@ -933,31 +935,18 @@ jobs:
           printf '%s  %s\n' "$QUICK_SHARUN_SHA" /usr/local/bin/quick-sharun \
                            "$APPIMAGETOOL_SHA" /usr/local/bin/appimagetool | sha256sum -c
           EOF
-      # appimagetool takes a mkdwarfs on PATH before the target's it would fetch, and qemu runs that one: this is the
-      # x86-64 build of the DwarFS release appimagetool pins, checked against the SHA-256 it pins
-      - name: Install this machine's mkdwarfs
-        env:
-          MKDWARFS: https://github.com/mhx/dwarfs/releases/download/v0.15.6/dwarfs-universal-0.15.6-Linux-x86_64
-        run: |
-          docker exec -i -e MKDWARFS build sh -s <<'EOF'
-          set -eu
-          curl -fsSL --retry 15 --retry-delay 20 --retry-all-errors --connect-timeout 30 -o /usr/local/bin/dwarfs-universal "$MKDWARFS"
-          echo '50891c38ba359db8271819a6cbf6aaa8068681523f0c4f2b8242007a45edaa28  /usr/local/bin/dwarfs-universal' |
-            sha256sum -c
-          chmod +x /usr/local/bin/dwarfs-universal
-          ln -sf dwarfs-universal /usr/local/bin/mkdwarfs
-          EOF
       # The build machine's: Clang and LLD build for the target (cmake/cross.cmake) and LLVM's libraries for it
       # (scripts/linux-llvm.sh), ccache caches the compiles, glslang builds the shaders, qemu-user runs the target's
       # own programs, wayland's wayland-scanner the protocols SDL3 builds, jdk21-openjdk the Android app driver's javac
-      # and jni.h. Each pacman is tried 3 times, as in the linux job
+      # and jni.h, meson dav1d for the target (cmake/dav1d.cmake, from a cross file). Each pacman is tried 3 times, as
+      # in the linux job
       - name: Install the build tools
         run: |
           docker exec -i build sh -s <<'EOF'
           set -eu
           retry() { for try in 1 2 3; do "$@" && return; [ "$try" = 3 ] && return 1; sleep 5; done; }
-          retry pacman -Syu --noconfirm --needed cmake ninja make patch perl python clang lld llvm glslang spirv-tools qemu-user \
-            git pkgconf patchelf wayland ccache jdk21-openjdk
+          retry pacman -Syu --noconfirm --needed cmake ninja make patch perl python clang lld llvm glslang qemu-user \
+            git pkgconf patchelf wayland ccache jdk21-openjdk meson
           EOF
       # Saved once a week, as in the linux job. Every architecture's job installs the same, so one of them saves it
       - name: Keep the installed packages
@@ -1008,8 +997,13 @@ jobs:
         with:
           path: .cache/llvm/${{ matrix.arch }}
           key: ${{ steps.llvm-cache.outputs.cache-primary-key }}
+      # When this run's compiles start: what ccache keeps is what they used (Keep what this run compiled, below)
+      - name: Name the compiles' start
+        id: compiles
+        run: echo "start=$(date +%s)" >> "$GITHUB_OUTPUT"
       # Through ccache, without debug information, which no one reads in these builds and the AppImage would carry.
-      # LLVM is the one built above (-DSNX_LLVM_CONFIG= drops the preset's, the system root's), and a release leaves
+      # LLVM is the one built above (-DSNX_LLVM_CONFIG= drops the preset's, the system root's), SDL3 the system root's
+      # package (SNX_SYSTEM_SDL3: a root without it, or with one too old, stops the configure), and a release leaves
       # out scarletnx --mcp's A64 disassembler (SNX_A64_DISASM)
       - name: Cross-build and install
         run: |
@@ -1018,17 +1012,12 @@ jobs:
           set -eu
           git config --global --add safe.directory '*'
           export SNX_SYSROOT=/src/sysroot
-          start=$(date +%s)
           cmake --preset ${{ matrix.preset }} -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTING=OFF \
             -DSNX_OPT_FLAGS="-O2 -g0" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DLLVM_DIR=/src/.cache/llvm/${{ matrix.arch }}/lib/cmake/llvm -DSNX_LLVM_CONFIG= -DSNX_A64_DISASM=OFF
+            -DLLVM_DIR=/src/.cache/llvm/${{ matrix.arch }}/lib/cmake/llvm -DSNX_LLVM_CONFIG= -DSNX_A64_DISASM=OFF \
+            -DSNX_SYSTEM_SDL3=ON
           cmake --build --preset ${{ matrix.preset }} --parallel "$(getconf _NPROCESSORS_ONLN)"
           DESTDIR=/src/stage cmake --install build/${{ matrix.preset }}
-          # only what this run used is kept, as in the linux job
-          ccache --show-stats --verbose
-          ccache --evict-older-than "$(( $(date +%s) - start ))s"
-          ccache --zero-stats
-          du -sh "$CCACHE_DIR"
           mkdir -p /src/.cache/deps
           chown -R "$(stat -c %u:%g /src)" /src/.cache/ccache /src/.cache/deps
           EOF
@@ -1044,7 +1033,8 @@ jobs:
           export SNX_SYSROOT=/src/sysroot
           cmake --preset ${{ matrix.preset }} -DBUILD_TESTING=ON \
             -DSNX_OPT_FLAGS="-O2 -g0" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DLLVM_DIR=/src/.cache/llvm/${{ matrix.arch }}/lib/cmake/llvm -DSNX_LLVM_CONFIG= -DSNX_A64_DISASM=OFF
+            -DLLVM_DIR=/src/.cache/llvm/${{ matrix.arch }}/lib/cmake/llvm -DSNX_LLVM_CONFIG= -DSNX_A64_DISASM=OFF \
+            -DSNX_SYSTEM_SDL3=ON
           cmake --build --preset ${{ matrix.preset }} --parallel "$(getconf _NPROCESSORS_ONLN)" \
             --target snx-test-llvm-qemu-differential
           # both forms run, and a failing one's examples go to the log: the container's /tmp goes with the job. A form
@@ -1068,6 +1058,38 @@ jobs:
             fi
           done
           exit $failed
+          EOF
+      # The launcher's tests on the target through qemu-user, as the preset's test preset runs them (QEMU_LD_PREFIX for
+      # the programs a test starts, which the binfmt handler above runs): what the AppImage's launcher draws, reads and
+      # writes, on a big-endian host too. The tree is the differential's, with every launcher test built. gui_sdl_events
+      # stops at the Settings' groups under qemu in these containers, whatever the architecture (#2017)
+      - name: Run the launcher's tests through qemu
+        run: |
+          docker exec -i -e CCACHE_DIR=/src/.cache/ccache -e CCACHE_BASEDIR=/src -e CCACHE_NOHASHDIR=true \
+            -e SNX_DEPS_CACHE=/src/.cache/deps build sh -s <<'EOF'
+          set -eu
+          git config --global --add safe.directory '*'
+          export SNX_SYSROOT=/src/sysroot
+          cmake --preset ${{ matrix.preset }} -DBUILD_TESTING=ON \
+            -DSNX_OPT_FLAGS="-O2 -g0" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLLVM_DIR=/src/.cache/llvm/${{ matrix.arch }}/lib/cmake/llvm -DSNX_LLVM_CONFIG= -DSNX_A64_DISASM=OFF \
+            -DSNX_SYSTEM_SDL3=ON
+          cmake --build --preset ${{ matrix.preset }} --parallel "$(getconf _NPROCESSORS_ONLN)" --target snx_gui_tests
+          ctest --preset ${{ matrix.preset }} -R '^gui_' -E '^gui_sdl_events$' -j"$(getconf _NPROCESSORS_ONLN)"
+          EOF
+      # Only what this run compiled is kept, as in the linux job: the AppImage's, the differential's and the launcher
+      # tests'. The container builds as root, and the runner's user saves the cache
+      - name: Keep what this run compiled
+        env:
+          START: ${{ steps.compiles.outputs.start }}
+        run: |
+          docker exec -i -e CCACHE_DIR=/src/.cache/ccache -e START build sh -s <<'EOF'
+          set -eu
+          ccache --show-stats --verbose
+          ccache --evict-older-than "$(( $(date +%s) - START ))s"
+          ccache --zero-stats
+          du -sh "$CCACHE_DIR"
+          chown -R "$(stat -c %u:%g /src)" /src/.cache/ccache
           EOF
       - if: github.event_name != 'pull_request'
         uses: actions/cache/save@v5
@@ -1161,12 +1183,12 @@ jobs:
         shell: bash
         run: git config --local core.autocrlf "$(git config core.autocrlf || echo false)"
       # Windows fetches SDL3's source, which Linux takes from its package, so this job's set is its own: one cache,
-      # and the restore key carries a dependencies.cmake bump over
+      # and the restore key carries a cpmfile.json bump over
       - uses: actions/cache@v5
         with:
           path: .cache/cpm
-          key: cpm-windows-${{ hashFiles('cmake/dependencies.cmake') }}
-          restore-keys: cpm-windows-
+          key: cpmutil-windows-${{ hashFiles('cpmfile.json') }}
+          restore-keys: cpmutil-windows-
       # ccache, set up as in the linux job
       - uses: actions/cache/restore@v5
         with:
@@ -1191,7 +1213,8 @@ jobs:
             echo "SNX_DEPS_CACHE=$ws/.cache/deps"
             echo "SNX_CCACHE_START=$(date +%s)"
           } >> "$GITHUB_ENV"
-      # llvm-mingw alone has no LLVM development libraries. Do not mix its C++ runtime with another LLVM build.
+      # llvm-mingw alone has no LLVM development libraries. Do not mix its C++ runtime with another LLVM build. meson:
+      # dav1d's build (cmake/dav1d.cmake), as in the linux job
       - name: Install Clang, LLVM development files and FFmpeg build tools
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
@@ -1210,10 +1233,10 @@ jobs:
             mingw-w64-clang-x86_64-lld
             mingw-w64-clang-x86_64-cmake
             mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-meson
             mingw-w64-clang-x86_64-nasm
             mingw-w64-clang-x86_64-pkgconf
             mingw-w64-clang-x86_64-python
-            mingw-w64-clang-x86_64-spirv-tools
             mingw-w64-clang-x86_64-ccache
       - name: Check required dependencies
         run: |
@@ -1226,8 +1249,7 @@ jobs:
           make --version
           perl --version
           nasm --version
-          spirv-val --version
-          spirv-dis --version
+          meson --version
       - name: Build the runtime and pinned dependencies
         run: |
           set -euo pipefail
@@ -1378,12 +1400,12 @@ jobs:
         run: echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
       - *fail-fast-watch
-      # One cache for both ABIs, and the restore key carries a dependencies.cmake bump over
+      # One cache for both ABIs, and the restore key carries a cpmfile.json bump over
       - uses: actions/cache@v5
         with:
           path: .cache/cpm
-          key: cpm-android-${{ hashFiles('cmake/dependencies.cmake') }}
-          restore-keys: cpm-android-
+          key: cpmutil-android-${{ hashFiles('cpmfile.json') }}
+          restore-keys: cpmutil-android-
       # Each ABI's LLVM is saved as soon as it is built, as the apple job saves its own: the hour of one is kept when
       # the other's build or a later step fails, or the run is cancelled
       - uses: actions/cache/restore@v5
@@ -1396,16 +1418,17 @@ jobs:
         with:
           path: android-llvm/arm64-v8a
           key: android-llvm-arm64-v8a-${{ hashFiles('scripts/android-llvm.sh') }}-${{ env.ANDROID_NDK_ROOT }}
-      # The NDK named above, which the runner's image may no longer carry, and NASM for FFmpeg's x86-64 assembly.
-      # sdkmanager's download sometimes ends early ("Premature EOF"): tried 3 times, 5 s apart
-      - name: Install the NDK and NASM
+      # The NDK named above, which the runner's image may no longer carry, NASM for FFmpeg's and dav1d's x86-64
+      # assembly, and meson for dav1d (cmake/dav1d.cmake, from a cross file). sdkmanager's download sometimes ends early
+      # ("Premature EOF"): tried 3 times, 5 s apart
+      - name: Install the NDK, NASM and meson
         run: |
           for try in 1 2 3; do
             "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_ROOT##*/}" > /dev/null && break
             [ "$try" = 3 ] && exit 1
             sleep 5
           done
-          sudo apt-get update && sudo apt-get install -y nasm ccache spirv-tools
+          sudo apt-get update && sudo apt-get install -y nasm meson ccache
       - name: Build LLVM's libraries for x86_64
         if: steps.llvm-x86_64.outputs.cache-hit != 'true'
         run: scripts/android-llvm.sh x86_64 "$PWD/android-llvm/x86_64"
@@ -1593,12 +1616,12 @@ jobs:
       - uses: actions/checkout@v7
       - *fail-fast-watch
       # macOS and iOS fetch the same sources (SDL3's among them, which Linux takes from its package): one cache, and
-      # the restore key carries a dependencies.cmake bump over
+      # the restore key carries a cpmfile.json bump over
       - uses: actions/cache@v5
         with:
           path: .cache/cpm
-          key: cpm-apple-${{ hashFiles('cmake/dependencies.cmake') }}
-          restore-keys: cpm-apple-
+          key: cpmutil-apple-${{ hashFiles('cpmfile.json') }}
+          restore-keys: cpmutil-apple-
       # LLVM's libraries for each (scripts/apple-llvm.sh) with AArch64's code generator alone, the one the recompiler
       # uses, built once per script and Xcode. Saved as soon as they are built: actions/cache saves only a job that
       # succeeds, and a later step's failure would build them again next run. Xcode's Clang builds everything, as a
@@ -1616,8 +1639,9 @@ jobs:
         with:
           path: ios-llvm
           key: ios-llvm-${{ hashFiles('scripts/apple-llvm.sh') }}-${{ steps.xcode.outputs.version }}
+      # meson: dav1d's build (cmake/dav1d.cmake), with a native file on macOS and a cross file on iOS
       - name: Install tools
-        run: brew install ninja ccache spirv-tools
+        run: brew install ninja meson ccache
       - name: Build LLVM's libraries for macOS
         id: macos-llvm-build
         if: steps.macos-llvm.outputs.cache-hit != 'true'
@@ -1943,16 +1967,16 @@ jobs:
     timeout-minutes: 30
     container: archlinux:latest
     env:
-      EDENPROBE_VERSION: v0.14.0
-      EDENPROBE_SHA256: 0e7db0f5ad88577b730481fe6f0f32b7b011fe90eb54e97e83a3eb46bbc01f3b
+      EDENPROBE_VERSION: v0.16.1
+      EDENPROBE_SHA256: b975506b1bce5feb9b36cf0e06446a02224c1395e9c3deb179bb98bdc0343234
       # every family that needs no person or network: headless, the audio family's sound is never played. Not graphics:
       # its suites write their own GPU command buffers, left out while the runtime had no Maxwell front end, and not
       # added back since it returned (docs/dev/edenprobe.md). hooks: the runtime answers nn::fs, time, pl, ngc and nsd
       # in the SDK's own functions and serves none of their services, so the probe asks through the functions it exports
       EDENPROBE_MODE: quick notime cpu fs video display kernel audio hooks
       # the APK (edenprobe's Android build) of a release of its own: its words run every family it has
-      EDENPROBE_APK_VERSION: v0.13.0
-      EDENPROBE_APK_SHA256: 51d638170d6404f4f07a1a1825009d2596d843514341b37850cf3019c1f09dcf
+      EDENPROBE_APK_VERSION: v0.16.1
+      EDENPROBE_APK_SHA256: 1270bf1f91fa164331951ec839c3fd8da7d2a0d8c0fd46481987504af7318d16
       EDENPROBE_APK_MODE: quick
     steps:
       # Artifacts carry the commit they came from: the branch's head in a pull request, else the commit pushed
@@ -1967,7 +1991,7 @@ jobs:
       - name: Install the runtime's libraries and lavapipe
         run: |
           for try in 1 2 3; do
-            pacman -Syu --noconfirm --needed python llvm-libs sdl3 vulkan-icd-loader vulkan-swrast spirv-tools \
+            pacman -Syu --noconfirm --needed python llvm-libs sdl3 vulkan-icd-loader vulkan-swrast \
               github-cli jre21-openjdk-headless && break
             [ "$try" = 3 ] && exit 1
             sleep 5

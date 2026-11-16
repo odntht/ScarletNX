@@ -114,6 +114,13 @@ static CPU cpu32;
 static u8 mem32[0x100];
 CPU* hook_a32_cpu(SnxArmCPU* arm) { return (void)arm, &cpu32; }
 void logf_(int lvl, const char* fmt, ...) { (void)lvl, (void)fmt; }
+/* hook.c takes its invalidation lock only when a hooked function's code changed */
+void pm_lock(PMutex* m) { (void)m; }
+void pm_unlock(PMutex* m) { (void)m; }
+/* ext_skyline.c's: no hook for a mod's trampoline */
+GuestFn hook_ext_skyline(const char* symbol, u32 sdk, const char** handler) {
+    return (void)symbol, (void)sdk, (void)handler, NULL;
+}
 void fatal(const char* fmt, ...) {
     fprintf(stderr, "fatal: %s\n", fmt);
     exit(1);
@@ -270,4 +277,9 @@ int main(void) {
     assert(!*text);
     puts("hook_install_a32: passed");
     return 0;
+}
+/* hook.c asks which families can run (family.c, not linked here): every one of this test's */
+const char* hook_family_unready(const char* family) {
+    (void)family;
+    return NULL;
 }

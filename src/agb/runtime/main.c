@@ -16,6 +16,7 @@
 #include "common/utilities/common.h"
 #include "common/utilities/game_ini.h"
 #include "common/utilities/script.h"
+#include "snx_settings.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,11 +31,10 @@
 
 /* the common options scarletnx-agb takes (common/utilities/cli.h): a ROM is read as it is, never extracted, and the
    AGB has no keys, updates, time limit or window-less run but --frames */
-static const unsigned agb_cli =
-    SNX_CLI_BIT(SNX_CLI_RECOMPILE) | SNX_CLI_BIT(SNX_CLI_GAME) | SNX_CLI_BIT(SNX_CLI_DATA) |
-    SNX_CLI_BIT(SNX_CLI_OUTDIR) | SNX_CLI_BIT(SNX_CLI_OUTPUT) | SNX_CLI_BIT(SNX_CLI_FRAMES) |
-    SNX_CLI_BIT(SNX_CLI_SHOT) | SNX_CLI_BIT(SNX_CLI_SCRIPT) | SNX_CLI_BIT(SNX_CLI_FULLSCREEN) |
-    SNX_CLI_BIT(SNX_CLI_HELP);
+static const unsigned agb_cli = SNX_CLI_BIT(SNX_CLI_RECOMPILE) | SNX_CLI_BIT(SNX_CLI_GAME) | SNX_CLI_BIT(SNX_CLI_DATA) |
+                                SNX_CLI_BIT(SNX_CLI_OUTDIR) | SNX_CLI_BIT(SNX_CLI_OUTPUT) |
+                                SNX_CLI_BIT(SNX_CLI_FRAMES) | SNX_CLI_BIT(SNX_CLI_SHOT) | SNX_CLI_BIT(SNX_CLI_SCRIPT) |
+                                SNX_CLI_BIT(SNX_CLI_FULLSCREEN) | SNX_CLI_BIT(SNX_CLI_HELP) | SNX_CLI_RECOMPILE_OPTIONS;
 static void usage(FILE* out) {
     fputs("Usage: scarletnx-agb [OPTIONS] ROM.gba|ROM.mb\n"
           "       scarletnx-agb [OPTIONS] --game=recompiled/<name>\n"
@@ -45,10 +45,22 @@ static void usage(FILE* out) {
           out);
     snx_cli_help(out, agb_cli);
     fputs("AGB options:\n"
-          "  --press_len=MS         How long each scripted press is held (default 300)\n"
+          "  --press-len=MS         How long each scripted press is held (default 300)\n"
           "  --registers            Print the CPU's registers when the run ends\n"
-          "  --aot_threads=N        The threads a recompile may take (0 to 1024), as the other drivers': a ROM's code\n"
-          "                         is one module, which compiles on 1 thread whatever N, and the recompile says so\n"
+          "  --gba-color=gba|raw    The screen's colours: gba as the original GBA's unlit screen shows them\n"
+          "                         (default), raw as the game writes them\n"
+          "  --aot-threads=N        The threads a recompile may take (0 to 1024), as the other drivers': a ROM's code\n"
+          "                         is one module, which compiles on 1 thread whatever N, and the recompile says so;\n"
+          "                         --aot-threads-most=N the same\n"
+          "\n"
+          "Each of these settings with an _ for each - (--press_len=MS), the older spelling, is still read, and said\n"
+          "once.\n"
+          "\n"
+          "On the GBA, a ROM's code is one module, compiled on 1 thread as one unit: --jobs and --chunk change\n"
+          "nothing, which the recompile says. -O is the module's level (default 2, the setting opt's), --jit-cache\n"
+          "FILE the map of the blocks runs reached that the recompile starts from, another game folder's\n"
+          "<name>_code.map (default: the game's own), --jit-only plays with no module, every block compiled as the\n"
+          "run reaches it, and --keep-ir keeps the module's IR in <name>_build of the game's folder.\n"
           "\n"
           "On the AGB, --frames runs with no window, sound or pacing, for tests. --shot writes the final frame as a\n"
           "PPM image. --script=MS:KEYS,... presses keys MS after the run's start, KEYS in hex as KEYINPUT has them (1\n"
@@ -158,8 +170,10 @@ int snx_agb_main(int argc, char** argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     const char* path = NULL;
     long press_len = 300;
-    const char* threads = NULL; /* --aot_threads=, as given */
+    const char *threads = NULL, *most = NULL; /* the values of aot_threads and aot_threads_most, as given */
+    char opt = '2';             /* the setting opt's default, or -O's */
     int registers = 0;
+    int lcd = 1; /* --gba-color: the original GBA's screen colours, raw the game's (settings.txt's gba_color) */
     SnxCli cli;
     snx_cli_init(&cli, "scarletnx-agb", agb_cli);
     for (int i = 1; i < argc; ++i) {
@@ -173,24 +187,36 @@ int snx_agb_main(int argc, char** argv) {
             snx_cli_free(&cli);
             return common < 0 ? 2 : 0;
         }
+        if (common == SNX_CLI_OPT) opt = cli.value[SNX_CLI_OPT][0];
         if (common) continue;
-        if (!strncmp(argv[i], "--press_len=", 12)) {
+        /* the settings it takes, their keys' _ a - or not */
+        char key[64];
+        const char* value = settings_arg(argv[i], key, sizeof key);
+        if (value && !strcmp(key, "press_len")) {
             char* end;
-            press_len = strtol(argv[i] + 12, &end, 10);
-            if (end == argv[i] + 12 || *end || press_len < 0 || press_len > 0x7FFFFFFF) {
-                fprintf(stderr, "scarletnx-agb: --press_len=%s is not a whole number of ms\n", argv[i] + 12);
+            press_len = strtol(value, &end, 10);
+            if (end == value || *end || press_len < 0 || press_len > 0x7FFFFFFF) {
+                fprintf(stderr, "scarletnx-agb: --press-len=%s is not a whole number of ms\n", value);
                 snx_cli_free(&cli);
                 return 2;
             }
-        } else if (!strncmp(argv[i], "--aot_threads=", 14)) {
+        } else if (value && (!strcmp(key, "aot_threads") || !strcmp(key, "aot_threads_most"))) {
+            /* the launcher's Gentle queue gives every driver both */
             char* end;
-            long n = strtol(argv[i] + 14, &end, 10);
-            if (end == argv[i] + 14 || *end || n < 0 || n > 1024) {
-                fprintf(stderr, "scarletnx-agb: aot_threads=%s is not a whole number from 0 to 1024\n", argv[i] + 14);
+            long n = strtol(value, &end, 10);
+            if (end == value || *end || n < 0 || n > 1024) {
+                fprintf(stderr, "scarletnx-agb: %s=%s is not a whole number from 0 to 1024\n", key, value);
                 snx_cli_free(&cli);
                 return 2;
             }
-            threads = argv[i] + 14;
+            *(strcmp(key, "aot_threads") ? &most : &threads) = value;
+        } else if (value && !strcmp(key, "gba_color")) {
+            if (strcmp(value, "raw") && strcmp(value, "gba")) {
+                fprintf(stderr, "scarletnx-agb: --gba-color=%s is not raw or gba\n", value);
+                snx_cli_free(&cli);
+                return 2;
+            }
+            lcd = !strcmp(value, "gba");
         } else if (!strcmp(argv[i], "--registers"))
             registers = 1;
         else if (!strcmp(argv[i], "--"))
@@ -207,6 +233,8 @@ int snx_agb_main(int argc, char** argv) {
     const char *output = cli.value[SNX_CLI_OUTPUT], *game = cli.value[SNX_CLI_GAME], *script = cli.value[SNX_CLI_SCRIPT];
     long frames = cli.frames;
     int recompile = !!(cli.flags & SNX_CLI_BIT(SNX_CLI_RECOMPILE)), fullscreen = cli.fullscreen == 1;
+    SnxCliRecompile asked = snx_cli_recompile(&cli);
+    int jobs = cli.jobs;
     snx_cli_free(&cli);
     char* own = path || game ? NULL : own_game(argv[0]); /* the game's copy of the runtime plays its game */
     if ((!path && !game && !own) || (path && game) || (game && (data || outdir || output))) {
@@ -261,6 +289,7 @@ int snx_agb_main(int argc, char** argv) {
         }
         path = rom;
         agb_board_init(&board);
+        agb_ppu_lcd(&board, lcd);
         if (!multiboot_rom(path) && agb_board_insert(&board, image, length, error, sizeof error)) {
             fprintf(stderr, "scarletnx-agb: %s: %s\n", path, error);
             free(image);
@@ -313,21 +342,48 @@ int snx_agb_main(int argc, char** argv) {
         }
         agb_cpu_init(&cpu, &board, map.base);
         agb_recomp_init(&recomp, base);
-        /* a recompile builds the module from every block the runs reached, the map's; else the cache is loaded */
-        if (recompile ? (agb_recomp_load_map(&recomp, &board, error, sizeof error), 1)
-                      : agb_recomp_load_cache(&recomp, &board, error, sizeof error)) {
-            if (error[0])
+        /* a recompile builds the module from every block the runs reached, the map's (another's that --jit-cache
+           names); else the cache is loaded, and made when it is not there. --jit-only loads and makes none: the run
+           compiles every block as it reaches it */
+        int make = !asked.jit_only && (recompile || agb_recomp_load_cache(&recomp, &board, error, sizeof error));
+        if (asked.jit_only && !asked.quiet)
+            puts("No code ahead of time (--jit-only): the run-time compiler compiles every block");
+        if (make && asked.jit_cache) {
+            if (!recompile) { /* what the cache's own map gave before its module was missing */
+                agb_recomp_free(&recomp);
+                agb_recomp_init(&recomp, base);
+            }
+            if (agb_recomp_load_map_from(&recomp, &board, asked.jit_cache, error, sizeof error)) {
+                fprintf(stderr, "scarletnx-agb: --jit-cache %s: %s\n", asked.jit_cache, error);
+                goto done;
+            }
+        } else if (make && recompile)
+            agb_recomp_load_map(&recomp, &board, error, sizeof error);
+        if (make) {
+            if (!asked.quiet && error[0])
                 printf("Recompiling %s: %s\n", path, error);
-            else
+            else if (!asked.quiet)
                 printf("Recompiling %s\n", path);
-            /* the queue's and a script's --aot_threads=, which every driver takes: nothing here to give them to */
+            /* the queue's and a script's --aot-threads=, --jobs and --chunk, which every driver takes: nothing here to
+               give them to */
             if (threads) printf("aot_threads=%s: a ROM's code is one module, compiled on 1 thread\n", threads);
+            if (most) printf("aot_threads_most=%s: a ROM's code is one module, compiled on 1 thread\n", most);
+            if (jobs >= 0) printf("--jobs %d: a ROM's code is one module, compiled on 1 thread\n", jobs);
+            if (asked.chunk) printf("--chunk %d: a ROM's code is one module, compiled as one unit\n", asked.chunk);
             error[0] = 0;
+            recomp.opt = opt;
+            if (asked.keep_ir &&
+                (!(recomp.keep_ir = snx_format("%s/%s_build", folder, name)) || snx_mkdirs(recomp.keep_ir))) {
+                char why[256];
+                fprintf(stderr, "scarletnx-agb: cannot make the folder of the IR --keep-ir keeps, %s: %s\n",
+                        recomp.keep_ir ? recomp.keep_ir : "(out of memory)", snx_os_error(why, sizeof why));
+                goto done;
+            }
             if (agb_recomp_build(&recomp, &board, error, sizeof error)) {
                 fprintf(stderr, "scarletnx-agb: %s\n", error);
                 goto done;
             }
-            printf("Built %zu blocks\n", recomp.count);
+            if (!asked.quiet) printf("Built %zu blocks\n", recomp.count);
         }
         /* the game's copy of the runtime and its .ini, so the launcher's Games plays it as any game made */
         {

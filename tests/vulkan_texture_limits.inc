@@ -161,15 +161,15 @@ static int check_txd_varying_offsets(void) {
                 u64 before = g_vk_dispatches;
                 if (variant) vk_pipeline_quiesce();
                 vk_lock();
-                int dynamic_offsets = g_shader_dynamic_texture_offsets;
+                int dynamic_offsets = g_spirv_translate.dynamic_texture_offsets;
                 /* The reduced domain has16 exact cases even on a host with maintenance8. Unique programs make
                    this a real portable-path check, not a cache hit on an earlier native-offset module. */
-                if (variant) g_shader_dynamic_texture_offsets = 0;
+                if (variant) g_spirv_translate.dynamic_texture_offsets = 0;
                 DispatchState dispatch;
                 mx_dispatch_state(qmd, channel->rcomp, address, &dispatch);
                 vk_dispatch(&dispatch);
                 vk_compute_land();
-                g_shader_dynamic_texture_offsets = dynamic_offsets;
+                g_spirv_translate.dynamic_texture_offsets = dynamic_offsets;
                 vk_unlock();
                 CHECK(g_vk_dispatches == before + 1);
                 u8 actual[1024];
@@ -235,6 +235,7 @@ static int check_texture_min_lod(void) {
     r[0x64b] = 1; r[0x286] = 0x6420;
     r[0x3fd] = r[0x3fe] = 4u << 16;
     r[0x680] = 0x1111; r[MAXWELL3D_RASTERIZE_ENABLE] = 1;
+    all_samples(r);
     const float transform[6] = {2, 2, 0.5f, 2, 2, 0.5f};
     memcpy(r + 0x280, transform, sizeof transform);
     r[0x458] = 1u << 21 | 7u << 27;

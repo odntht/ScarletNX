@@ -19,7 +19,8 @@
 #define AV1_IVF_HEAD  32u                    /* an IVF file's header, and a frame's: its size, then its timestamp */
 #define AV1_IVF_FRAME 12u
 
-static const char* const av1_ways[] = {"none", "the CPU's decoder", "Vulkan Video", "the black stand-in"};
+static const char* const av1_ways[] = {"none", "the CPU's decoder", "Vulkan Video", "the black stand-in",
+                                         "VideoToolbox"};
 /* the vectors: three Vulkan Video takes where the driver decodes AV1 Main (two keyframes; pictures predicted from
    others; film grain, which the decoder applies), and a monochrome one, which it never takes */
 static const char* const av1_vectors[] = {"av1-1-b8-01-size-66x66.ivf", "av1-1-b8-05-mv.ivf",
@@ -115,6 +116,58 @@ static int av1_image_black(u32 w, u32 h) {
             if (GP(AV1_IMAGE + pool.layout.chroma_offset + (u64)y * pool.layout.pitch)[x] != 128) return 0;
     return 1;
 }
+/* A software picture of an odd size in an NV12 video image, written by the CPU (native_video.c's image_write_cpu), from
+   a planar picture and from a semi-planar one: its 4:2:0 chroma covers the last column and the last row, as FFmpeg's
+   planes do. Run with the others, in a mapping of its own past the heap */
+#define NV12_ODD_CPU  (HEAP_BASE + 0x9400000)
+#define NV12_ODD_SPAN 0x10000u
+static int check_video_nv12_odd(void) {
+    const u32 w = 17, h = 9, pairs = (w + 1) / 2, rows = (h + 1) / 2;
+    const u32 pref[16] = {0, 1, (w - 1) | (h - 1) << 16};
+    NativeVideoPool pool = {.first = 1, .count = 1, .memory = 1, .cpu = NV12_ODD_CPU};
+    u64 size = 0;
+    CHECK(!nvideo_layout(pref, 1, &pool.layout, &size) && size <= NV12_ODD_SPAN);
+    CHECK(mem_map(NV12_ODD_CPU, NV12_ODD_SPAN, MS_NORMAL, PERM_RW) == 0);
+    for (int semi = 0; semi < 2; semi++) {
+        AVFrame* f = av_frame_alloc();
+        CHECK(f);
+        f->format = semi ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
+        f->width = (int)w;
+        f->height = (int)h;
+        CHECK(av_frame_get_buffer(f, 0) == 0);
+        for (u32 y = 0; y < h; y++)
+            for (u32 x = 0; x < w; x++) f->data[0][(size_t)y * (size_t)f->linesize[0] + x] = (u8)(y * w + x);
+        for (u32 y = 0; y < rows; y++)
+            for (u32 k = 0; k < pairs; k++) {
+                u8* u = semi ? f->data[1] + (size_t)y * (size_t)f->linesize[1] + 2 * k
+                             : f->data[1] + (size_t)y * (size_t)f->linesize[1] + k;
+                u8* v = semi ? u + 1 : f->data[2] + (size_t)y * (size_t)f->linesize[2] + k;
+                *u = (u8)(0x80 + y * pairs + k);
+                *v = (u8)(0x10 + y * pairs + k);
+            }
+        memset(GP(NV12_ODD_CPU), 0xff, pool.layout.image_bytes);
+        int wrote = native_video_image_write(&pool, pool.first, f);
+        av_frame_free(&f);
+        CHECK(wrote);
+        guest_done(NV12_ODD_CPU, pool.layout.image_bytes);
+        for (u32 y = 0; y < h; y++)
+            for (u32 x = 0; x < w; x++) CHECK(GP(NV12_ODD_CPU + (u64)y * pool.layout.pitch)[x] == (u8)(y * w + x));
+        for (u32 y = 0; y < rows; y++) {
+            const u8* row = GP(NV12_ODD_CPU + pool.layout.chroma_offset + (u64)y * pool.layout.pitch);
+            for (u32 k = 0; k < pairs; k++)
+                if (row[2 * k] != (u8)(0x80 + y * pairs + k) || row[2 * k + 1] != (u8)(0x10 + y * pairs + k)) {
+                    fprintf(stderr,
+                            "vulkan_headless: a %ux%u %s picture's chroma row %u pair %u is %02x %02x in its NV12 "
+                            "image, not %02x %02x\n",
+                            w, h, semi ? "semi-planar" : "planar", y, k, row[2 * k], row[2 * k + 1],
+                            (u8)(0x80 + y * pairs + k), (u8)(0x10 + y * pairs + k));
+                    return 1;
+                }
+        }
+    }
+    CHECK(mem_unmap(NV12_ODD_CPU, NV12_ODD_SPAN) == 0);
+    return 0;
+}
 /* the vector at path (its list at list_path) through a decoder opened with hw (the device for Vulkan Video, taken
    over; NULL for none), fed as the service's pump feeds it: a packet when it asks for one, then the end of the
    stream. Every picture has its packet's timestamp and the list's MD5 (the stand-in's: black), and none is missing */
@@ -177,11 +230,28 @@ static int av1_run(const char* path, const char* list_path, void* hw, Av1Run* ru
     free(data);
     return 0;
 }
+/* the way this host decodes AV1 first: the Apple media engine where it has one and the setting allows it, else Vulkan
+   Video where the caller's device has a decode queue for it, else the CPU's decoder */
+static u32 av1_first_way(const void* hw) {
+#if defined(__APPLE__)
+    if (g_settings.apple_video_decode && nvideo_vt_available()) return NVIDEO_DECODER_VT;
+#endif
+    if (hw) return NVIDEO_DECODER_VULKAN;
+    return avcodec_find_decoder_by_name("libdav1d") ? NVIDEO_DECODER_CPU : NVIDEO_DECODER_BLACK;
+}
+/* whether Vulkan Video is asked first here: the media engine is, where this host has one */
+static int av1_vulkan_first(void) {
+#if defined(__APPLE__)
+    if (g_settings.apple_video_decode && nvideo_vt_available()) return 0;
+#endif
+    return 1; /* elsewhere the device is asked first, and the loop below skips the one without a queue */
+}
 static int check_video_av1(const char* paths_file) {
     char *path[AV1_VECTORS] = {0}, *list[AV1_VECTORS] = {0};
     const u32 cpu_way = avcodec_find_decoder_by_name("libdav1d") ? NVIDEO_DECODER_CPU : NVIDEO_DECODER_BLACK;
-    const char* as =
-        cpu_way == NVIDEO_DECODER_BLACK ? "black where the stand-in made them" : "each with its list's MD5";
+    /* what the pictures of a run were held to: the media engine's and the CPU's have the list's MD5, the stand-in's
+       are black */
+    const char* as_black = "black where the stand-in made them", *as = "each with its list's MD5";
     Av1Run run;
     size_t size = 0;
     char* text = (char*)snx_read_file(paths_file, &size);
@@ -204,7 +274,7 @@ static int check_video_av1(const char* paths_file) {
     /* the device's way from the first packet to the last: nothing these three need is refused */
     for (u32 i = 0; i < AV1_REFUSED; i++) {
         void* hw = g_renderer->nvdec_hw_device(NVDEC_HW_AV1);
-        u32 way = hw ? NVIDEO_DECODER_VULKAN : cpu_way;
+        u32 way = av1_first_way(hw);
         CHECK(!hw == !(g_vk.video_codecs & VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR));
         CHECK(!av1_run(path[i], list[i], hw, &run));
         if (run.first_way != way || run.last_way != way) {
@@ -212,11 +282,13 @@ static int check_video_av1(const char* paths_file) {
                     av1_ways[run.first_way], av1_ways[run.last_way], av1_ways[way]);
             return 1;
         }
-        printf("video AV1: %s: %u pictures, %s, from %s\n", av1_vectors[i], run.pictures, as, av1_ways[way]);
+        printf("video AV1: %s: %u pictures, %s, from %s\n", av1_vectors[i], run.pictures,
+               run.last_way == NVIDEO_DECODER_BLACK ? as_black : as, av1_ways[way]);
     }
     /* the refused one, on the renderer's device where it has one for AV1, and on a Vulkan device FFmpeg makes for
-       itself, which every machine this runs on has: the stream is refused before any device is asked */
-    for (u32 own = 0; own < 2; own++) {
+       itself, which every machine this runs on has: the stream is refused before any device is asked. The media
+       engine, where this host has one, is asked before either, so there the vector only has its pictures checked */
+    for (u32 own = 0; own < 2 && av1_vulkan_first(); own++) {
         AVBufferRef* hw = own ? NULL : g_renderer->nvdec_hw_device(NVDEC_HW_AV1);
         if (own) CHECK(av_hwdevice_ctx_create(&hw, AV_HWDEVICE_TYPE_VULKAN, NULL, NULL, 0) >= 0);
         if (!hw) continue;
@@ -227,7 +299,14 @@ static int check_video_av1(const char* paths_file) {
             return 1;
         }
         printf("video AV1: %s: %u pictures, %s, from %s after Vulkan Video refused it (%s device)\n",
-               av1_vectors[AV1_REFUSED], run.pictures, as, av1_ways[cpu_way], own ? "FFmpeg's own" : "the renderer's");
+               av1_vectors[AV1_REFUSED], run.pictures, run.last_way == NVIDEO_DECODER_BLACK ? as_black : as,
+               av1_ways[cpu_way], own ? "FFmpeg's own" : "the renderer's");
+    }
+    if (!av1_vulkan_first()) {
+        CHECK(!av1_run(path[AV1_REFUSED], list[AV1_REFUSED], NULL, &run));
+        printf("video AV1: %s: %u pictures, %s, from %s (the media engine was asked before Vulkan Video)\n",
+               av1_vectors[AV1_REFUSED], run.pictures, run.last_way == NVIDEO_DECODER_BLACK ? as_black : as,
+               av1_ways[run.last_way]);
     }
     for (u32 i = 0; i < AV1_VECTORS; i++) free(path[i]), free(list[i]);
     return 0;

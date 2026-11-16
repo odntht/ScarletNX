@@ -184,6 +184,47 @@ const char* snx_source_kind(const char* source) {
         if (snx_ends_with_nocase(source, dumps[i])) return "dump";
     return "folder";
 }
+SnxRomfs snx_romfs_state(const char* folder, const char* name) {
+    char *data = snx_format("%s/%s_data", folder, name), *part;
+    SnxRomfs state = SNX_ROMFS_WHOLE;
+    if (!data) return SNX_ROMFS_WHOLE;
+    part = snx_format("%s/%s.tmpfs", folder, name);
+    if (part && snx_is_file(part)) goto done; /* Extract to tmpfs keeps it there */
+    free(part);
+    part = snx_format("%s/%s.extracting", folder, name);
+    if (part && snx_is_file(part)) {
+        state = SNX_ROMFS_EXTRACTING;
+        goto done;
+    }
+    free(part);
+    part = snx_path_join(data, "exefs/main");
+    if (!part || !snx_is_file(part)) goto done; /* nothing extracted here, or an NRO's exefs/main.nro */
+    free(part);
+    part = snx_path_join(data, "romfs.bin");
+    if (!part || snx_is_file(part)) goto done; /* an NRO's RomFS */
+    free(part);
+    part = snx_path_join(data, "romfs.copying");
+    if (part && (snx_path_exists(part) || snx_is_link(part)))
+        state = SNX_ROMFS_STOPPED;
+    else {
+        free(part);
+        part = snx_path_join(data, "romfs");
+        if (!part || !snx_is_dir(part)) state = SNX_ROMFS_MISSING;
+    }
+done:
+    free(part);
+    free(data);
+    return state;
+}
+const char* snx_romfs_why(SnxRomfs state) {
+    switch (state) {
+        case SNX_ROMFS_EXTRACTING: return "an extraction of it stopped before it ended (its .extracting is left)";
+        case SNX_ROMFS_STOPPED: return "a copy of it stopped before it ended (romfs.copying is left)";
+        case SNX_ROMFS_MISSING: return "its exefs/ is there and its romfs/ is not";
+        case SNX_ROMFS_WHOLE: break;
+    }
+    return "";
+}
 int snx_record_source(const char* folder, const char* name, const char* dump) {
     char* ini = snx_game_ini(folder, name);
     int rc = snx_ini_record(ini, "source", dump);
@@ -252,7 +293,7 @@ int snx_addon_check(const char* folder, const char* name, const char* entry) {
     return rc;
 }
 
-static const char* const g_system_words[] = {"switch", "3ds", "vita", "gba"};
+static const char* const g_system_words[] = {"switch", "3ds", "vita", "gba", "nds"};
 const char* snx_system_word(SnxSystem system) { return g_system_words[system]; }
 SnxSystem snx_game_system(const char* folder, const char* name) {
     char *ini = snx_format("%s/%s.ini", folder, name), *word = snx_ini_value(ini, "system"), *model = NULL,
@@ -288,6 +329,29 @@ static int same_bytes(const char* a, const char* b) {
     if (y) fclose(y);
     return same;
 }
+#ifdef _WIN32
+/* Links where the disk takes them, so each game does not hold copies of the DLLs */
+int snx_copy_dlls(const char* runtime, const char* folder, int all) {
+    char **names = NULL, *from = snx_dirname(runtime), *src, *dst;
+    size_t count = 0;
+    int rc = snx_list_dir(from, &names, &count);
+    for (size_t i = 0; !rc && i < count; ++i) {
+        if (!snx_ends_with_nocase(names[i], ".dll")) continue;
+        src = snx_path_join(from, names[i]);
+        dst = snx_path_join(folder, names[i]);
+        /* a new one linked, else copied; one there already copied over when it differs (a newer zip's): with all, else
+           only when its size differs (a copy that stopped midway) */
+        int keep = !all && snx_path_exists(dst) && snx_file_size(dst) == snx_file_size(src);
+        if (snx_is_file(src) && !keep)
+            rc = (snx_path_exists(dst) || snx_link_file(src, dst)) && snx_copy_file(src, dst);
+        free(src);
+        free(dst);
+    }
+    snx_free_strings(names, count);
+    free(from);
+    return rc;
+}
+#endif
 int snx_place_runtime(const char* runtime, const char* copy, char* error, size_t error_size) {
     char *own = snx_absolute(runtime), *mine = snx_absolute(copy), *staged = snx_format("%s.tmp", copy), why[256];
     int rc = 0;
@@ -304,6 +368,19 @@ int snx_place_runtime(const char* runtime, const char* copy, char* error, size_t
             rc = -1;
         }
     }
+#ifdef _WIN32
+    /* Windows finds a program's DLLs next to it: the copy gets those next to the runtime (the package's LLVM), or it
+       does not start. All of them when the runtime was placed, else the ones the folder lacks or holds at another
+       size */
+    if (rc >= 0 && strcmp(own, mine)) {
+        char* folder = snx_dirname(mine);
+        if (!folder || snx_copy_dlls(own, folder, rc == 1)) {
+            snprintf(error, error_size, "cannot copy the runtime's DLLs to %s", folder ? folder : mine);
+            rc = -1;
+        }
+        free(folder);
+    }
+#endif
     free(staged);
     free(mine);
     free(own);

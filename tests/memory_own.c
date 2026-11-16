@@ -755,7 +755,8 @@ static void test_let_go_watched(void) {
 /* a watch: trapped pages that no resource holds. own_lookup skips it, own_stage reads its CPU bytes (through the
    mirror, or in place the shadows that own_watch took), own_trapped and own_hash see it. The first access asks the
    producer once (resolve), and lands what it published there. own_drop and own_unwatch open its pages with no resolve,
-   and a thread that holds the producer's lock drops it with no resolve and goes on. A watch never cuts an owner */
+   and a thread that holds the producer's lock drops it with no resolve, goes on and leaves its bytes owed
+   (own_owed_take). A watch never cuts an owner */
 /* An owner whose producer holds newer bytes for its span (a render target drawn again since its publish): the CPU's
    access asks the producer once before the owner lands, the producer publishes over it, and the access lands that.
    With nothing newer the owner lands as it is. A thread that holds the producer's lock is not asked */
@@ -800,6 +801,11 @@ static void test_watch(void) {
     CHECK(own_watch(a + 0x1100, 0x2000) == 0);
     CHECK(own_lookup(a, 0x10000, o, 4) == 0 && own_any());
     CHECK(own_trapped(a + 0x1000, 1) && own_trapped(a + 0x30FF, 1) && !own_trapped(a + 0x4000, 0x1000));
+    /* the first trapped byte (own_first_trapped, where vk_buf_get_window_input ends a range): the watch's first page,
+       the range's own start on a trapped page, and the range's end where none is */
+    CHECK(own_first_trapped(a, 0x10000) == a + 0x1000 && own_first_trapped(a + 0x800, 0x1000) == a + 0x1000);
+    CHECK(own_first_trapped(a + 0x1800, 0x100) == a + 0x1800);
+    CHECK(own_first_trapped(a, 0x800) == a + 0x800 && own_first_trapped(a + 0x4000, 0x1000) == a + 0x5000);
     CHECK(own_watched(a + 0x1100, 0x2000) && !own_watched(a + 0x1000, 0x2100) && !own_watched(a + 0x8000, 4));
     CHECK(own_hash(a, 0x10000, &h) == 1 && h != 0);
     CHECK(own_stage(a, sizeof buf, buf, o, 4) == 0);
@@ -825,18 +831,24 @@ static void test_watch(void) {
     CHECK(GP(a)[0x7010] == (u8)(0x11 + 0x7010));
     refs(r); /* the landing's thread done: it holds the producer's lock until then */
     CHECK(g_resolves == resolves + 2 && !own_trapped(a + 0x7000, 0x1000));
-    /* the producer's lock holder: its own_acquire and its own read drop the watch, with no resolve and no fatal */
+    /* the producer's lock holder: its own_acquire and its own read drop the watch, with no resolve and no fatal. Each
+       leaves the watch's bytes owed, for the producer to watch again when the holder lets go of its lock */
+    u64 owed = 0, owed_size = 0;
     CHECK(own_watch(a + 0x9000, 0x1000) == 0);
     g_busy_tid = plat_tid();
     own_acquire(a + 0x9000, 0x10);
     CHECK(!own_trapped(a + 0x9000, 0x1000));
+    CHECK(own_owed_take(&owed, &owed_size) && owed == a + 0x9000 && owed_size == 0x1000);
     CHECK(own_watch(a + 0x9000, 0x1000) == 0);
     CHECK(GP(a)[0x9010] == (u8)(0x11 + 0x9010));
     g_busy_tid = 0;
     CHECK(!own_trapped(a + 0x9000, 0x1000) && g_resolves == resolves + 2);
+    CHECK(own_owed_take(&owed, &owed_size) && owed == a + 0x9000 && owed_size == 0x1000);
+    CHECK(!own_owed_take(&owed, &owed_size));
     /* a watch and an owner on one page: the watch goes into the gap before the owner, and leaves it whole. A read of
        the owner's page answers the watch first (whole, its other page too), then lands the owner */
     CHECK(own_begin(a + 0xB400, 0x800, r, 0) == 0);
+    CHECK(own_first_trapped(a + 0xA000, 0x2000) == a + 0xB000); /* an owner's page */
     CHECK(own_watch(a + 0xA800, 0x1400) == 0);
     CHECK(own_lookup(a + 0xA000, 0x2000, o, 4) == 1 && o[0].addr == a + 0xB400 && o[0].size == 0x800);
     CHECK(own_watched(a + 0xA800, 0xC00) && !own_watched(a + 0xA800, 0xD00) && !own_watched(a + 0xBC00, 0x200));

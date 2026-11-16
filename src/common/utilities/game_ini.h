@@ -37,21 +37,39 @@ int snx_extracted_game(const char* path);
 char* snx_extracted_part(const char* path, int romfs);
 /* what a game's source= names, for a line about it: "folder" for an extracted game, there or not, else "dump" */
 const char* snx_source_kind(const char* source);
+/* The RomFS Extract dump keeps in the data folder of the game name in folder (<name>_data/romfs/), as a start and a
+   recompile check it: SNX_ROMFS_EXTRACTING when an extraction into it stopped before it ended and left
+   <name>.extracting in folder (it writes its files under their own names), SNX_ROMFS_STOPPED when a copy of it stopped
+   and left romfs.copying beside it, SNX_ROMFS_MISSING when exefs/ is there and romfs/ is not, else SNX_ROMFS_WHOLE:
+   romfs/ there, or none kept there (no exefs/: the game read in place; an NRO's exefs/main.nro or romfs.bin; Extract
+   to tmpfs, <name>.tmpfs) */
+typedef enum { SNX_ROMFS_WHOLE, SNX_ROMFS_EXTRACTING, SNX_ROMFS_STOPPED, SNX_ROMFS_MISSING } SnxRomfs;
+SnxRomfs snx_romfs_state(const char* folder, const char* name);
+/* the state, for a line: why a RomFS that is not whole is not ("" for SNX_ROMFS_WHOLE) */
+const char* snx_romfs_why(SnxRomfs state);
 
 /* the console a game's folder plays, as system= in [Game] of the .ini in it, <folder>/<name>.ini, says: the launcher
    picks the driver, the options and what R does by it, and cmake/deploy.cmake the runtime it copies there. A folder
    an older version made says none: a 3DS one's .ini has model=, a Vita one holds ux0/, any other is a Switch game's */
-typedef enum { SNX_SYSTEM_SWITCH, SNX_SYSTEM_3DS, SNX_SYSTEM_VITA, SNX_SYSTEM_GBA } SnxSystem;
+typedef enum { SNX_SYSTEM_SWITCH, SNX_SYSTEM_3DS, SNX_SYSTEM_VITA, SNX_SYSTEM_GBA, SNX_SYSTEM_NDS } SnxSystem;
 SnxSystem snx_game_system(const char* folder, const char* name);
-/* system='s word for each: "switch", "3ds", "vita", "gba" */
+/* system='s word for each: "switch", "3ds", "vita", "gba", "nds" */
 const char* snx_system_word(SnxSystem system);
 /* system= in [Game] of the .ini in the game's folder, <folder>/<name>.ini, as the 3DS and Vita drivers keep theirs: the
    file made when there is none. 0, or nonzero with a line saying why */
 int snx_record_system(const char* folder, const char* name, SnxSystem system);
 /* The game folder's copy of the runtime, which plays the game from then on: runtime copied to copy, through a
    temporary file and a rename (a copy that is running keeps its old file), when copy is missing or another build's;
-   nothing when runtime is copy. 1 when it copied, 0 when nothing had to, -1 with error saying why */
+   nothing when runtime is copy. On Windows the DLLs beside runtime go beside copy too (snx_copy_dlls): all of them when
+   it copied the runtime, else the ones the folder lacks or holds at another size. 1 when it copied the runtime, 0 when
+   it did not (it may still have added DLLs), -1 with error saying why */
 int snx_place_runtime(const char* runtime, const char* copy, char* error, size_t error_size);
+#ifdef _WIN32
+/* The DLLs beside the runtime, linked or copied into folder, where Windows finds them for the
+   program. With all, one that folder holds already is copied over when it differs, else only
+   when its size differs. 0, or nonzero */
+int snx_copy_dlls(const char* runtime, const char* folder, int all);
+#endif
 /* addons=: the game's updates and DLCs played with it, their entries (snx_addon_name: a title ID, an update's with
    its version), a comma between two. The most a list holds */
 #define SNX_ADDONS_MAX 2048

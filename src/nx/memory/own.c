@@ -33,7 +33,9 @@
    that finds watches on its pages asks the producer to publish its result there first (OwnHooks' resolve), with the
    producer's lock held and no mark taken. Then the watches left there go, and the owners the publish made land as any
    other. The thread that held the producer's lock before cannot wait for that publish: it drops the watches and reads
-   the CPU's bytes, as it would with no watch. In place, a watch's pages each get a shadow when it arms them */
+   the CPU's bytes, as it would with no watch. Their bytes are owed then (owe): the producer watches them again when
+   that thread lets go of its lock (own_owed_take), so the next CPU access still asks it for its result. In place, a watch's
+   pages each get a shadow when it arms them */
 #include "common/utilities/bits.h"
 #include <stdlib.h>
 #include <string.h>
@@ -61,22 +63,35 @@ static int region_owned(u64 lo, u64 hi) {
 }
 
 /* ---------------------------------------------------------------- in place (no mirror) */
-/* the shadows (OwnState's shadow, own.h): the CPU's bytes of trapped pages where there is no mirror */
-static u32 shadow_at_nl(u64 page) {
-    u32 lo = 0, hi = g_own.nshadow;
-    while (lo < hi) {
-        u32 mid = (lo + hi) / 2;
-        if (g_own.shadow[mid].page < page)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    return lo;
-}
+/* the shadows (OwnState's shadow, own.h): the CPU's bytes of trapped pages where there is no mirror, by page */
+#define SHADOW_LEAF (1u << OWN_SHADOW_LEAF_SHIFT)
+static u32 page_shift(void) { return snx_ctz64(g_own.page); }
 static u8* slot_bytes(u32 slot) { return g_own.slab + (size_t)slot * g_own.page; }
+/* page's entry in the table (its slot + 1, 0 for none), made with its leaf when make is set: NULL where there is no
+   leaf for it */
+static u32* shadow_entry_nl(u64 page, int make) {
+    const u64 pn = page >> page_shift(), l = pn >> OWN_SHADOW_LEAF_SHIFT;
+    if (!g_own.shadow) {
+        if (!make) return NULL;
+        g_own.shadow_leaves = ((AS_SIZE >> page_shift()) + SHADOW_LEAF - 1) >> OWN_SHADOW_LEAF_SHIFT;
+        g_own.shadow = (u32**)calloc((size_t)g_own.shadow_leaves, sizeof *g_own.shadow);
+        g_own.shadow_n = (u32*)calloc((size_t)g_own.shadow_leaves, sizeof *g_own.shadow_n);
+        if (!g_own.shadow || !g_own.shadow_n) fatal("Out of memory for the map of GPU-owned memory");
+    }
+    if (l >= g_own.shadow_leaves) {
+        if (make) fatal("memory: a shadow for page %llx, past the address space", (unsigned long long)page);
+        return NULL;
+    }
+    if (!g_own.shadow[l]) {
+        if (!make) return NULL;
+        if (!(g_own.shadow[l] = (u32*)calloc(SHADOW_LEAF, sizeof **g_own.shadow)))
+            fatal("Out of memory for the map of GPU-owned memory");
+    }
+    return &g_own.shadow[l][pn & (SHADOW_LEAF - 1)];
+}
 static const u8* shadow_get_nl(u64 page) {
-    u32 i = shadow_at_nl(page);
-    return i < g_own.nshadow && g_own.shadow[i].page == page ? slot_bytes(g_own.shadow[i].slot) : NULL;
+    const u32* e = shadow_entry_nl(page, 0);
+    return e && *e ? slot_bytes(*e - 1) : NULL;
 }
 static u32 slot_take_nl(void) {
     if (g_own.nfree) return g_own.slot_free[--g_own.nfree];
@@ -93,40 +108,36 @@ static u32 slot_take_nl(void) {
     return g_own.slot_top++;
 }
 /* the n pages page[] (sorted, apart), with bytes[i * g_own.page] as page[i]'s, as their shadows: a page with one keeps it,
-   from when it was first armed. One pass over the table, as a watch adds its pages at once */
+   from when it was first armed */
 static void shadow_add_nl(const u64* page, const u8* bytes, u32 n) {
-    u32 fresh = 0, i = 0;
     for (u32 j = 0; j < n; j++) {
-        while (i < g_own.nshadow && g_own.shadow[i].page < page[j]) i++;
-        if (i == g_own.nshadow || g_own.shadow[i].page != page[j]) fresh++;
-    }
-    if (!fresh) return;
-    if (g_own.nshadow + fresh > g_own.capshadow) {
-        u32 cap = g_own.capshadow ? g_own.capshadow : 64;
-        while (cap < g_own.nshadow + fresh) cap *= 2;
-        Shadow* t = (Shadow*)realloc(g_own.shadow, sizeof *t * (size_t)cap);
-        if (!t) fatal("Out of memory for the map of GPU-owned memory");
-        g_own.shadow = t;
-        g_own.capshadow = cap;
-    }
-    /* merged from the end, so no entry moves twice */
-    u32 k = g_own.nshadow + fresh;
-    i = g_own.nshadow;
-    for (u32 j = n; j-- > 0;) {
-        while (i && g_own.shadow[i - 1].page > page[j]) g_own.shadow[--k] = g_own.shadow[--i];
-        if (i && g_own.shadow[i - 1].page == page[j]) continue;
-        u32 slot = slot_take_nl();
+        u32* e = shadow_entry_nl(page[j], 1);
+        if (*e) continue;
+        const u32 slot = slot_take_nl();
         memcpy(slot_bytes(slot), bytes + (size_t)j * g_own.page, (size_t)g_own.page);
-        g_own.shadow[--k] = (Shadow){.page = page[j], .slot = slot};
+        *e = slot + 1;
+        g_own.shadow_n[(page[j] >> page_shift()) >> OWN_SHADOW_LEAF_SHIFT]++;
+        g_own.nshadow++;
     }
-    g_own.nshadow += fresh;
 }
-/* the pages [lo, hi) let go: their shadows go, and their slots are free */
+/* the pages [lo, hi) let go: their shadows go, and their slots are free. A leaf with none is skipped whole */
 static void shadow_drop_nl(u64 lo, u64 hi) {
-    u32 i = shadow_at_nl(lo), j = i;
-    while (j < g_own.nshadow && g_own.shadow[j].page < hi) g_own.slot_free[g_own.nfree++] = g_own.shadow[j++].slot;
-    memmove(&g_own.shadow[i], &g_own.shadow[j], sizeof *g_own.shadow * (size_t)(g_own.nshadow - j));
-    g_own.nshadow -= j - i;
+    const u32 sh = page_shift();
+    for (u64 pn = (lo + g_own.page - 1) >> sh, end = (hi + g_own.page - 1) >> sh; g_own.nshadow && pn < end;) {
+        const u64 l = pn >> OWN_SHADOW_LEAF_SHIFT;
+        u64 stop = (l + 1) << OWN_SHADOW_LEAF_SHIFT;
+        if (l >= g_own.shadow_leaves) break;
+        if (stop > end) stop = end;
+        for (u32* leaf = g_own.shadow_n[l] ? g_own.shadow[l] : NULL; leaf && pn < stop; pn++) {
+            u32* e = &leaf[pn & (SHADOW_LEAF - 1)];
+            if (!*e) continue;
+            g_own.slot_free[g_own.nfree++] = *e - 1;
+            *e = 0;
+            g_own.nshadow--;
+            if (!--g_own.shadow_n[l]) break;
+        }
+        pn = stop;
+    }
     if (g_own.nshadow) return;
     free(g_own.slab); /* none left: the slab goes, as a burst of watches made it big */
     free(g_own.slot_free);
@@ -430,28 +441,54 @@ static void unwatch(u64 lo, u64 hi, int whole, u64* keep) {
         c = b;
     }
 }
-/* the watches on [lo, hi), found by a landing with the producer's lock held and no mark taken: the producer publishes
-   its result over them (unless this thread held its lock before, busy), then every watch on [lo, hi) goes whole. Its
-   pages widen keep, which the landing lets go of when it is done (unwatch). A watch is an entry per run of pool pages,
-   and its pages come into the pool at different times (an owner's own_begin moves its own first): the watch entries
-   that continue the ones on [lo, hi) are the same watch, and are answered and go with them */
-static void watch_hit(u64 lo, u64 hi, int busy, u64* keep) {
-    pm_lock(&g_own.lk);
-    u32 i = first_after_nl(lo), first = g_own.nown, last = 0;
-    for (; i < g_own.nown && g_own.ent[i].lo < hi; i++)
+/* [lo, hi) widened to the whole watches on it. A watch is an entry for each run of pool pages, and its pages come into
+   the pool at different times (an owner's own_begin moves its own first): the watch entries that continue the ones on
+   [lo, hi) are the same watch. Under g_own.lk */
+static void watch_span_nl(u64* lo, u64* hi) {
+    u32 i = first_after_nl(*lo), first = g_own.nown, last = 0;
+    for (; i < g_own.nown && g_own.ent[i].lo < *hi; i++)
         if (!g_own.ent[i].res) {
             if (first == g_own.nown) first = i;
             last = i;
         }
-    if (first < g_own.nown) {
-        while (first && !g_own.ent[first - 1].res && g_own.ent[first - 1].hi == g_own.ent[first].lo) first--;
-        while (last + 1 < g_own.nown && !g_own.ent[last + 1].res && g_own.ent[last + 1].lo == g_own.ent[last].hi)
-            last++;
-        if (g_own.ent[first].lo < lo) lo = g_own.ent[first].lo;
-        if (g_own.ent[last].hi > hi) hi = g_own.ent[last].hi;
+    if (first == g_own.nown) return;
+    while (first && !g_own.ent[first - 1].res && g_own.ent[first - 1].hi == g_own.ent[first].lo) first--;
+    while (last + 1 < g_own.nown && !g_own.ent[last + 1].res && g_own.ent[last + 1].lo == g_own.ent[last].hi) last++;
+    if (g_own.ent[first].lo < *lo) *lo = g_own.ent[first].lo;
+    if (g_own.ent[last].hi > *hi) *hi = g_own.ent[last].hi;
+}
+/* watched bytes [lo, hi) whose watch goes with no publish, by a thread that held the producer's lock before: the
+   producer watches them again when that thread lets go of its lock (own_owed_take). A span that touches an owed one
+   joins it. When the list is full, the last span grows to take it in: that watches more targets, never fewer */
+static void owe(u64 lo, u64 hi) {
+    pm_lock(&g_own.lk);
+    u32 i = 0, n = g_own.nowed;
+    while (i < n && (g_own.owed[i][1] < lo || g_own.owed[i][0] > hi)) i++;
+    if (i == n && n < OWN_OWED_MAX) {
+        g_own.owed[n][0] = lo;
+        g_own.owed[n][1] = hi;
+        __atomic_store_n(&g_own.nowed, n + 1, __ATOMIC_RELEASE);
+    } else {
+        if (i == n) i = n - 1;
+        if (lo < g_own.owed[i][0]) g_own.owed[i][0] = lo;
+        if (hi > g_own.owed[i][1]) g_own.owed[i][1] = hi;
     }
     pm_unlock(&g_own.lk);
-    if (!busy && g_own.hooks.resolve) g_own.hooks.resolve(lo, hi - lo);
+}
+/* the watches on [lo, hi), found by a landing with the producer's lock held and no mark taken: the producer publishes
+   its result over them, then every watch on them goes whole. A thread that held the producer's lock before (busy)
+   cannot wait for a publish there: their bytes are owed instead. Their pages widen keep, which the landing lets go of
+   when it is done (unwatch) */
+static void watch_hit(u64 lo, u64 hi, int busy, u64* keep) {
+    pm_lock(&g_own.lk);
+    watch_span_nl(&lo, &hi);
+    pm_unlock(&g_own.lk);
+    if (g_own.hooks.resolve) {
+        if (busy)
+            owe(lo, hi);
+        else
+            g_own.hooks.resolve(lo, hi - lo);
+    }
     unwatch(lo, hi, 1, keep);
 }
 
@@ -516,6 +553,7 @@ static void land_pages(u64 lo, u64 hi, int by) {
        the owners here up to date first, once, before any mark, as it answers a watch. Not when this thread held
        its lock before: its own reads take what is pending from the producer */
     if (real && !busy && g_own.hooks.refresh) g_own.hooks.refresh(lo, hi - lo);
+    if (g_own.hooks.claim) g_own.hooks.claim(lo, hi);
     pm_lock(&g_own.lk);
     for (;;) {
         while (landing_nl(lo, hi)) pc_wait(&g_own.cv, &g_own.lk, -1);
@@ -666,12 +704,14 @@ static void own_fault(u8* p, int write, u32 tid) {
     if (tid && g_own.hooks.busy_tid && tid == g_own.hooks.busy_tid()) {
         int fault_state = plat_thread_in_fault(tid);
         if (fault_state != 0) {
-            /* only watches there: they go, and the thread reads the CPU's bytes, as with no watch (own_watch) */
+            /* only watches there: they go, and the thread reads the CPU's bytes, as with no watch. The page is owed:
+               the holder watches the targets over it again when it lets go of its lock (own_watch) */
             pm_lock(&g_own.lk);
             u32 i = next_real_nl(first_after_nl(page), page + g_own.page);
             int real = i < g_own.nown && g_own.ent[i].lo < page + g_own.page;
             pm_unlock(&g_own.lk);
             if (!real) {
+                if (g_own.hooks.resolve) owe(page, page + g_own.page);
                 unwatch(page, page + g_own.page, 1, NULL);
                 return;
             }
@@ -891,6 +931,19 @@ u32 own_stage(u64 addr, u64 size, u8* dst, OwnRange* out, u32 max) {
     u64 lo = addr & ~(g_own.page - 1), hi = (addr + size + g_own.page - 1) & ~(g_own.page - 1), at = addr;
     u32 n, i;
     int trapped;
+    /* No entry on its pages, in a 4 MB region that has one: read as they are, with one look under the lock. Each
+       constant buffer of one game's busy scene sat in such a region, and took the landing's locks, the lookup's and
+       the check's below in turn: about 2.5% of the renderer thread's time in the system's lock code */
+    if (own_any() && region_owned(lo, hi)) {
+        pm_lock(&g_own.lk);
+        u32 f = first_after_nl(lo);
+        trapped = f < g_own.nown && g_own.ent[f].lo < hi;
+        pm_unlock(&g_own.lk);
+        if (!trapped) {
+            memcpy(dst, GP(addr), (size_t)size);
+            return 0;
+        }
+    }
     /* in place, a trapped page whose CPU bytes it reads and no shadow holds lands first: before the lookup, whose
        resources a landing would release */
     if (!g_own.mirror && g_own.traps && own_any() && region_owned(lo, hi)) {
@@ -1016,6 +1069,37 @@ int own_watched(u64 addr, u64 size) {
     return all;
 }
 
+int own_covered(u64 addr, u64 size) {
+    u64 c = addr, end = addr + size;
+    int all = 1;
+    if (!size || !own_any() || !region_owned(addr, end)) return 0;
+    pm_lock(&g_own.lk);
+    for (u32 i = first_after_nl(addr); c < end; i++) {
+        if (i >= g_own.nown || g_own.ent[i].lo > c || g_own.ent[i].landing) {
+            all = 0;
+            break;
+        }
+        c = g_own.ent[i].hi;
+    }
+    pm_unlock(&g_own.lk);
+    return all;
+}
+
+int own_owed_take(u64* addr, u64* size) {
+    int any = 0;
+    if (!__atomic_load_n(&g_own.nowed, __ATOMIC_ACQUIRE)) return 0;
+    pm_lock(&g_own.lk);
+    u32 n = g_own.nowed;
+    if (n) {
+        *addr = g_own.owed[n - 1][0];
+        *size = g_own.owed[n - 1][1] - g_own.owed[n - 1][0];
+        __atomic_store_n(&g_own.nowed, n - 1, __ATOMIC_RELEASE);
+        any = 1;
+    }
+    pm_unlock(&g_own.lk);
+    return any;
+}
+
 void own_unwatch(u64 addr, u64 size) {
     if (size && own_any() && region_owned(addr, addr + size)) unwatch(addr, addr + size, 0, NULL);
 }
@@ -1028,6 +1112,19 @@ int own_trapped(u64 addr, u64 size) {
     any = owned_nl(lo, hi);
     pm_unlock(&g_own.lk);
     return any;
+}
+
+u64 own_first_trapped(u64 addr, u64 size) {
+    u64 lo = addr & ~(g_own.page - 1), hi = (addr + size + g_own.page - 1) & ~(g_own.page - 1), at = addr + size;
+    if (!size || !own_any() || !region_owned(lo, hi)) return at;
+    pm_lock(&g_own.lk);
+    u32 i = first_after_nl(lo);
+    if (i < g_own.nown && g_own.ent[i].lo < hi) { /* the entries are in address order: the first is the lowest */
+        u64 page = g_own.ent[i].lo & ~(g_own.page - 1);
+        at = page > addr ? page : addr;
+    }
+    pm_unlock(&g_own.lk);
+    return at;
 }
 
 void own_acquire(u64 addr, u64 size) {

@@ -6,6 +6,7 @@
 #include "common/cpu/recompiler/auto_workers.h"
 #include "common/cpu/recompiler/compile_thread.h"
 #include "nx/loader/codegen_view.h"
+#include "nx/loader/ounce.h"
 #include "common/cpu/recompiler/llvm/ir.h"
 #include "common/cpu/recompiler/llvm/link.h"
 #include "common/cpu/recompiler/llvm/objects_pack.h"
@@ -175,8 +176,9 @@ end:
     return order;
 }
 
-/* SnxIr.bound: the function the BR at address reaches once it is bound, 0 for none */
-static SnxU64 bound_at(void* user, SnxU64 address) {
+/* SnxIr.bound: the function the BR at address reaches once it is bound, 0 for none, and whether its slot may hold
+   another */
+static SnxU64 bound_at(void* user, SnxU64 address, int* guard) {
     const Queue* q = (const Queue*)user;
     size_t lo = 0, hi = q->bound_count;
     while (lo < hi) {
@@ -186,7 +188,9 @@ static SnxU64 bound_at(void* user, SnxU64 address) {
         else
             hi = middle;
     }
-    return lo < q->bound_count && q->bound[lo].at == address ? q->bound[lo].target : 0;
+    if (lo == q->bound_count || q->bound[lo].at != address) return 0;
+    *guard = q->bound[lo].guard;
+    return q->bound[lo].target;
 }
 /* SnxIr.direct: nonzero for a target the module imports, which its snx_aot_<target> calls */
 static SnxU64 imported(void* user, SnxU64 target) {
@@ -816,8 +820,8 @@ int snx_build_module_llvm(SnxProgram* loaded, const SnxCodegenOptions* options, 
         snx_error("--jit-cache cannot go with --target %s: a JIT cache is this host's", build->triple);
         goto done;
     }
-    /* an Ounce program's CPU (loader/ounce.h): the runtime JIT takes the same features from the same NPDM */
-    SnxU64 features = g_settings.cpu_extensions || loaded->npdm.ounce ? SNX_A64_TARGET_SWITCH_EXTENDED : 0;
+    /* the program's CPU (loader/ounce.h): the runtime JIT takes the same features from the same NPDM */
+    SnxU64 features = snx_guest_features(loaded->npdm.ounce, g_settings.cpu_extensions);
     if (options->jit_cache) {
         char* key = snx_jit_cache_key(build->opt, options->hook_direct_calls, 1, features);
         if (!key) {
@@ -1014,8 +1018,10 @@ int snx_build_module_llvm(SnxProgram* loaded, const SnxCodegenOptions* options, 
             snx_error("linking failed: %s", error);
             goto done;
         }
-        if (snx_write_file(tmp, linked.data, linked.size) || plat_replace_file(tmp, build->output)) {
-            snx_error("linking failed: cannot write %s", build->output);
+        /* a module Android can map: its text is loaded executable, which its file must allow there */
+        if (snx_write_file(tmp, linked.data, linked.size) || snx_make_executable(tmp) ||
+            plat_replace_file(tmp, build->output)) {
+            snx_error("linking failed: cannot write %s or make it executable", build->output);
             if (snx_is_file(tmp)) snx_remove_tree(tmp);
             goto done;
         }

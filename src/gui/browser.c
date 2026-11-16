@@ -35,6 +35,8 @@ bool gui_is_vpk(const char* name) { return suffix(name, ".vpk"); }
 /* a GBA ROM: a cartridge's image, or a MultiBoot ROM (.mb), the program the console receives through the link cable */
 bool gui_is_gba(const char* name) { return suffix(name, ".gba") || gui_is_multiboot(name); }
 bool gui_is_multiboot(const char* name) { return suffix(name, ".mb"); }
+/* a DS card's image */
+bool gui_is_nds(const char* name) { return suffix(name, ".nds"); }
 /* an Android app, one APK or a bundle of split APKs (an XAPK, an APKS) that scarletnx-android installs */
 bool gui_is_apk(const char* name) { return suffix(name, ".apk") || suffix(name, ".xapk") || suffix(name, ".apks"); }
 bool gui_is_dump(const char* name) {
@@ -108,7 +110,7 @@ static bool playable(const char* directory, char* name, int kinds) {
     char* path;
     bool listed;
     if (name[0] == '.') return false;
-    if (gui_is_cia(name) || gui_is_vpk(name) || gui_is_gba(name) || gui_is_apk(name)) {
+    if (gui_is_cia(name) || gui_is_vpk(name) || gui_is_gba(name) || gui_is_nds(name) || gui_is_apk(name)) {
         if (!(kinds & GUI_GAMES_CIA)) return false;
         path = snx_path_join(directory, name);
         listed = path && snx_is_file(path);
@@ -296,10 +298,12 @@ char* gui_game_shown(const char* path) {
 }
 /* a Switch game's file to play from when it is not there, owned: source= in its .ini, or an older version's link
    <name>.source by where it points, naming a dump or an extracted game's folder that it reads in place, its ExeFS not
-   extracted into its <name>_data (driver.c's drop_extraction); else NULL */
+   extracted into its <name>_data (driver.c's drop_extraction), or whose RomFS there is not whole (snx_romfs_state),
+   which the driver extracts again from it: "" for such a RomFS when no file is named; else NULL */
 static char* switch_missing(const char* folder, const char* name) {
     char *source, *target, link[SNX_PATH_SIZE], exefs[SNX_PATH_SIZE];
     int recorded = 0;
+    SnxRomfs romfs;
     if (snx_path_format(link, sizeof link, "%s/%s.source", folder, name) ||
         snx_path_format(exefs, sizeof exefs, "%s/%s_data/exefs", folder, name) ||
         !(source = snx_game_source(folder, name, &recorded)))
@@ -308,9 +312,14 @@ static char* switch_missing(const char* folder, const char* name) {
         free(source);
         source = target;
     }
-    if (!recorded || snx_is_file(source) || snx_extracted_game(source) || snx_is_dir(exefs)) {
+    if (recorded && (snx_is_file(source) || snx_extracted_game(source))) { /* there */
         free(source);
         return NULL;
+    }
+    romfs = snx_romfs_state(folder, name);
+    if (!recorded || (snx_is_dir(exefs) && romfs == SNX_ROMFS_WHOLE)) { /* none named, or played from its extraction */
+        free(source);
+        return recorded || romfs == SNX_ROMFS_WHOLE ? NULL : snx_strdup("");
     }
     return source;
 }
@@ -363,7 +372,8 @@ bool gui_game_source_missing(const char* path, const char* work, char* out, size
     name = snx_strdup(snx_path_leaf(folder));
     switch (snx_game_system(folder, name)) {
         case SNX_SYSTEM_SWITCH: file = switch_missing(folder, name); break;
-        case SNX_SYSTEM_GBA: file = gba_missing(folder, name); break;
+        case SNX_SYSTEM_GBA:
+        case SNX_SYSTEM_NDS: file = gba_missing(folder, name); break; /* a card image, named as a ROM is */
         case SNX_SYSTEM_3DS: file = ctr_missing(folder, name, work); break;
         case SNX_SYSTEM_VITA: file = vita_missing(folder); break;
     }
@@ -757,7 +767,7 @@ bool gui_games_add_deep(GuiGames* games, const char* directory, int kinds, int d
 bool gui_games_heading(const GuiGames* games, size_t i) { return i < games->count && !games->paths[i]; }
 bool gui_games_dumps_group(const GuiGames* games, size_t i) {
     return gui_is_dump(games->names[i]) || gui_is_cia(games->names[i]) || gui_is_vpk(games->names[i]) ||
-           gui_is_gba(games->names[i]) || gui_is_apk(games->names[i]);
+           gui_is_gba(games->names[i]) || gui_is_nds(games->names[i]) || gui_is_apk(games->names[i]);
 }
 bool gui_dump_title(const char* path, GuiDumpTitle* title) {
     size_t size = 0;

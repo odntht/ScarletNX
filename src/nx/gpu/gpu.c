@@ -99,12 +99,14 @@ void gmem_write_raw(u64 gva, const void* src, u64 size) { copy_runs(gva, NULL, (
 /* whether anything the renderer holds may cover [gva, gva + size): one lookup where each hook below makes its own */
 static int mem_pending(u64 gva, u64 size) { return !g_renderer->mem_pending || g_renderer->mem_pending(gva, size); }
 void gmem_need(u64 gva, u64 size) {
-    if ((__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE) || g_cs_any || g_gfx_any || g_gfx_img_any || g_uma_any) &&
+    if ((__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE) || g_cs_any || g_gfx_any || g_gfx_img_any || g_uma_any ||
+         g_mir_any) &&
         !mem_pending(gva, size))
         return;
     if (!size) return;
     if (g_cs_any && g_renderer->cs_mem_need) g_renderer->cs_mem_need(gva, size);
-    if ((g_gfx_any || g_gfx_img_any || g_uma_any) && g_renderer->gfx_mem_need) g_renderer->gfx_mem_need(gva, size);
+    if ((g_gfx_any || g_gfx_img_any || g_uma_any || g_mir_any) && g_renderer->gfx_mem_need)
+        g_renderer->gfx_mem_need(gva, size);
     if (__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE) && g_renderer->release_need)
         g_renderer->release_need(gva, size);
 }
@@ -114,7 +116,8 @@ void gmem_before_write(u64 gva, u64 size) {
     if (size && g_gpu_before_write) g_gpu_before_write(gva, size);
 }
 int gmem_read(u64 gva, void* dst, u64 size) {
-    if ((__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE) || g_cs_any || g_gfx_any || g_gfx_img_any || g_uma_any) &&
+    if ((__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE) || g_cs_any || g_gfx_any || g_gfx_img_any || g_uma_any ||
+         g_mir_any) &&
         !mem_pending(gva, size))
         return copy_runs(gva, (u8*)dst, NULL, size) ? 0 : -1;
     /* a queued release's payload is known: the stream reads it without waiting for the work before it, as the console's
@@ -125,7 +128,7 @@ int gmem_read(u64 gva, void* dst, u64 size) {
         if (r > 0) return 0;
         if (r < 0) g_renderer->release_need(gva, size);
         if (g_cs_any) g_renderer->cs_mem_need(gva, size);
-        if (g_gfx_any || g_gfx_img_any || g_uma_any) g_renderer->gfx_mem_need(gva, size);
+        if (g_gfx_any || g_gfx_img_any || g_uma_any || g_mir_any) g_renderer->gfx_mem_need(gva, size);
         gmem_read_raw(gva, dst, size);
         return 0;
     }
@@ -138,6 +141,14 @@ int gmem_write(u64 gva, const void* src, u64 size) {
     gmem_before_write(gva, size);
     all = copy_runs(gva, NULL, (const u8*)src, size);
     gpu_mem_written(gva, size);
+    return all ? 0 : -1;
+}
+int gmem_write_cb(u64 gva, const void* src, u64 size) {
+    int all;
+    if (!size) return 0;
+    gmem_before_write(gva, size);
+    all = copy_runs(gva, NULL, (const u8*)src, size);
+    gpu_mem_written_cb(gva, size);
     return all ? 0 : -1;
 }
 /* the host pointer of [gva, gva + size) when contiguous, what the GPU holds of it landed (memory/own.c): the caller
@@ -169,13 +180,22 @@ u32 gmem_r32(u64 gva) {
        result, over any guest memory, take the general path below, and so does a word on a host page the GPU owns
        bytes of: the page is trapped, and the caller may hold the renderer's lock, which its landing needs */
     u64 cpu = 0, owners = 0;
-    if (!g_cs_any && !g_gfx_any && !g_gfx_img_any && !g_uma_any &&
+    if (!g_cs_any && !g_gfx_any && !g_gfx_img_any && !g_uma_any && !g_mir_any &&
         !__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE) && gmmu_run(gva, 4, &cpu) == 4 &&
         !own_hash(cpu, 4, &owners))
         return snx_ld_le32(GP(cpu));
     u8 b[4] = {0};
     gmem_read(gva, b, 4);
     return snx_ld_le32(b);
+}
+const u8* gmem_cpu_bytes(u64 gva, u64 size) {
+    u64 cpu = 0, owners = 0;
+    if ((__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE) || g_cs_any || g_gfx_any || g_gfx_img_any || g_uma_any ||
+         g_mir_any) &&
+        mem_pending(gva, size))
+        return NULL;
+    if (!size || gmmu_run(gva, size, &cpu) != size || own_hash(cpu, size, &owners)) return NULL;
+    return GP(cpu);
 }
 void gmem_w32(u64 gva, u32 v) {
     u8 b[4];
@@ -401,8 +421,10 @@ void i2m_data(GpuChannel* ch, u32 v) {
 /* the 3D state a channel starts from: zero, but for what games expect without setting it (Eden's
    InitializeRegisterDefaults), and ScarletNX's own: color masks enabled (two games never write them), sRGB writes
    on (framebuffer_srgb, else sRGB targets come out too dark), the render enable TRUE and its override
-   USE_RENDER_ENABLE (deko3d never writes it). The registers and their values are Eden's Maxwell3D::Regs fields
-   and enums (maxwell_3d_regs.h) */
+   USE_RENDER_ENABLE (deko3d never writes it), the tessellation levels 1, as the NVN path starts them (a patch
+   drawn without a control program before any level is set is not culled), and every sample in the sample masks, as
+   deko3d starts them (a draw before any mask is set writes them all). The registers and their values are Eden's
+   Maxwell3D::Regs fields and enums (maxwell_3d_regs.h) */
 static void reset_3d(u32* r) {
     static const float one = 1.0f;
     u32 i, f1;
@@ -443,6 +465,8 @@ static void reset_3d(u32* r) {
     r[MAXWELL3D_GL_FRONT_FACE] = MAXWELL3D_FRONT_FACE_CLOCKWISE;
     r[MAXWELL3D_GL_CULL_FACE] = MAXWELL3D_CULL_FACE_BACK;
     r[MAXWELL3D_POINT_SIZE] = f1;
+    for (i = 0; i < 6; i++) r[MAXWELL3D_TESS_LEVELS + i] = f1;
+    for (i = 0; i < 4; i++) r[MAXWELL3D_SAMPLE_MASK + i] = 0xFFFF;
     for (i = 0; i < MAXWELL3D_NUM_VERTEX_ATTRIBUTES; i++)
         r[MAXWELL3D_VERTEX_ATTRIB_FORMAT + i] = MAXWELL3D_VERTEX_ATTRIB_CONSTANT; /* constant until set */
     r[MAXWELL3D_RASTERIZE_ENABLE] = 1;
@@ -827,7 +851,9 @@ static void job_end(const GpuItem* j, GpuChannel* ch) {
     dma_snap_finish(j->chan, j->id);
     for (i = 0; i < j->incs; i++) stream_incr(j->chan);
     if (g_renderer->stream_end) g_renderer->stream_end();
-    v = g_renderer->release_value ? g_renderer->release_value(j->chan) : syncpt_read(j->chan);
+    v = g_renderer->release_value_at_least ? g_renderer->release_value_at_least(j->chan)
+        : g_renderer->release_value        ? g_renderer->release_value(j->chan)
+                                           : syncpt_read(j->chan);
     if ((i32)(v - j->expect) < 0)
         WARN_LIMIT(8, "gpu: channel %u ended a submission at syncpoint value %u, short of the %u it promised\n",
                    j->chan, v, j->expect);

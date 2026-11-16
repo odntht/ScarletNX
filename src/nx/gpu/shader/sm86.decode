@@ -285,6 +285,14 @@ UP2UR        ---- 001 010000011
 UP2UR        ---- 010 010000011
 UP2UR        ---- 100 010000011
 PLOP3        ---- 100 000011100
+# 0x80d, which neither NAK nor CuAssembler's sm_86 list has: by the name, PSETP ("Combine Predicates and Set
+# Predicate"), which NVIDIA's Ampere instruction set table lists in the predicate group beside PLOP3 (0x81c) and which
+# compute compilers don't emit. An Ounce game's vertex programs end with two of them after six FSETPs of the position
+# against its w (P0 to P5, outside each clip plane), then @P0 EXIT before any output is written: a cull test of the
+# vertex. Its destinations are at bits 81 and 84 as PLOP3's (both PT in the first, P0 in the second); bits 32-63 hold
+# 0xc4321111 in the first and 0x80000000 in the second, by their nibbles the predicate operands (not decoded). Only
+# this form is seen
+PSETP        ---- 100 000001101
 UPLOP3       ---- 100 010011100
 CS2R         ---- 100 000000101
 S2R          ---- 100 100011001
@@ -395,6 +403,13 @@ OUT          ---- 001 100100100
 OUT          ---- 100 100100100
 OUT          ---- 101 100100100
 OUT          ---- 110 100100100
+# LEPC (0x34e): the address of its own instruction into a register pair (CuAssembler's sm_86 record "LEPC R128"). A
+# geometry program that ends through an exit stub adds the stub's offset to it and hands the sum to 0x357, which sets
+# where EXIT goes on; the stub runs OUT and 0x957 before its own EXIT (nxnative's notes on one game's geometry
+# program, MIT). No public table names 0x357 or 0x957
+LEPC         ---- 001 101001110
+STUB_SET     ---- 001 101010111
+STUB_END     ---- 100 101010111
 # textures and surfaces: the handle in a constant buffer, or bindless (.B, in a register)
 TEX          ---- 101 101100000
 TEX_B        ---- 001 101100001
@@ -408,14 +423,16 @@ TXD          ---- 101 101101100
 TXD_B        ---- 001 101101101
 TXQ          ---- 101 101101111
 TXQ_B        ---- 001 101110000
-# TEX, TLD, TLD4 and TXQ with the handle in a uniform register: the constant buffer codes with bit 10, the register at
-# 40-45 in place of the constant buffer's reference, bit 91 set, the rest of the fields theirs. CuAssembler's sm_86
-# records: "TEX.SCR.LL.DC R34, R8, R2, R6, UR4, 2D" (0x00000000099e4f08_3000040602227f60) and "TXQ R35, R20, UR12,
-# TEX_HEADER_DIMENSION, 0x2" (0x00000000080002ff_00000c0014237f6f). One game's programs take the handle from memory:
-# an LDG.64 of a table of handles, R2UR, then UR + 1 = UR >> 20, the sampler's index
+# TEX, TLD, TLD4, TXD and TXQ with the handle in a uniform register: the constant buffer codes with bit 10, the
+# register at 40-45 in place of the constant buffer's reference, bit 91 set, the rest of the fields theirs.
+# CuAssembler's sm_86 records: "TEX.SCR.LL.DC R34, R8, R2, R6, UR4, 2D" (0x00000000099e4f08_3000040602227f60) and
+# "TXQ R35, R20, UR12, TEX_HEADER_DIMENSION, 0x2" (0x00000000080002ff_00000c0014237f6f). One game's programs take the
+# handle from memory: an LDG.64 of a table of handles, R2UR, then UR + 1 = UR >> 20, the sampler's index. Another
+# game's fragment and compute programs sample with TXD this way (0xf6c, with TXD's fields: Lichii's lowering of it)
 TEX_U        ---- 111 101100000
 TLD_U        ---- 111 101100110
 TLD4_U       ---- 111 101100011
+TXD_U        ---- 111 101101100
 TXQ_U        ---- 111 101101111
 SULD_P       ---- 101 110010111
 SULD_P_B     ---- 100 110011000

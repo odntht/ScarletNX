@@ -5,11 +5,13 @@
    image, and the window's swapchain shows both screens, the top one above the bottom one as on the console, each
    keeping its shape (frame_layout). With separate screens each one has its own window and fills it. Nothing of the
    frame passes through the CPU. The frame dumps (the first eight, then each screen's latest about once a second, in
-   frame_dir) and the tests' hashes are the one readback: the shader writes those frames' RGBA pixels to a
-   host-visible buffer as well, and a latest dump is written once the GPU is done, without a wait for it. The 3DS framebuffer is 240x400/320 portrait, one 240-pixel row per screen column from
+   frame_dir), the tests' hashes and --shot read a frame back: the shader writes those frames' RGBA pixels to a
+   host-visible buffer as well, and a latest dump is written once the GPU is done, without a wait for it. --shot copies
+   each screen's image at its render scale into a buffer of its own. The 3DS framebuffer is 240x400/320 portrait, one 240-pixel row per screen column from
    the left, each row from the bottom of the screen up (libctru's console draws pixel (x, y) at x * 240 + 239 - y);
    the window and the dumps show it that way round. A 3D render scaled by its screen's resolution setting is drawn
-   from its render target while the GPU keeps that newer than memory. */
+   from its render target while the GPU keeps that newer than memory, or from the copy that a display transfer made
+   of it. */
 #include "3ds/gpu/present.h"
 #include "3ds/board/clock.h"
 #include "3ds/input/input.h"
@@ -19,6 +21,7 @@
 #include "3ds/gpu/vk/vk_y2r.h"
 #include "3ds/gpu/vk/vk_render.h"
 #include "common/utilities/bits.h"
+#include "common/gpu/vk/notice.h"
 #include "common/gpu/vk/swapchain.h"
 #include "common/utilities/build_info.h"
 #include "common/utilities/common.h"
@@ -26,11 +29,18 @@
 #include "common/platform/file.h"
 #include "common/utilities/window_icon.h"
 #include "snx_settings.h"
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define MAX_SIDE 1024u /* the largest framebuffer side presented */
+
+static volatile sig_atomic_t g_quit; /* a headless run's Ctrl+C or SIGTERM */
+static void quit_signal(int signal_number) {
+    (void)signal_number;
+    g_quit = 1;
+}
 
 typedef struct {
     VkImage image;
@@ -50,6 +60,11 @@ static struct {
     SnxVkSwapchain swap[2]; /* the combined window's, or each screen's own */
     /* each submission slot's: a slot is free again only once its submission is done, and so are they */
     VkSemaphore acquire[2][SNX_CTR_VK_SLOTS], presented[2][SNX_CTR_VK_SLOTS];
+    /* a line over the game for a few seconds, as a Switch game shows one: Esc's first press. In the window it was
+       asked in, each window's band copied by its own (common/gpu/vk/notice.h) */
+    SnxNotice notice;
+    SDL_WindowID notice_window;
+    SnxVkNotice* notice_vk[2];
     const char* frame_dir;
     unsigned dumps;
     double latest_at[2];   /* past the first dumps, when each screen's latest was last kept (host seconds) */
@@ -62,6 +77,8 @@ static struct {
     } pending;
     unsigned bottom_alone; /* bottom screen frames since the window last showed, the top screen showing none */
     uint64_t decoded[2];   /* each screen's frames decoded */
+    uint64_t
+        console_frames; /* the console's frames: the top screen's, or the bottom's until the first top screen frame */
     uint64_t unshown;      /* the shows that found every image of their window on the display */
     uint64_t quit_by;      /* a second Esc before this closes the window (common/utilities/quit_key.h) */
     SDL_FingerID finger;   /* the finger holding the touch screen, while one does (by_finger) */
@@ -154,30 +171,42 @@ static bool semaphores(const SnxCtrVk* v, const VkSemaphoreCreateInfo* si) {
                 return false;
     return true;
 }
-bool snx_ctr_present_init(SnxCtrMemory* memory, const char* frame_dir) {
+bool snx_ctr_present_init(SnxCtrMemory* memory, const char* frame_dir, bool headless) {
     if (g_present.up) return true;
     /* a finger and the mouse each reach the touch screen once, as on the Switch (backend/sdl3.c): SDL would also send
        each as the other, and a pen as both (it stays a finger) */
     SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
     SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
     SDL_SetHint(SDL_HINT_PEN_MOUSE_EVENTS, "0");
-    char why[1024];
-    if (!snx_ctr_vk_init(memory, why, sizeof why)) {
-        fprintf(stderr, "3ds gpu: %s\n", why);
-        return false;
+    /* Headless starts no SDL video, audio or gamepad, so it installs the signal handler itself: Ctrl+C and SIGTERM
+       end the run with its report, --shot and a finalised WAV */
+    if (headless) {
+        g_quit = 0;
+        signal(SIGINT, quit_signal);
+        signal(SIGTERM, quit_signal);
     }
+    char why[1024];
+    if (!snx_ctr_vk_init(memory, headless, why, sizeof why)) {
+        fprintf(stderr, "3ds gpu: %s\n", why);
+        memset(&g_present, 0, sizeof g_present);
+        return false; /* the signal handlers stay for a headless run with no Vulkan device */
+    }
+    /* the device is up: from here the presenter's free unwinds a partial start too */
+    g_present.up = 1;
     const SnxCtrVk* v = snx_ctr_vk();
     g_present.frame_dir = frame_dir;
     g_present.separate = g_settings.ctr_separate_screens && v->second && v->second_surface;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                              .size = (VkDeviceSize)MAX_SIDE * MAX_SIDE * 4,
-                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    if (!snx_ctr_vk_compute(snx_ctr_present_spv, snx_ctr_present_spv_size / 4, 2, 2, 36, &g_present.decode) ||
+    if (!snx_ctr_vk_compute(snx_ctr_present_spv, snx_ctr_present_spv_size / 4, 3, 2, 52, &g_present.decode) ||
         !frame_make(&g_present.source_dummy, 1, 1, 1) ||
-        vkCreateBuffer(v->device, &bi, NULL, &g_present.readback) != VK_SUCCESS)
+        vkCreateBuffer(v->device, &bi, NULL, &g_present.readback) != VK_SUCCESS) {
+        snx_ctr_present_free();
         return false;
+    }
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(v->device, g_present.readback, &req);
     /* host-cached where the device has it: the host reads these frames */
@@ -193,9 +222,16 @@ bool snx_ctr_present_init(SnxCtrMemory* memory, const char* frame_dir) {
     if (type == UINT32_MAX || vkAllocateMemory(v->device, &ai, NULL, &g_present.readback_memory) != VK_SUCCESS ||
         vkBindBufferMemory(v->device, g_present.readback, g_present.readback_memory, 0) != VK_SUCCESS ||
         vkMapMemory(v->device, g_present.readback_memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS ||
-        !semaphores(v, &si))
+        !semaphores(v, &si)) {
+        snx_ctr_present_free();
         return false;
+    }
     g_present.readback_view = mapped;
+    for (unsigned screen = 0; screen < 2; ++screen)
+        if (!(g_present.notice_vk[screen] = snx_vk_notice_create(v->phys, v->device, SNX_CTR_VK_SLOTS))) {
+            snx_ctr_present_free();
+            return false;
+        }
     image_barrier(snx_ctr_vk_commands(), g_present.source_dummy.image, VK_IMAGE_LAYOUT_UNDEFINED,
                   VK_IMAGE_LAYOUT_GENERAL);
     g_present.source_dummy.layout = VK_IMAGE_LAYOUT_GENERAL;
@@ -210,7 +246,6 @@ bool snx_ctr_present_init(SnxCtrMemory* memory, const char* frame_dir) {
                                                       : "at once, tearing (immediate)",
                 g_settings.vsync);
     }
-    g_present.up = 1;
     return true;
 }
 void snx_ctr_present_title(const char* name, const char* addons) {
@@ -254,12 +289,13 @@ static bool dump_due(unsigned screen) {
 static void write_ppm(unsigned screen, unsigned width, unsigned height, const unsigned char* rgba) {
     bool latest = g_present.dumps >= 8;
     char path[1024], staged[1040];
-    if (latest)
-        snprintf(path, sizeof path, "%s/frame-%u-latest.ppm", g_present.frame_dir, screen);
-    else
-        snprintf(path, sizeof path, "%s/frame-%u-%02u.ppm", g_present.frame_dir, screen, g_present.dumps);
-    snx_path_native(path);
-    snprintf(staged, sizeof staged, "%s.partial", path);
+    if (latest) {
+        if (snx_path_format(path, sizeof path, "%s/frame-%u-latest.ppm", g_present.frame_dir, screen)) return;
+        if (snx_path_format(staged, sizeof staged, "%s.partial", path)) return;
+    } else {
+        if (snx_path_format(path, sizeof path, "%s/frame-%u-%02u.ppm", g_present.frame_dir, screen, g_present.dumps))
+            return;
+    }
     FILE* file = fopen(latest ? staged : path, "wb");
     if (!file) return;
     /* the landscape rows are the framebuffer's columns from its last, each column's pixels a framebuffer row apart */
@@ -284,32 +320,37 @@ static void write_pending(bool wait) {
     write_ppm(g_present.pending.screen, g_present.pending.width, g_present.pending.height, g_present.readback_view);
 }
 /* The blit rectangle of a screen in swapchain pixels: in one window the pair scaled to fit and centred, each screen
-   centred across the layout; in its own window the screen scaled to fit and centred. False before a layout and a
-   swapchain exist. */
+   centred across the layout; in its own window the screen scaled to fit and centred. The layout takes each screen at
+   the console's size (its frame's size over its render scale), so screens at different scales keep the console's
+   proportions. False before a layout and a swapchain exist. */
 static bool screen_rect(unsigned screen, VkOffset2D rect[2]) {
     const Frame* frames = g_present.frames;
+    uint32_t width[2], height[2];
+    for (unsigned i = 0; i < 2; ++i) {
+        width[i] = frames[i].scale ? frames[i].width / frames[i].scale : 0;
+        height[i] = frames[i].scale ? frames[i].height / frames[i].scale : 0;
+    }
     unsigned window = g_present.separate ? screen : 0;
     VkExtent2D e = g_present.swap[window].extent;
     if (g_present.separate) {
-        const Frame* f = &frames[screen];
-        if (!f->width || !f->height || !e.width || !e.height) return false;
-        double scale = (double)e.width / f->width < (double)e.height / f->height ? (double)e.width / f->width
-                                                                                 : (double)e.height / f->height;
-        double x = (e.width - f->width * scale) / 2, y = (e.height - f->height * scale) / 2;
+        if (!width[screen] || !height[screen] || !e.width || !e.height) return false;
+        double scale = (double)e.width / width[screen] < (double)e.height / height[screen]
+                           ? (double)e.width / width[screen]
+                           : (double)e.height / height[screen];
+        double x = (e.width - width[screen] * scale) / 2, y = (e.height - height[screen] * scale) / 2;
         rect[0] = (VkOffset2D){(int32_t)x, (int32_t)y};
-        rect[1] = (VkOffset2D){(int32_t)(x + f->width * scale), (int32_t)(y + f->height * scale)};
+        rect[1] = (VkOffset2D){(int32_t)(x + width[screen] * scale), (int32_t)(y + height[screen] * scale)};
         return true;
     }
-    uint32_t layout_w = snx_max_u32(frames[0].width, frames[1].width);
-    uint32_t layout_h = frames[0].height + frames[1].height;
+    uint32_t layout_w = snx_max_u32(width[0], width[1]);
+    uint32_t layout_h = height[0] + height[1];
     if (!layout_w || !layout_h || !e.width || !e.height) return false;
     double scale = (double)e.width / layout_w < (double)e.height / layout_h ? (double)e.width / layout_w
                                                                             : (double)e.height / layout_h;
-    const Frame* f = &frames[screen];
-    double x = (e.width - layout_w * scale) / 2 + (layout_w - f->width) * scale / 2;
-    double y = (e.height - layout_h * scale) / 2 + (screen ? frames[0].height * scale : 0);
+    double x = (e.width - layout_w * scale) / 2 + (layout_w - width[screen]) * scale / 2;
+    double y = (e.height - layout_h * scale) / 2 + (screen ? height[0] * scale : 0);
     rect[0] = (VkOffset2D){(int32_t)x, (int32_t)y};
-    rect[1] = (VkOffset2D){(int32_t)(x + f->width * scale), (int32_t)(y + f->height * scale)};
+    rect[1] = (VkOffset2D){(int32_t)(x + width[screen] * scale), (int32_t)(y + height[screen] * scale)};
     return true;
 }
 /* The touch screen's pixel under a pointer at x and y, in the window's points as SDL reports them. The blit's own scale
@@ -397,9 +438,14 @@ void snx_ctr_present_fullscreen(void) {
     const SnxCtrVk* v = snx_ctr_vk();
     if (g_present.up && v && v->host.window) fullscreen(v->host.window, true);
 }
+/* a line over the game in window (0: the top screen's) for a few seconds */
+static void notice(const char* text, SDL_WindowID window) {
+    snx_notice_show(&g_present.notice, text, SDL_GetTicksNS());
+    g_present.notice_window = window || !g_present.up ? window : SDL_GetWindowID(screen_window(0));
+}
 /* The window's own keys, as a Switch game's (backend/sdl3.c): F11, or Alt+Enter, switches the window it is pressed in
    to fullscreen and back, F4 turns the FPS limit off and back on (board/clock.h), and Esc twice closes it, a first one
-   warning on the terminal; not with Ctrl or the system key, the desktop's, nor F4 or Esc with Alt */
+   warning on the terminal and over the game; not with Ctrl or the system key, the desktop's, nor F4 or Esc with Alt */
 static void key_event(const SDL_Event* event) {
     if (event->type != SDL_EVENT_KEY_DOWN || event->key.repeat || (event->key.mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI)))
         return;
@@ -412,17 +458,14 @@ static void key_event(const SDL_Event* event) {
             char warning[64];
             snx_quit_warning(warning, sizeof warning, "Esc");
             fprintf(stderr, "%s\n", warning);
+            notice(warning, event->key.windowID);
         }
     } else if (window && ((event->key.key == SDLK_F11 && !alt) || (event->key.key == SDLK_RETURN && alt)))
         fullscreen(window, !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
     else if (event->key.key == SDLK_F4 && !alt) {
-        int pace = snx_ctr_clock_toggle();
-        if (pace == SNX_CTR_PACE_NONE)
-            fprintf(stderr, "FPS limit: off\n");
-        else if (pace == SNX_CTR_PACE_CONSOLE)
-            fprintf(stderr, "FPS limit: the game's pace\n");
-        else
-            fprintf(stderr, "FPS limit: %d\n", pace);
+        char line[64];
+        snx_ctr_clock_toggle(line, sizeof line);
+        fprintf(stderr, "%s\n", line);
     }
 }
 static void pump(void) {
@@ -434,9 +477,13 @@ static void pump(void) {
         snx_ctr_input_event(&event); /* the gamepads connected and gone */
     }
 }
-/* SDL turns SIGINT and SIGTERM into a quit event too, so this is also how Ctrl+C ends a run, with or without a window
-   (the audio output initializes SDL's events) */
+const char* snx_ctr_present_notice(void) {
+    return snx_notice_shown(&g_present.notice, SDL_GetTicksNS()) ? g_present.notice.text : "";
+}
+/* SDL turns SIGINT and SIGTERM into a quit event in a windowed run. A headless run installs its own handler, since it
+   starts no SDL subsystem, and this is how Ctrl+C ends it with its report, --shot and a finalised WAV */
 bool snx_ctr_present_closed(void) {
+    if (g_quit) g_present.closed = 1;
     if (SDL_WasInit(SDL_INIT_EVENTS)) pump();
     return g_present.closed;
 }
@@ -453,10 +500,12 @@ static void image_barrier(VkCommandBuffer cb, VkImage image, VkImageLayout old, 
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
                          NULL, 1, &b);
 }
+static void notice_log(const char* text) { fprintf(stderr, "3ds gpu: %s\n", text); }
 /* The window's picture: in one window the top screen above the bottom one, which is centred under it (400 and 320
    pixels wide, 240 high), the pair scaled as one to fit the swapchain's image and centred in it, the rest black; in
-   separate windows this screen alone, scaled to fit and centred. */
-static void show_screens(VkCommandBuffer cb, VkImage target, unsigned screen) {
+   separate windows this screen alone, scaled to fit and centred. Over it the notice while one shows in that window,
+   its band in slot's buffer */
+static void show_screens(VkCommandBuffer cb, VkImage target, unsigned screen, unsigned slot) {
     image_barrier(cb, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkClearColorValue black = {.float32 = {0, 0, 0, 1}};
     VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -478,6 +527,14 @@ static void show_screens(VkCommandBuffer cb, VkImage target, unsigned screen) {
         vkCmdBlitImage(cb, f->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &blit, VK_FILTER_NEAREST);
     }
+    /* the notice over the window it was asked in: the screen's own, or the one both share */
+    unsigned shown = g_present.separate ? screen : 0;
+    SDL_Window* window = screen_window(shown);
+    if (window && SDL_GetWindowID(window) == g_present.notice_window)
+        (void)snx_vk_notice_record(g_present.notice_vk[shown], cb, slot, target, g_present.swap[shown].format.format,
+                                   g_present.swap[shown].extent.width, g_present.swap[shown].extent.height,
+                                   snx_display_percent(SDL_GetWindowDisplayScale(window)), &g_present.notice,
+                                   SDL_GetTicksNS(), notice_log);
     image_barrier(cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 }
 bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigned height, unsigned format,
@@ -492,13 +549,12 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
         return false;
     const SnxCtrVk* v = snx_ctr_vk();
     Frame* f = &g_present.frames[screen];
-    /* A render target the GPU has not stored is the frame at its render scale: the shader reads it instead of the
-       framebuffer, whose pixels it has not written yet */
-    VkImageView source = g_present.source_dummy.view;
-    unsigned scale = 1, flip = 1;
-    static const unsigned target_format[5] = {0, 1, 3, 2, 4}; /* GSP's colour formats to transfer.h's */
-    bool from_target = pitch == width * bytes && snx_ctr_vk_target_image(pa, width, height, target_format[format],
-                                                                        &source, &scale, &flip);
+    /* A render target the GPU has not stored, or a display transfer's copy of one, is the frame at its render scale:
+       the shader reads it instead of the framebuffer, whose pixels it has not written yet, and a copy's bytes it
+       compares with the framebuffer's memory. The GSP's colour format is transfer.h's, as a target's is */
+    SnxCtrVkScaled scaled = {.view = g_present.source_dummy.view, .scale = 1, .flip = 1};
+    bool from_target = snx_ctr_vk_target_image(pa, width, height, format, pitch, &scaled);
+    unsigned scale = scaled.scale;
     unsigned frame_width = height * scale, frame_height = width * scale;
     if (f->width != frame_width || f->height != frame_height) {
         snx_ctr_vk_finish();
@@ -511,7 +567,8 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
     if (hash) write_pending(true); /* the readback is about to be written again */
     bool dump = dump_due(screen), readback = dump || hash;
     bool latest = dump && g_present.dumps >= 8 && !hash, waited = readback && !latest;
-    if (!from_target) snx_ctr_vk_sync(pa, pitch * (height - 1) + width * bytes, false); /* the draws over it stored */
+    if (!from_target || scaled.kept) /* the draws over it stored, and its stale pages in the copy */
+        snx_ctr_vk_sync(pa, pitch * (height - 1) + width * bytes, false);
     VkCommandBuffer cb = snx_ctr_vk_commands();
     unsigned slot = snx_ctr_vk_slot(); /* the open recording's, whose semaphores it takes */
     uint64_t recording = snx_ctr_vk_serial();
@@ -519,10 +576,11 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
     image_barrier(cb, f->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL); /* the shader writes all of it */
     f->layout = VK_IMAGE_LAYOUT_GENERAL;
     VkDescriptorSet set = snx_ctr_vk_set(g_present.decode.set);
-    VkDescriptorBufferInfo in = {w.buffer, w.offset, w.range}, out = {g_present.readback, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo in = {w.buffer, w.offset, w.range}, out = {g_present.readback, 0, VK_WHOLE_SIZE},
+                           kept = {scaled.kept ? scaled.kept : g_present.readback, 0, VK_WHOLE_SIZE};
     VkDescriptorImageInfo image = {VK_NULL_HANDLE, f->view, VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorImageInfo from = {VK_NULL_HANDLE, source, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet writes[4] = {{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+    VkDescriptorImageInfo from = {VK_NULL_HANDLE, scaled.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet writes[5] = {{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                        .dstSet = set,
                                        .dstBinding = 0,
                                        .descriptorCount = 1,
@@ -538,26 +596,48 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
                                        .dstSet = set,
                                        .dstBinding = 2,
                                        .descriptorCount = 1,
-                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                       .pImageInfo = &image},
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                       .pBufferInfo = &kept},
                                       {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                        .dstSet = set,
                                        .dstBinding = 3,
                                        .descriptorCount = 1,
                                        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                       .pImageInfo = &image},
+                                      {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                       .dstSet = set,
+                                       .dstBinding = 4,
+                                       .descriptorCount = 1,
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                        .pImageInfo = &from}};
-    vkUpdateDescriptorSets(v->device, 4, writes, 0, NULL);
-    uint32_t push[9] = {inside, format, pitch, width, height, readback, from_target, flip, scale};
+    vkUpdateDescriptorSets(v->device, 5, writes, 0, NULL);
+    uint32_t push[13] = {inside,        format,      pitch, width,    height,   readback,
+                         from_target,   scaled.flip, scale, scaled.x, scaled.y, scaled.kept ? 1u : 0u,
+                         scaled.kept_at};
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_present.decode.pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_present.decode.layout, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(cb, g_present.decode.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
-    unsigned columns = from_target ? width * scale : width, rows = from_target ? height * scale : height;
+    /* the shader writes a block per console pixel, or one image pixel of a direct target */
+    unsigned columns = from_target && !scaled.kept ? width * scale : width;
+    unsigned rows = from_target && !scaled.kept ? height * scale : height;
     vkCmdDispatch(cb, (columns + 7) / 8, (rows + 7) / 8, 1);
     ++g_present.decoded[screen];
     /* both screens in one window, at each top screen frame: a game draws both every frame, and showing at each
        screen's would wait for two vblanks a frame. A bottom screen that changes while the top one stays still shows
        at its second frame. In separate windows each screen shows at its own */
     unsigned window_index = g_present.separate ? screen : 0;
+    /* a window the swapchain was not made for (a phone turned tall, a window dragged): the frames show turned or
+       stretched, and the driver need not say the surface is out of date. Made again until the surface reports the
+       window's size, which it does a frame or two after a turn */
+    {
+        SDL_Window* window = screen_window(screen);
+        int ww = 0, wh = 0;
+        if (window && SDL_GetWindowSizeInPixels(window, &ww, &wh) && ww > 0 && wh > 0 &&
+            g_present.swap[window_index].swapchain &&
+            ((uint32_t)ww != g_present.swap[window_index].extent.width ||
+             (uint32_t)wh != g_present.swap[window_index].extent.height))
+            (void)swap_create(window_index);
+    }
     uint32_t index = 0;
     g_present.bottom_alone = screen ? g_present.bottom_alone + 1 : 0;
     /* a window without a swapchain gets one again when its surface has a size: on Windows a minimized window's
@@ -582,7 +662,7 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
     }
     if (show) {
         g_present.bottom_alone = 0;
-        show_screens(cb, g_present.swap[window_index].images[index], screen);
+        show_screens(cb, g_present.swap[window_index].images[index], screen, slot);
     }
     /* submitted, waited for only when the host reads the frame (a dump, a test's hash) */
     bool ok = true;
@@ -604,6 +684,7 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
     }
     pump();
     if (!ok) return false;
+    if (screen == 0 || !g_present.decoded[0]) ++g_present.console_frames;
     if (latest) {
         g_present.pending.active = true;
         g_present.pending.serial = recording;
@@ -619,6 +700,127 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
         if (dump) write_ppm(screen, width, height, rgba);
     }
     return true;
+}
+uint64_t snx_ctr_present_frames(void) { return g_present.up ? g_present.console_frames : 0; }
+/* a host-visible buffer a shot copies a frame into, sized for that frame */
+typedef struct {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    unsigned char* map;
+} ShotBuffer;
+static bool shot_buffer_make(SnxCtrVk* v, VkDeviceSize size, ShotBuffer* b) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                             .size = size,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    *b = (ShotBuffer){0};
+    if (vkCreateBuffer(v->device, &bi, NULL, &b->buffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(v->device, b->buffer, &req);
+    uint32_t type = snx_ctr_vk_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                                                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (type == UINT32_MAX)
+        type = snx_ctr_vk_memory_type(req.memoryTypeBits,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryAllocateInfo ai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
+    if (type == UINT32_MAX || vkAllocateMemory(v->device, &ai, NULL, &b->memory) != VK_SUCCESS ||
+        vkBindBufferMemory(v->device, b->buffer, b->memory, 0) != VK_SUCCESS ||
+        vkMapMemory(v->device, b->memory, 0, VK_WHOLE_SIZE, 0, (void**)&b->map) != VK_SUCCESS) {
+        if (b->memory) vkFreeMemory(v->device, b->memory, NULL);
+        if (b->buffer) vkDestroyBuffer(v->device, b->buffer, NULL);
+        *b = (ShotBuffer){0};
+        return false;
+    }
+    return true;
+}
+static void shot_buffer_free(SnxCtrVk* v, ShotBuffer* b) {
+    if (b->map) vkUnmapMemory(v->device, b->memory);
+    if (b->memory) vkFreeMemory(v->device, b->memory, NULL);
+    if (b->buffer) vkDestroyBuffer(v->device, b->buffer, NULL);
+    *b = (ShotBuffer){0};
+}
+/* A screen's decoded frame (an RGBA image on the device) into rgba, width * height * 4 bytes; false when the screen
+   has no frame or the GPU lost it */
+static bool read_frame(unsigned screen, VkBuffer target, unsigned char* map, unsigned char* rgba, unsigned* width,
+                       unsigned* height) {
+    Frame* f = &g_present.frames[screen];
+    *width = *height = 0;
+    if (!f->image || !f->width || !f->height) return false;
+    VkCommandBuffer cb = snx_ctr_vk_commands();
+    if (!cb) return false;
+    snx_ctr_vk_compute_barrier(cb); /* after the GPU's last work, and any write to this buffer */
+    image_barrier(cb, f->image, f->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    f->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkBufferImageCopy region = {.bufferOffset = 0,
+                                .bufferRowLength = 0,
+                                .bufferImageHeight = 0,
+                                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                .imageOffset = {0, 0, 0},
+                                .imageExtent = {f->width, f->height, 1}};
+    vkCmdCopyImageToBuffer(cb, f->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, 1, &region);
+    if (!snx_ctr_vk_finish()) return false;
+    memcpy(rgba, map, (size_t)f->width * f->height * 4);
+    *width = f->width;
+    *height = f->height;
+    return true;
+}
+bool snx_ctr_present_shot(const char* path) {
+    if (!g_present.up || !path || !path[0]) return false;
+    write_pending(true);
+    SnxCtrVk* v = snx_ctr_vk();
+    unsigned char* screens[2] = {NULL, NULL};
+    unsigned width[2] = {0, 0}, height[2] = {0, 0};
+    VkDeviceSize bytes = 0;
+    for (unsigned screen = 0; screen < 2; ++screen) {
+        Frame* f = &g_present.frames[screen];
+        if (f->image && (VkDeviceSize)f->width * f->height * 4 > bytes) bytes = (VkDeviceSize)f->width * f->height * 4;
+    }
+    ShotBuffer shot = {0};
+    bool ok = bytes && shot_buffer_make(v, bytes, &shot);
+    if (ok) snx_ctr_vk_render_close(); /* a draw may have left its rendering pass open */
+    for (unsigned screen = 0; screen < 2 && ok; ++screen) {
+        Frame* f = &g_present.frames[screen];
+        if (!f->image) continue;
+        screens[screen] = malloc((size_t)f->width * f->height * 4);
+        ok = screens[screen] &&
+             read_frame(screen, shot.buffer, shot.map, screens[screen], &width[screen], &height[screen]);
+    }
+    shot_buffer_free(v, &shot);
+    unsigned layout_w = width[0] > width[1] ? width[0] : width[1];
+    unsigned layout_h = height[0] + height[1];
+    if (ok && layout_w && layout_h) {
+        unsigned char* canvas = calloc((size_t)layout_w * layout_h, 4);
+        ok = canvas != NULL;
+        if (ok) {
+            unsigned y = 0;
+            for (unsigned screen = 0; screen < 2; ++screen) {
+                if (!screens[screen]) continue;
+                unsigned x = (layout_w - width[screen]) / 2;
+                for (unsigned row = 0; row < height[screen]; ++row)
+                    memcpy(canvas + ((size_t)(y + row) * layout_w + x) * 4,
+                           screens[screen] + (size_t)row * width[screen] * 4, (size_t)width[screen] * 4);
+                y += height[screen];
+            }
+            char staged[1040], native[1024];
+            if (snx_path_format(native, sizeof native, "%s", path) ||
+                snx_path_format(staged, sizeof staged, "%s.partial", native))
+                ok = false;
+            else {
+                FILE* file = fopen(staged, "wb");
+                ok = file && !snx_ppm_write(file, layout_w, layout_h, canvas, 4, (ptrdiff_t)layout_w * 4, SNX_PPM_RGBA);
+                if (file && fclose(file)) ok = false;
+                if (ok)
+                    ok = !plat_replace_file(staged, native);
+                else
+                    remove(staged);
+            }
+            free(canvas);
+        }
+    }
+    for (unsigned screen = 0; screen < 2; ++screen) free(screens[screen]);
+    return ok && layout_w && layout_h;
 }
 void snx_ctr_present_report(void) {
     if (!g_present.up) return;
@@ -638,19 +840,28 @@ void snx_ctr_present_report(void) {
            copies, (unsigned long long)t.traps);
 }
 void snx_ctr_present_free(void) {
-    if (!g_present.up) return;
+    if (!g_present.up) {
+        memset(&g_present, 0, sizeof g_present);
+        return; /* a headless run keeps its signal handlers until the process ends */
+    }
     write_pending(true);
+    /* The open recording is handed to the GPU before anything its commands name is freed: vkDeviceWaitIdle below
+       waits for what was submitted, not for that recording, and the buffers, pipelines and layouts freed under it
+       would leave the GPU reading memory that is gone (a gfxhub page fault and a ring reset at the run's end) */
+    (void)snx_ctr_vk_finish();
     const SnxCtrVk* v = snx_ctr_vk();
     vkDeviceWaitIdle(v->device);
     for (unsigned screen = 0; screen < 2; ++screen)
         if (g_present.swap[screen].swapchain) swap_destroy(screen);
     for (unsigned i = 0; i < 2; ++i) frame_free(&g_present.frames[i]);
     frame_free(&g_present.source_dummy);
+    for (unsigned screen = 0; screen < 2; ++screen) snx_vk_notice_destroy(g_present.notice_vk[screen]);
     for (unsigned screen = 0; screen < 2; ++screen)
         for (unsigned i = 0; i < SNX_CTR_VK_SLOTS; ++i) {
             if (g_present.acquire[screen][i]) vkDestroySemaphore(v->device, g_present.acquire[screen][i], NULL);
             if (g_present.presented[screen][i]) vkDestroySemaphore(v->device, g_present.presented[screen][i], NULL);
         }
+    if (g_present.readback_view) vkUnmapMemory(v->device, g_present.readback_memory);
     if (g_present.readback) vkDestroyBuffer(v->device, g_present.readback, NULL);
     if (g_present.readback_memory) vkFreeMemory(v->device, g_present.readback_memory, NULL);
     snx_ctr_vk_compute_free(&g_present.decode);

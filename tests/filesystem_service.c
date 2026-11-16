@@ -2399,9 +2399,36 @@ static void test_save_commit(void) {
     save = mount_save(6);
     close_fs(save);
     CHECK(test_flat_said == 1);
+    /* a sync tool's entry in a save's folder, there before anything of the save (Syncthing's .stfolder): not the
+       game's, so the folder is no save an older version kept. It is laid out as this version keeps one, the game
+       does not see the entry, it is no file put beside the save, and it stays. The BCAT save an earlier test made
+       goes first, so the folder holds the entry alone */
+    pm_lock(&g_hle.fs.tree.lock);
+    {
+        FsTreeResult gone = fs_tree_remove(&g_hle.fs.tree, NULL, "save/bcat", 1, 1, 0);
+        CHECK(gone == FS_TREE_OK || gone == FS_TREE_NOTFOUND);
+    }
+    pm_unlock(&g_hle.fs.tree.lock);
+    CHECK(!tree_has("save/bcat"));
+    old = mount_folder("save/bcat");
+    root_op(old, CREATE_DIR, "/.stfolder", 0, 0);
+    root_op(old, CREATE_FILE, "/.stfolder/syncthing-folder-1.txt", 6, 0);
+    close_fs(old);
+    CHECK(tree_has("save/bcat/.stfolder/syncthing-folder-1.txt") && !tree_has("save/bcat/" SNX_SAVE_JOURNALED));
+    test_flat_said = 0;
+    test_stray_said = 0;
+    save = mount_save(2);
+    root_op(save, ENTRY_TYPE, "/.stfolder", 0, SNX_RC_FS_PATH_NOT_FOUND);
+    root_op(save, CREATE_FILE, "/slot.bin", 4, 0);
+    commit(save);
+    close_fs(save);
+    CHECK(test_flat_said == 0 && test_stray_said == 0 && tree_has("save/bcat/" SNX_SAVE_JOURNALED) &&
+          tree_has("save/bcat/" SNX_SAVE_COMMITTED "/slot.bin") &&
+          tree_has("save/bcat/.stfolder/syncthing-folder-1.txt") && !tree_has("save/bcat/slot.bin"));
     g_settings.save_layout[0] = 0;
     puts("PASS a save's commit: the last commit and the working copy, an open after no commit, a commit refused with "
-         "a file open for writing, a commit cut short finished, an older version's save played where it is");
+         "a file open for writing, a commit cut short finished, an older version's save played where it is, a sync "
+         "tool's entry beside a save");
 }
 
 /* A game killed while it saves (#1147). Each launch is a process of this harness on the same data folder, which
@@ -2848,6 +2875,48 @@ int main(int argc, char** argv) {
         return 0;
     }
 #endif
+    /* #2110: a console game's data folder whose own RomFS a copy (romfs.copying beside it) or an extraction (its
+       .extracting beside the game) that stopped left, and one with no RomFS at all, end the start in a fatal, the
+       folder in the log line before it; a whole one starts */
+    if (argc == 4 && (!strcmp(argv[3], "romfs-copying") || !strcmp(argv[3], "romfs-extracting") ||
+                      !strcmp(argv[3], "romfs-none") || !strcmp(argv[3], "romfs-whole"))) {
+        const char* how = argv[3] + 6;
+        jmp_buf jump;
+        int stopped;
+        CHECK(!snx_mkdirs("cut-data/0100000000AB0000_data/exefs") &&
+              !snx_write_file("cut-data/0100000000AB0000_data/exefs/main", "main", 4));
+        if (strcmp(how, "none"))
+            CHECK(!snx_mkdirs("cut-data/0100000000AB0000_data/romfs") &&
+                  !snx_write_file("cut-data/0100000000AB0000_data/romfs/a.bin", "a", 1));
+        if (!strcmp(how, "copying")) CHECK(!snx_mkdirs("cut-data/0100000000AB0000_data/romfs.copying"));
+        if (!strcmp(how, "extracting")) CHECK(!snx_write_file("cut-data/0100000000AB0000.extracting", "", 0));
+        strcpy(g_exedir, "cut-data/");
+        strcpy(g_gamename, "0100000000AB0000");
+        strcpy(g_datadir, "cut-data/0100000000AB0000_data/");
+        fs_init(NULL, NULL);
+        test_scans_allowed = 0;
+        svc_fs_init();
+        test_fatal_text[0] = 0;
+        test_fatal_jump = &jump;
+        stopped = setjmp(jump);
+        if (!stopped) romfs_init();
+        test_fatal_jump = NULL;
+        if (!strcmp(how, "whole")) {
+            CHECK(!stopped && !test_fatal_text[0] && g_hle.fs.nrfiles == 1);
+            cleanup_service();
+        } else if (!strcmp(how, "none"))
+            CHECK(stopped && !strcmp(test_fatal_text, "The game has no RomFS: started from the launcher or scarletnx "
+                                                      "with Extract dump, it is extracted from the game's dump before "
+                                                      "the game starts"));
+        else
+            CHECK(stopped && !strcmp(test_fatal_text, "The game's RomFS is a copy that stopped before it ended: "
+                                                      "started from the launcher or scarletnx with Extract dump, it "
+                                                      "is extracted again from the game's dump"));
+        free(g_mem);
+        printf("PASS %u checks: a data folder's RomFS %s\n", test_checks,
+               !strcmp(how, "whole") ? "whole starts" : "cut short or missing stops the start");
+        return 0; /* a fatal left the tree locked: nothing more of it */
+    }
     /* source= an extracted game's folder, outside the data folder: its ExeFS and RomFS read where they are, read-only;
        one that is not there is said to be a folder, with the settings that name it */
     if (argc == 4 && (!strcmp(argv[3], "folder-source") || !strcmp(argv[3], "folder-gone"))) {

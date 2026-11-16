@@ -18,8 +18,10 @@
 #include "nx/gpu/maxwell/kepler_compute_regs.h"
 #include "nx/gpu/shader/shader.h"
 #include "nx/gpu/shader/sm86.h"
+#include "common/utilities/spirv_emit.h" /* SPV_CAPABILITY_COOPERATIVE_MATRIX_KHR, the scanner's */
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
+#include "common/platform/thread.h" /* plat_thread_note */
 #include "nx/gpu/vk/lookup_ways.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/ledger.h"
@@ -117,6 +119,7 @@ static u64 g_cval;
 static int g_ar_gfx;
 static u64 g_org_cap;
 u64 g_vk_dispatches, g_vk_cs_batches, g_vk_cs_wait_ns;
+u64 g_vk_cs_open, g_vk_cs_left; /* vk.h */
 /* A program's window: 80 zero bytes in place of a header, then the bytes of its code that cs_read_code reads, and zeros
    after them. It takes as much code as a graphics program's window (pipeline.c's SH_CODE): an Ounce game has a
    compute program of 256,160 bytes. In a window of 64 KiB that program had no end, and each of its dispatches was
@@ -218,7 +221,12 @@ static void cs_init(void) {
 
 /* a bigger arena; only between batches, nothing points into it then */
 static u64 g_ar_want = 8ull << 20; /* doubles when a batch fills the arena, up to 64 MB */
-/* arenas draws read from: reused once the frames that read them are done */
+/* Arenas draws read from: reused once the frames that read them are done. They are kept by bytes, ARENA_KEEP or
+   twice what a batch's arena is wanted at where that is more (128 MiB once the arenas grew to 64 MiB), and one at
+   least: eight were kept whatever their size, up to 512 MiB of host memory after a burst. A game's frame takes
+   three or four of 8 MiB in turn, which the bytes hold. One no batch took for ARENA_IDLE frames goes too */
+#define ARENA_IDLE 600u
+#define ARENA_KEEP (64ull << 20)
 static struct {
     VkBuffer b;
     DevMem m;
@@ -226,14 +234,34 @@ static struct {
     u64 cap, frame;
 } g_retired[8];
 static int g_nretired;
+static void retired_drop(int i) {
+    vk_defer_buffer(g_retired[i].b, g_retired[i].m);
+    memmove(g_retired + i, g_retired + i + 1, sizeof g_retired[0] * (size_t)(g_nretired - i - 1));
+    g_nretired--;
+}
+/* the list within its bytes, its count and its age: the oldest go first, the newest stays */
+static void retired_trim(void) {
+    u64 bytes = 0;
+    for (int i = 0; i < g_nretired; i++) bytes += g_retired[i].cap;
+    const u64 keep = 2 * g_ar_want > ARENA_KEEP ? 2 * g_ar_want : ARENA_KEEP;
+    while (g_nretired > 1 && (bytes > keep || g_nretired == 8)) {
+        bytes -= g_retired[0].cap;
+        retired_drop(0);
+    }
+    for (int i = 0; i < g_nretired - 1;)
+        if (g_retired[i].frame + ARENA_IDLE <= vk_frame_id())
+            retired_drop(i);
+        else
+            i++;
+}
+static void retired_add(VkBuffer b, DevMem m, u8* p, u64 cap, u64 frame) {
+    if (g_nretired == 8) retired_drop(0); /* full: the oldest goes for good */
+    g_retired[g_nretired++] = (typeof(g_retired[0])){b, m, p, cap, frame};
+    retired_trim();
+}
 static void arena_retire(void) {
     if (!g_ar) return;
-    if (g_nretired == 8) { /* full: the oldest goes for good */
-        vk_defer_buffer(g_retired[0].b, g_retired[0].m);
-        memmove(g_retired, g_retired + 1, sizeof g_retired[0] * 7);
-        g_nretired--;
-    }
-    g_retired[g_nretired++] = (typeof(g_retired[0])){g_ar, g_ar_mem, g_ar_ptr, g_ar_cap, vk_frame_id()};
+    retired_add(g_ar, g_ar_mem, g_ar_ptr, g_ar_cap, vk_frame_id());
     g_ar = VK_NULL_HANDLE;
 }
 /* the original bytes beside the arena, as big as it: batches put aside swap theirs with the current one's */
@@ -263,6 +291,9 @@ static int arena_fit(u64 need) {
     if (g_ar) vk_defer_buffer(g_ar, g_ar_mem); /* draws may still read it */
     u64 cap = g_ar_want;
     while (cap < need) cap *= 2;
+    /* no allocation is bigger than the driver gives (memory.c): an arena that holds the dispatch within that, not the
+       next power of two, which found no memory */
+    if (cap > g_vk.alloc_cap && need <= g_vk.alloc_cap) cap = g_vk.alloc_cap;
     u32 fam[2] = {g_vk.gfx_family, g_vk.compute_family};
     VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                               .size = cap,
@@ -278,7 +309,17 @@ static int arena_fit(u64 need) {
     DevMemInfo info;
     g_ar = VK_NULL_HANDLE;
     g_ar_cap = 0;
-    if (!VK_OK(vk_buffer_create(&bci, &aci, &g_ar, &g_ar_mem, &info))) return 0;
+    /* one the driver has no memory for in one allocation, though the heap has: again within what it gives, while
+       that holds the dispatch (memory.c) */
+    VkResult made;
+    while ((made = vk_buffer_create(&bci, &aci, &g_ar, &g_ar_mem, &info)) != VK_SUCCESS) {
+        if (!vk_alloc_cap_lower(cap) || need > g_vk.alloc_cap) {
+            VK_OK(made); /* said, with what holds the memory */
+            g_ar = VK_NULL_HANDLE;
+            return 0;
+        }
+        bci.size = cap = g_vk.alloc_cap;
+    }
     vk_mem_track(g_ar_mem, VK_OWN_ARENA);
     g_ar_ptr = info.ptr;
     g_ar_cap = cap;
@@ -288,6 +329,73 @@ static u64 arena_alloc(u64 size) {
     u64 al = vk_stage_align(), at = (g_ar_used + al - 1) & ~(al - 1);
     g_ar_used = at + size;
     return at;
+}
+
+/* The storage buffers that hold the shared memory of programs that ask for more than the device gives
+   (ShaderInfo.shared_spill), a dispatch's blocks' parts one after another: one for the dispatches recorded on the
+   graphics queue's command buffer and one for the compute batch's, so the two queues never share one, each grown to the
+   most a dispatch of its queue needed */
+static struct {
+    VkBuffer b;
+    DevMem m;
+    u64 cap;
+} g_spill[2];
+
+static void cs_land(void);
+/* The buffer for a dispatch of the grid's blocks, each its program's shared_size in words, on queue gfx: 0 when it
+   can't have one, an indirect dispatch's grid being the GPU's alone, or more than an allocation may be. A bigger one
+   replaces the old once the work that may use it is done: the compute batch landed, the frames through
+   vk_defer_buffer */
+static int cs_spill(const CsPipe* p, int indirect, u32 gx, u32 gy, u32 gz, int gfx, VkDescriptorBufferInfo* out) {
+    u64 block = ((u64)p->si.shared_size + 3) & ~3ull, need = (u64)gx * gy * gz * block;
+    if (indirect) {
+        LOG_LIMIT(4,
+                  "vulkan: compute %016llx's shared memory is a storage buffer's, which an indirect dispatch can't "
+                  "size (its grid is the GPU's): skipped\n",
+                  (unsigned long long)p->key);
+        return 0;
+    }
+    /* the descriptor's range is all of it: no more than the device binds as one storage buffer, nor allocates */
+    u64 range = g_vk.props.limits.maxStorageBufferRange, most = range < g_vk.alloc_cap ? range : g_vk.alloc_cap;
+    if (need > most) {
+        LOG_LIMIT(4,
+                  "vulkan: compute %016llx's shared memory for %ux%ux%u blocks of %llu bytes is %llu bytes, past the "
+                  "%llu a storage buffer may be (maxStorageBufferRange %llu, an allocation %llu): skipped\n",
+                  (unsigned long long)p->key, gx, gy, gz, (unsigned long long)block, (unsigned long long)need,
+                  (unsigned long long)most, (unsigned long long)range, (unsigned long long)g_vk.alloc_cap);
+        return 0;
+    }
+    if (need > g_spill[gfx].cap) {
+        if (g_spill[gfx].b) {
+            if (!gfx) cs_land(); /* the batch's dispatches that use it */
+            vk_defer_buffer(g_spill[gfx].b, g_spill[gfx].m);
+            g_spill[gfx].b = VK_NULL_HANDLE;
+            g_spill[gfx].cap = 0;
+        }
+        u64 cap = 1ull << 20;
+        while (cap < need) cap *= 2;
+        if (cap > g_vk.alloc_cap) cap = need;
+        u32 fam[2] = {g_vk.gfx_family, g_vk.compute_family};
+        VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                  .size = cap,
+                                  .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                  .sharingMode =
+                                      fam[0] != fam[1] ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+                                  .queueFamilyIndexCount = fam[0] != fam[1] ? 2 : 0,
+                                  .pQueueFamilyIndices = fam};
+        DevMemWant aci = {.at = DM_DEVICE};
+        if (!VK_OK(vk_buffer_create(&bci, &aci, &g_spill[gfx].b, &g_spill[gfx].m, NULL))) {
+            g_spill[gfx].b = VK_NULL_HANDLE;
+            LOG_LIMIT(
+                4, "vulkan: no memory for %llu bytes of shared memory in a storage buffer: compute %016llx skipped\n",
+                (unsigned long long)cap, (unsigned long long)p->key);
+            return 0;
+        }
+        vk_mem_track(g_spill[gfx].m, VK_OWN_ARENA);
+        g_spill[gfx].cap = cap;
+    }
+    *out = (VkDescriptorBufferInfo){g_spill[gfx].b, 0, need};
+    return 1;
 }
 
 static GpOp g_op[VK_GP_OPS];
@@ -365,13 +473,7 @@ static void cs_write_back(DevMem mem, const u8* ar, const u8* org, const CsOut* 
 /* an arena whose batch has landed: draws that read it may still run (gfx), so it waits for their frame like the
    arenas draws read; one they didn't read is free now */
 static void cs_arena_done(VkBuffer b, DevMem m, u8* p, u64 cap, int gfx) {
-    if (g_nretired == 8) { /* full: the oldest goes for good */
-        vk_defer_buffer(g_retired[0].b, g_retired[0].m);
-        memmove(g_retired, g_retired + 1, sizeof g_retired[0] * 7);
-        g_nretired--;
-    }
-    g_retired[g_nretired++] = (typeof(g_retired[0])){
-        b, m, p, cap, gfx || vk_frame_id() < VK_FRAMES ? vk_frame_id() : vk_frame_id() - VK_FRAMES};
+    retired_add(b, m, p, cap, gfx || vk_frame_id() < VK_FRAMES ? vk_frame_id() : vk_frame_id() - VK_FRAMES);
 }
 static void cs_any_update(void) {
     int any = g_nout > 0;
@@ -503,21 +605,94 @@ static void cs_land(void) {
 /* The windows a dispatch binds for a pointer table in constant buffer bank (SH_GBUF_TABLE), base[w] and len[w] for
    each of windows: the bank's 64-bit words that map are its pointers, and so are the 64-bit words at the cells
    (ShaderInfo.table_cells, bit k: the 8 bytes at 8 * k) of the memory each of them points to, which the program loads
-   pointers from. Each run of memory mapped from the lowest pointer not in an earlier run (at most 16 MiB, as
-   vk_gbuf_desc binds a bare address) holds those below its end. With more runs than windows, the two runs closest
-   together are bound as one, the memory between them too, until they fit: copy_runs reads what isn't mapped as zero.
-   A window the table has no run for has base 0, with the 16 bytes an unbound buffer gets. One game's culling programs
-   keep 20 pointers in cbuf 4, in 11 runs over two stretches of about 2 MiB, and one of them has 9 buffer slots left
-   for them. Four of those pointers are to records whose first 8 bytes point to the instances of a kind of plant,
-   which the program reads through them */
+   pointers from. vk_pointer_windows makes the windows: copy_runs reads what isn't mapped between two runs it joined as
+   zero. One game's culling programs keep 20 pointers in cbuf 4, in 11 runs over two stretches of about 2 MiB, and one
+   of them has 9 buffer slots left for them. Four of those pointers are to records whose first 8 bytes point to the
+   instances of a kind of plant, which the program reads through them */
 static int u64_order(const void* a, const void* b) {
     u64 x = *(const u64*)a, y = *(const u64*)b;
     return x < y ? -1 : x > y;
 }
 static int table_pointer(u64 x) { return x && !(x & 3) && !(x >> 40); } /* the GPU's addresses have 40 bits */
+typedef struct {
+    u64 from, to;
+    u32 parent, lo, hi; /* the group it is in (run_root), and a group's first and last runs */
+} PtrRun;
+typedef struct {
+    u64 gap;
+    u32 k;
+} RunGap;
+static int gap_order(const void* a, const void* b) {
+    const RunGap *x = a, *y = b;
+    return x->gap < y->gap ? -1 : x->gap > y->gap ? 1 : (x->k > y->k) - (x->k < y->k);
+}
+static u32 run_root(PtrRun* r, u32 k) {
+    while (r[k].parent != k) k = r[k].parent = r[r[k].parent].parent;
+    return k;
+}
+/* the runs and gaps of vk_pointer_windows, kept from call to call: its callers (a dispatch's and a draw's binding)
+   hold vk_lock */
+static void* g_ptr_scratch;
+static size_t g_ptr_scratch_size;
+u32 vk_pointer_windows(u64* v, u32 n, u32 windows, u32 reach, int whole, u64* base, u32* len) {
+    u32 runs = 0, m = 0;
+    for (u32 w = 0; w < windows; w++) base[w] = 0, len[w] = 16;
+    for (u32 i = 0; i < n; i++)
+        if (table_pointer(v[i])) v[m++] = v[i];
+    if (!m) return 0;
+    qsort(v, m, sizeof *v, u64_order);
+    size_t need = (size_t)m * (sizeof(PtrRun) + sizeof(RunGap));
+    if (need > g_ptr_scratch_size) {
+        void* grown = realloc(g_ptr_scratch, need);
+        if (!grown) return m;
+        g_ptr_scratch = grown;
+        g_ptr_scratch_size = need;
+    }
+    PtrRun* r = g_ptr_scratch;
+    RunGap* gaps = (RunGap*)(r + m);
+    reach = (reach + 3) & ~3u;
+    for (u32 i = 0; i < m;) {
+        u64 cpu = 0, run = gmmu_run(v[i], 16u << 20, &cpu) & ~3ull;
+        if (!run) { /* no memory there: a word that is no pointer */
+            i++;
+            continue;
+        }
+        u64 end = v[i] + run;
+        PtrRun* at = &r[runs];
+        *at = (PtrRun){v[i], reach && reach < run ? v[i] + reach : end, runs, runs, runs};
+        runs++;
+        for (; i < m && v[i] < at->to; i++)
+            if (reach && v[i] + reach > at->to) at->to = v[i] + reach < end ? v[i] + reach : end;
+    }
+    /* the closest runs joined first, as one window of at most 16 MiB (with whole, only over mapped memory), until
+       they fit: each run a group, joined to its neighbour across the smallest gaps */
+    u32 groups = runs;
+    for (u32 k = 0; k + 1 < runs; k++) gaps[k] = (RunGap){r[k + 1].from - r[k].to, k};
+    qsort(gaps, runs ? runs - 1 : 0, sizeof *gaps, gap_order);
+    for (u32 g = 0; g + 1 < runs && groups > windows; g++) {
+        u32 k = gaps[g].k, a = run_root(r, k), b = run_root(r, k + 1);
+        u64 cpu = 0, span = r[r[b].hi].to - r[r[a].lo].from;
+        if (span > (16u << 20) || (whole && gaps[g].gap && gmmu_run(r[k].to, gaps[g].gap, &cpu) < gaps[g].gap))
+            continue;
+        r[b].parent = a;
+        r[a].hi = r[b].hi;
+        groups--;
+    }
+    u32 w = 0;
+    for (u32 k = 0; k < runs; k++) {
+        u32 root = run_root(r, k);
+        if (r[root].lo != k) continue; /* inside a group: its first run stands for it */
+        if (w < windows) {
+            base[w] = r[k].from;
+            len[w] = (u32)(r[r[root].hi].to - r[k].from);
+        }
+        w++;
+    }
+    return groups > windows ? runs : 0;
+}
 static void table_windows(u32 bank, u32 cells, u32 windows, u64* base, u32* len) {
-    u64 v[512], from[64], to[64];
-    u32 n = 0, runs = 0, unused;
+    u64 v[512];
+    u32 n = 0, unused;
     for (u32 w = 0; w < windows; w++) base[w] = 0, len[w] = 16;
     if (bank >= QMD_NUM_CONST_BUFFERS) return;
     /* a bank a pending write in place covers isn't in g_cb yet (g_cb_later): the windows are made of its words, so it
@@ -538,36 +713,12 @@ static void table_windows(u32 bank, u32 cells, u32 windows, u64* base, u32* len)
             u64 x = snx_le32(q[0]) | (u64)snx_le32(q[1]) << 32;
             if (table_pointer(x)) v[n++] = x;
         }
-    qsort(v, n, sizeof *v, u64_order);
-    for (u32 i = 0; i < n && runs < 64;) {
-        u64 cpu = 0, run = gmmu_run(v[i], 16u << 20, &cpu) & ~3ull;
-        if (!run) { /* no memory there: a word that is no pointer */
-            i++;
-            continue;
-        }
-        from[runs] = v[i];
-        to[runs++] = v[i] + run;
-        while (i < n && v[i] < to[runs - 1]) i++;
-    }
-    while (runs > windows) { /* the two runs closest together, as one window of at most 16 MiB */
-        u32 best = runs;
-        for (u32 k = 0; k + 1 < runs; k++)
-            if (to[k + 1] - from[k] <= (16u << 20) && (best == runs || from[k + 1] - to[k] < from[best + 1] - to[best]))
-                best = k;
-        if (best == runs) break;
-        to[best] = to[best + 1] > to[best] ? to[best + 1] : to[best];
-        for (u32 k = best + 1; k + 1 < runs; k++) from[k] = from[k + 1], to[k] = to[k + 1];
-        runs--;
-    }
-    if (runs > windows)
+    u32 runs = vk_pointer_windows(v, n, windows, 0, 0, base, len);
+    if (runs)
         LOG_LIMIT(1,
                   "vulkan: a compute program's pointer table in constant buffer %u has %u runs of mapped memory "
                   "that its %u windows can't hold: the pointers in the others read 0\n",
                   bank, runs, windows);
-    for (u32 w = 0; w < runs && w < windows; w++) {
-        base[w] = from[w];
-        len[w] = (u32)(to[w] - from[w]);
-    }
 }
 /* A descriptor can fail after its inputs were copied into the arena. No command references those inputs yet. */
 static void cs_abandon_binding(u8* originals[8]) {
@@ -645,6 +796,7 @@ u64 vk_compute_put_aside(void) {
 void vk_compute_wait(u64 value) {
     if (value) cs_wait(value);
 }
+u64 vk_compute_number(void) { return g_cval + (g_recording ? 1 : 0); }
 void vk_compute_progress(u64* submitted, u64* done) {
     *submitted = __atomic_load_n(&g_cval, __ATOMIC_RELAXED);
     *done = 0;
@@ -747,8 +899,12 @@ static int cs_replay_read(u32 idx, u32 off, u32* out);
 static int cs_reads_lanes(const u32* spv, size_t words) {
     for (size_t at = 5; at < words;) {
         u32 width = spv[at] >> 16;
-        if (!width || at + width > words || (spv[at] & 0xffffu) != 17) break; /* past the OpCapability ones */
-        if (width == 2 && ((spv[at + 1] >= 61 && spv[at + 1] <= 68) || spv[at + 1] == 6022)) return 1;
+        if (!width || at + width > words || (spv[at] & 0xffffu) != SPV_OP_CAPABILITY)
+            break; /* past the OpCapability ones */
+        if (width == 2 && ((spv[at + 1] >= SPV_CAPABILITY_GROUP_NON_UNIFORM &&
+                            spv[at + 1] <= SPV_CAPABILITY_GROUP_NON_UNIFORM_QUAD) ||
+                           spv[at + 1] == SPV_CAPABILITY_COOPERATIVE_MATRIX_KHR))
+            return 1;
         at += width;
     }
     return 0;
@@ -759,8 +915,8 @@ static int cs_uses_shared(const u32* spv, size_t words) {
     for (size_t at = 5; at < words;) {
         u32 width = spv[at] >> 16;
         if (!width || at + width > words) break;
-        if ((spv[at] & 0xffffu) == 59 && width >= 4 && spv[at + 3] == 4) return 1;
-        if ((spv[at] & 0xffffu) == 54) break; /* OpFunction: the variables of the module come before */
+        if ((spv[at] & 0xffffu) == SPV_OP_VARIABLE && width >= 4 && spv[at + 3] == SPV_STORAGE_WORKGROUP) return 1;
+        if ((spv[at] & 0xffffu) == SPV_OP_FUNCTION) break; /* OpFunction: the variables of the module come before */
         at += width;
     }
     return 0;
@@ -808,8 +964,9 @@ static CsPipe* cs_make(const u8* code, u32 blen, u64 key, u32 flow_base, u32 lx,
     if (shm && g_shader_sm86) shm = (shm + 255u) & ~255u;
     p->si.shared_size = (int)shm;
     /* A block may ask for more shared memory than the device gives (48 KiB on the console, 32 KiB on Adreno 6xx to
-       8xx). The program then gets the device's size when no access of it can reach past that, and is skipped
-       otherwise: an access past the array would read and write another word */
+       8xx, Bifrost's PanVK and lavapipe). The program then gets the device's size when no access of it can reach past
+       that, and otherwise its shared memory goes to a storage buffer (ShaderInfo.shared_spill, cs_spill), a block's
+       part at its place in the grid: an access past the array would read and write another word */
     u32 shared_max = g_vk.props.limits.maxComputeSharedMemorySize, shared, reach;
     if (shm > shared_max) {
         if (!shader_shared_fit(code, CS_WINDOW, p->si.cs_local, shm, shared_max, &shared, &reach)) {
@@ -819,16 +976,16 @@ static CsPipe* cs_make(const u8* code, u32 blen, u64 key, u32 flow_base, u32 lx,
             else
                 snprintf(upto, sizeof upto, "%u bytes", reach);
             LOG("vulkan: compute %016llx asks for %u bytes of shared memory, past this GPU's %u, and its accesses may "
-                "reach %s: its dispatches are skipped\n",
-                (unsigned long long)key, shm, shared_max, upto);
-            p->failed = 1;
-            p->shared_past = 1;
-            return p;
+                "reach %s: its shared memory is a storage buffer's, %u bytes for each block of a dispatch\n",
+                (unsigned long long)key, shm, shared_max, upto, (shm + 3u) & ~3u);
+            p->si.shared_spill = 1;
+            p->shared_past = 1; /* a translation that can't spill it is skipped under that reason */
+        } else {
+            LOG("vulkan: compute %016llx asks for %u bytes of shared memory, past this GPU's %u; its accesses reach %u "
+                "bytes at most, so it gets %u\n",
+                (unsigned long long)key, shm, shared_max, reach, shared);
+            p->si.shared_size = (int)shared;
         }
-        LOG("vulkan: compute %016llx asks for %u bytes of shared memory, past this GPU's %u; its accesses reach %u "
-            "bytes at most, so it gets %u\n",
-            (unsigned long long)key, shm, shared_max, reach, shared);
-        p->si.shared_size = (int)shared;
     }
     p->si.img_int_mask = k.image;
     p->si.img_sint_mask = k.image_sint;
@@ -869,10 +1026,19 @@ static CsPipe* cs_make(const u8* code, u32 blen, u64 key, u32 flow_base, u32 lx,
     /* subgroups of 32 for one that reads other lanes (cs_reads_lanes), whole where the block's x is whole subgroups (as
        Vulkan asks of the flag) */
     int warp = g_vk.has_cs_warp32 && cs_reads_lanes(spv, nw);
+    /* the crash report's note while the driver compiles it (plat_thread_note) */
+    plat_thread_note("making the compute pipeline %016llx (%zu KB of SPIR-V, a block of %ux%ux%u, %u bytes of shared "
+                     "memory)",
+                     (unsigned long long)key, nw / 256, lx, ly, lz, (unsigned)p->si.shared_size);
     if (!VK_OK(snx_vk_compute_pipeline_subgroups(g_vk.dev, vk_pipeline_cache(), g_vk.cs_playout, spv, (size_t)nw * 4,
                                                  warp ? 32 : 0, warp && lx % 32 == 0, &p->p)))
         p->failed = 1;
+    plat_thread_note_clear();
     free(spv);
+    /* as a draw's program says it (pipeline.c): the textures a compute program samples as none */
+    if (!p->failed && p->si.memh_none)
+        LOG_LIMIT(64, "vulkan: compute %016llx samples %u texture%s as none, whose handles no dispatch gives (%s)\n",
+                  (unsigned long long)key, p->si.memh_none, p->si.memh_none == 1 ? "" : "s", p->si.memh_why);
     if (!p->failed)
         LOG_LIMIT(12, "vulkan: compute %016llx ready: block %ux%ux%u, %d global buffers, %d textures, %d images\n",
                   (unsigned long long)key, lx, ly, lz, p->si.ngbuf, p->si.ntex, p->si.nimg);
@@ -1190,7 +1356,9 @@ void vk_dispatch(const DispatchState* d) {
     u64 tic_key_base;
     VkBufImg bimg[8] = {0};
     int i;
+    SNX_ZONE(z_dispatch, "dispatch");
     vk_frame_check();
+    vk_own_room();
     if (d->indirect) gx = gy = gz = 1; /* the GPU's: these only say there is a grid */
     if (!gx || !gy || !gz || !lx || !ly || !lz) return;
     const VkPhysicalDeviceLimits* lim = &g_vk.props.limits;
@@ -1492,6 +1660,13 @@ void vk_dispatch(const DispatchState* d) {
     }
     VkOwnRes* made[16] = {0};
     deferred = deferred || resident;
+    /* shared memory in a storage buffer: the one of the queue it records on, before the batch's chains are worked out
+       (a bigger buffer for the compute queue lands the batch first) */
+    VkDescriptorBufferInfo spill = {0};
+    if (p->si.shared_spill && !cs_spill(p, d->indirect != 0, gx, gy, gz, gfx || resident, &spill)) {
+        g_cs_skips[CS_SKIP_SHARED]++;
+        return;
+    }
     /* a read-only input inside a pending result of this batch is read from the arena on the GPU, after a barrier
        (multi-pass skinning reads what the pass before wrote); any other overlap lands the results first */
     i64 chain[16];
@@ -1563,13 +1738,11 @@ rebind:
     u32 nw = 0;
     for (int i = 0; i < 8; i++)
         if (p->si.cbuf_mask & (1u << i)) {
-            /* only the bytes the shader reads (robust buffer access keeps reads past them in bounds, of undefined
-               value) */
+            /* only the bytes the shader reads, zeros after the guest's: reads past the range are zero with
+               robustBufferAccess2, and stay in bounds, of undefined value, with robust buffer access alone */
             u32 range = g_cbn[i];
             if (p->si.cbuf_max[i] && range > p->si.cbuf_max[i]) range = p->si.cbuf_max[i];
-            range = (range + 15) & ~15u;
-            if (!range) range = 16;
-            if (range > g_vk.props.limits.maxUniformBufferRange) range = g_vk.props.limits.maxUniformBufferRange;
+            range = vk_cb_range(range); /* a whole checked step, within the limit; the tail is zeroed below */
             u32 n = g_cbn[i] < range ? g_cbn[i] : range;
             VkBuffer cbuf = g_ar;
             u64 o;
@@ -1608,7 +1781,7 @@ rebind:
             nw++;
         }
     if (p->si.root_max) { /* an Ounce program's root tables, the bytes it reads (SNX_VKB_ROOT) */
-        u32 range = (p->si.root_max + 15u) & ~15u;
+        u32 range = vk_cb_range(p->si.root_max); /* a uniform buffer: the same checked step as a constant buffer */
         VkBuffer rbuf = g_ar;
         u64 o;
         u8* dst;
@@ -1622,7 +1795,8 @@ rebind:
             o = arena_alloc(range);
             dst = g_ar_ptr + o;
         }
-        memcpy(dst, d->root, range);
+        memcpy(dst, d->root, p->si.root_max); /* only the real bytes; the rest of the step is zeroed, not read past */
+        memset(dst + p->si.root_max, 0, range - p->si.root_max);
         bi[nw] = (VkDescriptorBufferInfo){rbuf, o, range};
         w[nw] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                        .dstSet = set,
@@ -1663,6 +1837,7 @@ rebind:
     for (int i = 0; i < ng; i++) {
         VkBuffer sbuf = g_ar;
         u64 o;
+        u32 srange = ss[i]; /* the bound range: a whole storage step where the arena zero-fills the tail below */
         int alias = -1;
         for (int k = 0; k < i && resident && alias < 0; k++)
             if (sa[k] && sa[k] == sa[i] && ss[k] == ss[i]) alias = k; /* one range bound twice names one buffer */
@@ -1705,20 +1880,24 @@ rebind:
             so[i] = o;
         } else {
             if (chain[i] >= 0) chained = 1;
-            o = so[i] = chain[i] >= 0 ? (u64)chain[i] : arena_alloc(ss[i]);
+            /* a chained buffer reads an earlier dispatch's in place: its range stays ss[i]. A fresh one spans a whole
+               checked step, the tail zeroed, so reads past ss[i] in it are zero, not a neighbour's in the arena */
+            if (chain[i] < 0) srange = vk_sb_round(ss[i]);
+            o = so[i] = chain[i] >= 0 ? (u64)chain[i] : arena_alloc(srange);
             if (chain[i] >= 0)
                 ; /* written by an earlier dispatch of the batch, read in place */
             /* read: its bytes copied in. So are those of one written and not logged: its result is what differs from
                them after the dispatch, and a store of the bytes zeroed in their place would differ from nothing */
-            else if (sa[i] && (((p->si.gbuf_rmask >> i) & 1) || !(log && p->si.gbuf_mark[i])))
+            else if (sa[i] && (((p->si.gbuf_rmask >> i) & 1) || !(log && p->si.gbuf_mark[i]))) {
                 gmem_read(sa[i], g_ar_ptr + o, ss[i]);
-            else {
+                memset(g_ar_ptr + o + ss[i], 0, srange - ss[i]);
+            } else {
                 if (sa[i]) gmem_need(sa[i], ss[i]); /* write-only: results pending there land, but nothing is read */
-                memset(g_ar_ptr + o, 0, ss[i]);
+                memset(g_ar_ptr + o, 0, srange);
             }
         }
         bi_buf[i] = sbuf;
-        bi[nw] = (VkDescriptorBufferInfo){sbuf, o, ss[i]};
+        bi[nw] = (VkDescriptorBufferInfo){sbuf, o, srange}; /* outputs still write back ss[i] bytes (g_out) */
         w[nw] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                        .dstSet = set,
                                        .dstBinding = SNX_VKB_SSBO + i,
@@ -1882,18 +2061,20 @@ rebind:
                 return;
             }
             vk_gmem_words(tic_base + (h & 0xFFFFF) * 32ull, tic, 8);
-            /* a slot with nothing bound (an empty header): an empty image, which nothing writes back. One game's
-               program that makes a texture's levels from its first has seven image slots, one for each level, and
-               the game leaves those past the texture's last level empty (images 4 to 6 of a texture of 4 levels).
-               Skipped whole for them, the dispatch left levels 1 to 3 zero, and the trilinear lookups of the
-               texture drew a dark square under the game's kart */
+            /* a slot with nothing bound (an empty header): a null descriptor (vk_null_descriptors), or else an empty
+               image, which nothing writes back. One game's program that makes a texture's levels from its first has
+               seven image slots, one for each level, and the game leaves those past the texture's last level empty
+               (images 4 to 6 of a texture of 4 levels). Skipped whole for them, the dispatch left levels 1 to 3 zero,
+               and the trilinear lookups of the texture drew a dark square under the game's kart */
             VkImageView null_view = VK_NULL_HANDLE;
-            Surf* null_image = vk_tic_empty(tic)
+            int null_slot = vk_tic_empty(tic) && vk_null_descriptors();
+            Surf* null_image = vk_tic_empty(tic) && !null_slot
                                    ? vk_null_storage(vk_storage_image_type(&p->si, i), p->si.img[i].kind, &null_view)
                                    : NULL;
-            if (null_image) {
-                vk_surf_use(vk_cmd(), null_image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                            VK_STORAGE_IMAGE_ACCESS);
+            if (null_image || null_slot) {
+                if (null_image)
+                    vk_surf_use(vk_cmd(), null_image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_STORAGE_IMAGE_ACCESS);
                 ii[p->si.ntex + i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, null_view, VK_IMAGE_LAYOUT_GENERAL};
                 w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                                  .dstSet = set,
@@ -2066,6 +2247,16 @@ rebind:
             pend_add(&g_pages, bimg[i].gva, bimg[i].bytes, 1);
         }
     }
+    if (spill.buffer) {
+        bi[nw] = spill;
+        w[nw] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                       .dstSet = set,
+                                       .dstBinding = SNX_VKB_SSBO + SH_SHARED_SPILL,
+                                       .descriptorCount = 1,
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                       .pBufferInfo = &bi[nw]};
+        nw++;
+    }
     if (gfx || resident) {
         vk_render_end();
         cb = vk_cmd();
@@ -2081,6 +2272,18 @@ rebind:
     }
     vkUpdateDescriptorSets(g_vk.dev, nw, w, 0, NULL);
     if (resident) vk_all_barrier(cb); /* the copies into its buffers, and earlier work on them, before it */
+    /* its queue's shared memory buffer, after the dispatch before that used it */
+    if (spill.buffer) {
+        VkMemoryBarrier2 smb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT};
+        VkDependencyInfo sdi = {
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &smb};
+        rec_CmdPipelineBarrier2(cb, &sdi);
+    }
     if (chained) {
         VkMemoryBarrier2 cmb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                                 .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -2160,7 +2363,9 @@ rebind:
            once, the GPU runs it while the stream goes on, and a reader of its results waits for that submit alone,
            not for the draws recorded after it: Pokemon Legends Z-A writes command lists with a dispatch and fetches
            them a little later (a GPFIFO entry with SYNC), once a frame */
+        vk_uma_writer(p->key);
         vk_buf_writable_commit();
+        vk_uma_writer(0);
         for (i = 0; i < p->si.nimg && i < 8; i++)
             if (bufimg_view[i]) vk_defer_buffer_view(bufimg_view[i]);
         /* the storage images' texels over their guest bytes, after the dispatch on the GPU */
@@ -2175,7 +2380,18 @@ rebind:
         /* Not one in the GPU mirror: its results land only where the CPU first touches them, and that read submits
            what is open (vk_mirror_mem_need's finish). Submitted each, one game's Ounce programs made about 300
            submissions a present, each with a harvest of the mirror, and the GPU idled between them */
-        if (!mir) vk_submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+        if (mir) return;
+        /* On unified memory a dispatch with nothing staged for the host waits in the submission being recorded for
+           the end of the game's GPU submission (vk_release_submit) or whatever submits first, as the console's GPU
+           runs what a flush handed it. Submitted each, one game's battle map made 350 to 390 submissions a present
+           by the GPU profiler, and 22 to 24 so. A program a CPU reader waited for while its writes were still
+           unsubmitted (vk_uma_read_soon) is submitted at once, as above */
+        if (vk_uma() && !vk_buf_pending_unsubmitted() && !vk_uma_read_soon(p->key)) {
+            g_vk_cs_open = vk_submit_number();
+            g_vk_cs_left++;
+            return;
+        }
+        vk_submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
         return;
     }
     /* results visible to the host */

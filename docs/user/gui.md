@@ -86,8 +86,8 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   focus again. A tap on a finished run returns to the menu, and one on a
   running run's ESC line aborts it. Android's back button is ESC. On a screen packed with
   pixels (a phone) the text takes the display's own scale, as far as the menu still fits.
-- **Load Switch NSP/XCI/NRO**, **Load Linux ARM ELF**, **Load 3DS game**, **Load Vita VPK**, **Load GBA/MultiBoot ROM** and
-  **Load Android APK/XAPK** open a screen as the keys': a click on its blinking **[ Pick or drop a file ]**, or Enter, opens the system's file
+- **Load Switch NSP/XCI/NRO**, **Load Linux ARM ELF**, **Load 3DS game**, **Load Vita VPK**, **Load GBA/MultiBoot ROM**,
+  **Load NDS ROM** and **Load Android APK/XAPK** open a screen as the keys': a click on its blinking **[ Pick or drop a file ]**, or Enter, opens the system's file
   picker (on Linux the desktop's, else zenity's). Dropping a file on the window and Ctrl+V with
   a path work too. On the Switch's, **P** (on a phone a tap on *Folder* at the foot, on a pad Y) opens the system's
   folder picker instead, for an extracted game's folder (`exefs/` with its `main`, beside its `romfs/`), which plays as
@@ -118,20 +118,32 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   Settings > GBA > **Covers** on *Box art (libretro-thumbnails)* (`gba_covers=boxart`, off by default), each make that
   ends well downloads the game's box into its folder (`icon.png`), which its rows show; a ROM with no box there keeps
   Wimsy, and its row says why ([Settings](settings.md#gba)). See [AGB board](../platforms/agb/README.md).
+- **Load NDS ROM** uses `scarletnx-nds` on a card image (`.nds`), with the menu's data folder as its `--data`: it
+  makes the game's folder of `recompiled/` (named after the image's file), compiles the game's code ahead of time
+  on the first run, which takes a few minutes, and plays it in a window with both screens. See
+  [DS](../platforms/nds/README.md).
 - **Load Android APK/XAPK** uses `scarletnx-android` on an `.apk`, `.xapk` or `.apks` file, with no other argument.
   The driver installs a bundle of split APKs itself. The app runs as it is, as a Linux program does: nothing is
   compiled first, and its recent row shows at once. An APK in a games or dumps folder shows in Games, and Enter runs
   it the same way. R on it says that it runs as it is. See [Android apps](../platforms/android-apps/README.md).
 - **Install Keys**, immediately after the five load entries, blinks red (the theme's `failure` colour, at its
-  `blink_ms`) while no keys are in use, the Switch's or the 3DS's. It prompts you to
+  `blink_ms`) while no keys are in use, the Switch's or the 3DS's. Its screen has a row for each console's file,
+  **Switch** `prod.keys`, **3DS** `aes_keys.txt` and **NDS** `bios7.bin`, each *Installed* or *Not installed*: Up and
+  Down (a pad's D-pad) go over them, a click on one picks its file, and under them the row in focus says where its
+  file goes (*Installs to*). It prompts you to
   pick a keys file (a click on the blinking **[ Pick or drop a keys file ]** in the middle of
-  the screen, the theme's `[prompt]`, or Enter), drop it, or paste its path with Ctrl+V. The file's name says which
-  console's keys it is: a `prod.keys` is the Switch's and is installed to `~/.switch/prod.keys` (or
+  the screen, the theme's `[prompt]`, or Enter), drop it, or paste its path with Ctrl+V. A file picked is the row in
+  focus's; one dropped or pasted goes by its name: a `prod.keys` is the Switch's and is installed to
+  `~/.switch/prod.keys` (or
   `%USERPROFILE%\.switch\prod.keys` on Windows; on Linux, in the user's data folder, it is put there
   instead, `~/.local/share/scarletnx/prod.keys`, which the driver reads before
   `~/.switch`, and names the keys of `~/.switch` it would use until then), and an `aes_keys.txt` is the 3DS's, installed
-  to `~/.3ds/aes_keys.txt` (`%USERPROFILE%\.3ds` on Windows), where the 3DS driver reads it. The screen shows both
-  destinations, *Installs to* for the Switch's and *3DS keys to* for the 3DS's. Only **encrypted** 3DS files need the
+  to `~/.3ds/aes_keys.txt` (`%USERPROFILE%\.3ds` on Windows), where the 3DS driver reads it. Any other file is the
+  DS's ARM7 BIOS when it is named `bios7.bin`, has 16384 bytes or the NDS row has the focus: it is installed as
+  `bios7.bin` in the data folder (`~/.local/share/scarletnx/bios7.bin`, `%APPDATA%\scarletnx\bios7.bin` on Windows)
+  when its CRC-32 is 0x1280F0D5, the console's, and refused otherwise, the screen saying its size or its CRC-32 and the
+  BIOS's. `scarletnx-nds` decrypts with it a card image whose secure area is still encrypted
+  ([The DS](../platforms/nds/README.md#the-secure-area)). Only **encrypted** 3DS files need the
   3DS keys: a decrypted or homebrew 3DS game runs without an `aes_keys.txt`. It creates the
   folder if needed. Existing keys trigger the bright-red warning
   **Keys already setup. This will overwrite the previous ones**. The screen then says what the try
@@ -139,7 +151,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   (10 after a failure, while another file can still be picked); ESC cancels without changing them.
 - **Settings** opens on its groups, Enter opening one and ESC coming back: **App**, then
   **Launch** (the launcher's own and the recompiler's, from `src/nx/runtime/settings.txt`), then a group per section of the game's `.ini` (Display,
-  Graphics, Performance, Overlay, Controllers, Network, Debug; Overlay is the runtime's On-screen controls, the
+  Graphics, Audio, Performance, Overlay, Controllers, Network, Debug; Overlay is the runtime's On-screen controls, the
   name its page in the game and `settings.ini` keep), as `scarletnx --settings`
   prints them from the runtime's own tables: read from them in the same process where the menu is built into
   scarletnx (iOS too), so every section shows at once; a menu built alone asks `scarletnx --settings`. The game's menu's settings have its names and words
@@ -165,7 +177,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   **Background recompile** (*Auto*, `background_recompile = auto` in `app.ini`: *Gentle* while the computer or
   phone runs on its battery and *Full* on its charger or with none, asked as a recompile starts and every 5 s while it
   runs, the row saying what it is now; *Full*, `full`: the queue's recompiles take every core, or the AOT threads
-  picked; *Gentle*, `gentle`: as many as the memory holds, up to half of them (`--aot_threads=0 --aot_threads_most=N` to the game's driver, whichever console's; a GBA ROM
+  picked; *Gentle*, `gentle`: as many as the memory holds, up to half of them (`--aot-threads=0 --aot-threads-most=N` to the game's driver, whichever console's; a GBA ROM
   compiles on one thread either way), at a low priority, ten steps of nice under the launcher's, on Windows the
   class under the launcher's, for using the computer meanwhile; [the Compile tab](#the-compile-tab)),
 **Theme Editor**, which comes
@@ -193,20 +205,16 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   a folder of `gpu_drivers/` of the user's data folder named after the zip; a refusal says what is wrong, with the
   value. A
   package's box has **Use** and **Remove** (Del removes too), which asks first; one added is picked where packages
-  load. **Download Driver** lists, from GitHub, the releases of the driver repositories Eden's driver fetcher lists
-  (Mr. Purple Turnip, GameHub Adreno 8xx, KIMCHI Turnip, Weab-Chan Freedreno, Whitebelyash Turnip), fetched as it
-  opens, with the GPU and the driver Eden recommends for it, but T30 on an Adreno 605 to 613 (EOL-24.3.4 gives
-  those Vulkan 1.0); a repository that failed says why, and Enter fetches the
-  lists again. A release's box lists its downloads with their sizes, a GPU maker's own drivers (every GameHub one, and
-  one named Qualcomm) marked *proprietary, no license*; the one picked is downloaded, its progress in the note, and
-  added as Add Driver adds a zip. They load on Android 9 or newer, arm64, with an Adreno GPU (`/dev/kgsl-3d0`), a Mali
+  load. **Download Driver** lists the GitHub releases for the device's GPU: Eden's five repositories on an Adreno,
+  [NX-Mali](https://github.com/Slopinator99/NX-Mali) on a Mali, radv-xclipse's Android zips on an Xclipse; the one
+  recommended for its model is marked, a GPU maker's own *proprietary, no license*, and the one picked is downloaded
+  and added as Add Driver adds a zip. They load on Android 9 or newer, arm64, with an Adreno GPU
+  (`/dev/kgsl-3d0`), a Mali
   GPU (`/dev/mali0`) or an Xclipse GPU (a render node of the `amdgpu` kernel driver in `/dev/dri`, for [RADV's port to
   it](https://github.com/JimVulkan/radv-xclipse), whose package asks Android 14): the page's first line says what this
   device is and, anywhere else, why games there use the system driver. There the packages, Download Driver and Add
   Driver are greyed, each row saying what the device lacks (*Android only*, *Unsupported GPU*...) and Enter
-  the whole line; a package's box still opens for its Remove, its Use refused with that line. On an Xclipse or a
-  Mali GPU Download Driver alone is greyed, as those repositories hold Adreno's drivers: its package is added
-  from its zip. A
+  the whole line; a package's box still opens for its Remove, its Use refused with that line. A
   game whose package does not load stops, saying why, and so does one whose package lists no Vulkan device, a driver
   for another GPU. Under them, **edenprobe Mode** (Quick, the default:
   `notime cpu graphics hooks`; Full adds `fs video audio kernel display`) and **Run edenprobe**, which plays
@@ -268,7 +276,10 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   Share Log lists each entry.
   **Reset to Defaults**, the last row, puts every setting of the groups after App back to its default, asking first with how
   many change. A group of settings shows
-  a row each, its help above, Left/Right going round its values, Enter typing one. A value typed (a number, a text, a
+  a row each, its help above, Left/Right going round its values, Enter typing one. A slider's row, Audio's **Volume**,
+  has its value where the others' are and a slider at its right end, its knob at the value: Left/Right and Enter step
+  it, stopping at either end (the foot says the end: `Volume: 100% is its highest`), a click or a finger on the slider
+  takes the step under it, and a drag moves the knob along, each step kept at once. A value typed (a number, a text, a
   nickname, a theme's key, a color's `#RRGGBB`) is typed in a dialog, as UI scale's, never in the row: the row's label
   its title, the text with its cursor in a field, what the row takes under it with its numbers (`A number from 0.25 to
   16, two decimals at most; empty, the default 1`), then OK and Cancel. Enter or A is OK, ESC or B Cancel, Backspace
@@ -305,7 +316,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   nothing of a dump is extracted: the game's `.ini` records the dump, the recompile reads the ExeFS from it, and the
   game reads its ExeFS and RomFS out of the dump on the fly, decrypting them as it reads ([Usage](usage.md)). A CIA
   is read the same way. On, a dump is extracted as before, into the game's folder or with *Extract to tmpfs* into
-  tmpfs, which implies it. Turning it off again takes a game's extraction away on its next run.
+  tmpfs, which implies it; an extracted game's folder is read in place all the same, and copied only into tmpfs. Turning it off again takes a game's extraction away on its next run.
   **Optimization level** (0, 1, 2, 3 or z, 2 by default) is LLVM's level for the game's code, **AOT threads** the
   threads compiling it (0, the default Auto: the machine's cores with a quarter left free, the physical cores
   where it says them, at most 75%, so a recompile does not make the computer stutter), **Unit cache limit** the GB
@@ -607,7 +618,9 @@ cannot be read is named and the others still listed.
   **Recompile** recompiles it where it is, as R does, and Back does neither.
 - A made game whose file to play from is not there is greyed and says `(file not found)` after its name, in the list
   and in Recent Games, and the side box names the file (*Not found:* and its path), as each driver plays it: a Switch
-  game read from its dump in place (`source=` in its `.ini`; its ExeFS not extracted into its `<name>_data`), a GBA
+  game read from its dump in place (`source=` in its `.ini`; its ExeFS not extracted into its `<name>_data`, or its
+  RomFS there cut by a stopped extraction or copy, or not there, which its next start extracts again from that dump:
+  a game whose `.ini` names none says *Not found: the dump or folder its RomFS is extracted from*), a GBA
   game, whose ROM its driver reads at every run, a 3DS game (`source=` in the `.ini` of its folder), unless its folder
   holds its extraction (`exheader.bin`) or the extractions' folder a copy the 3DS driver decrypted
   (`3ds/<name>.decrypted.<extension>`), and a Vita game made from a dumped game's folder, which its `app/` links. A Vita
@@ -1102,6 +1115,9 @@ self-copy safety, cancellation, and the bright-red overwrite warning. Setup test
 page of a first start in a home of their own and check what each writes (a portable copy, the language, the folders,
 the keys, the first user) and refuses, users.ini kept or overwritten, the fixed uid kept for its saves, a notice
 alone after an update, `--no-setup`, and the question where `options-dialog` puts it.
+Pixel order tests (`gui_pixel_order`) draw every database Mii's picture, square and round, Wimsy's, a 3DS icon and
+the covers on the renderer and check each shows its source's colours, which a big-endian host's byte order swaps
+where a picture's bytes and its format disagree.
 Language tests cover a catalog's search in either byte order, catalogs cut or pointing out of themselves, the language
 Auto picks from the system's locales, English where a language has none, the Language row and `app.ini`'s key, and
 the script's refusals; they use a language of their own, `tests/po/xx.po`. Glyph tests cover the Latin, the titles'

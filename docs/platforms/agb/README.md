@@ -45,8 +45,11 @@ to the Switch, Linux and 3DS loaders.
 ## Playing
 
 `scarletnx-agb` takes the [common options](../../user/usage.md#common-options) that fit it: `-r`, `--game`, `--data`,
-`--outdir`, `--output`, `--frames`, `--shot`, `--script`, `-f` and `-h`, each
-value as `--option VALUE` or `--option=VALUE`.
+`--outdir`, `--output`, `--frames`, `--shot`, `--script`, `-f`, `-h` and the recompile's (`-O`, `--jobs`, `--chunk`,
+`--jit-cache`, `--jit-only`, `--keep-ir`, `-q`), each value as `--option VALUE` or `--option=VALUE`. A ROM's code is
+one module compiled on one thread as one unit, so `--jobs`, `--chunk` and `--aot-threads-most` change nothing, which
+the recompile says; `--jit-cache` names another game folder's `<name>_code.map`, and `--jit-only` plays with no
+module.
 
 A MultiBoot ROM (`.mb`) is a program the console receives through the link cable, as a GameCube game or another
 console sends one: `scarletnx-agb Program.mb` plays it with no cartridge, from EWRAM, where the BIOS puts it (256 KiB
@@ -57,22 +60,28 @@ memory.
 screen, scaled by whole steps when it is resized, with the console's sound and
 its 59.73 frames a second. `-f` (or `--fullscreen=1`) starts it fullscreen, and F11
 switches. Esc twice within 3 seconds closes it, a first press warning on the
-terminal. The keyboard is the Switch runtime's: the arrows are the D-pad, X or
+terminal and in a line over the game, as a Switch game's notices show. The screen goes through Vulkan, as the
+other consoles' windows, where the host has a Vulkan 1.3 device that presents to the window; without one, through
+SDL's renderer, which the start says, the same pixels either way. The keyboard is the Switch runtime's: the arrows are the D-pad, X or
 Space A, Z B, Q L, E R, Enter Start and Backspace Select. A gamepad's buttons are
 where the console has them (A east, B south), its shoulders and triggers L and
 R, its left stick the D-pad. `--script ms:hex,...` presses keys unattended, as the
 3DS and Vita drivers take it: each press at its time in ms from the start of the
 run, by the console's frames (the same with a window or without), its keys in
 KEYINPUT's bits (1 A, 2 B, 4 Select, 8 Start, 10 Right, 20 Left, 40 Up, 80 Down,
-100 R, 200 L), held for `--press_len=` ms (300).
+100 R, 200 L), held for `--press-len=` ms (300). `--gba-color=gba` (the default)
+shows the colours as the original GBA's unlit screen did, near's color emulation
+formula; `--gba-color=raw` as the game writes them, as mGBA without a shader
+(Settings > GBA > Colors).
 
 The game's folder is `recompiled/<name>/` of the data folder (`--data`, else the
 user's), named after the ROM's file, or `<name>/` of `--outdir`, or the folder
 `--output` names. It holds the
 module, the save (`<name>.sav`), a copy of the runtime named after the game
-(`<name>`, `<name>.exe` on Windows) and `<name>.ini`, whose `source=` names the
-ROM and `system=gba` the console the launcher plays it with, as a 3DS or Vita
-game's folder does; the ROM's folder stays as it is. The copy plays its game
+(`<name>`, `<name>.exe` on Windows), the DLLs beside that copy on Windows, which
+the copy loads, and `<name>.ini`, whose `source=` names the ROM and `system=gba`
+the console the launcher plays it with, as a 3DS or Vita game's folder does;
+the ROM's folder stays as it is. The copy plays its game
 alone, from the ROM its `.ini` names, and `scarletnx-agb --game=recompiled/<name>`
 plays it the same way; `-r` compiles the module again without playing. A build
 copies its runner beside every GBA game again (`cmake/deploy.cmake`), which it
@@ -95,7 +104,7 @@ The board is under construction, piece by piece:
 | Keypad (HID) | done: KEYINPUT and the KEYCNT interrupt, from the keyboard and gamepads |
 | Save memory | SRAM and flash, kept in the game's folder; EEPROM not yet |
 | CPU, DMA, timers, interrupts | done, and the BIOS's IntrWait waits for the game's handler to flag the interrupt |
-| Serial (link) | no cable: answers as a console with none plugged, as mGBA does without a link |
+| Serial (link) | no cable: answers as a console with none plugged, where a transfer that waits for a partner never ends |
 
 A ROM is recompiled when it is loaded, the same process the other system
 types use, and runs on the board from its native module.
@@ -153,6 +162,10 @@ SoftReset starts the machine again from EWRAM or the cartridge, as the byte at
 0x03007FFA says. Halt and Stop halt the machine until an interrupt, and
 IntrWait and VBlankIntrWait until the game's handler flags it in the BIOS's
 flags at 0x03007FF8. SoundBias and the sound driver's calls are known stubs.
+Each call takes the time the code of mGBA's HLE BIOS takes for it, replayed on
+the same bus (`bios/bios_time.c`): its dispatch, the math's and LZ77's stall,
+CpuSet's and CpuFastSet's loops, Halt, and IntrWait, whose return comes 5 cycles
+later on the console.
 
 Angles are turns in 16 bits, the way the BIOS counts them, and the affine matrix
 drops the low byte of the rotation angle, giving 256 steps around the circle.
@@ -196,10 +209,13 @@ the banked register state. Software interrupts go to the HLE BIOS and
 interrupts follow the entry and return the BIOS stub performs. The board starts
 with the registers as the BIOS leaves them (forced blank, the serial port's
 general purpose mode, the sound's bias at its middle, POSTFLG), which a game reads
-to tell a link boot from its own. Recompiled blocks are charged two cycles per
-instruction, and the waits and the save memory width rules are approximations
-documented divergences; a serial transfer ends at once, where mGBA waits for its
-time.
+to tell a link boot from its own. A block's time is replayed from the trace it
+leaves (`cpu/timing.c`, NanoBoyAdvance's model of the bus): each fetch, load and
+store at its region's wait states from WAITCNT, the cartridge's prefetch unit
+and the internal cycles. An access to the I/O window first runs the board up to
+its own cycle, so a timer read, a DMA or an interrupt lands inside the block
+where the console has it; near an interrupt the block runs an instruction at a
+time. The save memory width rules are approximations.
 
 ## The ROM header
 
@@ -213,7 +229,7 @@ image. A ROM the console would reject is refused with the failing byte named.
 ## Tests
 
 The board's unit tests are `tests/agb_*.c`. A test build also downloads
-[jsmolka's gba-tests](https://github.com/jsmolka/gba-tests) (`cmake/dependencies.cmake`)
+[jsmolka's gba-tests](https://github.com/jsmolka/gba-tests) (pinned in `cpmfile.json`)
 and runs each ROM as a test of its own, `agb_gba_<rom>` (`tests/agb_gba_tests.py`).
 The ROMs check the ARM and Thumb instruction sets, the BIOS's open bus, the
 memory map, the save memory and the display. A self-checking ROM leaves the
@@ -221,6 +237,21 @@ number of its first failed test in a register, which `scarletnx-agb --registers`
 prints at the end of the run. The display ROMs are checked against the picture
 their source draws.
 
+It downloads [DenSinH's FuzzARM](https://github.com/DenSinH/FuzzARM) too, five
+ROMs of 10000 random ARM and Thumb instructions each, `agb_fuzzarm_<rom>`
+(`tests/agb_fuzzarm.py`). A ROM whose instructions all gave the values its
+generator computed ends in the loop after its tests with "End of testing" alone
+on its top line; one that met a difference waits for a key with the instruction
+on its screen.
+
+With `-DSNX_TEST_AGB_MGBA_SUITE=ON` it downloads mGBA's test suite too (the ROM of
+mgba-emu/suite `e694203`, pinned in scarletnx/mgba-suite-rom's release), its 13
+sections each a test, `agb_mgba_<section>`, labelled `mgba-suite`
+(`tests/agb_mgba_suite.py`). Its results were measured on the console; a section
+short of all of them passes at the count it reaches today, its issue named, and
+fails at any other. It is off by default: the 13 take about 90 s.
+
 ```sh
-ctest --test-dir build/agb -R agb_gba
+ctest --test-dir build/agb -R 'agb_(gba|fuzzarm)'
+ctest --test-dir build/agb -L mgba-suite    # with SNX_TEST_AGB_MGBA_SUITE=ON
 ```

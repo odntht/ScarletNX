@@ -38,9 +38,11 @@ keeps audits and measurements as they were taken.
 
 - [Build](dev/build.md): prerequisites and builds on Linux, FreeBSD, macOS and Windows, build variants, installing
 - [Development](dev/development.md): checks, running and diagnosing a game, profiling, shaders and SVCs
+- [Profiling](dev/profiling.md): a walkthrough of the CPU and GPU profilers for a recompiled game, and how to read them
 - [Architecture](dev/architecture.md): AArch64 to a native module, the runtimes' boundaries and what each owns
 - [The recompiler as a library](dev/library.md): building, using and the limits of `libscarletnx-recompiler`
 - [edenprobe](dev/edenprobe.md): the hardware probes CI runs against a baseline
+- [Coverage](dev/coverage.md): which of the runtime's code edenprobe, the tests and a game run, and the paths none of them reach
 - [Status and roadmap](dev/roadmap.md): what is next
 - [The CPU cost of a draw](dev/draw-cost.md): the plan to cut the GPU thread's work for each draw
 - [Contributing](../CONTRIBUTING.md): game data, checks, commits and pull requests
@@ -61,6 +63,8 @@ keeps audits and measurements as they were taken.
   - [SuperTux target](platforms/3ds/supertux.md): the pinned homebrew, how to reproduce its run, and its baseline
 - [PS Vita](platforms/vita/README.md): the Vita driver, its shader corpus and its limits
 - [Game Boy Advance](platforms/agb/README.md): the AGB board, playing a ROM, its devices and tests
+- [DS](platforms/nds/README.md): the NDS driver, its compiled module, the ARM7's services and the display on
+  the GPU
 - [Linux AArch64 programs (GNU ABI)](platforms/gnuabi/README.md): the sysroot, how code runs, processes and the
   system calls
 - [Android apps](platforms/android-apps/README.md): `scarletnx-android`, which runs an Android app's code on a
@@ -85,11 +89,15 @@ keeps audits and measurements as they were taken.
     that the rewrite of the buffer cache, the rings and the texture trim must keep, from the comments of the code
   - [Graphics pipeline libraries](layers/gpu/pipeline-libraries.md): the design of pipelines linked from shader parts,
     and the optimized pipeline made after them
+  - [Driver quirks](layers/gpu/driver-quirks.md): what each GPU driver gets wrong, where that is known from, and how
+    the renderer works around it
   - [ASTC compute uploads](layers/gpu/astc.md)
   - [Block linear surfaces and texture conversions on the GPU](layers/gpu/blocklinear.md)
   - [BCn without BCn: ETC2 and EAC on phone GPUs](layers/gpu/bcn.md)
   - [glslc](layers/gpu/glslc.md): GLSL ES into SPIR-V, for the backends that run OpenGL ES programs on Vulkan
   - [The shared SPIR-V optimizer](layers/gpu/spirv-opt.md): the passes a layer runs on the module it translated
+  - [Constant buffer words folded into a translation](layers/gpu/constant-buffer-folds.md): which words a
+    fragment program's translation holds as constants, how many translations a program takes, what a draw pays
 - Video (`layers/media/`)
   - [VIC composition on the GPU](layers/media/vic.md)
 

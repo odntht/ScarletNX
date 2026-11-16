@@ -177,6 +177,10 @@ msgid "Not moved: %s could not be made: %s"
 msgstr "Não movido: não foi possível criar %s: %s"
 
 #: src/gui/clean.c
+msgid "Stays beside the save's 0/: a name that starts with a dot is a sync tool's or the system's, not one of the game's files"
+msgstr ""
+
+#: src/gui/clean.c
 #, c-format
 msgid "Its files are in %s, which could not take its place: %s"
 msgstr "Os arquivos dele estão em %s, que não pôde tomar o lugar dele: %s"
@@ -919,6 +923,12 @@ msgstr "clique na caixa (ou Enter) para abrir o seletor de arquivos"
 msgid "Ctrl+V: paste. ESC: back."
 msgstr "Ctrl+V: colar. ESC: voltar."
 
+#. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
+#: src/gui/main.c
+#, snx-keys
+msgid "Up/Down: console. Ctrl+V: paste. ESC: back."
+msgstr "Cima/Baixo: console. Ctrl+V: colar. ESC: voltar."
+
 #: src/gui/main.c
 msgid "Pick or drop a keys file"
 msgstr "Escolha ou solte um arquivo de chaves"
@@ -1138,6 +1148,12 @@ msgstr "X: save states."
 #, snx-keys
 msgid "A: pick a file. B: back."
 msgstr "A: escolher um arquivo. B: voltar."
+
+#. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
+#: src/gui/main.c
+#, snx-keys
+msgid "D-pad: console. A: pick a file. B: back."
+msgstr "Direcional: console. A: escolher um arquivo. B: voltar."
 
 #. Keys: "Key: what it does." sentences. Keep each key, or its translation in this file, and each ~
 #: src/gui/main.c
@@ -1531,6 +1547,50 @@ msgstr "...FALHOU"
 #: src/gui/main.c
 msgid "...OK"
 msgstr "...OK"
+
+#: src/gui/main.c src/gui/steps.c
+msgid "PROGRAM"
+msgstr ""
+
+#: src/gui/main.c
+msgid "STARTED BY"
+msgstr ""
+
+#: src/gui/main.c
+msgid "USER"
+msgstr ""
+
+#: src/gui/main.c
+msgid "VERSION"
+msgstr ""
+
+#: src/gui/main.c
+msgid "DLC"
+msgstr ""
+
+#: src/gui/main.c
+msgid "HANDED OVER"
+msgstr ""
+
+#: src/gui/main.c src/gui/steps.c
+msgid "GPU"
+msgstr "GPU"
+
+#: src/gui/main.c
+msgid "TITLE ID"
+msgstr ""
+
+#: src/gui/main.c src/gui/steps.c
+msgid "BUILD"
+msgstr "GERAR"
+
+#: src/gui/main.c src/gui/steps.c
+msgid "RECOMPILE"
+msgstr "RECOMPILAR"
+
+#: src/gui/main.c
+msgid "Program"
+msgstr ""
 
 #: src/gui/main.c
 msgid "Aborting..."
@@ -2274,6 +2334,10 @@ msgid "Runs a GBA ROM or MultiBoot ROM on the emulated AGB board"
 msgstr "Roda uma ROM de GBA ou de MultiBoot na placa AGB emulada"
 
 #: src/gui/main.c
+msgid "Recompiles a DS card image, then runs it"
+msgstr "Recompila uma imagem de cartão de DS e depois a roda"
+
+#: src/gui/main.c
 msgid "Runs an Android app's .apk, .xapk or .apks"
 msgstr "Roda o .apk, .xapk ou .apks de um app Android"
 
@@ -2313,6 +2377,10 @@ msgstr "Jogo de Vita, pronto para rodar"
 #: src/gui/main.c
 msgid "GBA game, ready to run"
 msgstr "Jogo de GBA, pronto para rodar"
+
+#: src/gui/main.c
+msgid "NDS game, ready to run"
+msgstr "Jogo de NDS, pronto para rodar"
 
 #: src/gui/main.c
 msgid "Ready to run"
@@ -2363,6 +2431,10 @@ msgstr ""
 #: src/gui/main.c
 msgid "GBA ROM, played with scarletnx-agb"
 msgstr "ROM de GBA, jogada com o scarletnx-agb"
+
+#: src/gui/main.c
+msgid "NDS ROM, played with scarletnx-nds"
+msgstr "ROM de NDS, jogada com o scarletnx-nds"
 
 #: src/gui/main.c
 msgid "Android app, run with scarletnx-android"
@@ -2484,6 +2556,14 @@ msgid "%zu game(s)"
 msgstr "%zu jogo(s)"
 
 #: src/gui/main.c
+msgid "Installed"
+msgstr "Instalado"
+
+#: src/gui/main.c
+msgid "Not installed"
+msgstr "Não instalado"
+
+#: src/gui/main.c
 #, c-format
 msgid "Installs to: %s"
 msgstr "Instala em: %s"
@@ -2494,16 +2574,8 @@ msgstr "Sem pasta pessoal"
 
 #: src/gui/main.c
 #, c-format
-msgid "3DS keys to: %s"
-msgstr "Chaves do 3DS em: %s"
-
-#: src/gui/main.c
-msgid "Installed"
-msgstr "Instalado"
-
-#: src/gui/main.c
-msgid "Not installed"
-msgstr "Não instalado"
+msgid "The DS's ARM7 BIOS: %u bytes, CRC-32 0x%08X"
+msgstr "O BIOS ARM7 do DS: %u bytes, CRC-32 0x%08X"
 
 #: src/gui/main.c
 #, c-format
@@ -3123,10 +3195,6 @@ msgid "Not in this build"
 msgstr "Não está neste build"
 
 #: src/gui/main.c
-msgid "Adreno only"
-msgstr "Só Adreno"
-
-#: src/gui/main.c
 #, c-format
 msgid "No Vulkan loader: %s"
 msgstr "Sem loader do Vulkan: %s"
@@ -3186,12 +3254,8 @@ msgid "Download Driver"
 msgstr "Baixar driver"
 
 #: src/gui/main.c
-msgid "The driver repositories Eden lists hold drivers for Adreno GPUs. An Xclipse GPU's driver, RADV, is added from its zip with Add Driver"
-msgstr "Os repositórios de drivers que o Eden lista têm drivers para GPUs Adreno. O driver de uma GPU Xclipse, o RADV, é adicionado pelo zip com Adicionar driver"
-
-#: src/gui/main.c
-msgid "The releases of the driver repositories Eden lists, from GitHub: one picked is downloaded and added as Add Driver adds a zip. A GPU maker's own drivers are marked proprietary, no license"
-msgstr "As releases dos repositórios de drivers que o Eden lista, do GitHub: a escolhida é baixada e adicionada como o Adicionar driver adiciona um zip. Os drivers do próprio fabricante da GPU aparecem como proprietários, sem licença"
+msgid "Drivers from GitHub releases: Turnip and a GPU maker's own for an Adreno (the maker's marked proprietary, no license), NX-Mali and FristOneRR's PanVK for a Mali, RADV for an Xclipse. One picked is downloaded and added as Add Driver adds a zip"
+msgstr "Drivers das releases do GitHub: o Turnip e o do próprio fabricante para uma Adreno (o do fabricante marcado como proprietário, sem licença), o NX-Mali e o PanVK do FristOneRR para uma Mali, o RADV para uma Xclipse. O escolhido é baixado e adicionado como o Adicionar driver adiciona um zip"
 
 #: src/gui/main.c
 msgid "Add Driver"
@@ -3731,6 +3795,16 @@ msgstr "%s não é um apelido: %s"
 #, c-format
 msgid "%s: %s. A game on this system runs the same whatever it says, and it stays %s"
 msgstr "%s: %s. Um jogo neste sistema roda igual seja qual for o valor, e o ajuste fica %s"
+
+#: src/gui/main.c
+#, c-format
+msgid "%s: %s is its lowest"
+msgstr "%s: %s é o mínimo"
+
+#: src/gui/main.c
+#, c-format
+msgid "%s: %s is its highest"
+msgstr "%s: %s é o máximo"
 
 #: src/gui/main.c
 msgid "Paste one local folder's path"
@@ -4386,6 +4460,10 @@ msgid "Shortcuts"
 msgstr "Atalhos"
 
 #: src/gui/main.c
+msgid "Out of memory"
+msgstr ""
+
+#: src/gui/main.c
 #, c-format
 msgid "The game starts its program %d, %s, which is not made: Recompile the game to make its programs"
 msgstr "O jogo inicia o seu programa %d, %s, que não foi compilado: Recompilar o jogo compila os programas dele"
@@ -4680,6 +4758,10 @@ msgid "Removed games not kept: %s could not be written (%s)."
 msgstr ""
 
 #: src/gui/main.c
+msgid "the dump or folder its RomFS is extracted from, which its settings do not name"
+msgstr "o dump ou a pasta de onde a RomFS dele é extraída, que as configurações dele não nomeiam"
+
+#: src/gui/main.c
 #, c-format
 msgid "Locate...: the folder picker could not open: %s"
 msgstr ""
@@ -4951,12 +5033,24 @@ msgid "M opens the mods and cheats of a recompiled Switch game in focus."
 msgstr "M abre os mods e cheats de um jogo de Switch recompilado em foco."
 
 #: src/gui/main.c
+msgid "Cannot install bios7.bin: APPDATA is not set"
+msgstr "Não foi possível instalar o bios7.bin: APPDATA não está definido"
+
+#: src/gui/main.c
+msgid "Cannot install bios7.bin: HOME is not set"
+msgstr "Não foi possível instalar o bios7.bin: HOME não está definido"
+
+#: src/gui/main.c
 msgid "Cannot install aes_keys.txt: neither USERPROFILE nor HOME is set"
 msgstr "Não foi possível instalar o aes_keys.txt: nem USERPROFILE nem HOME estão definidos"
 
 #: src/gui/main.c
 msgid "Cannot install aes_keys.txt: HOME is not set"
 msgstr "Não foi possível instalar o aes_keys.txt: HOME não está definido"
+
+#: src/gui/main.c
+msgid "bios7.bin installed: encrypted NDS games can be decrypted now."
+msgstr "bios7.bin instalado: os jogos de NDS criptografados já podem ser descriptografados."
 
 #: src/gui/main.c
 msgid "aes_keys.txt installed: encrypted 3DS games can be decrypted now."
@@ -4972,8 +5066,34 @@ msgid "Cannot install %s: %s"
 msgstr "Não foi possível instalar %s: %s"
 
 #: src/gui/main.c
-msgid "Please drop a readable file named prod.keys or aes_keys.txt."
-msgstr "Solte um arquivo legível chamado prod.keys ou aes_keys.txt."
+#, c-format
+msgid "%s is not the DS's ARM7 BIOS: it has %zu bytes, the BIOS %u (CRC-32 0x%08X)."
+msgstr "%s não é o BIOS ARM7 do DS: tem %zu bytes, o BIOS %u (CRC-32 0x%08X)."
+
+#: src/gui/main.c
+#, c-format
+msgid "%s is not the DS's ARM7 BIOS: its CRC-32 is 0x%08X, the BIOS's 0x%08X."
+msgstr "%s não é o BIOS ARM7 do DS: o CRC-32 dele é 0x%08X, o do BIOS 0x%08X."
+
+#: src/gui/main.c
+#, c-format
+msgid "%s could not be read, or has over %d bytes: the DS's ARM7 BIOS has %u."
+msgstr "Não foi possível ler %s, ou ele tem mais de %d bytes: o BIOS ARM7 do DS tem %u."
+
+#: src/gui/main.c
+#, c-format
+msgid "%s could not be read, or has over %d bytes."
+msgstr "Não foi possível ler %s, ou ele tem mais de %d bytes."
+
+#: src/gui/main.c
+#, c-format
+msgid "%s is not prod.keys, aes_keys.txt or the DS's ARM7 BIOS."
+msgstr "%s não é prod.keys, aes_keys.txt nem o BIOS ARM7 do DS."
+
+#: src/gui/main.c
+#, c-format
+msgid "%s is not a file."
+msgstr "%s não é um arquivo."
 
 #: src/gui/main.c
 #, c-format
@@ -5636,24 +5756,12 @@ msgid "EXTRACT"
 msgstr "EXTRAIR"
 
 #: src/gui/steps.c
-msgid "RECOMPILE"
-msgstr "RECOMPILAR"
-
-#: src/gui/steps.c
-msgid "BUILD"
-msgstr "GERAR"
-
-#: src/gui/steps.c
 msgid "LAUNCH"
 msgstr "INICIAR"
 
 #: src/gui/steps.c
 msgid "READY"
 msgstr "PRONTO"
-
-#: src/gui/steps.c
-msgid "GPU"
-msgstr "GPU"
 
 #: src/gui/steps.c
 msgid "--:-- left"
@@ -6045,6 +6153,10 @@ msgstr "Abrir Vita VPK"
 #: src/gui/ui.txt
 msgid "Load GBA/MultiBoot ROM"
 msgstr "Abrir ROM de GBA/MultiBoot"
+
+#: src/gui/ui.txt
+msgid "Load NDS ROM"
+msgstr "Abrir ROM de NDS"
 
 #: src/gui/ui.txt
 msgid "Load Android APK/XAPK"
@@ -6551,8 +6663,35 @@ msgid "The picture a GBA game made from a ROM shows in Games. None = Wimsy, as a
 msgstr ""
 
 #: src/nx/runtime/settings.txt
+msgid "GBA colors"
+msgstr ""
+
+#: src/nx/runtime/settings.txt
+msgid "Colors"
+msgstr ""
+
+#: src/nx/runtime/settings.txt
+msgid "The colors a GBA game shows. GBA screen = as the original GBA's unlit screen showed them: the game's colors, painted strong for that screen, come out softer and darker (near's color emulation article, Talarubi's formula). Raw = as the game writes them, the same as mGBA without a shader"
+msgstr ""
+
+#: src/nx/runtime/settings.txt
 msgid "GBA"
 msgstr ""
+
+#~ msgid "3DS keys to: %s"
+#~ msgstr "Chaves do 3DS em: %s"
+
+#~ msgid "Please drop a readable file named prod.keys or aes_keys.txt."
+#~ msgstr "Solte um arquivo legível chamado prod.keys ou aes_keys.txt."
+
+#~ msgid "Adreno only"
+#~ msgstr "Só Adreno"
+
+#~ msgid "The driver repositories Eden lists hold drivers for Adreno GPUs. An Xclipse GPU's driver, RADV, is added from its zip with Add Driver"
+#~ msgstr "Os repositórios de drivers que o Eden lista têm drivers para GPUs Adreno. O driver de uma GPU Xclipse, o RADV, é adicionado pelo zip com Adicionar driver"
+
+#~ msgid "The releases of the driver repositories Eden lists, from GitHub: one picked is downloaded and added as Add Driver adds a zip. A GPU maker's own drivers are marked proprietary, no license"
+#~ msgstr "As releases dos repositórios de drivers que o Eden lista, do GitHub: a escolhida é baixada e adicionada como o Adicionar driver adiciona um zip. Os drivers do próprio fabricante da GPU aparecem como proprietários, sem licença"
 
 #~ msgid "The threads compiling the game's code when it is recompiled: 0 (Auto) = 1 to start, then one more each second while the memory the code units are seen to take leaves room for it and the system reports no memory pressure, up to the cores with the last quarter left free, so the machine stays responsive; N = that many, whatever the memory. The recompile says each thread it opens and why it opens no more"
 #~ msgstr "As threads que compilam o código do jogo ao recompilar: 0 (Auto) = 1 para começar, depois mais uma a cada segundo enquanto a memória que as unidades de código mostram usar deixa espaço para ela e o sistema não acusa pressão de memória, até os núcleos deixando o último quarto livre, para o computador seguir respondendo; N = esse número, qualquer que seja a memória. A recompilação diz cada thread que abre e por que não abre mais"

@@ -8,6 +8,8 @@
 * [Versions](#versions)
 * [Struct layouts](#struct-layouts)
 * [Game patches: hooks by address](#game-patches-hooks-by-address)
+* [A game that rewrites a hooked function](#a-game-that-rewrites-a-hooked-function)
+* [A mod's call of the original](#a-mods-call-of-the-original)
 * [Verify mode](#verify-mode)
 * [Checking a hook](#checking-a-hook)
 * [What the guest profile showed](#what-the-guest-profile-showed)
@@ -56,7 +58,12 @@ that runs the function's own code is still correct, only not accelerated.
 `hook_install` (`src/nx/hle/hook/hook.c`) reads the game's exported functions (`kernel_load_symbols`) and puts the
 hook's adapter into each matching function's slot, before the game's first thread and the JIT start. The slots never
 change while the game runs, except for `hook_restore` putting a hook back after the JIT drops the code of a range
-(`jit_code_invalidate`).
+(`jit_code_invalidate`), and a hook the game invalidates
+([below](#a-game-that-rewrites-a-hooked-function)). It holds `HOOK_SITES` hooked functions (`hook.h`), as many as a table has entries at most,
+and `hook.c` does not build with a table larger than that, so a game that exports each function once gets every hook.
+One whose modules export them more than once can run out: the game then stops, naming the function left without its
+hook, since that function would run the SDK's own code beside the native hooks of its family, which keep the family's
+state, and a service that only the native functions answer would be asked (`tests/hook_sites.c`).
 
 What no hook sees is code the game's own compiler inlined from an SDK header: there is no call to take. A handler
 therefore keeps the guest's data as the function does, so inlined copies read what it left.
@@ -271,6 +278,71 @@ and keeps the game's own code doing the rest: `hook_run_original(c, addr)` runs 
 the call left it, through the dispatch loop until the function returns to the call's return address, so a handler can
 change an argument before it and a result after it. `hook_site(key)` gives the address the hook went to, from which a
 handler finds its module's base and data.
+
+## A game that rewrites a hooked function
+
+No game changes its own SDK while it runs, but a mod's loader (skyline, exlaunch) hooks SDK functions by writing a
+branch over their first instruction, and keeps a trampoline: that instruction, then a jump back to the one after it.
+When such a function has a native hook, its slot would keep running the handler, and the mod's code would never run.
+
+So when the JIT drops a range's code (`jit_code_invalidate`), `hook_restore` compares the first 4 bytes of each hooked
+function in it with the ones `hook_install` saw: one A64 or A32 instruction, or two Thumb ones. Only those 4 bytes,
+on purpose: they are what every mod's hook writes over, and a change further into the function is not looked at. A
+function whose first 4 bytes changed has its native hook invalidated:
+
+- the hook's adapter (its own host code, which a copy of its address still reaches: an NRO's import bound to it, a
+  direct call the JIT compiled) is rewritten into a jump to `hook_invalidated` (`jump.c`, `hook.c`). It is a jump, not
+  a call, on every architecture: the sad path gets the arguments the adapter's caller left and returns straight to
+  that caller. `hook_invalidated` runs the game's code now at the function (`hook_original`, the JIT's code of it);
+- its slot is left empty, so a call through it compiles the game's code;
+- a warning names the function, its address, its first instruction before and after, and the handler that answered
+  it. A hook whose adapter is the same code (another site of the same entry, or an entry the linker folded into it) is
+  named too, and runs its own code from then on.
+
+The game's code then runs as on the console, the SDK's own code included wherever it calls it: a mod's call of the
+original function through its trampoline runs the SDK's code of that function, which may reach a service only the
+native layer answers, unless an ext_skyline hook takes it ([below](#a-mods-call-of-the-original)).
+
+When the system refuses to make the adapter's code writable (`mprotect`, `VirtualProtect`), the game stops with the
+reason and the values, since the mod's code would never run.
+
+The jump, by host architecture, written past the adapter's landing pad (x86_64's `endbr64`, AArch64's `bti`; an
+AArch64 `paciasp` becomes `bti c`, as the jump must not sign the return address):
+
+| Host | Jump | Bytes |
+| --- | --- | --- |
+| x86_64 | `jmp rel32`, or `movabs r11` and `jmp r11` | 5 or 13 |
+| AArch64 | `b`, or `ldr x16, #8`, `br x16` and the address | 4 or 16 |
+| ppc64 ELFv2 (LE, BE) | `r12` loaded with the global entry (`lis`, `ori`, `sldi`, `oris`, `ori`), `mtctr r12`, `bctr` | 28 |
+| ppc64 ELFv1 | `r12` loaded with the descriptor, `ld r0`, `ld r2`, `mtctr r0`, `bctr`, at the descriptor's entry | 36 |
+| s390x | `brcl 15`, or `lgrl %r1` of an aligned doubleword and `br %r1` | 6, or up to 22 |
+| mips64 (EL, EB) | `$t9` loaded with the address, `jalr $zero, $t9` and the delay slot's `nop` | 32 |
+| riscv64 | `auipc t1` and `jalr`, or `auipc`, `ld` of an aligned doubleword and `jalr` | 8, or up to 24 |
+| loongarch64 | `pcaddu18i $t0` and `jirl` (128 GiB either way) | 8 |
+| ia64 | one MLX bundle, `nop.m 0` and `brl.sptk.few`, at the descriptor's entry | 16 |
+
+It assumes the adapter's code is long enough to hold the jump in the default build. Every adapter calls its handler
+and stores its result, so none is that short, though an x86_64 function can be a lone `ret`.
+`tests/hook_invalidated.c` runs the jump on x86_64 alone (the test is skipped on another host); `tests/hook_jump.c`
+checks every architecture's bytes on any host, against llvm-mc's disassembly and, for IA-64, GNU objdump's (clang has
+no IA-64 target yet; llvm-ia64 will take its place). Under NCE the JIT drops no code, so nothing is invalidated
+there. A 32-bit game's hooks are not invalidated either: their slots are blocks `hook_restore` does not handle.
+
+## A mod's call of the original
+
+`src/nx/hle/hook/ext_skyline.hooks` holds native hooks for the detours loaders are known to make (skyline's and
+Cobalt's on `nn::fs::MountRom`, skyline's on `nn::ro::Initialize`), each with the handler and arguments of the
+function's native hook, in a table of its own (prefix `skyline`, `ext_skyline.c`). They are not installed at the
+start: once a function's native hook is invalidated, a dispatch miss at a pc (`rt_miss`, `hook_trampoline`) checks
+whether the code there is the mod's trampoline of that function, its first instructions as `hook_install` saw them
+(1, or 4 or 5 when the hook was too far for a `b`) followed by a jump back to the one after them (a `b`, or
+`ldr x17, #8` and `br x17` of the address, after a `nop` that aligns it), as skyline's and exlaunch's
+And64InlineHook writes it. The first time it runs, the hook takes the trampoline's slot, and the mod's call of the
+original runs the handler. A handler that hands a case back to the function's own code (`hook_run_original`) runs the
+trampoline's code, entered at the trampoline: the SDK's, past the instructions the mod moved. A first instruction that
+reads the pc (`adr`, `adrp`, a literal load, a branch) is rewritten in the trampoline, so it is never recognized, and
+that function's original stays the SDK's code. A hook of a detour no loader makes is never reached, so the file lists
+the known ones only, and its hooks change no route list.
 
 ## Verify mode
 

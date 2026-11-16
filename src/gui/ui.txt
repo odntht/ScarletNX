@@ -24,6 +24,9 @@
 		[button]"Load GBA/MultiBoot ROM" {
 			icon = gamepad
 		}
+		[button]"Load NDS ROM" {
+			icon = gamepad
+		}
 		[button]"Load Android APK/XAPK" {
 			icon = package-plus
 		}
@@ -119,6 +122,14 @@
 [scene]Queue {
 	[list]Rows {
 		max_rows = 16
+		android.row_height = 48px
+	}
+}
+# the keys screen's consoles under its box's head, a row each: a file picked is the one in focus's, and a file dropped
+# is too unless its name says another's
+[scene]Keys {
+	[list]Rows {
+		max_rows = 8
 		android.row_height = 48px
 	}
 }

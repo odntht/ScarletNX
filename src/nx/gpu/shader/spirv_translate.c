@@ -18,7 +18,8 @@ static void advanced_blend_sample(DirectCtx* c, const ShaderInfo* si, u32 vec4, 
     u32 loaded_image = 0, destination;
     if (sample) {
         loaded_image = spv_emit_load(e, image_type, image);
-        destination = SPV(e, 98, vec4, loaded_image, xy, 64, sample); /* Sample image operand */
+        destination = SPV(e, SPV_OP_IMAGE_READ, vec4, loaded_image, xy, SPV_IMAGE_OPERANDS_SAMPLE,
+                          sample); /* Sample image operand */
     } else
         destination = spv_emit_image_read(e, vec4, image_type, image, xy);
     u32 linear_destination = si->advanced_blend_mask & SH_BLEND_SRGB
@@ -40,7 +41,7 @@ static void advanced_blend_sample(DirectCtx* c, const ShaderInfo* si, u32 vec4, 
     }
     if (sample) {
         u32 args[] = {loaded_image, xy, result, 64, sample};
-        spv_emit_void_op(e, 99, args, 5);
+        spv_emit_void_op(e, SPV_OP_IMAGE_WRITE, args, 5);
     } else
         spv_emit_image_write(e, image_type, image, xy, result);
 }
@@ -58,11 +59,12 @@ static void advanced_blend_epilogue(DirectCtx* c, const ShaderInfo* si, u32 vec4
         pixel = shader_depth_stencil_coordinates(e, c->f32_type, c->u32_type, c->bool_type,
                                                    depth_buffer, position, &inside);
         kept = SPV(e, SPV_OP_LOGICAL_AND, c->bool_type, kept, inside);
-        u32 mask = spv_emit_load(e, c->u32_type,
-                                 spv_emit_interface_scalar_pointer(e, 1, c->u32_type, coverage, 0, c->zero));
+        u32 mask = spv_emit_load(
+            e, c->u32_type, spv_emit_interface_scalar_pointer(e, SPV_STORAGE_INPUT, c->u32_type, coverage, 0, c->zero));
         if (sample_mask_output) {
-            u32 output_mask = spv_emit_load(e, c->u32_type,
-                spv_emit_interface_scalar_pointer(e, 3, c->u32_type, sample_mask_output, 0, c->zero));
+            u32 output_mask = spv_emit_load(
+                e, c->u32_type,
+                spv_emit_interface_scalar_pointer(e, SPV_STORAGE_OUTPUT, c->u32_type, sample_mask_output, 0, c->zero));
             mask = SPV(e, SPV_OP_BITWISE_AND, c->u32_type, mask, output_mask);
         }
         u32 covered = spv_emit_binary(
@@ -72,7 +74,7 @@ static void advanced_blend_epilogue(DirectCtx* c, const ShaderInfo* si, u32 vec4
         incoming = spv_emit_vec4_extract(e, c->f32_type, position, 2);
         front = spv_emit_load(e, c->bool_type, frontface);
     }
-    spv_emit_void_op(e, 5364, NULL, 0); /* OpBeginInvocationInterlockEXT */
+    spv_emit_void_op(e, SPV_OP_BEGIN_INVOCATION_INTERLOCK_EXT, NULL, 0);
     if (depth_buffer)
         kept = shader_depth_stencil_test(e, c->f32_type, c->u32_type, c->bool_type, depth_buffer,
                                            pixel, incoming, front, kept);
@@ -93,8 +95,9 @@ static void advanced_blend_epilogue(DirectCtx* c, const ShaderInfo* si, u32 vec4
         } else
             xy = SPV(e, SPV_OP_COMPOSITE_CONSTRUCT, spv_emit_type_vec2(e, i32), coordinate[0], coordinate[1]);
         if (si->advanced_blend_mask & SH_BLEND_MULTISAMPLE) {
-            u32 mask = spv_emit_load(e, c->u32_type,
-                spv_emit_interface_scalar_pointer(e, 1, c->u32_type, coverage, 0, c->zero));
+            u32 mask = spv_emit_load(
+                e, c->u32_type,
+                spv_emit_interface_scalar_pointer(e, SPV_STORAGE_INPUT, c->u32_type, coverage, 0, c->zero));
             u32 samples = si->advanced_blend_mask >> 8 & 63;
             for (u32 i = 0; i < samples; i++) {
                 u32 bit = spv_emit_constant_u32(e, c->u32_type, 1u << i);
@@ -114,7 +117,8 @@ static void advanced_blend_epilogue(DirectCtx* c, const ShaderInfo* si, u32 vec4
         spv_emit_branch(e, done);
         spv_emit_label(e, done);
     }
-    spv_emit_void_op(e, 5365, NULL, 0); /* OpEndInvocationInterlockEXT; implicitly publishes coherent image writes */
+    spv_emit_void_op(e, SPV_OP_END_INVOCATION_INTERLOCK_EXT, NULL,
+                     0); /* OpEndInvocationInterlockEXT; implicitly publishes coherent image writes */
     /* Coverage-only keeps its native integer output. Kill after the interlock suppresses that output on a late
        failure while retaining stencil fail/depth-fail updates and all original guest shader side effects. */
     u32 reject = spv_emit_id(e), finish = spv_emit_id(e);
@@ -128,125 +132,422 @@ static void advanced_blend_epilogue(DirectCtx* c, const ShaderInfo* si, u32 vec4
     spv_emit_return(e);
 }
 
-int g_shader_texture_arrays;
-u32 g_shader_tex_array = SNX_TEX_ARRAY;
-u32 g_shader_uniform_cbufs = 18;
-int g_shader_stage_point_size;
-int g_shader_output_layer = 1;
-int g_shader_viewport_index = 3;
-int g_shader_geometry = 1;
-int g_shader_geometry_streams = 1;
-int g_shader_geometry_streams_lines_triangles = 1;
-int g_shader_float16 = 1;
-int g_shader_resource_min_lod = 1;
-int g_shader_dynamic_texture_offsets;
-int g_shader_half_rounding;
-int g_shader_i2f_nearest;
-int g_shader_draw_parameters = 1;
-int g_shader_quad = 1;
-int g_shader_quad_compute = 1;
-int g_shader_mixed_dot;
-int g_shader_hmma_coop;
-int g_shader_hmma_pairs;
-u32 g_shader_mesh_tasks_max;
-int g_shader_float_atomic_add;
-int g_shader_tessellation = 1;
-int g_shader_clock_scopes;
-int g_shader_maximal_reconvergence;
-int g_shader_xfb_stores;
+ShCaps g_spirv_translate = {.tex_array = SNX_TEX_ARRAY,
+                            .uniform_cbufs = 18,
+                            .output_layer = 1,
+                            .viewport_index = 3,
+                            .geometry = 1,
+                            .geometry_streams = 1,
+                            .geometry_streams_lines_triangles = 1,
+                            .float16 = 1,
+                            .float64 = 1,
+                            .resource_min_lod = 1,
+                            .draw_parameters = 1,
+                            .quad = 1,
+                            .quad_compute = 1,
+                            .tessellation = 1};
 
 /* the family of instructions whose branches take each opcode, FAM_NONE for one no branch takes (refused by
    the prescan, or one that writes nothing): a family's function is the only one with branches for its opcodes */
 enum { FAM_NONE, FAM_FLOW, FAM_IO, FAM_THREAD, FAM_INT, FAM_FLOAT, FAM_MEMORY, FAM_TEXTURE };
-static const u8 op_family[O__COUNT] = {
-    [O_JCAL] = FAM_FLOW,        [O_JMP] = FAM_FLOW,       [O_JMX] = FAM_FLOW,        [O_BRA] = FAM_FLOW,
-    [O_BRX] = FAM_FLOW,         [O_SSY] = FAM_FLOW,       [O_SYNC] = FAM_FLOW,       [O_PBK] = FAM_FLOW,
-    [O_BRK] = FAM_FLOW,         [O_PCNT] = FAM_FLOW,      [O_CONT] = FAM_FLOW,       [O_EXIT] = FAM_FLOW,
-    [O_KIL] = FAM_FLOW,         [O_CAL] = FAM_FLOW,       [O_RET] = FAM_FLOW,        [O_PRET] = FAM_FLOW,
-    [O_PEXIT] = FAM_FLOW,       [O_IDE] = FAM_FLOW,       [O_CCTL] = FAM_FLOW,       [O_CCTLL] = FAM_FLOW,
-    [O_BPT] = FAM_FLOW,         [O_IPA] = FAM_IO,         [O_ALD] = FAM_IO,          [O_AST] = FAM_IO,
-    [O_OUT_R] = FAM_IO,         [O_OUT_C] = FAM_IO,       [O_OUT_I] = FAM_IO,        [O_ISBERD] = FAM_IO,
-    [O_AL2P] = FAM_IO,          [O_PIXLD] = FAM_IO,       [O_S2R] = FAM_THREAD,      [O_CS2R] = FAM_THREAD,
-    [O_BAR] = FAM_THREAD,       [O_MEMBAR] = FAM_THREAD,  [O_VOTE] = FAM_THREAD,     [O_SHFL] = FAM_THREAD,
-    [O_I2I_R] = FAM_INT,        [O_I2I_C] = FAM_INT,      [O_I2I_I] = FAM_INT,       [O_MOV_R] = FAM_INT,
-    [O_MOV_C] = FAM_INT,        [O_MOV_I] = FAM_INT,      [O_MOV32I] = FAM_INT,      [O_IADD_R] = FAM_INT,
-    [O_IADD_C] = FAM_INT,       [O_IADD_I] = FAM_INT,     [O_IADD32I] = FAM_INT,     [O_IADD3_R] = FAM_INT,
-    [O_IADD3_C] = FAM_INT,      [O_IADD3_I] = FAM_INT,    [O_ISCADD_R] = FAM_INT,    [O_ISCADD_C] = FAM_INT,
-    [O_ISCADD_I] = FAM_INT,     [O_ISCADD32I] = FAM_INT,  [O_IMNMX_R] = FAM_INT,     [O_IMNMX_C] = FAM_INT,
-    [O_IMNMX_I] = FAM_INT,      [O_ISETP_R] = FAM_INT,    [O_ISETP_C] = FAM_INT,     [O_ISETP_I] = FAM_INT,
-    [O_ISET_R] = FAM_INT,       [O_ISET_C] = FAM_INT,     [O_ISET_I] = FAM_INT,      [O_ICMP_R] = FAM_INT,
-    [O_ICMP_RC] = FAM_INT,      [O_ICMP_CR] = FAM_INT,    [O_ICMP_I] = FAM_INT,      [O_LOP_R] = FAM_INT,
-    [O_LOP_C] = FAM_INT,        [O_LOP_I] = FAM_INT,      [O_LOP32I] = FAM_INT,      [O_LOP3_R] = FAM_INT,
-    [O_LOP3_C] = FAM_INT,       [O_LOP3_I] = FAM_INT,     [O_SHL_R] = FAM_INT,       [O_SHL_C] = FAM_INT,
-    [O_SHL_I] = FAM_INT,        [O_SHR_R] = FAM_INT,      [O_SHR_C] = FAM_INT,       [O_SHR_I] = FAM_INT,
-    [O_SHF_LR] = FAM_INT,       [O_SHF_LI] = FAM_INT,     [O_SHF_RR] = FAM_INT,      [O_SHF_RI] = FAM_INT,
-    [O_BFE_R] = FAM_INT,        [O_BFE_C] = FAM_INT,      [O_BFE_I] = FAM_INT,       [O_BFI_R] = FAM_INT,
-    [O_BFI_RC] = FAM_INT,       [O_BFI_CR] = FAM_INT,     [O_BFI_I] = FAM_INT,       [O_SEL_R] = FAM_INT,
-    [O_SEL_C] = FAM_INT,        [O_SEL_I] = FAM_INT,      [O_POPC_R] = FAM_INT,      [O_POPC_C] = FAM_INT,
-    [O_POPC_I] = FAM_INT,       [O_FLO_R] = FAM_INT,      [O_FLO_C] = FAM_INT,       [O_FLO_I] = FAM_INT,
-    [O_PRMT_R] = FAM_INT,       [O_PRMT_RC] = FAM_INT,    [O_PRMT_CR] = FAM_INT,     [O_PRMT_I] = FAM_INT,
-    [O_XMAD_R] = FAM_INT,       [O_XMAD_RC] = FAM_INT,    [O_XMAD_CR] = FAM_INT,     [O_XMAD_I] = FAM_INT,
-    [O_IMUL_R] = FAM_INT,       [O_IMUL_C] = FAM_INT,     [O_IMUL_I] = FAM_INT,      [O_IMUL32I] = FAM_INT,
-    [O_IMAD_R] = FAM_INT,       [O_IMAD_RC] = FAM_INT,    [O_IMAD_CR] = FAM_INT,     [O_IMAD_I] = FAM_INT,
-    [O_IMAD32I] = FAM_INT,      [O_LEA_HR] = FAM_INT,     [O_LEA_HC] = FAM_INT,      [O_LEA_LR] = FAM_INT,
-    [O_LEA_LC] = FAM_INT,       [O_LEA_LI] = FAM_INT,     [O_PSETP] = FAM_INT,       [O_PSET] = FAM_INT,
-    [O_P2R_R] = FAM_INT,        [O_P2R_C] = FAM_INT,      [O_P2R_I] = FAM_INT,       [O_R2P_R] = FAM_INT,
-    [O_R2P_C] = FAM_INT,        [O_R2P_I] = FAM_INT,      [O_CSET] = FAM_INT,        [O_CSETP] = FAM_INT,
-    [O_VMNMX] = FAM_INT,        [O_VMAD] = FAM_INT,       [O_VSETP] = FAM_INT,       [O_VADD] = FAM_INT,
-    [O_VABSDIFF] = FAM_INT,     [O_VSET] = FAM_INT,       [O_VSHL] = FAM_INT,        [O_VSHR] = FAM_INT,
-    [O_FADD_R] = FAM_FLOAT,     [O_FADD_C] = FAM_FLOAT,   [O_FADD_I] = FAM_FLOAT,    [O_FADD32I] = FAM_FLOAT,
-    [O_FMUL_R] = FAM_FLOAT,     [O_FMUL_C] = FAM_FLOAT,   [O_FMUL_I] = FAM_FLOAT,    [O_FMUL32I] = FAM_FLOAT,
-    [O_FFMA_R] = FAM_FLOAT,     [O_FFMA_RC] = FAM_FLOAT,  [O_FFMA_CR] = FAM_FLOAT,   [O_FFMA_I] = FAM_FLOAT,
-    [O_FFMA32I] = FAM_FLOAT,    [O_FMNMX_R] = FAM_FLOAT,  [O_FMNMX_C] = FAM_FLOAT,   [O_FMNMX_I] = FAM_FLOAT,
-    [O_FSETP_R] = FAM_FLOAT,    [O_FSETP_C] = FAM_FLOAT,  [O_FSETP_I] = FAM_FLOAT,   [O_FSET_R] = FAM_FLOAT,
-    [O_FSET_C] = FAM_FLOAT,     [O_FSET_I] = FAM_FLOAT,   [O_FCMP_R] = FAM_FLOAT,    [O_FCMP_RC] = FAM_FLOAT,
-    [O_FCMP_CR] = FAM_FLOAT,    [O_FCMP_I] = FAM_FLOAT,   [O_MUFU] = FAM_FLOAT,      [O_RRO_R] = FAM_FLOAT,
-    [O_RRO_C] = FAM_FLOAT,      [O_RRO_I] = FAM_FLOAT,    [O_F2F_R] = FAM_FLOAT,     [O_F2F_C] = FAM_FLOAT,
-    [O_F2F_I] = FAM_FLOAT,      [O_F2I_R] = FAM_FLOAT,    [O_F2I_C] = FAM_FLOAT,     [O_F2I_I] = FAM_FLOAT,
-    [O_I2F_R] = FAM_FLOAT,      [O_I2F_C] = FAM_FLOAT,    [O_I2F_I] = FAM_FLOAT,     [O_FSWZADD] = FAM_FLOAT,
-    [O_FCHK_R] = FAM_FLOAT,     [O_FCHK_C] = FAM_FLOAT,   [O_FCHK_I] = FAM_FLOAT,    [O_HADD2_R] = FAM_FLOAT,
-    [O_HADD2_C] = FAM_FLOAT,    [O_HADD2_I] = FAM_FLOAT,  [O_HADD2_32I] = FAM_FLOAT, [O_HMUL2_R] = FAM_FLOAT,
-    [O_HMUL2_C] = FAM_FLOAT,    [O_HMUL2_I] = FAM_FLOAT,  [O_HMUL2_32I] = FAM_FLOAT, [O_HFMA2_R] = FAM_FLOAT,
-    [O_HFMA2_RC] = FAM_FLOAT,   [O_HFMA2_CR] = FAM_FLOAT, [O_HFMA2_I] = FAM_FLOAT,   [O_HFMA2_32I] = FAM_FLOAT,
-    [O_HSETP2_R] = FAM_FLOAT,   [O_HSETP2_C] = FAM_FLOAT, [O_HSETP2_I] = FAM_FLOAT,  [O_HSET2_R] = FAM_FLOAT,
-    [O_HSET2_C] = FAM_FLOAT,    [O_HSET2_I] = FAM_FLOAT,  [O_DADD_R] = FAM_FLOAT,    [O_DADD_C] = FAM_FLOAT,
-    [O_DADD_I] = FAM_FLOAT,     [O_DMUL_R] = FAM_FLOAT,   [O_DMUL_C] = FAM_FLOAT,    [O_DMUL_I] = FAM_FLOAT,
-    [O_DFMA_R] = FAM_FLOAT,     [O_DFMA_RC] = FAM_FLOAT,  [O_DFMA_CR] = FAM_FLOAT,   [O_DFMA_I] = FAM_FLOAT,
-    [O_DSET_R] = FAM_FLOAT,     [O_DSET_C] = FAM_FLOAT,   [O_DSET_I] = FAM_FLOAT,    [O_DSETP_R] = FAM_FLOAT,
-    [O_DSETP_C] = FAM_FLOAT,    [O_DSETP_I] = FAM_FLOAT,  [O_DMNMX_R] = FAM_FLOAT,   [O_DMNMX_C] = FAM_FLOAT,
-    [O_DMNMX_I] = FAM_FLOAT,    [O_LDC] = FAM_MEMORY,     [O_LDG] = FAM_MEMORY,      [O_STG] = FAM_MEMORY,
-    [O_LDS] = FAM_MEMORY,       [O_STS] = FAM_MEMORY,     [O_LDL] = FAM_MEMORY,      [O_STL] = FAM_MEMORY,
-    [O_ATOM] = FAM_MEMORY,      [O_ATOMS] = FAM_MEMORY,   [O_RED] = FAM_MEMORY,      [O_ATOM_CAS] = FAM_MEMORY,
-    [O_ATOMS_CAS] = FAM_MEMORY, [O_TEX] = FAM_TEXTURE,    [O_TEX_B] = FAM_TEXTURE,   [O_TEXS] = FAM_TEXTURE,
-    [O_TLD] = FAM_TEXTURE,      [O_TLD_B] = FAM_TEXTURE,  [O_TLDS] = FAM_TEXTURE,    [O_TLD4] = FAM_TEXTURE,
-    [O_TLD4_B] = FAM_TEXTURE,   [O_TLD4S] = FAM_TEXTURE,  [O_TXQ] = FAM_TEXTURE,     [O_TXQ_B] = FAM_TEXTURE,
-    [O_TMML] = FAM_TEXTURE,     [O_TMML_B] = FAM_TEXTURE, [O_TXD] = FAM_TEXTURE,     [O_TXD_B] = FAM_TEXTURE,
-    [O_SULD] = FAM_TEXTURE,     [O_SUST] = FAM_TEXTURE,   [O_SURED] = FAM_TEXTURE,   [O_SUATOM] = FAM_TEXTURE};
+static int op_family(int op) {
+    switch (op) {
+        case O_JCAL:
+        case O_JMP:
+        case O_JMX:
+        case O_BRA:
+        case O_BRX:
+        case O_SSY:
+        case O_SYNC:
+        case O_PBK:
+        case O_BRK:
+        case O_PCNT:
+        case O_CONT:
+        case O_EXIT:
+        case O_KIL:
+        case O_CAL:
+        case O_RET:
+        case O_PRET:
+        case O_PEXIT:
+        case O_IDE:
+        case O_CCTL:
+        case O_CCTLL:
+        case O_BPT: return FAM_FLOW;
+        case O_IPA:
+        case O_ALD:
+        case O_AST:
+        case O_OUT_R:
+        case O_OUT_C:
+        case O_OUT_I:
+        case O_ISBERD:
+        case O_AL2P:
+        case O_PIXLD: return FAM_IO;
+        case O_S2R:
+        case O_CS2R:
+        case O_BAR:
+        case O_MEMBAR:
+        case O_VOTE:
+        case O_SHFL: return FAM_THREAD;
+        case O_I2I_R:
+        case O_I2I_C:
+        case O_I2I_I:
+        case O_MOV_R:
+        case O_MOV_C:
+        case O_MOV_I:
+        case O_MOV32I:
+        case O_IADD_R:
+        case O_IADD_C:
+        case O_IADD_I:
+        case O_IADD32I:
+        case O_IADD3_R:
+        case O_IADD3_C:
+        case O_IADD3_I:
+        case O_ISCADD_R:
+        case O_ISCADD_C:
+        case O_ISCADD_I:
+        case O_ISCADD32I:
+        case O_IMNMX_R:
+        case O_IMNMX_C:
+        case O_IMNMX_I:
+        case O_ISETP_R:
+        case O_ISETP_C:
+        case O_ISETP_I:
+        case O_ISET_R:
+        case O_ISET_C:
+        case O_ISET_I:
+        case O_ICMP_R:
+        case O_ICMP_RC:
+        case O_ICMP_CR:
+        case O_ICMP_I:
+        case O_LOP_R:
+        case O_LOP_C:
+        case O_LOP_I:
+        case O_LOP32I:
+        case O_LOP3_R:
+        case O_LOP3_C:
+        case O_LOP3_I:
+        case O_SHL_R:
+        case O_SHL_C:
+        case O_SHL_I:
+        case O_SHR_R:
+        case O_SHR_C:
+        case O_SHR_I:
+        case O_SHF_LR:
+        case O_SHF_LI:
+        case O_SHF_RR:
+        case O_SHF_RI:
+        case O_BFE_R:
+        case O_BFE_C:
+        case O_BFE_I:
+        case O_BFI_R:
+        case O_BFI_RC:
+        case O_BFI_CR:
+        case O_BFI_I:
+        case O_SEL_R:
+        case O_SEL_C:
+        case O_SEL_I:
+        case O_POPC_R:
+        case O_POPC_C:
+        case O_POPC_I:
+        case O_FLO_R:
+        case O_FLO_C:
+        case O_FLO_I:
+        case O_PRMT_R:
+        case O_PRMT_RC:
+        case O_PRMT_CR:
+        case O_PRMT_I:
+        case O_XMAD_R:
+        case O_XMAD_RC:
+        case O_XMAD_CR:
+        case O_XMAD_I:
+        case O_IMUL_R:
+        case O_IMUL_C:
+        case O_IMUL_I:
+        case O_IMUL32I:
+        case O_IMAD_R:
+        case O_IMAD_RC:
+        case O_IMAD_CR:
+        case O_IMAD_I:
+        case O_IMAD32I:
+        case O_LEA_HR:
+        case O_LEA_HC:
+        case O_LEA_LR:
+        case O_LEA_LC:
+        case O_LEA_LI:
+        case O_PSETP:
+        case O_PSET:
+        case O_P2R_R:
+        case O_P2R_C:
+        case O_P2R_I:
+        case O_R2P_R:
+        case O_R2P_C:
+        case O_R2P_I:
+        case O_CSET:
+        case O_CSETP:
+        case O_VMNMX:
+        case O_VMAD:
+        case O_VSETP:
+        case O_VADD:
+        case O_VABSDIFF:
+        case O_VSET:
+        case O_VSHL:
+        case O_VSHR: return FAM_INT;
+        case O_FADD_R:
+        case O_FADD_C:
+        case O_FADD_I:
+        case O_FADD32I:
+        case O_FMUL_R:
+        case O_FMUL_C:
+        case O_FMUL_I:
+        case O_FMUL32I:
+        case O_FFMA_R:
+        case O_FFMA_RC:
+        case O_FFMA_CR:
+        case O_FFMA_I:
+        case O_FFMA32I:
+        case O_FMNMX_R:
+        case O_FMNMX_C:
+        case O_FMNMX_I:
+        case O_FSETP_R:
+        case O_FSETP_C:
+        case O_FSETP_I:
+        case O_FSET_R:
+        case O_FSET_C:
+        case O_FSET_I:
+        case O_FCMP_R:
+        case O_FCMP_RC:
+        case O_FCMP_CR:
+        case O_FCMP_I:
+        case O_MUFU:
+        case O_RRO_R:
+        case O_RRO_C:
+        case O_RRO_I:
+        case O_F2F_R:
+        case O_F2F_C:
+        case O_F2F_I:
+        case O_F2I_R:
+        case O_F2I_C:
+        case O_F2I_I:
+        case O_I2F_R:
+        case O_I2F_C:
+        case O_I2F_I:
+        case O_FSWZADD:
+        case O_FCHK_R:
+        case O_FCHK_C:
+        case O_FCHK_I:
+        case O_HADD2_R:
+        case O_HADD2_C:
+        case O_HADD2_I:
+        case O_HADD2_32I:
+        case O_HMUL2_R:
+        case O_HMUL2_C:
+        case O_HMUL2_I:
+        case O_HMUL2_32I:
+        case O_HFMA2_R:
+        case O_HFMA2_RC:
+        case O_HFMA2_CR:
+        case O_HFMA2_I:
+        case O_HFMA2_32I:
+        case O_HSETP2_R:
+        case O_HSETP2_C:
+        case O_HSETP2_I:
+        case O_HSET2_R:
+        case O_HSET2_C:
+        case O_HSET2_I:
+        case O_DADD_R:
+        case O_DADD_C:
+        case O_DADD_I:
+        case O_DMUL_R:
+        case O_DMUL_C:
+        case O_DMUL_I:
+        case O_DFMA_R:
+        case O_DFMA_RC:
+        case O_DFMA_CR:
+        case O_DFMA_I:
+        case O_DSET_R:
+        case O_DSET_C:
+        case O_DSET_I:
+        case O_DSETP_R:
+        case O_DSETP_C:
+        case O_DSETP_I:
+        case O_DMNMX_R:
+        case O_DMNMX_C:
+        case O_DMNMX_I: return FAM_FLOAT;
+        case O_LDC:
+        case O_LDG:
+        case O_STG:
+        case O_LDS:
+        case O_STS:
+        case O_LDL:
+        case O_STL:
+        case O_ATOM:
+        case O_ATOMS:
+        case O_RED:
+        case O_ATOM_CAS:
+        case O_ATOMS_CAS: return FAM_MEMORY;
+        case O_TEX:
+        case O_TEX_B:
+        case O_TEXS:
+        case O_TLD:
+        case O_TLD_B:
+        case O_TLDS:
+        case O_TLD4:
+        case O_TLD4_B:
+        case O_TLD4S:
+        case O_TXQ:
+        case O_TXQ_B:
+        case O_TMML:
+        case O_TMML_B:
+        case O_TXD:
+        case O_TXD_B:
+        case O_SULD:
+        case O_SUST:
+        case O_SURED:
+        case O_SUATOM: return FAM_TEXTURE;
+        default: return FAM_NONE;
+    }
+}
 
 /* A conservative source-invariance proof for portable coverage reduction. Only these pure register, uniform
    constant and control operations may contribute to the source color. In particular, FSWZADD, PIXLD, input loads,
    clocks, subgroup operations, derivatives, texture reads and memory accesses do not inherit this property from
    their instruction family. New instructions remain unproven until explicitly reviewed here. */
-static const u8 mixed_invariant_ops[O__COUNT] = {
-    [O_NOP] = 1, [O_EXIT] = 1, [O_MOV_R] = 1, [O_MOV_C] = 1, [O_MOV_I] = 1, [O_MOV32I] = 1,
-    [O_FADD_R] = 1, [O_FADD_C] = 1, [O_FADD_I] = 1, [O_FADD32I] = 1,
-    [O_FMUL_R] = 1, [O_FMUL_C] = 1, [O_FMUL_I] = 1, [O_FMUL32I] = 1,
-    [O_FFMA_R] = 1, [O_FFMA_RC] = 1, [O_FFMA_CR] = 1, [O_FFMA_I] = 1, [O_FFMA32I] = 1,
-    [O_FMNMX_R] = 1, [O_FMNMX_C] = 1, [O_FMNMX_I] = 1,
-    [O_FSET_R] = 1, [O_FSET_C] = 1, [O_FSET_I] = 1,
-    [O_FSETP_R] = 1, [O_FSETP_C] = 1, [O_FSETP_I] = 1,
-    [O_F2F_R] = 1, [O_F2F_C] = 1, [O_F2F_I] = 1,
-    [O_F2I_R] = 1, [O_F2I_C] = 1, [O_F2I_I] = 1,
-    [O_I2F_R] = 1, [O_I2F_C] = 1, [O_I2F_I] = 1,
-    [O_I2I_R] = 1, [O_I2I_C] = 1, [O_I2I_I] = 1,
-    [O_IADD_R] = 1, [O_IADD_C] = 1, [O_IADD_I] = 1, [O_IADD32I] = 1,
-    [O_IMUL_R] = 1, [O_IMUL_C] = 1, [O_IMUL_I] = 1, [O_IMUL32I] = 1,
-    [O_LOP_R] = 1, [O_LOP_C] = 1, [O_LOP_I] = 1, [O_LOP32I] = 1,
-    [O_LOP3_R] = 1, [O_LOP3_C] = 1, [O_LOP3_I] = 1,
-    [O_LDC] = 1, [O_BRA] = 1, [O_SSY] = 1, [O_SYNC] = 1, [O_PBK] = 1, [O_BRK] = 1,
-    [O_PCNT] = 1, [O_CONT] = 1, [O_CAL] = 1, [O_RET] = 1, [O_PRET] = 1, [O_PEXIT] = 1, [O_KIL] = 1,
-};
+static int mixed_invariant_op(int op) {
+    switch (op) {
+        case O_NOP:
+        case O_EXIT:
+        case O_MOV_R:
+        case O_MOV_C:
+        case O_MOV_I:
+        case O_MOV32I:
+        case O_FADD_R:
+        case O_FADD_C:
+        case O_FADD_I:
+        case O_FADD32I:
+        case O_FMUL_R:
+        case O_FMUL_C:
+        case O_FMUL_I:
+        case O_FMUL32I:
+        case O_FFMA_R:
+        case O_FFMA_RC:
+        case O_FFMA_CR:
+        case O_FFMA_I:
+        case O_FFMA32I:
+        case O_FMNMX_R:
+        case O_FMNMX_C:
+        case O_FMNMX_I:
+        case O_FSET_R:
+        case O_FSET_C:
+        case O_FSET_I:
+        case O_FSETP_R:
+        case O_FSETP_C:
+        case O_FSETP_I:
+        case O_F2F_R:
+        case O_F2F_C:
+        case O_F2F_I:
+        case O_F2I_R:
+        case O_F2I_C:
+        case O_F2I_I:
+        case O_I2F_R:
+        case O_I2F_C:
+        case O_I2F_I:
+        case O_I2I_R:
+        case O_I2I_C:
+        case O_I2I_I:
+        case O_IADD_R:
+        case O_IADD_C:
+        case O_IADD_I:
+        case O_IADD32I:
+        case O_IMUL_R:
+        case O_IMUL_C:
+        case O_IMUL_I:
+        case O_IMUL32I:
+        case O_LOP_R:
+        case O_LOP_C:
+        case O_LOP_I:
+        case O_LOP32I:
+        case O_LOP3_R:
+        case O_LOP3_C:
+        case O_LOP3_I:
+        case O_LDC:
+        case O_BRA:
+        case O_SSY:
+        case O_SYNC:
+        case O_PBK:
+        case O_BRK:
+        case O_PCNT:
+        case O_CONT:
+        case O_CAL:
+        case O_RET:
+        case O_PRET:
+        case O_PEXIT:
+        case O_KIL: return 1;
+        default: return 0;
+    }
+}
 
+/* The pre-draw capture (ShaderInfo.predraw_slots, vk/predraw.c), in the program's first block. In the interlock, the
+   draw's first fragment at the pixel (its stamp is not the draw's number, push word 26) fetches each slot's texel
+   there, which no fragment of the draw has written yet, into the slot's side image as bits, and stamps the pixel. It
+   keeps what it fetched, and the others take the side images' texels. Every read of those slots returns them
+   (DirectCtx.predraw). The slots are 2D color textures of one sample, read at the own pixel only, so the fetch at
+   gl_FragCoord's pixel is their read. Helper lanes store nothing, and a lane that a later test or discard drops took
+   only what the pixel held. (A fetch before the interlock, for a shorter section, cost the same on an RTX 4090) */
+static void predraw_prologue(DirectCtx* c, u64 slots, u32 i32, u32 vec4, u32 fragcoord, u32 push, u32 stamp,
+                             u32 stamp_type, const u32* side, u32 side_type, const u32* texture_vec4) {
+    SpvEmitter* e = &c->emit;
+    u32 uvec4 = spv_emit_type_vec4(e, c->u32_type);
+    u32 position = spv_emit_load(e, vec4, fragcoord);
+    u32 x = spv_emit_unary(e, SPV_OP_CONVERT_F_TO_S, i32, spv_emit_vec4_extract(e, c->f32_type, position, 0));
+    u32 y = spv_emit_unary(e, SPV_OP_CONVERT_F_TO_S, i32, spv_emit_vec4_extract(e, c->f32_type, position, 1));
+    u32 xy = SPV(e, SPV_OP_COMPOSITE_CONSTRUCT, spv_emit_type_vec2(e, i32), x, y);
+    u32 pointer = SPV(e, SPV_OP_ACCESS_CHAIN, spv_emit_type_pointer(e, SPV_STORAGE_PUSH_CONSTANT, c->u32_type), push,
+                      shader_u32(c, 3), shader_u32(c, 2));
+    u32 draw = spv_emit_load(e, c->u32_type, pointer);
+    spv_emit_void_op(e, SPV_OP_BEGIN_INVOCATION_INTERLOCK_EXT, NULL, 0);
+    u32 old = spv_emit_vec4_extract(e, c->u32_type, spv_emit_image_read(e, uvec4, stamp_type, stamp, xy), 0);
+    u32 fresh = spv_emit_binary(e, SPV_OP_I_NOT_EQUAL, c->bool_type, old, draw);
+    /* the first fragment keeps what it fetched, the others read what it stored */
+    u32 take = spv_emit_id(e), keep = spv_emit_id(e), done = spv_emit_id(e);
+    u32 fetched[SH_PREDRAW_MAX], stored[SH_PREDRAW_MAX], k = 0;
+    spv_emit_selection_merge(e, done);
+    spv_emit_branch_conditional(e, fresh, take, keep);
+    spv_emit_label(e, take);
+    for (int slot = 0; slot < SH_MAXTEX; slot++) {
+        if (!(slots >> slot & 1)) continue;
+        u32 texel = spv_emit_image_fetch(e, texture_vec4[slot], c->sampled_type[slot], c->sampler[slot], xy,
+                                         spv_emit_constant_u32(e, i32, 0));
+        fetched[k] = texture_vec4[slot] == uvec4 ? texel : spv_emit_unary(e, SPV_OP_BITCAST, uvec4, texel);
+        spv_emit_image_write(e, side_type, side[k], xy, fetched[k]);
+        k++;
+    }
+    u32 stamped[4] = {draw, c->zero, c->zero, c->zero};
+    spv_emit_image_write(e, stamp_type, stamp, xy, spv_emit_vec4_construct(e, uvec4, stamped));
+    spv_emit_branch(e, done);
+    spv_emit_label(e, keep);
+    for (u32 j = 0; j < k; j++) stored[j] = spv_emit_image_read(e, uvec4, side_type, side[j], xy);
+    spv_emit_branch(e, done);
+    spv_emit_label(e, done);
+    k = 0;
+    for (int slot = 0; slot < SH_MAXTEX; slot++) {
+        if (!(slots >> slot & 1)) continue;
+        u32 bits = spv_emit_phi2(e, uvec4, fetched[k], take, stored[k], keep);
+        k++;
+        c->predraw[slot] = texture_vec4[slot] == uvec4 ? bits : spv_emit_unary(e, SPV_OP_BITCAST, texture_vec4[slot], bits);
+    }
+    spv_emit_void_op(e, SPV_OP_END_INVOCATION_INTERLOCK_EXT, NULL, 0);
+}
+/* the texture slots a pre-draw capture can serve (ShaderInfo.tex_predraw_mask) of those read at the own pixel: plain
+   2D color textures of one sample, not raw, indexed, compared or reduced */
+static u64 predraw_capable(const ShTex* textures, int count, const ShaderInfo* si) {
+    u64 slots = 0;
+    for (int k = 0; k < count && k < SH_MAXTEX; k++)
+        if (textures[k].type == 1 && !textures[k].array && !textures[k].shadow &&
+            !(textures[k].flags & (1 | 2 | SNX_TEX_INDEXED)) && !(si->tex_dc_color_mask >> k & 1) &&
+            !(si->tex_minmax_mask >> k & 1))
+            slots |= 1ull << k;
+    return slots;
+}
 /* A fragment program's plain 2D sample (no offset, depth reference or level other than 0) at a perspective generic's
    (x / w, y / w), or at those mapped onto [0, 1] as clip space maps (ShaderInfo.screen_ndc), the same generic and
    mapping as the program's other such samples (*screen_in, -1 before the first, and *ndc): it reads the fragment's own
@@ -376,6 +677,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     int has_stack = 0, has_pexit = 0, has_conditional_exit = 0;
     int needs_local = 0, needs_shared = 0, needs_subgroup = 0, needs_atomic_cas = 0, lane_used = 0, needs_quad = 0;
     int votes = 0, swizzle_lanes = 0; /* VOTE or SHFL; FSWZADD whose lanes take different modes */
+    int quad_reads = 0;               /* a fragment program's SHFL within its quad that reads another pixel of it */
     int needs_gather_extended = 0;
     int fp32_flush = 0, fp32_preserve = 0;
     u32 out_reg = 0;
@@ -398,7 +700,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     for (u32 i = 11; i < n; i++) {
         if (!IDX_OK(i)) continue;
         const Op* op = flow->op[i];
-        if (!op || !mixed_invariant_ops[op->id]) mixed_sample_invariant = 0;
+        if (!op || !mixed_invariant_op(op->id)) mixed_sample_invariant = 0;
         if (!op || !shader_supported(insn[i], op->id) || !shader_stage_has(insn[i], op->id, stage)) {
             if (op && op->id == O_TEXS)
                 snprintf(si->first_unsupported, sizeof si->first_unsupported, "TEXS encoding %u, fp32 %u",
@@ -516,7 +818,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             return NULL;
         }
         /* an opcode taken here that no family writes (op_family) would be dropped: refused, the no-ops aside */
-        if (!op_family[op->id] && op->id != O_NOP && op->id != O_DEPBAR && op->id != O_VOTE_VTG) {
+        if (!op_family(op->id) && op->id != O_NOP && op->id != O_DEPBAR && op->id != O_VOTE_VTG) {
             snprintf(si->first_unsupported, sizeof si->first_unsupported, "%s %016llx: no family writes it", op->name,
                      (unsigned long long)insn[i]);
             si->unsupported = 1;
@@ -555,7 +857,8 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         if (op->id == O_S2R || op->id == O_CS2R) {
             u32 sr = B(insn[i], 20, 8);
             int scope_bit = sr >= 0x50 && sr <= 0x53 ? (sr < 0x52 ? 1 : 2) : 0;
-            if (scope_bit && !(g_shader_clock_scopes & scope_bit)) return direct_reject(si, "shader clock unavailable");
+            if (scope_bit && !(g_spirv_translate.clock_scopes & scope_bit))
+                return direct_reject(si, "shader clock unavailable");
             if (scope_bit) needs_clock = 1;
         }
         if (op->id == O_PIXLD) {
@@ -741,9 +1044,9 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             (op->id >= O_I2F_R && op->id <= O_I2F_I)) {
             int f2f = op->id <= O_F2F_I && op->id >= O_F2F_R, f2i = op->id >= O_F2I_R && op->id <= O_F2I_I;
             u32 dst_format = B(insn[i], 8, 2), src_format = B(insn[i], 10, 2);
-            if (dst_format == 1 && !f2i && B(insn[i], 39, 2) == 0 && (g_shader_half_rounding & 1)) {
+            if (dst_format == 1 && !f2i && B(insn[i], 39, 2) == 0 && (g_spirv_translate.half_rounding & 1)) {
                 needs_f16 = 1;
-                if (g_shader_half_rounding & 2) needs_f64 = 1;
+                if (g_spirv_translate.half_rounding & 2) needs_f64 = 1;
             }
             if ((src_format == 3 && (f2f || f2i)) || (dst_format == 3 && !f2i)) needs_f64 = 1;
             if ((dst_format == 3 && f2i) || (src_format == 3 && !f2f && !f2i)) needs_i64 = 1;
@@ -961,7 +1264,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             if (B(insn[i], 54, 1) || B(insn[i], 44, 1)) needs_glsl = 1;
         }
         if (op->id == O_TEXS) {
-            if (!B(insn[i], 59, 1) && (g_shader_half_rounding & 1)) needs_f16 = 1;
+            if (!B(insn[i], 59, 1) && (g_spirv_translate.half_rounding & 1)) needs_f16 = 1;
             u32 off = B(insn[i], 36, 13);
             u32 encoding = B(insn[i], 53, 4);
             int shadow = shader_texs_shadow(encoding), type = shader_texs_type(encoding),
@@ -1115,7 +1418,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         }
         if (shader_half_arithmetic(op->id)) {
             needs_glsl = 1;
-            if (g_shader_half_rounding & 1) needs_f16 = 1;
+            if (g_spirv_translate.half_rounding & 1) needs_f16 = 1;
             if (a < 255) used[a] = 1;
             if ((op->id == O_HADD2_R || op->id == O_HMUL2_R || op->id == O_HFMA2_R) && b < 255) used[b] = 1;
             if ((op->id == O_HFMA2_R || op->id == O_HFMA2_RC || op->id == O_HFMA2_CR || op->id == O_HFMA2_I) &&
@@ -1215,7 +1518,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             if (!B(insn[i], 59, 1)) {
                 u32 regs[4], comps[4];
                 int outputs = shader_texs_outputs(insn[i], regs, comps);
-                if (g_shader_half_rounding & 1) needs_f16 = 1;
+                if (g_spirv_translate.half_rounding & 1) needs_f16 = 1;
                 if (d < 255) used[d] = 1;
                 if (outputs > 2 && B(insn[i], 28, 8) < 255) used[B(insn[i], 28, 8)] = 1;
             } else {
@@ -1226,7 +1529,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             int bindless = op->id == O_TEX_B;
             u32 mode = bindless ? B(insn[i], 37, 3) : B(insn[i], 55, 3);
             u32 clamp = B(insn[i], bindless ? 40 : 58, 1);
-            if (clamp && stage == ST_FS && !g_shader_resource_min_lod)
+            if (clamp && stage == ST_FS && !g_spirv_translate.resource_min_lod)
                 return direct_reject(si, "fragment minimum LOD needs shaderResourceMinLod");
             /* Explicit LOD (also every non-fragment sample) clamps LC through GLSL FMax. */
             if (clamp && (mode == 1 || mode == 3 || mode == 7 || stage != ST_FS)) needs_glsl = 1;
@@ -1399,7 +1702,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 if (B(insn[i], 51, 1)) needs_gather_extended = 1;
                 if (B(insn[i], 55, 1)) {
                     needs_glsl = 1;
-                    if (g_shader_half_rounding & 1) needs_f16 = 1;
+                    if (g_spirv_translate.half_rounding & 1) needs_f16 = 1;
                 }
                 if (B(insn[i], 50, 1) || B(insn[i], 51, 1)) {
                     if (a + 1 < 255) used[a + 1] = 1;
@@ -1476,7 +1779,12 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         if (stage == ST_FS && shader_helper_side_effect(op->id)) needs_demote = 1;
         if (op->id == O_KIL) has_discard = 1;
         if (op->id == O_VOTE || op->id == O_SHFL) needs_subgroup = votes = 1;
-        if (op->id == O_SHFL && stage == ST_FS && g_shader_quad && shader_shfl_quad(insn[i], NULL)) needs_quad = 1;
+        if (op->id == O_SHFL && stage == ST_FS && g_spirv_translate.quad && shader_shfl_quad(insn[i], NULL))
+            needs_quad = 1;
+        if (op->id == O_SHFL && stage == ST_FS) {
+            u8 dir[4];
+            if (shader_shfl_quad_lanes(insn[i], dir, NULL) && (dir[0] | dir[1] | dir[2] | dir[3])) quad_reads = 1;
+        }
         /* FSWZADD's lanes in a quad are the subgroup's, as SHFL's are, when they don't all do the same */
         if (op->id == O_FSWZADD && shader_fswzadd_lanes(insn[i], B(insn[i], 28, 2)) != 15)
             needs_subgroup = swizzle_lanes = 1;
@@ -1493,14 +1801,27 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
        runs each invocation as a warp whose only active lane is lane 0, as the console runs a batch of one vertex or
        primitive: its ballot is its own bit, VOTE.ALL and VOTE.ANY are its predicate, VOTE.EQ is true, and SHFL keeps
        its own value, which is the console's for its own lane or one out of range and as good as any for a lane
-       that runs nothing. Control programs keep the subgroup: their invocations are the lanes of one warp together */
-    int lone_lane = votes && !swizzle_lanes && !can_subgroup && (stage == ST_VS || stage == ST_TES || stage == ST_GS);
-    int lane_model = (!needs_subgroup || lone_lane) && stage != ST_FS && stage != ST_CS;
+       that runs nothing. Control programs keep the subgroup: their invocations are the lanes of one warp together.
+       A fragment program that votes, shuffles, reads its lane or swizzles across its quad, on a device without
+       subgroups in the fragment stage, runs each invocation as one lane alone too, the lane of its place in its 2x2
+       quad (DirectCtx.quad_lane, from FragCoord): its ballot is that lane's bit, the votes are its predicate,
+       FSWZADD takes the mode of its place, a SHFL within the quad reads the other pixel's register through fine
+       derivatives (emit_thread.c's quad_read; dFdx and dFdy are SHFL.BFLY then FSWZADD on the console) and any other
+       SHFL keeps its own value. Those reads take every pixel of the quad in step, as derivatives do */
+    int quad_lane = stage == ST_FS && !can_subgroup && (votes || swizzle_lanes || lane_used);
+    int lone_lane = quad_lane ||
+                    (votes && !swizzle_lanes && !can_subgroup && (stage == ST_VS || stage == ST_TES || stage == ST_GS));
+    int lane_model = quad_lane || ((!needs_subgroup || lone_lane) && stage != ST_FS && stage != ST_CS);
     int lane_is_invocation = lane_model && stage == ST_TCS;
     if (lane_used && lane_is_invocation) invocation_used = 1;
     if (lane_used && !lane_model) needs_subgroup = 1;
     if (lone_lane) needs_subgroup = 0;
-    if (needs_f16 && (g_shader_half_rounding & 2)) needs_f64 = 1;
+    if (quad_lane) {
+        needs_quad = 0;
+        needs_fragcoord = 1;
+        if (quad_reads) needs_derivatives = 1;
+    }
+    if (needs_f16 && (g_spirv_translate.half_rounding & 2)) needs_f64 = 1;
     if (!has_exit) return direct_reject(si, "missing exit");
     if (has_pexit && has_conditional_exit) return direct_reject(si, "conditional EXIT with PEXIT token");
     if (needs_subgroup && !can_subgroup) return direct_reject(si, "subgroup ballot/shuffle unavailable");
@@ -1624,10 +1945,13 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 u32 descriptor = (u32)(current - 1);
                 for (; slot < ngbuf && gbuf_off[slot] != descriptor; slot++) {}
                 if (slot == ngbuf) {
-                    if (ngbuf == 16) {
+                    /* the last slot holds the shared memory where it is spilled (SH_SHARED_SPILL) */
+                    if (ngbuf == (needs_shared && si->shared_spill ? SH_SHARED_SPILL : 16)) {
                         free(gb_at);
                         free(pop_targets);
-                        return direct_reject(si, "global buffer count");
+                        return direct_reject(si, needs_shared && si->shared_spill
+                                                     ? "global buffer count, with the shared memory in a buffer"
+                                                     : "global buffer count");
                     }
                     gbuf_off[ngbuf++] = descriptor;
                 }
@@ -1684,9 +2008,9 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     /* Only the last active vertex-processing stage selects the layer and viewport. A control program can write
        these outputs, but its later evaluation stage makes them inert. They have no downstream builtin inputs. */
     if (stage == ST_TCS) layer_output_used = viewport_used = 0;
-    if (viewport_used && !(g_shader_viewport_index & (stage == ST_GS ? 2 : 1)))
+    if (viewport_used && !(g_spirv_translate.viewport_index & (stage == ST_GS ? 2 : 1)))
         return direct_reject_with_buffers(si, "viewport index output unavailable", pop_targets, gb_at);
-    if ((point_size_used || point_in_used) && stage == ST_TCS && !g_shader_stage_point_size)
+    if ((point_size_used || point_in_used) && stage == ST_TCS && !g_spirv_translate.stage_point_size)
         return direct_reject_with_buffers(si, "tessellation point size unavailable", pop_targets, gb_at);
     if (stage == ST_TES && ((si->rt_int_mask & 3) == 3 || ((si->rt_int_mask >> 4) & 3) == 3))
         return direct_reject_with_buffers(si, "tessellation domain or spacing", pop_targets, gb_at);
@@ -1705,9 +2029,9 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             return direct_reject_with_buffers(si, "transform feedback stream", pop_targets, gb_at);
         if (si->xfb.stream[b]) stream_mask |= 1u << si->xfb.stream[b];
     }
-    if (stream_mask && !g_shader_geometry_streams)
+    if (stream_mask && !g_spirv_translate.geometry_streams)
         return direct_reject_with_buffers(si, "geometry streams unavailable", pop_targets, gb_at);
-    if (stream_mask && !g_shader_geometry_streams_lines_triangles && ((sph[3] >> 24) & 15) != 1)
+    if (stream_mask && !g_spirv_translate.geometry_streams_lines_triangles && ((sph[3] >> 24) & 15) != 1)
         return direct_reject_with_buffers(si, "nonpoint transform feedback streams unavailable", pop_targets, gb_at);
     /* Each distinct handle range and sampled image kind needs its own descriptor table. */
     for (k_indexed = 0; k_indexed < texture_count; k_indexed++) {
@@ -1748,6 +2072,17 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     }
     if (si->late_depth) {
         needs_fragcoord = needs_frontface = needs_coverage = needs_demote = 1;
+    }
+    /* the pre-draw capture's slots (ShaderInfo.predraw_slots): each read only at the own pixel, and its own interlock,
+       which is the program's one */
+    u64 predraw = stage == ST_FS ? si->predraw_slots : 0;
+    if (predraw) {
+        u64 own = tex_read & ~tex_elsewhere & ~(tex_screen & tex_uv);
+        if ((predraw & ~(own & predraw_capable(textures, texture_count, si))) || advanced_blend || si->late_depth ||
+            (si->advanced_blend_mask & SH_CAPTURE_TILED) || snx_popcount64(predraw) > SH_PREDRAW_MAX ||
+            image_info.nimg + 1 + (int)snx_popcount64(predraw) > 8)
+            return direct_reject_with_buffers(si, "pre-draw capture interface", pop_targets, gb_at);
+        needs_fragcoord = 1;
     }
     if (stage == ST_FS && (si->advanced_blend_mask & SH_CAPTURE_TILED)) {
         needs_fragcoord = 1;
@@ -1821,7 +2156,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
            again as the program's code. Lanes that must reconverge for subgroup operations, barriers or derivatives
            take them where the device reconverges them at each construct's merge (MaximallyReconvergesKHR), as the
            hardware does at its SYNC targets, and keep the loop otherwise, which runs the lowest pc first */
-        if (!advanced_blend && !dynamic_stack && !has_calls && (!converge || g_shader_maximal_reconvergence) &&
+        if (!advanced_blend && !dynamic_stack && !has_calls && (!converge || g_spirv_translate.maximal_reconvergence) &&
             !unknown_brx)
             structure = shader_structure(insn, n, block_start, pop_targets);
         if (quad_flow && !structure) {
@@ -1853,26 +2188,30 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
          (si->advanced_blend_mask & SH_BLEND_EARLY_TESTS));
     if (post_depth_coverage) {
         spv_emit_extension(&c->emit, "SPV_KHR_post_depth_coverage");
-        spv_emit_capability(&c->emit, 4447); /* SampleMaskPostDepthCoverage */
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_SAMPLE_MASK_POST_DEPTH_COVERAGE);
+    }
+    if (predraw) {
+        spv_emit_extension(&c->emit, "SPV_EXT_fragment_shader_interlock");
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_FRAGMENT_SHADER_PIXEL_INTERLOCK_EXT);
     }
     if (advanced_blend || si->late_depth) {
         spv_emit_extension(&c->emit, "SPV_EXT_fragment_shader_interlock");
-        spv_emit_capability(&c->emit, 5378); /* FragmentShaderPixelInterlockEXT */
-        if (advanced_blend) spv_emit_capability(&c->emit, 55); /* StorageImageReadWithoutFormat */
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_FRAGMENT_SHADER_PIXEL_INTERLOCK_EXT);
+        if (advanced_blend) spv_emit_capability(&c->emit, SPV_CAPABILITY_STORAGE_IMAGE_READ_WITHOUT_FORMAT);
         c->blend_end = spv_emit_id(&c->emit);
     }
-    if (stage == ST_TCS || stage == ST_TES) spv_emit_capability(&c->emit, 3); /* Tessellation */
-    if (stage == ST_GS) spv_emit_capability(&c->emit, 2);                     /* Geometry */
-    if (stream_mask) spv_emit_capability(&c->emit, 54); /* GeometryStreams */
+    if (stage == ST_TCS || stage == ST_TES) spv_emit_capability(&c->emit, SPV_CAPABILITY_TESSELLATION);
+    if (stage == ST_GS) spv_emit_capability(&c->emit, SPV_CAPABILITY_GEOMETRY);
+    if (stream_mask) spv_emit_capability(&c->emit, SPV_CAPABILITY_GEOMETRY_STREAMS);
     if (needs_demote || (converge && stage == ST_FS)) {
-        spv_emit_capability(&c->emit, 5379); /* DemoteToHelperInvocation */
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_DEMOTE_TO_HELPER_INVOCATION);
         spv_emit_demote_extension(&c->emit);
     }
     if (needs_f16) spv_emit_float16_capability(&c->emit);
     if (needs_f64) spv_emit_float64_capability(&c->emit);
     if (needs_clock) spv_emit_shader_clock_extension(&c->emit);
-    if (needs_i64) spv_emit_capability(&c->emit, 11); /* Int64 */
-    if ((needs_instance || needs_draw_params) && g_shader_draw_parameters && stage == ST_VS)
+    if (needs_i64) spv_emit_capability(&c->emit, SPV_CAPABILITY_INT64);
+    if ((needs_instance || needs_draw_params) && g_spirv_translate.draw_parameters && stage == ST_VS)
         spv_emit_draw_parameters_capability(&c->emit);
     if (needs_subgroup || converge) spv_emit_subgroup_capabilities(&c->emit);
     if (needs_quad) spv_emit_subgroup_quad_capability(&c->emit);
@@ -1936,12 +2275,12 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     /* BuiltIn Layer takes the Geometry capability (a geometry program has it; the device's geometryShader) or
        ShaderLayer (its shaderOutputLayer), which a vertex or tessellation program writing the layer needs. A fragment
        program reads it with either. Without one a write is dropped and a read is 0 */
-    if (layer_output_used && stage != ST_GS && !g_shader_output_layer) layer_output_used = 0;
-    if (layer_input_used && !g_shader_geometry && !g_shader_output_layer) layer_input_used = 0;
-    if ((layer_output_used && stage != ST_GS) || (layer_input_used && !g_shader_geometry))
+    if (layer_output_used && stage != ST_GS && !g_spirv_translate.output_layer) layer_output_used = 0;
+    if (layer_input_used && !g_spirv_translate.geometry && !g_spirv_translate.output_layer) layer_input_used = 0;
+    if ((layer_output_used && stage != ST_GS) || (layer_input_used && !g_spirv_translate.geometry))
         spv_emit_layer_capability(&c->emit);
     else if (layer_input_used && stage != ST_GS)
-        spv_emit_capability(&c->emit, 2); /* Geometry */
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_GEOMETRY);
     if (clip_used || clip_in_used) spv_emit_clip_distance_capability(&c->emit);
     u32 coverage_output = 0, capture_output = 0;
     if (stage == ST_FS)
@@ -1972,23 +2311,26 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
        sample i, and a single-sampled one only bit 0. PIXLD.COVMASK likewise reports the host's coverage */
     u32 sample_mask_output = 0; /* SampleMask, an array of one word */
     if (stage == ST_FS && ((sph[19] & 1u) || (si->advanced_blend_mask & SH_ALPHA_COVERAGE))) {
-        sample_mask_output = spv_emit_interface_variable(&c->emit, 3, c->u32_type, c->u32_type, 1, 20, 0, 0);
+        sample_mask_output =
+            spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, c->u32_type, c->u32_type, 1, 20, 0, 0);
         interfaces[count++] = sample_mask_output;
     }
     if (stage != ST_FS && stage != ST_CS) {
         /* a tessellation control program's outputs are arrays of its output vertices */
         u32 per_vertex = stage == ST_TCS ? out_vertices : 0;
-        if (stage == ST_VS || (g_shader_stage_point_size && (stage != ST_TCS || point_size_used))) {
-            if (stage == ST_TCS || stage == ST_TES) spv_emit_capability(&c->emit, 23); /* TessellationPointSize */
-            if (stage == ST_GS) spv_emit_capability(&c->emit, 24);  /* GeometryPointSize */
-            point_size = per_vertex ? spv_emit_interface_variable(&c->emit, 3, c->f32_type, c->u32_type,
-                                                                  per_vertex, 1, 0, 0)
+        if (stage == ST_VS || (g_spirv_translate.stage_point_size && (stage != ST_TCS || point_size_used))) {
+            if (stage == ST_TCS || stage == ST_TES)
+                spv_emit_capability(&c->emit, SPV_CAPABILITY_TESSELLATION_POINT_SIZE);
+            if (stage == ST_GS) spv_emit_capability(&c->emit, SPV_CAPABILITY_GEOMETRY_POINT_SIZE);
+            point_size = per_vertex ? spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, c->f32_type,
+                                                                  c->u32_type, per_vertex, 1, 0, 0)
                                     : spv_emit_point_size_output(&c->emit, c->f32_type);
             interfaces[count++] = point_size;
         }
         if (viewport_used) {
             spv_emit_capability(&c->emit, stage == ST_GS ? 57 : 70); /* MultiViewport, ShaderViewportIndex */
-            viewport_output = spv_emit_interface_variable(&c->emit, 3, i32_type, c->u32_type, 0, 10, 0, 0);
+            viewport_output =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, i32_type, c->u32_type, 0, 10, 0, 0);
             interfaces[count++] = viewport_output;
         }
         if (layer_output_used) {
@@ -2001,7 +2343,8 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             clip_count = 8;
             if (per_vertex) {
                 u32 array = spv_emit_type_array(&c->emit, c->f32_type, clip_count);
-                clip_output = spv_emit_interface_variable(&c->emit, 3, array, c->u32_type, per_vertex, 3, 0, 0);
+                clip_output =
+                    spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, array, c->u32_type, per_vertex, 3, 0, 0);
             } else
                 clip_output = spv_emit_clip_distance_output(&c->emit, c->f32_type, c->u32_type, clip_count);
             interfaces[count++] = clip_output;
@@ -2021,12 +2364,13 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                     xfb_on = 1;
                 }
         /* without the extension the vertex program stores the capture (xfb_write) */
-        if (xfb_on && g_shader_xfb_stores) {
+        if (xfb_on && g_spirv_translate.xfb_stores) {
             xfb_stores = stage == ST_VS && ngbuf <= SNX_XFB_GBUF_MAX;
             xfb_on = xfb_stores;
         }
         if (position_used) {
-            position = per_vertex ? spv_emit_interface_variable(&c->emit, 3, vec4, c->u32_type, per_vertex, 0, 0, 0)
+            position = per_vertex ? spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, vec4, c->u32_type,
+                                                                per_vertex, 0, 0, 0)
                                   : spv_emit_position_output(&c->emit, vec4);
             interfaces[count++] = position;
             /* the captured position is a copy, a component a variable at an output location the program leaves
@@ -2077,9 +2421,10 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                     }
                     continue;
                 }
-                output_attrs[i] = per_vertex ? spv_emit_interface_variable(&c->emit, 3, vec4, c->u32_type, per_vertex,
-                                                                           SPV_NOT_BUILTIN, i, 0)
-                                             : spv_emit_output_vec4(&c->emit, vec4, i);
+                output_attrs[i] = per_vertex
+                                      ? spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, vec4, c->u32_type,
+                                                                    per_vertex, SPV_NOT_BUILTIN, i, 0)
+                                      : spv_emit_output_vec4(&c->emit, vec4, i);
                 interfaces[count++] = output_attrs[i];
             }
         if (position_slot && position_fix) {
@@ -2100,7 +2445,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 u32 slot = stream_slots[stream]++;
                 u32 variable = spv_emit_output_component(&c->emit, c->f32_type, slot / 4, slot & 3);
                 stream_capture[b][w] = variable;
-                spv_emit_decorate(&c->emit, variable, 29, &stream, 1);
+                spv_emit_decorate(&c->emit, variable, SPV_DECORATION_STREAM, &stream, 1);
                 spv_emit_xfb_capture(&c->emit, variable, b, si->xfb.stride[b], w * 4);
                 interfaces[count++] = variable;
                 xfb_on = 1;
@@ -2124,58 +2469,66 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                     spv_emit_interface_variable(&c->emit, storage, vec4, c->u32_type, 0, SPV_NOT_BUILTIN, i, 1);
                 interfaces[count++] = patch_vars[i];
             }
-        patch_vertices = spv_emit_interface_variable(&c->emit, 1, c->u32_type, c->u32_type, 0, 14, 0, 0);
+        patch_vertices =
+            spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->u32_type, c->u32_type, 0, 14, 0, 0);
         interfaces[count++] = patch_vertices;
     }
     /* PIXLD's sample (SampleId, which shades each sample, with SampleRateShading) and coverage (SampleMask in) */
     u32 sample_id = 0, coverage = 0;
     if (needs_sample_id) {
-        spv_emit_capability(&c->emit, 35); /* SampleRateShading */
-        sample_id = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 18);
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_SAMPLE_RATE_SHADING);
+        sample_id = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_SAMPLE_ID);
         interfaces[count++] = sample_id;
     }
     if (needs_coverage) {
-        coverage = spv_emit_interface_variable(&c->emit, 1, c->u32_type, c->u32_type, 1, 20, 0, 0);
+        coverage = spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->u32_type, c->u32_type, 1, 20, 0, 0);
         spv_emit_flat(&c->emit, coverage); /* an integer fragment input */
         interfaces[count++] = coverage;
     }
     /* Fragment PrimitiveId can declare Geometry or Tessellation. Without either feature the read is zero. */
-    if (stage == ST_FS && primitive_id_used && (g_shader_geometry || g_shader_tessellation)) {
-        if (!g_shader_geometry || !layer_input_used) spv_emit_capability(&c->emit, g_shader_geometry ? 2 : 3);
-        primitive_id = spv_emit_interface_variable(&c->emit, 1, c->u32_type, c->u32_type, 0, 7, 0, 0);
+    if (stage == ST_FS && primitive_id_used && (g_spirv_translate.geometry || g_spirv_translate.tessellation)) {
+        if (!g_spirv_translate.geometry || !layer_input_used)
+            spv_emit_capability(&c->emit, g_spirv_translate.geometry ? 2 : 3);
+        primitive_id = spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->u32_type, c->u32_type, 0, 7, 0, 0);
         spv_emit_flat(&c->emit, primitive_id);
         interfaces[count++] = primitive_id;
     }
     if (between) {
         if (point_in_used) {
             spv_emit_capability(&c->emit, stage == ST_GS ? 24 : 23);
-            point_size_in = spv_emit_interface_variable(&c->emit, 1, c->f32_type, c->u32_type, in_vertices, 1, 0, 0);
+            point_size_in = spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->f32_type, c->u32_type,
+                                                        in_vertices, 1, 0, 0);
             interfaces[count++] = point_size_in;
         }
         if (clip_in_used) {
             u32 array = spv_emit_type_array(&c->emit, c->f32_type, 8);
-            clip_input = spv_emit_interface_variable(&c->emit, 1, array, c->u32_type, in_vertices, 3, 0, 0);
+            clip_input =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, array, c->u32_type, in_vertices, 3, 0, 0);
             interfaces[count++] = clip_input;
         }
         if (position_in_used) {
-            position_in = spv_emit_interface_variable(&c->emit, 1, vec4, c->u32_type, in_vertices, 0, 0, 0);
+            position_in =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, vec4, c->u32_type, in_vertices, 0, 0, 0);
             interfaces[count++] = position_in;
         }
         if (primitive_id_used || stage == ST_GS) {
-            primitive_id = spv_emit_interface_variable(&c->emit, 1, c->u32_type, c->u32_type, 0, 7, 0, 0);
+            primitive_id =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->u32_type, c->u32_type, 0, 7, 0, 0);
             interfaces[count++] = primitive_id;
         }
         if (stage == ST_GS) {
             /* Vulkan requires a geometry shader to write PrimitiveId for a later fragment shader to read it. */
-            primitive_id_out = spv_emit_interface_variable(&c->emit, 3, c->u32_type, c->u32_type, 0, 7, 0, 0);
+            primitive_id_out =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_OUTPUT, c->u32_type, c->u32_type, 0, 7, 0, 0);
             interfaces[count++] = primitive_id_out;
         }
         if (tess_coord_used) {
-            tess_coord = spv_emit_interface_variable(&c->emit, 1, vec3, c->u32_type, 0, 13, 0, 0);
+            tess_coord = spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, vec3, c->u32_type, 0, 13, 0, 0);
             interfaces[count++] = tess_coord;
         }
         if (invocation_used) {
-            invocation_id = spv_emit_interface_variable(&c->emit, 1, c->u32_type, c->u32_type, 0, 8, 0, 0);
+            invocation_id =
+                spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, c->u32_type, c->u32_type, 0, 8, 0, 0);
             interfaces[count++] = invocation_id;
         }
     }
@@ -2201,18 +2554,19 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         input_component_type[i] = component_type;
         int arrays = between || ((pv_mask >> i & 1) && !pv_flat);
         if ((pv_mask >> i & 1) && pv_flat) interpolation = 1; /* the first vertex's value, flat */
-        inputs[i] = arrays ? spv_emit_interface_variable(&c->emit, 1, vector_type, c->u32_type,
+        inputs[i] = arrays ? spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, vector_type, c->u32_type,
                                                          between ? in_vertices : 3, SPV_NOT_BUILTIN, i, 0)
                            : spv_emit_input_vec4(&c->emit, vector_type, i, interpolation);
-        if (arrays && !between) spv_emit_decorate(&c->emit, inputs[i], 5285, NULL, 0); /* PerVertexKHR */
+        if (arrays && !between) spv_emit_decorate(&c->emit, inputs[i], SPV_DECORATION_PER_VERTEX_KHR, NULL, 0);
         interfaces[count++] = inputs[i];
     }
     u32 pv_position[3] = {0, 0, 0}, pv_copy[32][2] = {{0}};
     if (pv_mask && !pv_flat) {
         spv_emit_extension(&c->emit, "SPV_KHR_fragment_shader_barycentric");
-        spv_emit_capability(&c->emit, 5284); /* FragmentBarycentricKHR */
-        pv_position[0] = spv_emit_interface_variable(&c->emit, 1, vec4, c->u32_type, 3, SPV_NOT_BUILTIN, pv_slot, 0);
-        spv_emit_decorate(&c->emit, pv_position[0], 5285, NULL, 0);
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_FRAGMENT_BARYCENTRIC_KHR);
+        pv_position[0] =
+            spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, vec4, c->u32_type, 3, SPV_NOT_BUILTIN, pv_slot, 0);
+        spv_emit_decorate(&c->emit, pv_position[0], SPV_DECORATION_PER_VERTEX_KHR, NULL, 0);
         interfaces[count++] = pv_position[1] = pv_position[2] = pv_position[0];
     } else if (pv_mask) {
         for (u32 k = 0; k < 3; k++)
@@ -2224,52 +2578,55 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     }
     u32 fragcoord = 0;
     if (layer_input_used) {
-        layer_input = spv_emit_builtin_input_u32(&c->emit, i32_type, 9);
+        layer_input = spv_emit_builtin_input_u32(&c->emit, i32_type, SPV_BUILT_IN_LAYER);
         interfaces[count++] = layer_input;
     }
     u32 frontface = 0;
     if (needs_frontface) {
-        frontface = spv_emit_builtin_input_u32(&c->emit, c->bool_type, 17);
+        frontface = spv_emit_builtin_input_u32(&c->emit, c->bool_type, SPV_BUILT_IN_FRONT_FACING);
         interfaces[count++] = frontface;
     }
     /* a[0x2e0] and a[0x2e4] are the point sprite's S and T */
     u32 point_coord = 0;
     if (needs_point_coord) {
-        point_coord = spv_emit_interface_variable(&c->emit, 1, vec2, c->u32_type, 0, 16, 0, 0);
+        point_coord = spv_emit_interface_variable(&c->emit, SPV_STORAGE_INPUT, vec2, c->u32_type, 0, 16, 0, 0);
         interfaces[count++] = point_coord;
     }
     u32 instance_index = 0, vertex_index = 0, base_instance = 0;
     u32 local_input = 0, group_input = 0;
     if (needs_local_id) {
-        local_input = spv_emit_builtin_input_vec3(&c->emit, vec3_u32, 27);
+        local_input = spv_emit_builtin_input_vec3(&c->emit, vec3_u32, SPV_BUILT_IN_LOCAL_INVOCATION_ID);
         interfaces[count++] = local_input;
     }
-    if (needs_group_id) {
-        group_input = spv_emit_builtin_input_vec3(&c->emit, vec3_u32, 26);
+    /* shared memory in a buffer: a block's part is at its place in the grid (shader_shared_pointer) */
+    int shared_spill = needs_shared && si->shared_spill;
+    if (needs_group_id || shared_spill) {
+        group_input = spv_emit_builtin_input_vec3(&c->emit, vec3_u32, SPV_BUILT_IN_WORKGROUP_ID);
         interfaces[count++] = group_input;
     }
     if (needs_subgroup) {
-        c->subgroup_lane_input = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 41);
+        c->subgroup_lane_input =
+            spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_SUBGROUP_LOCAL_INVOCATION_ID);
         if (stage == ST_FS) spv_emit_flat(&c->emit, c->subgroup_lane_input);
         interfaces[count++] = c->subgroup_lane_input;
     }
     if (needs_instance || xfb_stores) { /* the stores' vertex places (xfb_write) */
-        instance_index = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 43);
-        vertex_index = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 42);
+        instance_index = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_INSTANCE_INDEX);
+        vertex_index = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_VERTEX_INDEX);
         interfaces[count++] = instance_index;
         interfaces[count++] = vertex_index;
-        if (needs_instance && g_shader_draw_parameters && stage == ST_VS) {
-            base_instance = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 4425); /* BaseInstance */
+        if (needs_instance && g_spirv_translate.draw_parameters && stage == ST_VS) {
+            base_instance = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_BASE_INSTANCE);
             interfaces[count++] = base_instance;
         }
     }
     u32 base_vertex = 0;
-    if (needs_draw_params && g_shader_draw_parameters && stage == ST_VS) {
+    if (needs_draw_params && g_spirv_translate.draw_parameters && stage == ST_VS) {
         if (!base_instance) {
-            base_instance = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 4425); /* BaseInstance */
+            base_instance = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_BASE_INSTANCE);
             interfaces[count++] = base_instance;
         }
-        base_vertex = spv_emit_builtin_input_u32(&c->emit, c->u32_type, 4424); /* BaseVertex */
+        base_vertex = spv_emit_builtin_input_u32(&c->emit, c->u32_type, SPV_BUILT_IN_BASE_VERTEX);
         interfaces[count++] = base_vertex;
     }
     if (needs_fragcoord) {
@@ -2279,7 +2636,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     u32 capture_tiles = 0, capture_helper = 0;
     if (stage == ST_FS && (si->advanced_blend_mask & SH_CAPTURE_TILED)) {
         capture_tiles = shader_capture_tiles_declare(&c->emit, c->u32_type, shader_vk_set(ST_FS), SNX_VKB_CAPTURE);
-        capture_helper = spv_emit_builtin_input_u32(&c->emit, c->bool_type, 23); /* HelperInvocation */
+        capture_helper = spv_emit_builtin_input_u32(&c->emit, c->bool_type, SPV_BUILT_IN_HELPER_INVOCATION);
         interfaces[count++] = capture_tiles;
         interfaces[count++] = capture_helper;
     }
@@ -2288,22 +2645,37 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         depth_buffer = shader_depth_stencil_declare(&c->emit, c->u32_type, shader_vk_set(ST_FS), SNX_VKB_CAPTURE);
         interfaces[count++] = depth_buffer;
     }
+    u32 predraw_stamp = 0, predraw_stamp_type = 0, predraw_side[SH_PREDRAW_MAX] = {0}, predraw_side_type = 0;
+    if (predraw) {
+        u32 set = shader_vk_set(ST_FS), binding = SNX_VKB_IMG + (u32)image_info.nimg;
+        predraw_stamp = spv_emit_storage_image(&c->emit, c->u32_type, set, binding, SPV_DIM_2D, 0, 33 /* R32ui */,
+                                               &predraw_stamp_type);
+        spv_emit_decorate(&c->emit, predraw_stamp, SPV_DECORATION_COHERENT, NULL, 0);
+        interfaces[count++] = predraw_stamp;
+        for (u32 k = 0; k < snx_popcount64(predraw); k++) {
+            predraw_side[k] = spv_emit_storage_image(&c->emit, c->u32_type, set, binding + 1 + k, SPV_DIM_2D, 0,
+                                                     30 /* Rgba32ui */, &predraw_side_type);
+            spv_emit_decorate(&c->emit, predraw_side[k], SPV_DECORATION_COHERENT, NULL, 0);
+            interfaces[count++] = predraw_side[k];
+        }
+    }
     u32 blend_image = 0, blend_image_type = 0;
     if (advanced_blend) {
         int array = !!(si->advanced_blend_mask & SH_BLEND_ARRAY);
         if (si->advanced_blend_mask & SH_BLEND_MULTISAMPLE) {
-            spv_emit_capability(&c->emit, 27); /* StorageImageMultisample */
-            if (array) spv_emit_capability(&c->emit, 48); /* ImageMSArray */
-            spv_emit_capability(&c->emit, 56); /* StorageImageWriteWithoutFormat */
-            blend_image_type = spv_emit_type_image(&c->emit, c->f32_type, SPV_DIM_2D, 0, array, 1, 2, 0);
-            blend_image = spv_emit_variable(&c->emit, 0, blend_image_type);
+            spv_emit_capability(&c->emit, SPV_CAPABILITY_STORAGE_IMAGE_MULTISAMPLE);
+            if (array) spv_emit_capability(&c->emit, SPV_CAPABILITY_IMAGE_MS_ARRAY);
+            spv_emit_capability(&c->emit, SPV_CAPABILITY_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT);
+            blend_image_type =
+                spv_emit_type_image(&c->emit, c->f32_type, SPV_DIM_2D, 0, array, 1, 2, SPV_IMAGE_FORMAT_UNKNOWN);
+            blend_image = spv_emit_variable(&c->emit, SPV_STORAGE_UNIFORM_CONSTANT, blend_image_type);
             u32 set = shader_vk_set(ST_FS), binding = SNX_VKB_BLEND + (u32)image_info.nimg;
-            spv_emit_decorate(&c->emit, blend_image, 34, &set, 1);
-            spv_emit_decorate(&c->emit, blend_image, 33, &binding, 1);
+            spv_emit_decorate(&c->emit, blend_image, SPV_DECORATION_DESCRIPTOR_SET, &set, 1);
+            spv_emit_decorate(&c->emit, blend_image, SPV_DECORATION_BINDING, &binding, 1);
         } else
             blend_image = spv_emit_storage_image(&c->emit, c->f32_type, shader_vk_set(ST_FS), SNX_VKB_BLEND + (u32)image_info.nimg,
                                                  SPV_DIM_2D, array, 0, &blend_image_type);
-        spv_emit_decorate(&c->emit, blend_image, 23, NULL, 0); /* Coherent */
+        spv_emit_decorate(&c->emit, blend_image, SPV_DECORATION_COHERENT, NULL, 0);
         interfaces[count++] = blend_image;
     }
     if (needs_scale || needs_texel_scale) {
@@ -2313,7 +2685,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     }
     for (u32 i = 0; i < 18; i++) {
         if (!cbuf_used[i]) continue;
-        c->cbuf[i] = (i < g_shader_uniform_cbufs ? spv_emit_uniform_vec4_array : spv_emit_readonly_vec4_array)(
+        c->cbuf[i] = (i < g_spirv_translate.uniform_cbufs ? spv_emit_uniform_vec4_array : spv_emit_readonly_vec4_array)(
             &c->emit, vec4_u32, c->u32_type, c->u32_type, shader_vk_set(stage), i, 4096, &c->cbuf_pointer[i]);
         interfaces[count++] = c->cbuf[i];
     }
@@ -2346,13 +2718,13 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 c->tex_array[i] = spv_emit_sampler_image_array_ex(
                     &c->emit, scalar, c->u32_type, shader_vk_set(stage), SNX_VKB_TEXARRAY,
                     textures[i].type == 0 ? 1 : textures[i].type, textures[i].array, 0, !!(textures[i].flags & 2),
-                    g_shader_tex_array, &c->sampled_type[i]);
+                    g_spirv_translate.tex_array, &c->sampled_type[i]);
                 interfaces[count++] = c->tex_array[i];
                 if (textures[i].shadow) {
-                    c->tex_depth[i] =
-                        spv_emit_sampler_image_array(&c->emit, c->f32_type, c->u32_type, shader_vk_set(stage),
-                                                     SNX_VKB_TEXDEPTH, textures[i].type == 0 ? 1 : textures[i].type,
-                                                     textures[i].array, 1, g_shader_tex_array, &c->tex_depth_type[i]);
+                    c->tex_depth[i] = spv_emit_sampler_image_array(
+                        &c->emit, c->f32_type, c->u32_type, shader_vk_set(stage), SNX_VKB_TEXDEPTH,
+                        textures[i].type == 0 ? 1 : textures[i].type, textures[i].array, 1, g_spirv_translate.tex_array,
+                        &c->tex_depth_type[i]);
                     interfaces[count++] = c->tex_depth[i];
                 }
             } else {
@@ -2430,37 +2802,52 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 interfaces[count++] = xo.buffer[b];
             }
     }
-    u32 shared_array = 0, shared_element_pointer = 0, shared_words = 0;
+    u32 shared_array = 0, shared_element_pointer = 0, shared_words = 0, shared_groups = 0;
     if (needs_shared) {
         shared_words = ((u32)si->shared_size + 3) / 4;
-        u32 array_type = spv_emit_type_array_u32(&c->emit, c->u32_type, shared_words);
-        u32 pointer_type = spv_emit_type_workgroup_pointer(&c->emit, array_type);
-        shared_element_pointer = spv_emit_type_workgroup_pointer(&c->emit, c->u32_type);
-        shared_array = spv_emit_workgroup_variable(&c->emit, pointer_type);
+        if (shared_spill) { /* global buffer slot SH_SHARED_SPILL, the grid's size to place a block's part */
+            if (!gbuf_struct) {
+                gbuf_struct = spv_emit_type_struct_one(&c->emit, spv_emit_type_runtime_array(&c->emit, c->u32_type, 4));
+                c->gbuf_pointer = spv_emit_type_storage_pointer(&c->emit, c->u32_type);
+            }
+            shared_element_pointer = c->gbuf_pointer;
+            shared_array =
+                spv_emit_storage_buffer(&c->emit, gbuf_struct, shader_vk_set(stage), SNX_VKB_SSBO + SH_SHARED_SPILL);
+            spv_emit_decorate(&c->emit, shared_array, SPV_DECORATION_COHERENT, NULL, 0);
+            shared_groups = spv_emit_builtin_input_vec3(&c->emit, vec3_u32, SPV_BUILT_IN_NUM_WORKGROUPS);
+            interfaces[count++] = shared_groups;
+            /* UniformMemory: its barriers and atomics order the buffer */
+            c->emit.shared_semantics = SPV_MEMORY_SEMANTICS_UNIFORM_MEMORY;
+        } else {
+            u32 array_type = spv_emit_type_array_u32(&c->emit, c->u32_type, shared_words);
+            u32 pointer_type = spv_emit_type_workgroup_pointer(&c->emit, array_type);
+            shared_element_pointer = spv_emit_type_workgroup_pointer(&c->emit, c->u32_type);
+            shared_array = spv_emit_workgroup_variable(&c->emit, pointer_type);
+        }
         interfaces[count++] = shared_array;
     }
     u32 push = 0, push_pointer = 0;
     if ((stage == ST_FS && ((target & 15) || capture_output || needs_point_coord || needs_texel_scale || needs_frag_y ||
-                            needs_frag_ndc)) ||
+                            needs_frag_ndc || predraw)) ||
         position_fix || needs_instance || base_vertex || (point_size && !point_size_used)) {
         /* the fragment stage's uvec4: its scaled textures (shader_scaled_fetch) and the window's origin
            (shader_frag_y_origin). After it, each at its own member whichever the program reads: at byte 80 the draw's
            viewport (shader_frag_ndc), at 96 the scaled textures of the size drawn to (vk/render.c's own_size), at 112
            the capture's words */
-        if (stage == ST_FS && (needs_frag_ndc || capture_output || needs_texel_scale)) {
+        if (stage == ST_FS && (needs_frag_ndc || capture_output || needs_texel_scale || predraw)) {
             u32 members[5] = {vec4, vec4_u32, vec4, vec4_u32, vec4_u32}, offsets[5] = {16, 32, 80, 96, 112};
             u32 structure = spv_emit_type_struct(&c->emit, members, offsets, 5);
-            spv_emit_decorate(&c->emit, structure, 2, NULL, 0); /* Block */
-            push = spv_emit_variable(&c->emit, 9, structure);   /* PushConstant */
-            push_pointer = spv_emit_type_pointer(&c->emit, 9, c->f32_type);
+            spv_emit_decorate(&c->emit, structure, SPV_DECORATION_BLOCK, NULL, 0);
+            push = spv_emit_variable(&c->emit, SPV_STORAGE_PUSH_CONSTANT, structure);
+            push_pointer = spv_emit_type_pointer(&c->emit, SPV_STORAGE_PUSH_CONSTANT, c->f32_type);
         } else if (point_size && !point_size_used) {
             /* The first vector retains the viewport/draw ABI. Fixed point size has a separate vector at byte48,
                beyond the fragment-stage vectors, so every graphics stage can use one shared pipeline layout. */
             u32 members[2] = {vec4, vec4}, offsets[2] = {0, 48};
             u32 structure = spv_emit_type_struct(&c->emit, members, offsets, 2);
-            spv_emit_decorate(&c->emit, structure, 2, NULL, 0); /* Block */
-            push = spv_emit_variable(&c->emit, 9, structure);   /* PushConstant */
-            push_pointer = spv_emit_type_pointer(&c->emit, 9, c->f32_type);
+            spv_emit_decorate(&c->emit, structure, SPV_DECORATION_BLOCK, NULL, 0);
+            push = spv_emit_variable(&c->emit, SPV_STORAGE_PUSH_CONSTANT, structure);
+            push_pointer = spv_emit_type_pointer(&c->emit, SPV_STORAGE_PUSH_CONSTANT, c->f32_type);
         } else
             push =
                 spv_emit_push_vec4(&c->emit, vec4, c->f32_type, stage == ST_FS ? 16 : 0,
@@ -2475,10 +2862,10 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     }
     spv_emit_entry_str(&c->emit, (SpvShaderStage)stage, fn, "main", interfaces, count); /* ST_ is SPIR-V's model */
     if (xfb_on && !xfb_stores) {
-        spv_emit_capability(&c->emit, 53);               /* TransformFeedback */
-        spv_emit_execution_mode(&c->emit, fn, 11, 0, 0); /* Xfb */
+        spv_emit_capability(&c->emit, SPV_CAPABILITY_TRANSFORM_FEEDBACK);
+        spv_emit_execution_mode(&c->emit, fn, SPV_MODE_XFB, 0, 0);
     }
-    if (stage == ST_TCS) spv_emit_execution_mode(&c->emit, fn, 26, 1, out_vertices); /* OutputVertices */
+    if (stage == ST_TCS) spv_emit_execution_mode(&c->emit, fn, SPV_MODE_OUTPUT_VERTICES, 1, out_vertices);
     if (stage == ST_TES) {
         /* 0xC8: the domain (isolines, triangles, quads), the spacing (equal, fractional odd and even) and the output
            (points, lines, triangles clockwise and counterclockwise) */
@@ -2486,7 +2873,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         spv_emit_execution_mode(&c->emit, fn, domain == 0 ? 25 : domain == 1 ? 22 : 24, 0, 0);
         spv_emit_execution_mode(&c->emit, fn, spacing == 0 ? 1 : spacing == 1 ? 3 : 2, 0, 0);
         spv_emit_execution_mode(&c->emit, fn, output == 2 ? 4 : 5, 0, 0); /* VertexOrderCw, VertexOrderCcw */
-        if (output == 0) spv_emit_execution_mode(&c->emit, fn, 10, 0, 0); /* PointMode */
+        if (output == 0) spv_emit_execution_mode(&c->emit, fn, SPV_MODE_POINT_MODE, 0, 0);
     }
     if (stage == ST_GS) {
         /* the input primitive, the SPH's output topology and vertices, and its threads per input primitive */
@@ -2503,26 +2890,27 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                                    : 22,
                                 0, 0);
         spv_emit_execution_mode(&c->emit, fn, topology == 1 ? 27 : topology == 6 ? 28 : 29, 0, 0);
-        spv_emit_execution_mode(&c->emit, fn, 26, 1,
+        spv_emit_execution_mode(&c->emit, fn, SPV_MODE_OUTPUT_VERTICES, 1,
                                 passthrough        ? (in_vertices == 4   ? 2
                                                       : in_vertices == 6 ? 3
                                                                          : in_vertices)
                                 : (sph[4] & 0xfff) ? sph[4] & 0xfff
                                                    : 1);
-        spv_emit_execution_mode(&c->emit, fn, 0, 1, invocations ? invocations : 1); /* Invocations */
+        spv_emit_execution_mode(&c->emit, fn, SPV_MODE_INVOCATIONS, 1, invocations ? invocations : 1);
     }
     if (stage == ST_CS) spv_emit_local_size(&c->emit, fn, si->cs_local[0], si->cs_local[1], si->cs_local[2]);
     if (stage == ST_FS) spv_emit_fragment_origin_upper_left(&c->emit, fn);
-    if (advanced_blend || si->late_depth) spv_emit_execution_mode(&c->emit, fn, 5366, 0, 0); /* PixelInterlockOrderedEXT */
-    if (post_depth_coverage) spv_emit_execution_mode(&c->emit, fn, 4446, 0, 0); /* PostDepthCoverage */
+    if (advanced_blend || si->late_depth || predraw)
+        spv_emit_execution_mode(&c->emit, fn, SPV_MODE_PIXEL_INTERLOCK_ORDERED_EXT, 0, 0);
+    if (post_depth_coverage) spv_emit_execution_mode(&c->emit, fn, SPV_MODE_POST_DEPTH_COVERAGE, 0, 0);
     if (stage == ST_FS && (si->early_fragment_tests || si->coverage_early_tests ||
                           (si->advanced_blend_mask & SH_BLEND_EARLY_TESTS)))
-        spv_emit_execution_mode(&c->emit, fn, 9, 0, 0); /* EarlyFragmentTests */
+        spv_emit_execution_mode(&c->emit, fn, SPV_MODE_EARLY_FRAGMENT_TESTS, 0, 0);
     if (depth_output) spv_emit_fragment_depth_replacing(&c->emit, fn);
     spv_emit_float_controls(&c->emit, fn, fp32_flush && !fp32_preserve && can_flush == SH_FTZ_MODE, can_preserve,
                             needs_f64 && can_preserve_f64);
-    if (needs_f16 && (g_shader_half_rounding & 1))
-        spv_emit_half_rounding(&c->emit, fn, !!(g_shader_half_rounding & 2));
+    if (needs_f16 && (g_spirv_translate.half_rounding & 1))
+        spv_emit_half_rounding(&c->emit, fn, !!(g_spirv_translate.half_rounding & 2));
     spv_emit_function_void(&c->emit, void_type, fn, fn_type);
     spv_emit_label(&c->emit, label);
     c->emit.block_end = shader_var_flush;
@@ -2581,9 +2969,9 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     StructEmit se = {0};
     if (has_flow) {
         /* the guarantee those lanes need, and the one a quad's have for derivatives where the device gives it */
-        if (structure && (converge || (quad_flow && g_shader_maximal_reconvergence))) {
+        if (structure && (converge || (quad_flow && g_spirv_translate.maximal_reconvergence))) {
             spv_emit_extension(&c->emit, "SPV_KHR_maximal_reconvergence");
-            spv_emit_execution_mode(&c->emit, fn, 6023, 0, 0); /* MaximallyReconvergesKHR */
+            spv_emit_execution_mode(&c->emit, fn, SPV_MODE_MAXIMALLY_RECONVERGES_KHR, 0, 0);
         }
         if (structure) {
             se.st = structure;
@@ -2614,8 +3002,9 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         u32 one = spv_emit_constant_f32(&c->emit, c->f32_type, 1);
         u32 value[4] = {one, one, one, one};
         spv_emit_store(&c->emit, capture_output, spv_emit_constant_vec4(&c->emit, vec4, value));
-        u32 pointer = SPV(&c->emit, SPV_OP_ACCESS_CHAIN, spv_emit_type_pointer(&c->emit, 9, c->u32_type), push,
-                          shader_u32(c, 4), c->zero);
+        u32 pointer =
+            SPV(&c->emit, SPV_OP_ACCESS_CHAIN, spv_emit_type_pointer(&c->emit, SPV_STORAGE_PUSH_CONSTANT, c->u32_type),
+                push, shader_u32(c, 4), c->zero);
         c->primitive_base = spv_emit_load(&c->emit, c->u32_type, pointer);
     }
     if (capture_tiles) {
@@ -2627,16 +3016,35 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         shader_capture_tile_mark(&c->emit, c->f32_type, c->u32_type, c->bool_type, capture_tiles,
                                    spv_emit_load(&c->emit, vec4, fragcoord), layer, live);
     }
+    if (predraw)
+        predraw_prologue(c, predraw, i32_type, vec4, fragcoord, push, predraw_stamp, predraw_stamp_type, predraw_side,
+                         predraw_side_type, texture_vec4);
     /* in the function's first block, so that every read has them */
+    if (quad_lane) {
+        u32 parity[2];
+        for (u32 k = 0; k < 2; k++) {
+            u32 pixel = spv_emit_unary(&c->emit, SPV_OP_CONVERT_F_TO_U, c->u32_type,
+                                       shader_input_component(c, vec4, fragcoord, c->f32_type, k));
+            parity[k] = spv_emit_binary(&c->emit, SPV_OP_BITWISE_AND, c->u32_type, pixel, shader_u32(c, 1));
+            c->quad_sign[k] =
+                spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->f32_type,
+                                 spv_emit_binary(&c->emit, SPV_OP_I_NOT_EQUAL, c->bool_type, parity[k], c->zero),
+                                 spv_emit_constant_f32(&c->emit, c->f32_type, -1.0f),
+                                 spv_emit_constant_f32(&c->emit, c->f32_type, 1.0f));
+        }
+        c->quad_lane = spv_emit_binary(
+            &c->emit, SPV_OP_BITWISE_OR, c->u32_type, parity[0],
+            spv_emit_binary(&c->emit, SPV_OP_SHIFT_LEFT_LOGICAL, c->u32_type, parity[1], shader_u32(c, 1)));
+    }
     u32 frag_ndc[2] = {0, 0}, pv_weight[2] = {0, 0};
     if (needs_frag_ndc) shader_frag_ndc(c, fragcoord, vec4, push, push_pointer, frag_ndc);
     if (pv_mask) shader_frag_weights(c, vec4, pv_position, pv_flat, frag_ndc, pv_weight);
     for (clip = 0; clip < clip_count; clip++) {
         u32 index = shader_u32(c, clip);
         u32 ptr = stage == ST_TCS
-            ? spv_emit_interface_scalar_pointer(&c->emit, 3, c->f32_type, clip_output,
-                 shader_input(c, c->u32_type, invocation_id), index)
-            : spv_emit_output_element_pointer(&c->emit, c->f32_type, clip_output, index);
+                      ? spv_emit_interface_scalar_pointer(&c->emit, SPV_STORAGE_OUTPUT, c->f32_type, clip_output,
+                                                          shader_input(c, c->u32_type, invocation_id), index)
+                      : spv_emit_output_element_pointer(&c->emit, c->f32_type, clip_output, index);
         spv_emit_store(&c->emit, ptr, zero_f);
     }
     if (has_flow && !structure) {
@@ -2808,6 +3216,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         .shared_words = shared_words,
         .shared_element_pointer = shared_element_pointer,
         .shared_array = shared_array,
+        .shared_groups = shared_groups,
         .push = push,
         .push_pointer = push_pointer,
         .local_words = local_words,
@@ -2889,7 +3298,10 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             if (shader_flow_has_cc(op) && B(w, 0, 5) != 15)
                 condition = cc_and(c, condition, shader_cc_test(c, B(w, 0, 5)));
             if (skip_helper) condition = cc_and(c, condition, cc_not(c, shader_lane_dead(c)));
-            if (shader_pure_op(op) && !skip_helper && !(shader_flow_has_cc(op) && B(w, 0, 5) != 15))
+            /* a fragment's lone-lane VOTE and SHFL change nothing but their writes either, and a SHFL's reads
+               through derivatives want every pixel of the quad in step, whose guards may differ */
+            if ((shader_pure_op(op) || (quad_lane && (op == O_VOTE || op == O_SHFL))) && !skip_helper &&
+                !(shader_flow_has_cc(op) && B(w, 0, 5) != 15))
                 c->guard = condition;
             else {
                 u32 execute = spv_emit_id(&c->emit);
@@ -2900,7 +3312,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             }
         }
         /* the instruction to the family whose branches take its opcode */
-        switch (op_family[op]) {
+        switch (op_family(op)) {
             case FAM_FLOW: emit_flow(&tr, i, w, op, d, a, b); break;
             case FAM_IO: emit_io(&tr, i, w, op, d, a, b); break;
             case FAM_THREAD: emit_thread(&tr, i, w, op, d, a, b); break;
@@ -2993,6 +3405,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     next.primitive_split_safe = stage == ST_VS && !votes && !needs_subgroup && !lane_used && !needs_clock;
     memcpy(next.cs_local, si->cs_local, sizeof next.cs_local);
     next.shared_size = si->shared_size;
+    next.shared_spill = si->shared_spill;
     next.attr_int_mask = si->attr_int_mask;
     next.attr_sint_mask = si->attr_sint_mask;
     next.clip_enable = si->clip_enable;
@@ -3016,11 +3429,14 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     tex_elsewhere |= tex_screen & tex_uv;
     next.tex_own_pixel_mask = stage == ST_FS ? tex_read & ~tex_elsewhere & ~tex_screen & ~tex_uv : 0;
     next.tex_screen_mask = stage == ST_FS ? tex_read & ~tex_elsewhere & tex_screen : 0;
+    next.predraw_slots = predraw;
     next.screen_in = next.tex_screen_mask ? (u32)screen_in : 0;
     next.screen_ndc = next.tex_screen_mask ? (u32)screen_ndc : 0;
     next.tex_uv_mask = stage == ST_FS ? tex_read & ~tex_elsewhere & tex_uv : 0;
     next.uv_in = next.tex_uv_mask ? (u32)uv_in : 0;
     next.tex_unread_mask = tex_asked & ~tex_read;
+    next.tex_predraw_mask = (next.tex_own_pixel_mask | next.tex_screen_mask | next.tex_uv_mask) &
+                            predraw_capable(textures, texture_count, si);
     if (stage == ST_VS) next.screen_out_mask = shader_direct_screen_out(flow, &next.screen_out_yneg_mask);
     if (stage == ST_VS) next.uv_out_mask = shader_direct_uv_out(flow, &next.uv_out_yneg_mask);
     if (stage == ST_VS) next.pos_out_mask = shader_direct_position_out(flow);

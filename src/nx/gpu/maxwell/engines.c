@@ -48,11 +48,6 @@ static struct {
 } g_engines;
 
 /* ------------------------------------------------------------ timestamps */
-/* GM20B's timer counts at 614.4 MHz (Eden's common/cpu_features.h GPUTickFreq, its NsToGPUTickRatio): ticks =
-   ns * 614400000 / 10^9 = ns * 384 / 625. With ns = q * 625 + rem, that is q * 384 + rem * 384 / 625 exactly
-   (rem * 384 < 625 * 384 can't carry), which never overflows where ns * 384 would */
-#define GPU_TICKS_PER_NS_NUM 384u
-#define GPU_TICKS_PER_NS_DEN 625u
 /* stamps step at least this many ns, more than one tick (625 / 384 ns), so that they strictly increase */
 #define GPU_TICK_MIN_STEP_NS 16u
 /* The timestamp a report or semaphore carries: the guest clock when the stream reaches it, as GPU ticks, past the
@@ -61,8 +56,7 @@ u64 gpu_ticks(void) {
     u64 ns = guest_ns();
     if (ns < g_engines.last_tick_ns + GPU_TICK_MIN_STEP_NS) ns = g_engines.last_tick_ns + GPU_TICK_MIN_STEP_NS;
     g_engines.last_tick_ns = ns;
-    return ns / GPU_TICKS_PER_NS_DEN * GPU_TICKS_PER_NS_NUM +
-           ns % GPU_TICKS_PER_NS_DEN * GPU_TICKS_PER_NS_NUM / GPU_TICKS_PER_NS_DEN;
+    return snx_gpu_ticks_of_ns(ns);
 }
 
 /* ------------------------------------------------------------ made-up counter values */
@@ -331,10 +325,10 @@ static void inline_push(GpuChannel* ch, const u32* idx, u32 n) {
     ch->inline_n += n;
 }
 /* ------------------------------------------------------------ the shadow RAM and the merged draw */
-/* the methods the shadow RAM leaves alone: the class's own, the window origin, and the data streams */
+/* the methods the shadow RAM leaves alone: the class's own and the data streams */
 static int shadowed(u32 m) {
-    return m >= MAXWELL3D_SHADOW_FIRST && m != MAXWELL3D_WINDOW_ORIGIN && m != MAXWELL3D_INLINE_INDEX_4X8_INDEX0 &&
-           m != MAXWELL3D_DRAW_INLINE_INDEX && m != MAXWELL3D_INLINE_INDEX_2X16_EVEN &&
+    return m >= MAXWELL3D_SHADOW_FIRST && m != MAXWELL3D_INLINE_INDEX_4X8_INDEX0 && m != MAXWELL3D_DRAW_INLINE_INDEX &&
+           m != MAXWELL3D_INLINE_INDEX_2X16_EVEN &&
            !(m >= MAXWELL3D_CONST_BUFFER_BUFFER && m <= MAXWELL3D_CONST_BUFFER_BUFFER_LAST);
 }
 /* a transform feedback buffer's start_offset, the write pointer its load resets */
@@ -492,6 +486,7 @@ static const u16 g_m3d_group[MAXWELL3D_MACRO_REGISTERS_START] = {
     M3D_RT(5), M3D_RT(6), M3D_RT(7), M3D_RANGE4(0x3F8, R3D_TARGETS), [0x3FC] = R3D_TARGETS, M3D_RANGE2(0x48A,
     R3D_TARGETS), [0x48C] = R3D_TARGETS,
     [0x54E] = R3D_TARGETS, [0x574] = R3D_RTFORMAT | R3D_TARGETS, [0x54F] = R3D_PIPEMISC,
+    [MAXWELL3D_RASTER_SAMPLES_ENABLE] = R3D_PIPEMISC, M3D_RANGE4(MAXWELL3D_SAMPLE_MASK, R3D_PIPEMISC),
     [MAXWELL3D_COLOR_MASK_COMMON] = R3D_BLEND, [MAXWELL3D_BLEND_PER_TARGET_ENABLED] = R3D_BLEND,
     M3D_RANGE16(MAXWELL3D_BLEND + 1, R3D_BLEND), [MAXWELL3D_FRAMEBUFFER_SRGB] = R3D_TARGETS,
     M3D_RANGE2(MAXWELL3D_LOGIC_OP, R3D_BLEND),

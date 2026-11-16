@@ -798,6 +798,7 @@ REC2(CmdSetStencilWriteMask, VkStencilFaceFlags, u32)
 REC1(CmdSetAttachmentFeedbackLoopEnableEXT, VkImageAspectFlags)
 REC1(CmdSetPolygonModeEXT, VkPolygonMode)
 REC1(CmdSetDepthClampEnableEXT, VkBool32)
+REC1(CmdSetDepthClipEnableEXT, VkBool32)
 REC1(CmdSetProvokingVertexModeEXT, VkProvokingVertexModeEXT)
 REC1(CmdSetConservativeRasterizationModeEXT, VkConservativeRasterizationModeEXT)
 REC1(CmdSetExtraPrimitiveOverestimationSizeEXT, float)
@@ -854,6 +855,24 @@ typedef struct {
 static void blend_run(const void* p) {
     const BlendArgs* x = p;
     vkCmdSetBlendConstants(x->cb, x->c);
+}
+typedef struct {
+    VkCommandBuffer cb;
+    VkDepthClampModeEXT mode;
+    VkDepthClampRangeEXT range;
+} ClampRangeArgs;
+static void clamp_range_run(const void* p) {
+    const ClampRangeArgs* x = p;
+    vkCmdSetDepthClampRangeEXT(x->cb, x->mode, &x->range);
+}
+void rec_CmdSetDepthClampRangeEXT(VkCommandBuffer cb, VkDepthClampModeEXT mode, const VkDepthClampRangeEXT* range) {
+    if (!rec_on(cb)) {
+        vkCmdSetDepthClampRangeEXT(cb, mode, range);
+        return;
+    }
+    ClampRangeArgs* x = rec_push(clamp_range_run, sizeof *x);
+    *x = (ClampRangeArgs){cb, mode, *range};
+    rec_commit();
 }
 void rec_CmdSetBlendConstants(VkCommandBuffer cb, const float c[4]) {
     if (!rec_on(cb)) {
@@ -1520,6 +1539,8 @@ static u32 g_rset_next;
 typedef struct {
     VkDescriptorPool pool[64];
     int npool, ipool;
+    int took, peak; /* the pools this use allocated from, the most of this window's uses (vk_desc_pools_keep) */
+    u32 uses;
     struct {
         VkDescriptorSetLayout layout;
         VkDescriptorSet set[REC_SPARE_SETS];
@@ -1552,6 +1573,7 @@ static u32 rec_alloc_n(RecPools* f, VkDescriptorSetLayout layout, VkDescriptorSe
         VkResult r = vkAllocateDescriptorSets(g_vk.dev, &ai, sets);
         if (r == VK_SUCCESS) {
             vk_desc_taken(layout, count);
+            if (f->ipool + 1 > f->took) f->took = f->ipool + 1;
             return count;
         }
         if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) {
@@ -1572,8 +1594,10 @@ static VkDescriptorSet rec_alloc(RecPools* f, VkDescriptorSetLayout layout) {
 }
 static void frame_reset_run(const void* p) {
     RecPools* f = &g_rpools[*(const u32*)p];
+    vk_desc_pools_keep(f->pool, &f->npool, &f->peak, &f->uses, f->took);
     for (int i = 0; i < f->npool; i++) vkResetDescriptorPool(g_vk.dev, f->pool[i], 0);
     f->ipool = 0;
+    f->took = 0;
     memset(f->spare, 0, sizeof f->spare);
 }
 void vk_rec_frame_reset(u32 slot) {

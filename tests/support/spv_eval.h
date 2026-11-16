@@ -23,6 +23,7 @@ typedef struct {
     uint32_t out_written[32];
     uint32_t frag_depth;
     uint32_t position[4];  /* the Position output (BuiltIn 0) when the invocation ends */
+    uint32_t clip[8];      /* the ClipDistance output (BuiltIn 3) when it ends: 0xdeadbeef for a plane none wrote */
     uint32_t shared[4096]; /* the first Workgroup variable's words when the invocation ends */
     uint32_t shared_words;
     uint32_t texel[64][4];      /* what every sample or fetch of the sampled image at each binding returns */
@@ -31,6 +32,7 @@ typedef struct {
     uint32_t gather[64][4][4];  /* what an OpImageGather of each component of the image at each binding returns */
     int killed;                 /* the invocation ended with OpKill or OpTerminateInvocation */
     int helper;                 /* the invocation is a fragment's helper: OpIsHelperInvocationEXT answers true */
+    int half_flush;             /* PackHalf2x16 flushes f16 subnormals to a signed zero, as a driver may */
     uint32_t shuffle_id;        /* the invocation the last OpGroupNonUniformShuffle read from (its Id operand) */
     uint32_t steps_max;         /* 0: 1000000 */
     uint32_t push[20];          /* the push constant block's words */
@@ -45,6 +47,13 @@ typedef struct {
     int set_outputs, emitted_tasks;
     uint32_t* arrays[34];
     uint32_t array_words[34];
+    /* a geometry program: its input arrays' words (up to 6 vertices of a vec4) by location, 32 for Position; and each
+       vertex it emits (the first 8), its outputs by location, then 32 for Position and 33 for PrimitiveId, with the
+       counts of OpEmitVertex and OpEndPrimitive. vertex_clip is each emitted vertex's ClipDistance */
+    uint32_t gs_in[33][6 * 4];
+    uint32_t vertex[8][34][4];
+    uint32_t vertex_clip[8][8];
+    uint32_t emitted, primitives;
 } SpvEvalEnv;
 /* Runs the module's first entry point: NULL when it returned, else why it stopped (a static string) */
 const char* spv_eval(const uint32_t* words, size_t count, SpvEvalEnv* env);

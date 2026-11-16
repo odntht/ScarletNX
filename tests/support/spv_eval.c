@@ -179,6 +179,18 @@ static uint32_t new_block(Ev* e, uint32_t* words, uint32_t n, int owned) {
     return e->nblocks++;
 }
 
+/* a value rounded to the nearest even f16, its bits: infinities past 65504 and its subnormals kept */
+static uint32_t half_bits(double v) {
+    uint32_t sign = signbit(v) ? 0x8000u : 0;
+    double a = fabs(v);
+    if (a != a) return 0x7e00u;
+    if (a >= 65520.0) return sign | 0x7c00u;
+    if (a < 6.103515625e-05) return sign | (uint32_t)nearbyint(ldexp(a, 24)); /* in units of 2^-24 */
+    int ex;
+    double m = frexp(a, &ex); /* a = m 2^ex, m in [0.5, 1) */
+    return sign | (((uint32_t)(ex + 14) << 10) + (uint32_t)nearbyint(ldexp(m, 11)) - 0x400u); /* a carry: next binade */
+}
+
 /* GLSL.std.450 */
 static const char* ext_inst(Ev* e, uint32_t t, uint32_t fn, const uint32_t* args, uint32_t nargs, Val* r) {
     uint32_t n = components(e, t);
@@ -193,7 +205,7 @@ static const char* ext_inst(Ev* e, uint32_t t, uint32_t fn, const uint32_t* args
             else if (a >= 65520.0f)
                 h = 0x7c00u;
             else if (a < 6.103515625e-05f) /* a subnormal half: in units of 2^-24 */
-                h = (uint32_t)nearbyintf(ldexpf(a, 24));
+                h = (uint32_t)nearbyintf(ldexpf(a, 24)), h = e->env->half_flush && h < 0x400u ? 0 : h;
             else {
                 int ex;
                 float m = frexpf(a, &ex); /* a = m 2^ex, m in [0.5, 1) */
@@ -213,7 +225,14 @@ static const char* ext_inst(Ev* e, uint32_t t, uint32_t fn, const uint32_t* args
         uint64_t x = nargs > 0 ? e->ids[args[0]].v.c[k] : 0, y = nargs > 1 ? e->ids[args[1]].v.c[k] : 0,
                  z = nargs > 2 ? e->ids[args[2]].v.c[k] : 0;
         uint64_t v;
-        if (fl && !is64(e, t)) {
+        if (fl && is16(e, t)) {
+            /* Fma of f16, rounded once: the double holds the product of two f16 whole, and its sum with a third
+               rounds only where the two are more than 53 bits apart, below any half's rounding point */
+            if (fn != 50) return "GLSL function on f16 other than Fma";
+            double a = half_f((uint32_t)x & 0xffffu), b = half_f((uint32_t)y & 0xffffu),
+                   c = half_f((uint32_t)z & 0xffffu);
+            v = half_bits(fma(a, b, c));
+        } else if (fl && !is64(e, t)) {
             float a = f32(x), b = f32(y), c = f32(z);
             switch (fn) {
                 case 1: v = u_f32(roundf(a)); break;
@@ -702,6 +721,24 @@ static const char* run(Ev* e) {
                 break;
             case 224: /* OpControlBarrier, OpMemoryBarrier: the invocation is alone */
             case 225: break;
+            case 218: /* OpEmitVertex: the outputs as they are, by location, then Position (32) and PrimitiveId (33) */
+                for (uint32_t id = 0; id < e->bound; id++) {
+                    const Id* v = &e->ids[id];
+                    Block* b = &e->blocks[v->block];
+                    if (v->kind != K_VAR || v->sclass != 3 || !b->words) continue;
+                    uint32_t slot = v->location ? v->location - 1 : v->builtin == 0 + 1 ? 32
+                                                                 : v->builtin == 7 + 1   ? 33
+                                                                                         : 34;
+                    uint32_t words = b->n < 4 ? b->n : 4;
+                    if (e->env->emitted < 8 && slot < 34) memcpy(e->env->vertex[e->env->emitted][slot], b->words, words * 4);
+                    if (e->env->emitted < 8 && v->builtin == 3 + 1) /* ClipDistance */
+                        memcpy(e->env->vertex_clip[e->env->emitted], b->words, (b->n < 8 ? b->n : 8) * 4);
+                    /* the emit leaves every output undefined: a program that relies on one after it reads this */
+                    for (uint32_t k = 0; k < b->n; k++) b->words[k] = 0xdeadbeefu;
+                }
+                e->env->emitted++;
+                break;
+            case 219: e->env->primitives++; break; /* OpEndPrimitive */
             case 5295: /* OpSetMeshOutputsEXT */
                 e->env->mesh_outputs[0] = (uint32_t)e->ids[in[1]].v.c[0];
                 e->env->mesh_outputs[1] = (uint32_t)e->ids[in[2]].v.c[0];
@@ -903,9 +940,19 @@ static const char* ev_open(Ev* e, const uint32_t* w, size_t count, SpvEvalEnv* e
                 why = "out of memory";
                 break;
             }
-            if (sc == 1 && v->builtin && v->builtin - 1 < 64)
+            /* a ClipDistance output starts undefined, as the 0xdeadbeef of an emit: a plane that no store writes
+               shows */
+            if (sc == 3 && v->builtin == 3 + 1)
+                for (uint32_t k = 0; k < n; k++) m[k] = 0xdeadbeefu;
+            /* an input array (a geometry program's, one element for each vertex of the input primitive) takes its
+               words from gs_in: the generic's location, or 32 for Position */
+            int array = e->ids[pointee].op == 28;
+            uint32_t gs = array && v->builtin == 0 + 1 ? 32 : array && v->location ? v->location - 1 : 33;
+            if (sc == 1 && gs < 33)
+                memcpy(m, env->gs_in[gs], (n < 6 * 4 ? n : 6 * 4) * 4);
+            else if (sc == 1 && v->builtin && v->builtin - 1 < 64)
                 memcpy(m, env->builtin[v->builtin - 1], (n < 4 ? n : 4) * 4);
-            if (sc == 1 && !v->builtin && v->location && v->location - 1 < 32)
+            else if (sc == 1 && !v->builtin && v->location && v->location - 1 < 32)
                 memcpy(m, env->in[v->location - 1], (n < 4 ? n : 4) * 4);
             if (sc == 9) memcpy(m, env->push, (n < 20 ? n : 20) * 4);
             if (sc == 5402) memcpy(m, env->payload, (n < 1024 ? n : 1024) * 4); /* TaskPayloadWorkgroupEXT */
@@ -940,6 +987,8 @@ static void ev_close(Ev* e) {
         if (v->builtin == 22 + 1) env->frag_depth = m[0];
         if (v->builtin == 0 + 1)
             for (uint32_t k = 0; k < 4 && k < n; k++) env->position[k] = m[k];
+        if (v->builtin == 3 + 1)
+            for (uint32_t k = 0; k < 8 && k < n; k++) env->clip[k] = m[k];
         /* an array's elements */
         uint32_t slot = v->location ? v->location - 1 : v->builtin == 1 ? 32 : v->builtin == 5296 + 1 ? 33 : 34;
         if (e->ids[e->ids[v->type].a].op == 28 && slot < 34 && env->arrays[slot])

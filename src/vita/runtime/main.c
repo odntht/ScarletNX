@@ -27,11 +27,11 @@
 
 /* the common options scarletnx-vita takes (common/utilities/cli.h): a VPK is always extracted, and the Vita runtime
    has no keys, frame count, fullscreen setting or window-less run */
-static const unsigned vita_cli =
-    SNX_CLI_BIT(SNX_CLI_EXTRACT) | SNX_CLI_BIT(SNX_CLI_RECOMPILE) | SNX_CLI_BIT(SNX_CLI_GAME) |
-    SNX_CLI_BIT(SNX_CLI_UPDATE) | SNX_CLI_BIT(SNX_CLI_DATA) | SNX_CLI_BIT(SNX_CLI_OUTDIR) |
-    SNX_CLI_BIT(SNX_CLI_OUTPUT) | SNX_CLI_BIT(SNX_CLI_SECONDS) | SNX_CLI_BIT(SNX_CLI_SHOT) |
-    SNX_CLI_BIT(SNX_CLI_SCRIPT) | SNX_CLI_BIT(SNX_CLI_HELP);
+static const unsigned vita_cli = SNX_CLI_BIT(SNX_CLI_EXTRACT) | SNX_CLI_BIT(SNX_CLI_RECOMPILE) |
+                                 SNX_CLI_BIT(SNX_CLI_GAME) | SNX_CLI_BIT(SNX_CLI_UPDATE) | SNX_CLI_BIT(SNX_CLI_DATA) |
+                                 SNX_CLI_BIT(SNX_CLI_OUTDIR) | SNX_CLI_BIT(SNX_CLI_OUTPUT) |
+                                 SNX_CLI_BIT(SNX_CLI_SECONDS) | SNX_CLI_BIT(SNX_CLI_SHOT) |
+                                 SNX_CLI_BIT(SNX_CLI_SCRIPT) | SNX_CLI_BIT(SNX_CLI_HELP) | SNX_CLI_RECOMPILE_OPTIONS;
 static void usage(FILE* out) {
     fputs(
         "Usage: scarletnx-vita [OPTIONS] game.vpk\n"
@@ -46,10 +46,18 @@ static void usage(FILE* out) {
     snx_cli_help(out, vita_cli);
     fputs(
         "Vita options:\n"
-        "  --KEY=VALUE            A Vita debug setting: --vita_hle_trace=1 logs each import the runtime lacks (2\n"
-        "                         every call), --vita_gxm_trace=1 each scene. And the Switch's --aot_threads=N:\n"
+        "  --KEY=VALUE            A Vita debug setting: --vita-hle-trace=1 logs each import the runtime lacks (2\n"
+        "                         every call), --vita-gxm-trace=1 each scene. And the Switch's --aot-threads=N:\n"
         "                         the game's code compiles on N threads (1 to 1024; the default 0: the computer's\n"
-        "                         cores with a quarter left free, or --aot_threads_most=N)\n"
+        "                         cores with a quarter left free, or --aot-threads-most=N), the same as --jobs N.\n"
+        "                         KEY is the key with a - for each _; the key as written, the older spelling, is still\n"
+        "                         read, and said once\n"
+        "\n"
+        "On the Vita, -O is the level of the blocks' code and of the helpers they call. --chunk N puts N instructions\n"
+        "in a chunk, whole blocks (default: 512 blocks a chunk). --jit-cache FILE is the list of the blocks a run\n"
+        "compiled at run time that discovery starts from, another game folder's <title ID>.hints (default: the\n"
+        "game's own). --jit-only makes a module of no blocks, the run-time compiler compiling every one, and\n"
+        "--keep-ir keeps each chunk's IR in <title ID>_build of the game's folder.\n"
         "\n"
         "On the Vita, --update is the dumped game's update folder (default: patch/<title ID> beside its app/<title\n"
         "ID>), --shot saves PATH.ppm, and --script=ms:buttons,... is the setting vita_script.\n",
@@ -173,7 +181,8 @@ static void deploy_runtime(const char* folder, const char* runtime) {
     free(ini);
     free(copy);
 }
-static int play(const char* folder, bool recompile, double seconds, const char* shot, const char* runtime) {
+static int play(const char* folder, bool recompile, double seconds, const char* shot, const char* runtime,
+                const SnxCliRecompile* asked) {
     VitaImage image;
     VitaNative native = {0};
     VitaProcess* process = NULL;
@@ -227,8 +236,8 @@ static int play(const char* folder, bool recompile, double seconds, const char* 
     /* An existing module that matches is played as it is, else it is compiled first: decided from its file, before it
        is loaded, which happens once */
     bool current = !recompile && vita_module_current(module, &image);
-    if (!current) printf("Recompiling %s (Vita AArch32)\n", image.name);
-    if ((!current && vita_aot_compile(folder, &image, error, sizeof error)) ||
+    if (!current && !asked->quiet) printf("Recompiling %s (Vita AArch32)\n", image.name);
+    if ((!current && vita_aot_compile(folder, &image, asked, error, sizeof error)) ||
         !vita_native_open(module, &image, &native, error, sizeof error)) {
         fprintf(stderr, "scarletnx-vita: %s\n", error);
         goto done;
@@ -326,13 +335,16 @@ int snx_vita_main(int argc, char** argv) {
             return common < 0 ? 2 : 0;
         }
         if (common == SNX_CLI_SCRIPT) ini_read(ini_find(g_vita_debug_ini, "vita_script"), cli.value[SNX_CLI_SCRIPT]);
+        /* the Switch's settings, as --aot-threads= is: the last given counts */
+        if (common == SNX_CLI_OPT) ini_read(ini_find(g_recompile_ini, "opt"), cli.value[SNX_CLI_OPT]);
+        if (common == SNX_CLI_JOBS) g_settings.aot_threads = cli.jobs;
         if (common) continue;
         if (!strncmp(a, "--", 2) && strchr(a, '=')) {
-            /* the Vita debug table's, --press_len= and --shot_every= being vita_press_len and vita_shot_every (a Switch
-               game's are g_unattended_ini's), vulkan_video (which the Vita's AVC decoder doesn't take yet) and
-               gamepad_map */
+            /* the Vita debug table's, --press-len= and --shot-every= being vita_press_len and vita_shot_every (a Switch
+               game's are g_unattended_ini's), vulkan_video (which the Vita's AVC decoder doesn't take yet), a Vulkan
+               extension's (vk_ext_*) and gamepad_map */
             char key[64];
-            const char* value = ini_arg(a, key, sizeof key);
+            const char* value = settings_arg(a, key, sizeof key);
             const IniOpt* o = NULL;
             /* the recompile's threads, the Switch's setting: a value it does not take stops here, as there */
             if (value && (!strcmp(key, "aot_threads") || !strcmp(key, "aot_threads_most"))) {
@@ -348,6 +360,7 @@ int snx_vita_main(int argc, char** argv) {
                                                                             : key);
                 if (!o) o = ini_find(g_debug_ini, key);
                 if (!o && !strcmp(key, "vulkan_video")) o = ini_find(g_graphics_ini, key);
+                if (!o) o = ini_find(g_vk_extensions_ini, key); /* a Vulkan extension's, as the 3DS takes them */
             }
             if (o)
                 ini_read(o, value);
@@ -376,6 +389,13 @@ int snx_vita_main(int argc, char** argv) {
     const char *repo = cli.value[SNX_CLI_DATA], *game = cli.value[SNX_CLI_GAME], *shot = cli.value[SNX_CLI_SHOT];
     const char* patch = cli.update_count ? cli.updates[0] : NULL;
     bool extract_only = cli.flags & SNX_CLI_BIT(SNX_CLI_EXTRACT);
+    /* the recompile's options, for the game's code, which -x makes none of */
+    SnxCliRecompile asked = snx_cli_recompile(&cli);
+    if (asked.given && extract_only) {
+        fprintf(stderr, "scarletnx-vita: %s is the recompile's, and -x compiles no code\n", asked.given);
+        snx_cli_free(&cli);
+        return 2;
+    }
     bool recompile = cli.flags & SNX_CLI_BIT(SNX_CLI_RECOMPILE);
     double seconds = cli.seconds;
     snx_cli_free(&cli);
@@ -383,7 +403,7 @@ int snx_vita_main(int argc, char** argv) {
         snx_error("VITA_LOCKSTEP=%s is deprecated, %s: vita_lockstep=%d (docs/user/deprecations.md)", old_at,
                   g_settings.vita_lockstep != old_lockstep ? "and the command line gives vita_lockstep first"
                   : old_none                               ? "and VITA_LOCKSTEP_STEPS=0 compared none"
-                                                           : "and this run reads it as --vita_lockstep",
+                                                           : "and this run reads it as --vita-lockstep",
                   g_settings.vita_lockstep);
     if (old_none)
         snx_error("VITA_LOCKSTEP_STEPS=%s is deprecated, and compared no instruction group, which "
@@ -393,7 +413,7 @@ int snx_vita_main(int argc, char** argv) {
         snx_error("VITA_LOCKSTEP_STEPS=%s is deprecated, %s: vita_lockstep_steps=%d (docs/user/deprecations.md)", old_steps,
                   g_settings.vita_lockstep_steps != old_lockstep_steps
                       ? "and the command line gives vita_lockstep_steps first"
-                      : "and this run reads it as --vita_lockstep_steps",
+                      : "and this run reads it as --vita-lockstep-steps",
                   g_settings.vita_lockstep_steps);
     char *runtime = snx_executable(argv[0]), *folder = game ? snx_strdup(game) : input ? NULL : own_game(argv[0]);
     int status = 1;
@@ -439,7 +459,7 @@ int snx_vita_main(int argc, char** argv) {
             goto done;
         }
     }
-    status = play(folder, recompile, seconds, shot, runtime);
+    status = play(folder, recompile, seconds, shot, runtime, &asked);
 done:
     free(folder);
     free(runtime);

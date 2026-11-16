@@ -13,11 +13,12 @@ PowerPC64 LE's.
 
 As PowerPC64 LE's, with the `linux-riscv64-cross` or `linux-loongarch64-cross` preset and an Arch root of the
 architecture in `SNX_SYSROOT` (its pkg-config files, its LLVM and its GCC runtime). `scripts/appimage-sysroot.sh ROOT`
-installs what the AppImage links into an unpacked Arch root, as CI does, which keeps the root it makes for a week:
+installs what the AppImage links into an unpacked Arch root, as CI does, which keeps the root it makes for a week. Its
+SDL3 is the root's package, which `SNX_SYSTEM_SDL3` takes:
 
 ```bash
 export SNX_SYSROOT=/path/to/the/root
-cmake --preset linux-riscv64-cross
+cmake --preset linux-riscv64-cross -DSNX_SYSTEM_SDL3=ON
 cmake --build --preset linux-riscv64-cross
 ```
 
@@ -25,8 +26,9 @@ The root's `llvm-config` is a program of the target: `scripts/cross-llvm-config.
 machine its ELF header names (`qemu-riscv64`, `qemu-loongarch64`). The AppImages link LLVM statically instead, built
 for the architecture by `scripts/linux-llvm.sh riscv64 PREFIX` with `SNX_SYSROOT` set, and configured with
 `-DLLVM_DIR=PREFIX/lib/cmake/llvm -DSNX_LLVM_CONFIG=` ([Build](../dev/build.md#install--appimage)). CI packages them with
-this machine's `mkdwarfs`, as the target's compresses many times slower under qemu, and strips the target's files with
-`llvm-strip`, as this machine's `strip` knows its own architecture only.
+this machine's `appimagetool`, which resolves `mkdwarfs` for this machine too, as the target's compresses many times
+slower under qemu, and strips the target's files with `llvm-strip`, as this machine's `strip` knows its own
+architecture only.
 
 ## What differs from the other hosts
 

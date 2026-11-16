@@ -175,11 +175,11 @@ static VkFmt TC(VkFormat f, int bpp) { /* block compressed, 4x4 */
    textureCompressionBC, which the native_astc, native_etc2 and native_bc settings turn on (vk_blocks_want). A texture
    in them takes the game's own bytes (a 12x12 ASTC one a 36th of RGBA8's); the others are decoded on the GPU as they
    are uploaded, but BCn where the GPU samples ETC2: encoded again as ETC2 and EAC, the same bytes a texel (TB).
-   ASTC_AS_BC7: a decoded ASTC texture encoded again as BC7 (astc_mode's BC7, or its Auto, the default, on a GPU of
-   little memory, vk_astc_bc7), where the device samples BCn: vk_blocks_want turns textureCompressionBC on for it, so
-   BCn is sampled as it is only when native_bc says so as well */
+   ASTC_AS_BC7: a decoded ASTC texture encoded again as BC7 (astc_mode's BC7, or its Auto, the default, while the GPU's
+   memory has no room for RGBA8, vk_astc_bc7), where the device samples BCn: vk_blocks_want turns textureCompressionBC
+   on for it, so BCn is sampled as it is only when native_bc says so as well */
 enum { NATIVE_ASTC = 1, NATIVE_ETC2 = 2, NATIVE_BC = 4, ASTC_AS_BC7 = 8, BCN_AS_ASTC = 16, BC1_AS_ASTC = 32 };
-int vk_astc_bc7(void) { return snx_astc_bc7(g_settings.astc_mode, g_vk.astc_auto_bc7); }
+int vk_astc_bc7(void) { return snx_astc_bc7(g_settings.astc_mode, g_vk.astc_auto.bc7); }
 static u32 native_blocks(void) {
     return (g_vk.feat.textureCompressionASTC_LDR ? NATIVE_ASTC : 0) |
            (g_vk.feat.textureCompressionETC2 ? NATIVE_ETC2 : 0) |
@@ -276,11 +276,25 @@ static VkFmt TV(VkFormat f, int bpp, int conv) { /* converted on upload */
     r.conv = (u8)conv;
     return r;
 }
-/* Whether a header samples a depth/stencil target's stencil: R24G8 (stencil in G) or R8G24 (stencil in R), with
-   the first component taken from the stencil one. Unreal reads its scene stencil this way, R8G24 with R everywhere. */
+/* The header component a depth and stencil format keeps its stencil in, as the header's swizzle names it (2 R, 3 G),
+   0 for none: R in G24R8 and in the Z24S8 texture (0x29) whose word's low byte is the stencil, G in G8R24, in the one
+   with the stencil above its depth (0x2B) and in ZF32_X24S8, whose next word holds it */
+u32 vk_tic_stencil_component(u32 format) {
+    switch (format) {
+        case 0x0E:
+        case 0x29: return 2;
+        case 0x0D:
+        case 0x2B:
+        case 0x30: return 3;
+    }
+    return 0;
+}
+/* Whether a header samples a depth/stencil target's stencil: its first component taken from the stencil one. Unreal
+   reads its scene stencil this way, R8G24 with R everywhere; NVN's stencil view of a Z24S8 or ZF32_X24S8 texture
+   does it with the texture's own format */
 int vk_tic_reads_stencil(const u32* tic) {
-    u32 f = tic[0] & 0x7F, x = (tic[0] >> 19) & 7; /* 2 R, 3 G */
-    return (f == 0x0D && x == 3) || (f == 0x0E && x == 2);
+    u32 c = vk_tic_stencil_component(tic[0] & 0x7F);
+    return c && ((tic[0] >> 19) & 7) == c;
 }
 
 static VkFmt tic_format(u32 w0, int srgb, u32 native) {
@@ -519,6 +533,20 @@ void vk_blocks_say(void) {
     snprintf(why, sizeof why, "native_bc=%d, the GPU samples %sBCn, ETC2 %s", g_settings.native_bc,
              bc_has ? "" : "no ", g_vk.feat.textureCompressionETC2 ? "sampled" : "not sampled");
     family_say("BCn", why, g_settings.native_bc && !bc_has, bcn, bcn_names, 7);
+    /* and which encoder makes those encoded again as ASTC 4x4 (texconv.c), the GPU's vendor's where it has one */
+    int astc_encoded = 0;
+    for (int i = 0; i < 7; i++) {
+        const VkFmt f = vk_tic_format(bcn[i], 0);
+        astc_encoded |= f.conv && f.vk == VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+    }
+    if (astc_encoded) {
+        static const char* const encoders[3] = {"the generic encoder (gpu/texture/astc_encode.glsl)",
+                                                "Mali's encoder (gpu/texture/astc_encode_arm.glsl)",
+                                                "Adreno's encoder (gpu/texture/astc_encode_qcom.glsl)"};
+        const int enc = vk_astc_encoder(g_vk.props.vendorID);
+        LOG("vulkan: BCn encoded again as ASTC 4x4 by %s for vendor %04x, %s\n", encoders[enc], g_vk.props.vendorID,
+            enc != VK_ASTC_ENC_GENERIC && g_vk.bc7_dot ? "with packed dot products" : "its dot products spelled out");
+    }
 }
 
 VkFormat vk_srgb_as(VkFormat f, int srgb) {

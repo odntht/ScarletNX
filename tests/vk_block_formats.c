@@ -122,7 +122,7 @@ static void device(int astc, int etc2, int bc, int native_astc, int native_etc2,
     g_settings.native_bc = native_bc;
     g_settings.astc_mode = 1; /* Exact: ASTC decoded stays RGBA8, which needs no memory budget here */
     g_settings.bcn_astc = 0;  /* BCn as ETC2: at its default of 1 the BCn checks below would take ASTC 4x4 */
-    g_vk.astc_auto_bc7 = 0;
+    g_vk.astc_auto.bc7 = 0;
     vk_blocks_want(&have, &g_vk.feat);
     g_test.n = 0;
     vk_blocks_say();
@@ -235,6 +235,48 @@ int main(void) {
     line(2, "W vulkan: BCn textures (native_bc=1, the GPU samples no BCn, ETC2 sampled): encoded again on the GPU: BC1 "
             "as ASTC 4x4, BC2 as ASTC 4x4, BC3 as ASTC 4x4, BC4 as EAC R11, BC5 as EAC RG11, BC7 as ASTC 4x4; "
             "decoded on the GPU: BC6H to RGBA16F");
+    /* and by whose encoder (vk/texconv.c's builds): the Mali's own, with packed dot products where the GPU has an
+       instruction for them; Adreno's own; any other vendor's the generic one, which has no build with them */
+    line(3,
+         "vulkan: BCn encoded again as ASTC 4x4 by the generic encoder (gpu/texture/astc_encode.glsl) for vendor 0000, "
+         "its dot products spelled out");
+    CHECK(g_test.n == 4, "bcn_astc=1: %d log lines, not 4", g_test.n);
+    static const struct {
+        u32 vendor;
+        int dot;
+        const char* line;
+    } encoders[] = {
+        {0x13B5, 0,
+         "vulkan: BCn encoded again as ASTC 4x4 by Mali's encoder (gpu/texture/astc_encode_arm.glsl) for "
+         "vendor 13b5, its dot products spelled out"},
+        {0x13B5, 1,
+         "vulkan: BCn encoded again as ASTC 4x4 by Mali's encoder (gpu/texture/astc_encode_arm.glsl) for "
+         "vendor 13b5, with packed dot products"},
+        {0x5143, 1,
+         "vulkan: BCn encoded again as ASTC 4x4 by Adreno's encoder (gpu/texture/astc_encode_qcom.glsl) for "
+         "vendor 5143, with packed dot products"},
+        {0x10DE, 1,
+         "vulkan: BCn encoded again as ASTC 4x4 by the generic encoder (gpu/texture/astc_encode.glsl) for "
+         "vendor 10de, its dot products spelled out"}};
+    for (size_t i = 0; i < sizeof encoders / sizeof encoders[0]; i++) {
+        g_vk.props.vendorID = encoders[i].vendor;
+        g_vk.bc7_dot = encoders[i].dot;
+        g_test.n = 0;
+        vk_blocks_say();
+        line(3, encoders[i].line);
+    }
+    g_vk.props.vendorID = 0;
+    g_vk.bc7_dot = 0;
+    /* the encoder by vendor ID alone: Arm's and Qualcomm's own, and the generic one for NVIDIA, AMD, Intel,
+       Imagination, Apple, Mesa's software devices and none */
+    static const u32 generic[] = {0x10DE, 0x1002, 0x8086, 0x1010, 0x106B, 0x10005, 0};
+    CHECK(vk_astc_encoder(0x13B5) == VK_ASTC_ENC_ARM, "vendor 13b5 takes encoder %d, not Mali's (%d)",
+          vk_astc_encoder(0x13B5), VK_ASTC_ENC_ARM);
+    CHECK(vk_astc_encoder(0x5143) == VK_ASTC_ENC_QCOM, "vendor 5143 takes encoder %d, not Adreno's (%d)",
+          vk_astc_encoder(0x5143), VK_ASTC_ENC_QCOM);
+    for (size_t i = 0; i < sizeof generic / sizeof generic[0]; i++)
+        CHECK(vk_astc_encoder(generic[i]) == VK_ASTC_ENC_GENERIC, "vendor %x takes encoder %d, not the generic one",
+              generic[i], vk_astc_encoder(generic[i]));
     /* the images run short of memory: BC1, which ASTC 4x4 holds in twice its bytes, is ETC2 RGB8A1 from then on, said
        once; the others, the same bytes either way, stay ASTC. bcn_astc=2 keeps BC1 ASTC */
     g_test.n = 0;
@@ -252,6 +294,24 @@ int main(void) {
     device(0, 0, 0, 1, 1, 1);
     takes(0x17, 0, 0, VK_FORMAT_R8G8B8A8_UNORM, VKC_BC7, "none BC7");
     takes(0x0A, 0, 0, VK_FORMAT_R8G8B8A8_UNORM, VKC_ETC2_PTA, "none ETC2 RGB8A1");
+
+    /* a depth texture's stencil view (vk_tic_reads_stencil): the headers edenprobe's zeta suite samples through NVN,
+       the stencil of a Z24S8 (R, all four components) and of a ZF32_X24S8 (G), beside their depth views, and the
+       game driver's R8G24 one. The first two were taken for depth, and their stencil read as depth bits */
+    static const struct {
+        u32 w0;
+        int stencil;
+        const char* what;
+    } views[] = {
+        {0x24924a29u, 1, "Z24S8's stencil, R"},      {0x76da4a29u, 0, "Z24S8's depth, G"},
+        {0x36da53b0u, 1, "ZF32_X24S8's stencil, G"}, {0x749253b0u, 0, "ZF32_X24S8's depth, R"},
+        {0x60124a0eu, 1, "R8G24's stencil, R"},      {0x60124a0du, 0, "G8R24's depth, R"},
+    };
+    for (size_t i = 0; i < sizeof views / sizeof views[0]; i++) {
+        u32 tic[8] = {views[i].w0};
+        CHECK(vk_tic_reads_stencil(tic) == views[i].stencil, "%s (header word 0 %08x): reads the stencil %d, not %d",
+              views[i].what, views[i].w0, vk_tic_reads_stencil(tic), views[i].stencil);
+    }
 
     if (g_test.failures) {
         printf("%u of %u checks failed\n", g_test.failures, g_test.checks);

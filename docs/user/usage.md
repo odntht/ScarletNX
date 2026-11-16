@@ -27,40 +27,68 @@ For the keyboard-controlled SDL3 menu and file drops, see [GUI](gui.md).
 ## Common options
 
 Every driver of the program (`scarletnx` for the Switch, `scarletnx-3ds`, `scarletnx-vita`, `scarletnx-agb`,
-`scarletnx-android`, `scarletnx-gnuabi`) reads the options below from one table, `src/common/utilities/cli.c`. Each
+`scarletnx-nds`, `scarletnx-android`, `scarletnx-gnuabi`) reads the options below from one table, `src/common/utilities/cli.c`. Each
 `--help` shows them first, with the same words in the same column, then the driver's own options. Each option that
 takes a value takes it as `--option VALUE` or as `--option=VALUE`. A common option that a driver cannot do stops the
 run with the same message in each driver, `scarletnx-agb does not take --update`. An older name of an option still
 works for now, and the run says once what it is called now ([Deprecations](deprecations.md#now)).
 
-Each driver that recompiles (`scarletnx`, `scarletnx-3ds`, `scarletnx-vita`, `scarletnx-agb`) also takes
-`--aot_threads=N`, the setting [`aot_threads`](settings.md): the threads compiling the game's code, 0 (the default)
-up to the computer's cores with a quarter left free, or to `--aot_threads_most=N` (`scarletnx`'s open one at a time, as the memory holds them:
-[Extract → AOT → run](#extract--aot--run)). A GBA ROM's code is one module and compiles on one thread whatever N,
-which its recompile says. A value that is not a whole number from 0 to 1024 stops the run.
+Each driver that recompiles (`scarletnx`, `scarletnx-3ds`, `scarletnx-vita`, `scarletnx-agb`, `scarletnx-nds`) also takes
+`--aot-threads=N`, the setting [`aot_threads`](settings.md): the threads compiling the game's code, 0 (the default)
+up to the computer's cores with a quarter left free. Each also takes `--aot-threads-most=N`, the most 0 takes
+(`scarletnx`'s open one at a time, as the memory holds them: [Extract → AOT → run](#extract--aot--run)), which the
+launcher's Gentle queue gives every driver. A GBA ROM's code is one
+module and compiles on one thread whatever N, which its recompile says. A value that is not a whole number from 0
+to 1024 stops the run. `--jobs N` is the same setting for the Switch, 3DS, Vita and GBA drivers, and `-O` the
+setting [`opt`](settings.md), 2 unless the launcher's Optimization level says another, which
+the launcher gives every one of them. The recompile's options take effect when the game is made: a game made already
+keeps its code until `-r`.
 
-| Option | Meaning | Switch | 3DS | Vita | AGB | Android | GNU ABI |
-|---|---|---|---|---|---|---|---|
-| `-x`, `--extract` | Extract the game, without playing it | yes | yes | yes | | | |
-| `--extract-container` | Extract the game into its folder and play it from there. Without it, the game is read where it lies | yes | yes | | | | |
-| `-r`, `--recompile` (`--recomp`) | Recompile the game, without playing it | yes | yes | yes | yes | | |
-| `--game DIR` | Play the game in its folder DIR (`recompiled/<name>`), as its copy of the runtime does | yes | yes | yes | yes | | |
-| `--update PATH` (`--patch`) | An update or a DLC of the game, played with it. Give it once for each. For the Vita, it is the dumped game's update folder, given once | yes | yes | yes | | | |
-| `--data DIR` (`--repo`) | The data folder ([Folders](#folders)) | yes | yes | yes | yes | | yes |
-| `--outdir DIR` | The folder of the games, in which the game's folder is made (default: `recompiled/` of the data folder) | yes | yes | yes | yes | | |
-| `--output DIR` | The game's folder itself (default: `<outdir>/<the game's name>`) | | yes | yes | yes | | |
-| `--keys FILE` | The console's keys: `prod.keys` for the Switch, Azahar's `aes_keys.txt` for the 3DS | yes | yes | | | | |
-| `--seconds N` | Stop after N seconds | yes | yes | yes | | | |
-| `--frames N` | Stop after N frames (the AGB's run has no window, sound or pacing) | yes | | | yes | | |
-| `--shot PATH` | Save the screen to PATH when the run ends (Android: each frame `--shot-frame` names) | yes | | yes | yes | yes | |
-| `--script SPEC` | Press buttons at times of the run, `MS:BUTTONS,...` (each platform's page names the buttons) | yes | yes | yes | yes | | |
-| `-f`, `--fullscreen[=0\|1]` | Start fullscreen for this run, or windowed with `=0` | yes | yes | | yes | | |
-| `-H`, `--headless` | Run without a window | yes | | | | yes | |
-| `-h`, `--help` | Show the help | yes | yes | yes | yes | yes | yes |
+The recompile's options mean on each system:
+
+| Option | Switch | 3DS | Vita | GBA |
+|---|---|---|---|---|
+| `--chunk N` | the instructions of a code unit, whole functions (default: the setting `unit_instructions`) | the instructions of a chunk, whole blocks (default: 512 blocks a chunk) | the same as the 3DS's | one module compiled whole, said |
+| `--jit-cache PATH` | a profile run's `.jitcache`, linked into the module ([AOT packs](aot-packs.md)) | the list of the blocks a run compiled at run time that discovery starts from, another game folder's `<title ID>.hints` (default: the game's own) | the same as the 3DS's | the map of the blocks runs reached, another game folder's `<name>_code.map` (default: the game's own) |
+| `--jit-only` | a module with no code: the JIT compiles all of it | a module of no blocks: the run-time compiler compiles every one | the same as the 3DS's | no module: every block compiled as the run reaches it |
+| `--keep-ir` | each unit's IR in `<name>/<name>_build` | each chunk's IR and the index's in `<title ID>_build` of the game's folder | the same as the 3DS's | the module's IR in `<name>_build` of the game's folder |
+
+On GNU ABI and Android the code compiles as it runs: `-O` is their JIT's level (their `--jit-opt`), GNU ABI's
+`--jit-cache DIR` the folder its JIT keeps code in between runs, and `--jit-only` what both do anyway.
+
+| Option | Meaning | Switch | 3DS | Vita | AGB | NDS | Android | GNU ABI |
+|---|---|---|---|---|---|---|---|---|
+| `-x`, `--extract` | Extract the game, without playing it | yes | yes | yes | | | | |
+| `--extract-container` | Extract the game into its folder and play it from there. Without it, the game is read where it lies | yes | yes | | | | | |
+| `-r`, `--recompile` (`--recomp`) | Recompile the game, without playing it | yes | yes | yes | yes | yes | | |
+| `--game DIR` | Play the game in its folder DIR (`recompiled/<name>`), as its copy of the runtime does | yes | yes | yes | yes | yes | | |
+| `--update PATH` (`--patch`) | An update or a DLC of the game, played with it. Give it once for each. For the Vita, it is the dumped game's update folder, given once | yes | yes | yes | | | | |
+| `--data DIR` (`--repo`) | The data folder ([Folders](#folders)) | yes | yes | yes | yes | yes | | yes |
+| `--outdir DIR` | The folder of the games, in which the game's folder is made (default: `recompiled/` of the data folder) | yes | yes | yes | yes | yes | | |
+| `--output DIR` | The game's folder itself (default: `<outdir>/<the game's name>`) | | yes | yes | yes | yes | | |
+| `--keys FILE` | The console's keys: `prod.keys` for the Switch, Azahar's `aes_keys.txt` for the 3DS | yes | yes | | | | | |
+| `--seconds N` | Stop after N seconds | yes | yes | yes | | yes | | |
+| `--frames N` | Stop after N frames (the AGB's run has no window, sound or pacing) | yes | yes | | yes | yes | | |
+| `--shot PATH` | Save the screen to PATH when the run ends (Android: each frame `--shot-frame` names) | yes | yes | yes | yes | yes | yes | |
+| `--script SPEC` | Press buttons at times of the run, `MS:BUTTONS,...` (each platform's page names the buttons) | yes | yes | yes | yes | yes | | |
+| `-f`, `--fullscreen[=0\|1]` | Start fullscreen for this run, or windowed with `=0` | yes | yes | | yes | yes | | |
+| `-H`, `--headless` | Run without a window | yes | yes | | | yes | yes | |
+| `-O LEVEL`, `--opt LEVEL` | LLVM's optimization of the code it compiles: 0, 1, 2, 3, s or z (default: the setting `opt`, 2); `-O2` too | yes | yes | yes | yes | | yes | yes |
+| `--jobs N` | The threads compiling the game's code, the setting `aot_threads`: 1 to 1024, or 0 (the default), Auto | yes | yes | yes | yes | | | |
+| `--chunk N` | The instructions of a unit of code compiled at once (below) | yes | yes | yes | yes | | | |
+| `--jit-cache PATH` | The run-time compiler's record of the game's code, which the recompile starts from (below) | yes | yes | yes | yes | | | yes |
+| `--jit-only` (`--interp-only`) | Compile no code ahead of time: the run-time compiler compiles all of it | yes | yes | yes | yes | | yes | yes |
+| `--keep-ir` (`--keep-c`) | Save the code the recompile generates, LLVM IR (below) | yes | yes | yes | yes | | | |
+| `-q`, `--quiet` | Say no progress of the recompile | yes | yes | yes | yes | | | |
+| `-h`, `--help` | Show the help | yes | yes | yes | yes | yes | yes | yes |
 
 The Switch's `--seconds`, `--frames`, `--shot` and `--script` are settings of the game's run
 ([Settings](settings.md)), which reach the game as `--key=value` in both forms. The 3DS's `--script` is its setting
-`ctr_script`, and the Vita's is `vita_script`. The Switch driver also keeps its combined letters, as `-rx` and `-Hs`.
+`ctr_script`, and its `--frames` counts the frames it decodes (the top screen's, or the bottom screen's until the
+game first draws a top screen). Its `--shot` writes both screens as one PPM to exactly PATH. Its `-H` starts no SDL
+video, audio or gamepad subsystem, so it needs no display server and only `--script` presses reach the game. Its
+`--seconds` counts host seconds, which are the console's seconds at the default pace. The Vita's `--script` is
+`vita_script`. The Switch driver also keeps its combined letters, as `-rx` and `-Hs`.
 
 ## Extract → AOT → run
 
@@ -87,7 +115,10 @@ the `.ini`.
 `--extract-container` (the launcher's **Extract dump**) extracts the dump instead, straight into the game's
 folder, `recompiled/<id>/<id>_data/` (`exefs/`, `romfs/`, `control.nacp`), and the game is made from it there: there is no
 second copy. `<id>.extracting` stays in the game's folder while an extraction is unfinished, and a stopped one is redone
-on the next run, the game's saves kept. A game made from its dump is extracted on the first run with the option, with
+on the next run, the game's saves kept. A made game's RomFS that a stopped extraction (`<id>.extracting`) or copy
+(`romfs.copying` in its data folder) cut, or that is not there, is extracted again from the dump `source=` names at its
+next start, and by `-r --extract-container`; with no `source=`, or one that is not there, both stop before the game
+runs, saying which file they need, and the game itself refuses to start on such a RomFS. A game made from its dump is extracted on the first run with the option, with
 no recompile, and a game run without it again has that extraction taken away, as long as the dump it records is there.
 `--data DIR` and `--build-dir DIR` may precede the dump. Keys use the usual discovery paths below.
 `--outdir DIR` puts the game's folder in DIR in place of the data folder's `recompiled/`, as `-r` takes it. With
@@ -113,9 +144,10 @@ place. `-rx` (`-r -x` on Windows) prepares it extracted, as `-r --extract-contai
 An extracted game's folder, one whose `exefs/` holds the game's `main` (beside its `romfs/` and `control.nacp` when it
 has them, as `-x` or hactool lays one out), plays and prepares as a dump does: `./build/scarletnx "Game/"`, or
 `-r "Game/"`. The game is named by the title ID of its `exefs/main.npdm`, and shown by its `control.nacp`'s name, else
-by that ID. Nothing of it is copied by default: the `.ini` records the folder as `source=`, and each run reads the
-ExeFS and RomFS from it, on whatever disk it is. `--extract-container` copies it into the game's data folder and
-`--tmpfs` into tmpfs instead, as they extract a dump; `-x --out DIR -- "Game/"` copies it alone. Moving or deleting the
+by that ID. Nothing of it is copied: the `.ini` records the folder as `source=`, and each run reads the ExeFS and
+RomFS from it, on whatever disk it is, `--extract-container` or not (its RomFS can take gigabytes a copy doubles; what
+an older version copied into the game's data folder is taken away at the next run). `--tmpfs` copies it into tmpfs, as
+it extracts a dump; `-x --out DIR -- "Game/"` copies it alone. Moving or deleting the
 folder stops the game, the run naming it, until it is back or `source=` names its new place. `--out` names a dump's
 extraction, and is refused for a folder. Removing a game's files never goes through a folder where a disk or another
 folder is mounted (a RomFS bind-mounted into a game's data folder): the run stops naming the mount, to be unmounted
@@ -145,7 +177,10 @@ mouse's left button (the default). The game's menu sets it too; the game's `.ini
 `--controls=0|1|2` likewise hides or shows the [on-screen controls](#on-screen-controls), or shows them on a touch
 screen while no gamepad is connected (`2`, the default); the game's `.ini` keeps `controls`. Any other `--key=value` of the game's
 `.ini` is forwarded as well, for that run (`scarletnx --settings` lists them all), and so are the timed-run ones
-(`--seconds=`, `--shot=`...); any other key stops the run with `unknown option`.
+(`--seconds=`, `--shot=`...); any other key stops the run with `unknown option`. A key is given with a `-` for each
+`_` (`--state-slots=5`, `--aot-threads=4`); the key as the `.ini` writes it (`--state_slots=5`), the older spelling, is
+still read and said once a run, and goes on to the game and the recompile with `-`. A name with some `_` left
+(`--aot-threads_most=2`) is no setting.
 The game's own executable also takes `-v`, the same as `--log=2`.
 LLVM is the only backend. `--backend=llvm`, which older scripts give, is accepted and changes nothing, and any
 other `--backend` stops with an error.
@@ -162,7 +197,7 @@ be used as a base game.
 
 ### Experimental CPU extensions
 
-`--cpu_extensions=1` enables LSE atomics, RCpc loads and the PAuth branch, return and signing instructions with the emulated system's
+`--cpu-extensions=1` enables LSE atomics, RCpc loads and the PAuth branch, return and signing instructions with the emulated system's
 instruction and data authentication controls disabled. Signing and authentication leave the pointers unchanged.
 Pointer stripping uses 39-bit virtual addresses with top-byte ignore disabled.
 It provides no pointer authentication protection, and does not implement a complete CPU or graphics profile for a
@@ -174,8 +209,8 @@ Use the same value when recompiling and running. Changing it requires recompilat
 code. The default is 0, which keeps the Cortex-A57 instruction set. For example:
 
 ```sh
-./build/scarletnx -r work/Game Game --cpu_extensions=1
-./build/scarletnx --game=/path/to/recompiled/Game --cpu_extensions=1
+./build/scarletnx -r work/Game Game --cpu-extensions=1
+./build/scarletnx --game=/path/to/recompiled/Game --cpu-extensions=1
 ```
 
 ### Updates and DLC
@@ -396,7 +431,7 @@ Remaining examples: POSIX.
   area all extract, through what [`storage.c`](../../src/nx/runtime/driver/hactool/storage.c) ports from LibHac.
 - **Recompile:** AOT → module (LLVM) →
   final runtime deployment, for this machine's CPU. Shaders compile directly to SPIR-V at runtime.
-  `-O 0..3,s,z` (`--opt=`) sets the optimization level (2 by default), and `--jobs N` (`--aot_threads=N`) the threads
+  `-O 0..3,s,z` (`--opt=`) sets the optimization level (2 by default), and `--jobs N` (`--aot-threads=N`) the threads
   compiling (0 or none: the machine's cores with a quarter left free, the physical cores where it says them,
   else the logical ones, at most 75%, so a recompile does not make the computer stutter). The quarter is
   deliberate: a large game's recompile runs for minutes, a pass that took every core would keep the machine
@@ -414,20 +449,22 @@ Remaining examples: POSIX.
   ended: the recompile only stops opening. Its log says each thread it opens and each reason it opens none, with
   the numbers. Threads given (`--jobs N`) are all open from the start, whatever the memory. Every pass of LLVM's
   pipelines can be turned off for the game's code,
-  `--llvm_pass_<pass>=0` (`--llvm_pass_instcombine=0`), and each option LLVM's C API sets on the pass builder and the
-  target machine set, `--llvm_<option>=N` (`--llvm_inliner_threshold=50`). `scarletnx --settings=recompile` lists
+  `--llvm-pass-<pass>=0` (`--llvm-pass-instcombine=0`), and each option LLVM's C API sets on the pass builder and the
+  target machine set, `--llvm-<option>=N` (`--llvm-inliner-threshold=50`). `scarletnx --settings=recompile` lists
   them, as the launcher's LLVM Internals page shows them: the passes are those of the pipelines the build's LLVM prints
   for each level, and a build without an `opt` of that LLVM has none. A dump played with these is recompiled with them
   when it has to be, and a game made already keeps its code until `-r` recompiles it. A value a setting does not take
-  (`--aot_threads=abc`) stops the recompile. The code the runtime compiles while the game runs keeps LLVM's own, but
-  for the SLP vectorizer, which `slp_vectorizer` turns on or off for both.
+  (`--aot-threads=abc`) stops the recompile.
+  The code the runtime compiles while the game runs keeps LLVM's own, but for the SLP vectorizer, which
+  `slp_vectorizer` turns on or off for both.
   `--target auto|linux|win64` takes only this host's own system: modules are built for the machine that builds
   them. `--target ios` writes `<id>_code.snxobj` instead, a pack of the code's objects for the iOS app to load into JIT
   memory (64-bit games only, [macOS and iOS](../hosts/apple.md)); it makes no runtime copy. `--runtime FILE` deploys that runtime instead of the running one, or of the one a tools-only build builds in
   its checkout's `build/native-recomp` (`build/win64-recomp` on Windows). `-q` (`--quiet`) prints no progress.
-  `--keep-c` is the deprecated spelling of `--keep-ir`.
+  `--keep-c` is the older name of `--keep-ir`. These and the other recompile options are the
+  [common options](#common-options), which the 3DS, Vita and GBA drivers take too.
 - **Codegen:** `--no-build` stages data/INI only; `--jit-only` omits AOT functions.
-  `--chunk N` (`--unit_instructions=N`) sets the instructions per code unit: 90000 by default, 20000 on Android and
+  `--chunk N` (`--unit-instructions=N`) sets the instructions per code unit: 90000 by default, 20000 on Android and
   iOS, where a smaller unit takes less memory at once. Each unit's object, a 32-bit game's blocks too, is kept in
   `units/` of the cache folder ([Folders](#folders)), which every game's recompile shares, under the SHA-256 of the
   unit's LLVM IR, the LLVM, the CPU and its features, the optimization level and the LLVM Internals: a unit found
@@ -438,7 +475,7 @@ Remaining examples: POSIX.
   always leaves a tenth of its disk free, at most 10 GB: when a new unit would take that, the units reused longest ago
   are removed for it, and a unit there is still no room for is not cached (said once, with the disk's free bytes, the
   unit's size and that rule, and how many units at the end; the units removed for room are summed there too).
-  `--unit_cache_gb=N` (0, no limit, by default) also holds the folder to N GB after each recompile, the units reused
+  `--unit-cache-gb=N` (0, no limit, by default) also holds the folder to N GB after each recompile, the units reused
   longest ago removed first. A cache folder that cannot be made stops the recompile, saying why.
   `--keep-ir` saves the generated code (LLVM IR) in `<outdir>/<NAME>/<NAME>_build/`.
   `--hook-direct-calls` sends calls and branches between guest functions through the dispatch table too, so the
@@ -488,7 +525,7 @@ No debugger flags or combined short flags are supported on Windows.
 The recompiled game module is a shared library with a symbol for each function, so GDB names game
 frames as it loads. A 64-bit game's functions are `F_<address>`, and a 32-bit game's blocks are
 `A_<address>` (A32) and `T_<address>` (Thumb). Code the JIT compiles at run time lives in an
-anonymous code arena. With `--gdb_jit=1` (the `[Debug]` setting `gdb_jit`) and the stub (`-S` or
+anonymous code arena. With `--gdb-jit=1` (the `[Debug]` setting `gdb_jit`) and the stub (`-S` or
 `-s`), the runtime hands each compile to GDB through its JIT interface, with its symbols. A 32-bit
 game's are `a32_<address>_<thumb>`. GDB stops the whole game to read each compile while it is
 attached, and again for each at the game's end. That slows a 32-bit game (its blocks compile one
@@ -682,7 +719,7 @@ launcher's Settings > User renames a user (Enter types its nickname, the rule ab
 user's picture file is `users/<uid>.jpg`, the bytes the account service keeps (a JPEG, 256x256 as the console's, from
 its editor), at most 128 KiB, read when the game starts; with `picture=file` and none, or an empty file, it is Wimsy,
 and a launcher that cannot draw it says so and shows Wimsy. The game plays as the user its `.ini`'s `user_uid` names by
-its uid, empty for `[user1]` (`--user_uid=<uid>` for one run): with one user, the game picks it on its own; with more,
+its uid, empty for `[user1]` (`--user-uid=<uid>` for one run): with one user, the game picks it on its own; with more,
 the game's user selector gets that user. Each user's Account saves are in the data folder's
 `save/user.<uid>/<title ID>/`, every save of a game in the data folder's `save/` as the console keeps them
 (`save_layout=global`, the default, [Filesystem](../platforms/nx/filesystem.md)); with
@@ -820,8 +857,10 @@ fullscreen; F12 stats on and off; Ctrl+Shift+F12 a RenderDoc capture of the next
 (`renderdoc`, or a game RenderDoc's program started), as the game's menu's **Capture frame** is, which shows only then;
 Pause pauses the whole game and resumes it (the window's title says "(paused)"); Escape twice within 3 seconds quit, the
 first press a warning over the game; Ctrl+D the TV mode On, Off or Auto for the run, as the game's menu's **TV mode**
-is. Each of these keys is a setting ([Shortcuts](settings.md#shortcuts)), set in the game's menu's **Shortcuts** page
-too, and F1 lists them as they are set. A window shows at most one image per refresh and drops the rest unless images
+is. F4, F6, F12 and Pause say over the game what the press set and what it was (`FPS limit: off (was the game's
+pace)`, `Stats: on (was off)`), the log the same line. Each of these keys is a setting
+([Shortcuts](settings.md#shortcuts)), set in the game's menu's **Shortcuts** page too, and F1 lists them as they are
+set. A window shows at most one image per refresh and drops the rest unless images
 tear, and the game keeps the pace `fps_limit` sets.
 
 A save state is the whole game at one moment, kept in `states/` in the game's folder, one file a slot. F7 saves to
@@ -838,12 +877,17 @@ connection, local play with others, code modules it loaded, or NVN work waiting 
 
 In the launcher, S on Games lists the save states of the game in focus, the newest first, with the picture of the one
 in focus beside them. Enter plays the game from that state, and Del deletes it after asking. A state this version
-can't load is shown in the failure colour, and Enter on it says why. `--state_load=0:FILE` plays a game from the
+can't load is shown in the failure colour, and Enter on it says why. `--state-load=0:FILE` plays a game from the
 state FILE the same way.
 
 In the game's menu the arrows, Enter and Escape move, select and go back; a gamepad's D-pad or left stick, A and B
 do the same, the on-screen controls' too, and a direction held goes on after a moment. **TV mode** steps On, Off and
-Auto, Left and Right either way, once a press: each step docks or undocks the console under the game.
+Auto, Left and Right either way, once a press: each step docks or undocks the console under the game. **Volume** is the
+game's sound on a slider ([`volume`](settings.md#audio)), 100% at first: Left and Right step it 5% either way, held
+too, and Enter or A up, stopping at Mute and at 100%; a tap or a click on the slider takes the step under it, one left
+of it steps down and one on its value up, and a press moves the knob as it drags. Each step is heard at once and kept
+in the game's `.ini`, but while the launcher's Settings > Audio > Volume passes the run its own (`--volume=N`), which
+the run then keeps to: the step lasts until the game ends.
 
 A game that asks for text (a name, a password, a search) shows a box over the game, in the menu's look and the same
 on every platform: the game's own words for it, the line with the text the game started it with, and how many

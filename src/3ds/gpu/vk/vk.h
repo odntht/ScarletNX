@@ -51,6 +51,12 @@ typedef struct {
     VkPhysicalDeviceProperties properties;
     VkPhysicalDeviceMemoryProperties memory_properties;
     bool index8, logic_op; /* VK_EXT_index_type_uint8; the logicOp feature */
+    bool timeline;         /* timelineSemaphore: the ring's submissions signal a timeline, not fences */
+    /* VK_EXT_shader_object: draws bind shaders and set their state, with no pipelines (vk/render.c); and the device's
+       shaderBinaryUUID and shaderBinaryVersion, which the shaders' binaries kept between runs are for */
+    bool shader_object;
+    uint8_t shader_binary_uuid[VK_UUID_SIZE];
+    uint32_t shader_binary_version;
     bool clip_distance;    /* shaderClipDistance */
     bool fragment_stores;  /* fragmentStoresAndAtomics: a shadow pass's storage image */
     bool anisotropic;      /* samplerAnisotropy */
@@ -86,9 +92,10 @@ uint8_t snx_ctr_vk_target_scale(unsigned width, unsigned height);
 /* The device and the window (unless headless or none can be made), with memory's RAM regions its buffers: imported,
    or, when the driver refuses that, the RAM moved into the device's memory, or, when it cannot take it either, a copy
    of it in the device's host-visible memory, which the CPU keeps in step with the board's own (render.c). Each says so
-   on the standard error. Before the guest runs, as the move copies the RAM. False, with the reason in error, when the
-   host has no Vulkan device that can: Vulkan 1.3, 8-bit storage buffers and dynamic rendering */
-bool snx_ctr_vk_init(SnxCtrMemory* memory, char* error, size_t error_size);
+   on the standard error. Before the guest runs, as the move copies the RAM. With headless no SDL video starts and no
+   window or surface is made, whatever display the host has; frames go to the dumps and --shot. False, with the reason in
+   error, when the host has no Vulkan device that can: Vulkan 1.3, 8-bit storage buffers and dynamic rendering */
+bool snx_ctr_vk_init(SnxCtrMemory* memory, bool headless, char* error, size_t error_size);
 void snx_ctr_vk_free(void);
 /* why the last snx_ctr_vk_init failed, without the device's name, which its error adds ("; device <name>, driver
    <name> <info>") once one was chosen; "" when it made the device. A run that ends for want of the device ends with

@@ -8,6 +8,7 @@
 * [Value numbering](#value-numbering)
 * [Integer folds and identities](#integer-folds-and-identities)
 * [Known bits](#known-bits)
+* [Values of few possible values](#values-of-few-possible-values)
 * [Dead code](#dead-code)
 * [Tests](#tests)
 
@@ -82,6 +83,13 @@ integers of either sign and booleans, on constants that are no specialization co
   its bits known (below);
 - one operand that decides: `x - x`, `x ^ x`, `false && x`, `true || x` (`x & 0`, `x * 0` and `x | ~0` by their
   known bits);
+- a difference of two terms of one value (spirv-opt's merge of an add and a sub): each operand read as `y + k`,
+  `k + y`, `y - k` or `y` itself from the instruction that makes it, `(y + k1) - (y + k2)` is `k1 - k2`. The
+  instruction that makes an operand counts only undecorated;
+- an `&&` or `||` of two tests against zero where one implies the other: `p && q` is `p` and `p || q` is `q` when
+  `p` implies `q`. A test is `s != 0` or `s == 0`, the zero on either side, or the `!` of one; `s != 0` implies
+  `t != 0` when every bit of `s` that may be 1 is a bit of `t`: `s` is `t`, an `&` of `t`, `t` an `|` of `s`, or `s` an
+  `&` and `t` an `|` of one operand; `s == 0` implies `t == 0` the other way round;
 - one operand that leaves the other: `x + 0`, `x - 0`, `x | 0`, `x ^ 0`, a shift by 0, `x * 1`, `x & x`, `x | x`,
   `true && x`, `false || x`, `x && x`, `x || x`, with the constant on either side of what commutes (`x & ~0` by its
   known bits);
@@ -94,7 +102,9 @@ none, the instruction's own id becomes that constant, declared before the first 
 instruction left, so a module never grows. Float arithmetic, divisions and a decorated instruction are not folded.
 
 On the Maxwell translator's modules: `x + 0` for a register's offset, masks and shifts of immediates, selects on a
-constant condition, and bitcasts there and back.
+constant condition, and bitcasts there and back; an address less its base (`(y + 192) - y`), whose shifts and sums
+the known bits then fold; and a predicate made of a masked register, `(x & m) != 0 || !(x == 0)`, which is
+`!(x == 0)`.
 
 ## Known bits
 
@@ -127,6 +137,28 @@ splits an address made of a register shifted by 4 plus an offset into a vec4's i
 the low bits of such an address are known. Also the sign tests of masked values (an absolute value or a clamp of what
 cannot be negative) and the fields past a value's width.
 
+## Values of few possible values
+
+Known bits cannot see a value whose few possible values share no bit: a mask `m = c ? ~0 : 0`, its negation, its
+absolute value, a field or a product of those. The walk keeps, for a 32-bit integer or a boolean that is a function
+of one such value (its leaf), the value it has for each of the leaf's (ucas's map rule):
+
+- a leaf is a boolean (two values) or an integer whose known bits leave one or two bits unknown (two or four values,
+  `x & 3`);
+- an instruction whose operands are constants and values of one leaf (the leaf among them) is evaluated for each of
+  the leaf's values, with what SPIR-V gives each instruction: the integer and bitwise arithmetic, the shifts and
+  fields, `OpSelect`, the comparisons, the logical instructions, the bitcasts, and GLSL.std.450's `SAbs`, the
+  minima, maxima and clamps;
+- it is that constant when every value gives one (`0 > -m` is false, `-m == 0x80000000` false, a field of `-m` from
+  bit 16 is 0); it is an operand of its type, or the leaf itself, when it gives that one's values
+  (`0 > m ? -m : m` is `-m`, `m & (c ? 5 : 0)` is `c ? 5 : 0`, `!!c` is `c`, `((x & 3) << 4) >> 4` is `x & 3`); and
+  the bits all its values share are known bits for what follows;
+- a shift by 32 or more, a field past bit 32, a clamp whose least is past its most, or the absolute value of the
+  least integer for any of the values leaves the instruction as it is, and so do operands of two leaves.
+
+On the Maxwell translator's modules: the masks of predicates (`c ? ~0 : 0`), their negations and absolute values, and
+what vertex programs compute of them.
+
 ## Dead code
 
 `spv_opt_dead_code` takes out of a module's functions:
@@ -152,6 +184,9 @@ that never read them.
 - `spirv_opt` (`tests/spirv_opt.c`), `spirv_opt_values` (`tests/spirv_opt_values.c`) and `spirv_opt_fold`
   (`tests/spirv_opt_fold.c`): each rule above on a module written word by word. `spirv_opt_fold` also makes 4000
   modules at random (a fixed sequence) of values with a few unknown bits, runs each before and after the pass on
-  every value of those bits, and checks they store the same.
+  every value of those bits, and checks they store the same. 2000 modules of differences of terms at random run the
+  same way on values of x and y that take in the module's constants, their complements and negations, and numbers
+  at random. So do 2000 modules of tests against zero. And 3000 of values of few possible values, GLSL.std.450's
+  integer instructions among them.
 - `vulkan_headless`, `check_translation_dead_code` and `check_translation_values`: the runtime's module is the
   translator's with the passes run, and the device takes it.

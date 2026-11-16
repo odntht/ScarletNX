@@ -99,6 +99,7 @@ static int check_mesh_inputs(void) {
     r[0x3fd] = r[0x3fe] = 4u << 16;
     r[0x680] = 0x1111;
     r[MAXWELL3D_RASTERIZE_ENABLE] = 1; /* as reset_3d starts a channel */
+    all_samples(r);
     memcpy(r + 0x280, transform, sizeof transform);
     for (u32 stream = 0; stream < 2; stream++) {
         u64 source = stream ? colors : positions;
@@ -174,7 +175,7 @@ static int check_mesh_inputs(void) {
     channel->r3d_dirty = ~0u;
     CHECK(!mesh_pixel(channel, target, 0, (const u8[4]){0, 0, 255, 255}));
     printf("mesh inputs: 10 range, format, update and remapping cases checked (strict bounds %s)\n",
-           g_vk.has_vertex_robustness2 ? "on" : "unavailable");
+           (g_vk.has_vertex_robustness2 || g_vk.robust_buffer2) ? "on" : "unavailable");
     free(channel);
     return 0;
 }

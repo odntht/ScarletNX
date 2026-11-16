@@ -331,6 +331,13 @@ int snx_abort_requested(void);
 /* the memory this process is charged for now, in bytes: its footprint on macOS and iOS, its resident set on Linux,
    Android and FreeBSD, its working set on Windows; 0 where the system does not tell */
 SnxU64 snx_footprint(void);
+/* A recompile's progress, a line for each unit, the form every driver prints and the launcher reads
+   (gui/steps.c): unit `done` of `count` finished, "  compiled block 3/40: code_002, <label> (4.2 s)", or "(cached)" */
+void snx_report_unit(size_t done, size_t count, const char* name, const char* label, int cached, double seconds);
+/* snx_report_unit's line, into out: the unit's place, name and label, then cached, or its time and the memory the
+   process holds when used tells it (0: the system does not) */
+void snx_unit_line(char* out, size_t size, size_t done, size_t count, const char* name, const char* label, int cached,
+                   double seconds, SnxU64 used);
 /* the processor time this process has used, every thread's together, in ns; 0 where the system does not tell */
 SnxU64 snx_process_cpu_ns(void);
 #define SNX_DEBUGGER_NAME 32 /* a debugger's name, as snx_debugger gives it, with its NUL */
@@ -352,6 +359,9 @@ void snx_thread_clock_close(SnxU64 clock);
 /* names the calling thread for the system, which debuggers, crash reports, the system's tools and snx_threads show:
    Linux and Android keep its first 15 bytes, FreeBSD 19, the others 63 (Windows from 10 1607; earlier ones none) */
 void snx_thread_name(const char* name);
+/* the calling thread's name as the system keeps it, into out (n bytes): "" where the system gives none (Windows
+   before 10 1607, the BSDs but FreeBSD). On Linux and Android a system call alone, which a crash handler may make */
+void snx_thread_name_get(char* out, size_t n);
 /* The nice a thread snx_thread_priority_low lowers gets above its own on Linux and Android. Their scheduler shares a
    busy CPU by weight, 1.25 times less a step of nice (sched_prio_to_weight: 1024 at 0, 110 at 10, 15 at 19): at 10 a
    game thread at 0 keeps 90% of a CPU it shares with one and is given it first when it wakes, while a pipeline the
@@ -433,6 +443,10 @@ FILE* snx_fopen(const char* path, const char* mode);
    in the other one too */
 #define SNX_CONSOLE_LOG "scarletnx-console.log"
 #define SNX_ERROR_LOG   "scarletnx-error.log"
+/* The runtime's exit status when its recompiled code was made from another copy of the game: the driver recompiles
+   the game from its dump and plays it again. Nothing else exits with it */
+#define SNX_EXIT_REMAKE 75
+
 /* The line a game's runtime prints as it makes the game's log, on the console and in the log, before the log's
    absolute path: the launcher's Share Log takes the last run's game log from it, whatever the program is named */
 #define SNX_LOG_WRITTEN "log: written to "
@@ -501,6 +515,10 @@ SnxU64 snx_addon_version(const char* entry);
 #define SNX_SAVE_JOURNALED "snx-journaled"
 #define SNX_SAVE_COMMITTED "0"
 #define SNX_SAVE_WORKING   "1"
+/* An entry whose name starts with a dot, in a folder of saves or at a save's top beside its SNX_SAVE_COMMITTED: a sync
+   tool's or the system's (Syncthing's .stfolder and .stversions, a desktop's .directory), never a save nor one of its
+   files, as ScarletNX names everything there. In a save's 0/ and 1/ every name is the game's */
+#define SNX_SAVE_HIDDEN(name) ((name)[0] == '.')
 enum { SNX_ADDON_NONE, SNX_ADDON_UPDATE, SNX_ADDON_DLC, SNX_ADDON_PROGRAM };
 /* what the title id is to the game: SNX_ADDON_UPDATE for its patch (its ID with 0x800, as the console makes every
    patch's), SNX_ADDON_PROGRAM for another program of its application or that program's patch (snx_program_index),

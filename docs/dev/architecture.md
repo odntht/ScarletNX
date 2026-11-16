@@ -63,13 +63,13 @@ used as Linux syscalls.
 
 `scarletnx` is every driver the build has: `src/multicall/main.c` is the only `main`, and runs
 the driver its name says from the library of the driver's own folder (`snx_switch_program`,
-`snx_ctr_program`, `snx_vita_program`, `scarletnx-gnuabi`, `snx_agb_program`), so LLVM and SDL
+`snx_ctr_program`, `snx_vita_program`, `scarletnx-gnuabi`, `snx_agb_program`, `snx_nds_program`), so LLVM and SDL
 are in one program once. On Linux and macOS `scarletnx-switch`, `scarletnx-3ds`,
-`scarletnx-vita`, `scarletnx-gnuabi` and `scarletnx-agb` are symlinks to it. Windows has no
+`scarletnx-vita`, `scarletnx-gnuabi`, `scarletnx-agb` and `scarletnx-nds` are symlinks to it. Windows has no
 links: the driver's name goes first (`scarletnx.exe scarletnx-3ds ...`), and the launcher runs
 the drivers that way (`snx_menu_has_driver`), as Android's does through `libscarletnx-run.so`.
-A game's copy runs its driver too: a GBA game's by
-its `.ini` (`system=gba`), a 3DS or Vita game's by its title ID, any other the Switch's (or, in a
+A game's copy runs its driver too: a GBA or NDS game's by
+its `.ini` (`system=gba`, `system=nds`), a 3DS or Vita game's by its title ID, any other the Switch's (or, in a
 build without it, the one driver there is). The 3DS and Vita
 drivers read what a module was compiled for from its file before loading it, and compile first
 when it is stale, so a module is loaded once.
@@ -141,12 +141,14 @@ the game's image read from that image.
   The recompile binds each stub whose symbol one module alone of the program defines as a function
   (`snx_program_exports` and `snx_module_bound` in `src/nx/loader/loader.c`, from each module's dynamic symbols as the
   game's linker reads them: a symbol with a section, not local; the recompile's `PLT:` line counts them). A `BL` or
-  `B` to a bound stub runs the stub's three instructions where the call is (`ir_codegen.c`'s `call_stub`) and
-  compares the address they loaded with that function's: equal, it calls the function as a `BL` to it would; anything
-  else in the slot (the linker has not bound it yet, a mod wrote another function there) calls the stub's own
-  function, which goes through `CPU.disp` as before. That function, which a pointer to the stub reaches too, compares
-  the same way before its lookup, and a call whose stub's code the guest changed goes to it, stale as any other
-  (`RtAPI.code_changed`).
+  `B` to a bound stub calls the function where the call is, as a `BL` to it would (`ir_codegen.c`'s `call_stub`), and
+  does not read the slot: whatever links the game binds it to that function, the runtime when it loads the modules
+  and a game's own rtld at the stub's first call, since one module alone defines the name. `x16` is left as the
+  stub's `adrp` and `add` leave it and `x17` holds the function's address, as the bound slot gives it. A slot that
+  holds anything else (a game's own rtld has not bound it yet, something wrote another function there) changes
+  nothing for such a call. The stub's own function, which a pointer to the stub reaches, loads the slot, compares
+  the address with that function's and calls it when they are equal, and goes through `CPU.disp` when they are not;
+  a call whose stub's code the guest changed goes to that function, stale as any other (`RtAPI.code_changed`).
   A symbol two modules define is the linker's to pick, and its stub stays as it was; so does every stub with
   `--hook-direct-calls`, and the stub of a function a hook names calls through the function's slot
   ([Hooks](../platforms/nx/hooks.md#how-a-call-reaches-a-hook)). An NRO's module binds its stubs the same way
@@ -169,7 +171,9 @@ the game's image read from that image.
   SDK opens no session), at the address its AOT module is made for when it has one; its BSS zeroed; relocated behind
   the game's modules and the NROs loaded before it, in that order; each word or PLT slot of those that nothing
   defined until then bound to its definition; and its `DT_INIT` run on the thread that loads it. `UnloadModule` runs
-  its `DT_FINI`, puts each word of the others that points into it back to 0, a PLT slot to its lazy value, and unmaps
+  its `DT_FINI`, puts each word of the others that points into it back to 0, binds a PLT slot of theirs again to the
+  definition the modules left give its name (what lazy binding gives it at the slot's next call), or to its lazy
+  value when none of them defines it, and unmaps
   it. What the SDK stops the game on stops it with the reason: a result of ldr:ro's that is not `nn::ro`'s own, an
   NRO without a module header, one loaded for no other module to bind to that another binds to, an unload while the
   SDK counts thread-local destructors of the module not run yet. Where the runtime cannot link, the game's rtld
@@ -273,6 +277,7 @@ function's arguments, or a field added into a struct's tail padding: for those t
 | 16 | `stx`'s result for a store-exclusive whose range the armed monitor covers |
 | 17 | the FP helpers take FPCR by value and return their result with the FPSR flags they raised, and generated functions call `snx_fp_env` on entry |
 | 18 | a program's modules lie one after another, as the console's loader lays them (`src/nx/loader/loader.h`); the contract is as it was |
+| 19 | the route list names the SDK functions the runtime answers natively (nn::fs, time, pl, ngc, nsd, prepo, codec): a module made before calls the SDK's own code, which opens services no longer served; the contract is as it was |
 
 #### Code the game patches
 
@@ -301,7 +306,7 @@ covers hooks in code the game maps itself (NROs), which only the JIT runs.
 | `hle/services/`, `hle/filesystem/` | Services, nvdrv, guest filesystem services |
 | `gpu/` and `gpu/nvn/` | Guest memory as the GPU sees it, the GPU thread, NVN (loader, objects, command buffers, replay), shaders, Vulkan renderer |
 | `gpu/maxwell/` | The Maxwell front end for programs that write their own command buffers: the 3D, compute, 2D, DMA and inline-to-memory engines, the macro interpreter, the registers as the draw state, the last GPU write to each page |
-| `gpu/video/` | host1x, NVDEC H.264 and VP9 decoding through FFmpeg, VIC |
+| `gpu/video/` | host1x, NVDEC H.264, VP8 and VP9 decoding through FFmpeg, VIC |
 | `runtime/platform/` | Host APIs, SDL3/headless, input, screenshots, timed exit, the in-game menu, the shader loading screen |
 
 The host layer that every driver shares is `src/common/platform/`: threads (`thread.h`, `thread_spawn.c`) and the

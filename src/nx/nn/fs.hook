@@ -17,6 +17,10 @@ hook _ZN2nn2fs8MountRomEPKcPvm(const char* name, addr cache, u64 cache_size) -> 
 hook _ZN2nn2fs8MountRomEPKc(const char* name) -> u32 = nnfs_mount_rom_name
 hook _ZN2nn2fs22QueryMountRomCacheSizeEPm(u64* size) -> u32 = nnfs_query_mount_rom_cache_size
 @version(< 1.0.0) a32 hook _ZN2nn2fs22QueryMountRomCacheSizeEPj(u32* size) -> u32 = nnfs_query_mount_rom_cache_size
+# the two above for the program of the application at an index, from SDK 8 (read in 8.2 and 19.3, where they run the
+# same code as those, with the index given)
+hook _ZN2nn2fs8MountRomEPKciPvm(const char* name, i32 program, addr cache, u64 cache_size) -> u32 = nnfs_mount_rom_program
+hook _ZN2nn2fs22QueryMountRomCacheSizeEPmi(u64* size, i32 program) -> u32 = nnfs_query_mount_rom_cache_size_program
 hook _ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE(const char* name, addr uid) -> u32 = nnfs_mount_save_data a32 @version(< 1.0.0)
 hook _ZN2nn2fs19MountDeviceSaveDataEPKc(const char* name) -> u32 = nnfs_mount_device_save_data a32 @version(< 1.0.0)
 hook _ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE(const char* name, u64 application, addr uid) -> u32 = nnfs_mount_save_data_read_only
@@ -29,6 +33,7 @@ hook _ZN2nn2fs17MountCacheStorageEPKc(const char* name) -> u32 = nnfs_mount_cach
 hook _ZN2nn2fs17MountCacheStorageEPKci(const char* name, i32 index) -> u32 = nnfs_mount_cache_storage_index
 hook _ZN2nn2fs21MountTemporaryStorageEPKc(const char* name) -> u32 = nnfs_mount_temporary_storage
 hook _ZN2nn2fs7UnmountEPKc(const char* name) = nnfs_unmount a32 @version(< 1.0.0)
+hook _ZN2nn2fs9IsMountedEPKc(const char* name) -> bool = nnfs_is_mounted
 hook _ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci(addr handle, const char* path, i32 mode) -> u32 = nnfs_open_file a32 @version(< 1.0.0)
 hook _ZN2nn2fs9CloseFileENS0_10FileHandleE(addr h) = nnfs_close_file a32 @version(< 1.0.0)
 hook _ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm(u64* read, u64 h, i64 offset, addr buffer, u64 size) -> u32 = nnfs_read_file
@@ -81,6 +86,9 @@ hook _ZN2nn2fs17GetTotalSpaceSizeEPlPKc(i64* size, const char* path) -> u32 = nn
 # mount. No 32-bit SDK read has them
 hook _ZN2nn2fs24GetFileTimeStampForDebugEPNS0_13FileTimeStampEPKc(addr stamp, const char* path) -> u32 = nnfs_get_file_time_stamp
 hook _ZN2nn2fs27GetFileTimeStampRawForDebugEPNS0_16FileTimeStampRawEPKc(addr stamp, const char* path) -> u32 = nnfs_get_file_time_stamp_raw
+# a file's data cache, which takes a path (SDK 6 on; read in 6.5, 7.3, 11.4, 16.2 and 20.5). No 32-bit SDK has it
+hook _ZN2nn2fs29EnableIndividualFileDataCacheEPKcPvm(const char* path, addr buffer, u64 size) -> u32 = nnfs_enable_individual_file_data_cache
+hook _ZN2nn2fs30DisableIndividualFileDataCacheEPKc(const char* path) = nnfs_disable_individual_file_data_cache
 # what the SDK's C library asks of a path before it opens it (SDK 16 on; read in 16.2, 18.3, 19.3 and 20.5)
 hook _ZN2nn2fs13IsPathMountedEPKc(const char* path) -> bool = nnfs_is_path_mounted
 hook _ZN2nn2fs16GetPathLengthMaxEPmPKc(u64* out, const char* path) -> u32 = nnfs_get_path_length_max
@@ -89,6 +97,8 @@ hook _ZN2nn2fs21GetUtf16PathLengthMaxEPbPmPKc(bool* has, u64* out, const char* p
 hook _ZN2nn2fs26GetUtf16EntryNameLengthMaxEPbPmPKc(bool* has, u64* out, const char* path) -> u32 = nnfs_get_utf16_entry_name_length_max
 hook _ZN2nn2fs6CommitEPKc(const char* name) -> u32 = nnfs_commit
 hook _ZN2nn2fs6CommitEPKcRKNS0_12CommitOptionE(const char* name, addr option) -> u32 = nnfs_commit_option
+# several mounts at once, from SDK 6 (read in 13.3 and 20.5)
+hook _ZN2nn2fs6CommitEPKPKci(addr names, i32 count) -> u32 = nnfs_commit_names
 hook _ZN2nn2fs14CommitSaveDataEPKc(const char* name) -> u32 = nnfs_commit_save_data a32 @version(< 1.0.0)
 hook _ZN2nn2fs17MountAddOnContentEPKciPvm(const char* name, i32 index, addr cache, u64 cache_size) -> u32 = nnfs_mount_add_on_content
 @version(< 1.0.0) a32 hook _ZN2nn2fs17MountAddOnContentEPKciPvj(const char* name, i32 index, addr cache, usize cache_size) -> u32 = nnfs_mount_add_on_content
@@ -101,6 +111,8 @@ hook _ZN2nn2fs29QueryMountSystemDataCacheSizeEPmNS_3ncm12SystemDataIdE(u64* size
 hook _ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE(addr uid) -> u32 = nnfs_ensure_save_data a32 @version(< 1.0.0)
 hook _ZN2nn2fs14ExtendSaveDataERKNS_7account3UidEll(addr uid, i64 size, i64 journal_size) -> u32 = nnfs_extend_save_data
 hook _ZN2nn2fs15GetSaveDataSizeEPlS1_RKNS_7account3UidE(i64* size, i64* journal_size, addr uid) -> u32 = nnfs_get_save_data_size
+# a mounted save's Restore flag, which takes a mount name (SDK 10.4 on; read in 10.4, 15.3 and 20.5). No 32-bit SDK read has it
+hook _ZN2nn2fs22GetSaveDataRestoreFlagEPbPKc(bool* out, const char* name) -> u32 = nnfs_get_save_data_restore_flag
 hook _ZN2nn2fs18CreateCacheStorageEill(i32 index, i64 size, i64 journal_size) -> u32 = nnfs_create_cache_storage
 hook _ZN2nn2fs18DeleteCacheStorageEi(i32 index) -> u32 = nnfs_delete_cache_storage
 hook _ZN2nn2fs19GetCacheStorageSizeEPlS1_i(i64* size, i64* journal_size, i32 index) -> u32 = nnfs_get_cache_storage_size
@@ -111,6 +123,9 @@ hook _ZN2nn2fs6detail18IsEnabledAccessLogEv() -> bool = nnfs_is_enabled_access_l
 hook _ZN2nn2fs6detail18IsEnabledAccessLogEj(u32 mask) -> bool = nnfs_is_enabled_access_log_mask
 hook _ZN2nn2fs16IsSdCardInsertedEv() -> bool = nnfs_is_sd_card_inserted a32 @version(< 1.0.0)
 hook _ZN2nn2fs11MountSdCardEPKc(const char* name) -> u32 = nnfs_mount_sd_card a32 @version(< 1.0.0)
+# the same mount under its debug name, which mods' loaders call (read in 0.12.16 and 3.5, where it calls MountSdCard,
+# and in 10.4, 12.3 and 20.5, where it is MountSdCard's steps with the access log, which stays off here)
+hook _ZN2nn2fs19MountSdCardForDebugEPKc(const char* name) -> u32 = nnfs_mount_sd_card_for_debug a32 @version(< 1.0.0)
 hook _ZN2nn2fs13MountHostRootEv() -> u32 = nnfs_mount_host_root a32 @version(< 1.0.0)
 hook _ZN2nn2fs13MountHostRootERKNS0_15MountHostOptionE(addr option) -> u32 = nnfs_mount_host_root_option
 # MountHost opens a folder of the host PC, through the same service command as the root: refused the same way. The

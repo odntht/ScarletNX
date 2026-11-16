@@ -39,7 +39,7 @@ static const char* gradient_cube_path;
 static const char* draw_buffer_paths[10];
 static const char* texture_paths[6];
 static const char* arithmetic_path;
-static const char* beyond_paths[3];
+static const char* beyond_paths[4];
 static const char* attribute_paths[7];
 static const char* pexit_path;
 static const char* global_dynamic_path;
@@ -53,7 +53,8 @@ static const char* legacy_paths[4];
 static const char* rect_paths[3];
 static const char* minmax_paths[2]; /* a TEX and a TXD taking the least of their texels (minmax_samples) */
 static const char* window_paths[3];
-static const char* lone_lane_paths[9];
+static const char* lone_lane_paths[12];
+static const char* quad_read_paths[3];
 static struct {
     char** paths;
     size_t count, capacity;
@@ -858,15 +859,15 @@ static void count_conversions(const u32* code, size_t words, int* halves, int* w
     }
 }
 
-/* I2F.F32 of a 32-bit integer where the driver's conversions truncate (g_shader_i2f_nearest, a Turnip on an Adreno
-   610): no conversion is left a value with more than 16 significant bits, so the only rounding is the OpFAdd's, to
-   nearest even as the console's. A 16-bit integer converts exactly, and as it did */
+/* I2F.F32 of a 32-bit integer where the driver's conversions truncate (g_spirv_translate.i2f_nearest, a Turnip on an
+   Adreno 610): no conversion is left a value with more than 16 significant bits, so the only rounding is the OpFAdd's,
+   to nearest even as the console's. A 16-bit integer converts exactly, and as it did */
 static void i2f_by_halves(void) {
-    int was = g_shader_i2f_nearest;
+    int was = g_spirv_translate.i2f_nearest;
     for (u32 size = 1; size < 3; size++)
         for (u32 is_signed = 0; is_signed < 2; is_signed++)
             for (int nearest = 0; nearest < 2; nearest++) {
-                g_shader_i2f_nearest = nearest ? 3 : 0;
+                g_spirv_translate.i2f_nearest = nearest ? 3 : 0;
                 /* I2F.F32.{U,S}{16,32} R9, R9 */
                 const u64 program[] = {(0x5cb8000000970209ull | (u64)size << 10 | (u64)is_signed << 13)};
                 ShaderInfo info;
@@ -874,7 +875,7 @@ static void i2f_by_halves(void) {
                 u32* code = translate(program, 1, ST_FS, &info, &words, 1);
                 char what[96];
                 snprintf(what, sizeof what, "I2F.F32.%c%u with i2f_nearest %d translates", is_signed ? 'S' : 'U',
-                         8u << size, g_shader_i2f_nearest);
+                         8u << size, g_spirv_translate.i2f_nearest);
                 check_translated(code, &info, what);
                 if (!code) continue;
                 int halves, whole;
@@ -882,14 +883,14 @@ static void i2f_by_halves(void) {
                 int split = size == 2 && nearest;
                 if (halves != (split ? 2 : 0) || whole != (split ? 0 : 1))
                     fprintf(stderr, "I2F.F32.%c%u i2f_nearest %d: %d conversions of halves, %d of a whole value\n",
-                            is_signed ? 'S' : 'U', 8u << size, g_shader_i2f_nearest, halves, whole);
+                            is_signed ? 'S' : 'U', 8u << size, g_spirv_translate.i2f_nearest, halves, whole);
                 snprintf(what, sizeof what, "I2F.F32.%c%u with i2f_nearest %d converts %s", is_signed ? 'S' : 'U',
-                         8u << size, g_shader_i2f_nearest, split ? "two halves" : "the whole value");
+                         8u << size, g_spirv_translate.i2f_nearest, split ? "two halves" : "the whole value");
                 check(halves == (split ? 2 : 0) && whole == (split ? 0 : 1), what);
                 if (split) check(count_opcode(code, words, 129, 0xffffffffu) == 1, "one OpFAdd sums the halves");
                 free(code);
             }
-    g_shader_i2f_nearest = was;
+    g_spirv_translate.i2f_nearest = was;
 }
 
 static u64 mov32i(u32 reg, u32 value) { return 0x0100000000000000ull | ((u64)value << 20) | 0x71000ull | reg; }
@@ -1248,9 +1249,9 @@ static void constant_buffers_past_the_limit(void) {
               "a constant buffer below the limit is a uniform buffer");
     }
     free(code);
-    g_shader_uniform_cbufs = 2;
+    g_spirv_translate.uniform_cbufs = 2;
     code = translate(ops, 1, ST_FS, &info, &words, 1);
-    g_shader_uniform_cbufs = 18;
+    g_spirv_translate.uniform_cbufs = 18;
     check_translated(code, &info, "a constant buffer past the limit translates");
     if (code) {
         check(count_variables(code, words, 2) == uniform - 1 && count_variables(code, words, 12) == 1 &&
@@ -1625,6 +1626,54 @@ static void guarded_handle_merges(void) {
     free(code);
 }
 
+/* One game's compute program loads a surface handle under P5 = ISETP(R33), then sets P5 again from another register,
+   branches around a block on P6, and stores under P6 = ISETP(R33) once more: the same compare of the same register,
+   unwritten between, so the store's lanes are the load's. The instruction i lies at word 11 + i + i / 3 */
+static void recomputed_guard_handle(void) {
+    const u64 isetp_p5_r33 = 0x376b03fffff7212full, isetp_p6_r17 = 0x376b03fffff71137ull;
+    const u64 isetp_p5_r1 = 0x376b03fffff7012full, isetp_p6_r33 = 0x376b03fffff72137ull;
+    const u64 load_p5 = 0x4c98078804850013ull; /* @P5 MOV R19, c[0x2][0x120] */
+    const u64 load_r4 = 0x4c98078804870004ull; /* MOV R4, c[0x2][0x120] */
+    const u64 skip = 0xe2400000000e000full | (24ull << 20); /* @!P6 BRA, word 16 to word 20 */
+    const u64 store_r4 = unguarded(0xeb20020200f700a8ull, 8, 0, 4);
+    const u64 store_p6 = (unguarded(0xeb20098200f60d18ull, 8, 0, 19) & ~(0xfull << 16)) | 6ull << 16;
+    const u64 exit_ = 0xe30000000007000full;
+    const u64 program[] = {isetp_p5_r33, isetp_p6_r17, load_p5, isetp_p5_r1, skip,
+                           load_r4,      store_r4,     isetp_p6_r33, store_p6, exit_};
+    ShaderInfo info;
+    size_t words = 0;
+    u32* code = translate(program, 10, ST_CS, &info, &words, 1);
+    check_translated(code, &info, "a store under a guard computed again as its handle's load was reads that handle");
+    check(code && info.nimg >= 1 && info.img[0].bl_cbuf == 2 && info.img[0].cbuf_off == 0x120 / 4,
+          "the store under the recomputed guard binds c[0x2][0x120]");
+    free(code);
+    u64 variant[10];
+    memcpy(variant, program, sizeof variant);
+    variant[5] = 0x4c98078804870021ull; /* MOV R33, c[0x2][0x120] in the skipped block */
+    code = translate(variant, 10, ST_CS, &info, &words, 1);
+    check_refused(code, &info, "untracked surface handle", "a compare of a register written between is another guard");
+    free(code);
+    memcpy(variant, program, sizeof variant);
+    variant[7] = isetp_p6_r17;
+    code = translate(variant, 10, ST_CS, &info, &words, 1);
+    check_refused(code, &info, "untracked surface handle", "a compare of another register is another guard");
+    free(code);
+    /* the same program's other store: P5 itself, unwritten from the load to the store across the branch */
+    const u64 store_p5 = (store_p6 & ~(0xfull << 16)) | 5ull << 16;
+    const u64 kept[] = {isetp_p5_r33, isetp_p6_r17, load_p5, isetp_p6_r17, skip,
+                        load_r4,      store_r4,     isetp_p6_r33, store_p5, exit_};
+    code = translate(kept, 10, ST_CS, &info, &words, 1);
+    check_translated(code, &info, "a store under the predicate its handle was loaded under, kept across a branch");
+    check(code && info.nimg >= 1 && info.img[0].bl_cbuf == 2 && info.img[0].cbuf_off == 0x120 / 4,
+          "the store under the kept predicate binds c[0x2][0x120]");
+    free(code);
+    memcpy(variant, kept, sizeof variant);
+    variant[5] = isetp_p5_r1; /* P5 set again in the skipped block */
+    code = translate(variant, 10, ST_CS, &info, &words, 1);
+    check_refused(code, &info, "untracked surface handle", "a predicate written on the way is another guard");
+    free(code);
+}
+
 static void volume_surface_atomics(void) {
     const u64 operations[] = {0xea40020a00870009ull, 0xea48020a20870009ull, 0xeb50020a00070008ull,
                               0xeb50020a01170008ull};
@@ -1874,6 +1923,36 @@ static void subroutine_calls(void) {
     }
 }
 
+static int adjacent_brx_tables(u32 bank, u32 offset, u32* value) {
+    static const u32 table[4] = {0, 0, 0, 16}; /* c[0][0]: the first BRX's two entries, c[0][8]: the second's */
+    if (bank || offset >= sizeof table) return 0;
+    *value = table[offset / 4];
+    return 1;
+}
+
+/* Two switches without the IMNMX clamp whose tables lie one after the other, as one game's compute program lays out
+   seven: the first table ends where the second starts. Its entries count from the same base, so read on, the second
+   table's last entry lands in the second switch's code (word 15), which the first switch's cases never reach */
+static void brx_adjacent_tables(void) {
+    u64 code[32] = {0};
+    for (u32 i = 10; i < 32; i += 4) code[i] = SCHED;
+    code[11] = 0xef94000000070001ull; /* LDC.B32 R1, c[0][R0] */
+    code[12] = 0xe25000000007010full; /* BRX R1 */
+    code[13] = EXIT;
+    code[15] = 0xef94000000870002ull; /* LDC.B32 R2, c[0][R0 + 8] */
+    code[16] = 0xe25000000007020full; /* BRX R2 */
+    code[17] = EXIT;
+    code[19] = EXIT;
+    u32 targets[64];
+    int (*old)(u32, u32, u32*) = g_shader_cb_read;
+    g_shader_cb_read = adjacent_brx_tables;
+    int first = shader_brx_targets(code, 12, 20, targets, 64);
+    check(first == 2 && targets[0] == 13 && targets[1] == 13, "a jump table ends where the next one in its bank starts");
+    int second = shader_brx_targets(code, 16, 20, targets, 64);
+    check(second == 2 && targets[0] == 17 && targets[1] == 19, "the last jump table runs to its first invalid entry");
+    g_shader_cb_read = old;
+}
+
 static void brx_length(void) {
     u64 code[64] = {0};
     code[10] = 0x001F8000FC0007E0ull;
@@ -2053,7 +2132,7 @@ static void issue126_shader_modes(void) {
     for (int i = 0; i < 17; i++) {
         ShaderInfo info;
         size_t words = 0;
-        g_shader_texture_arrays = i == 16; /* the device's non-uniform indexing, for the table */
+        g_spirv_translate.texture_arrays = i == 16; /* the device's non-uniform indexing, for the table */
         u32* code = translate_with_rt_mask(cases[i].instructions, cases[i].count, cases[i].stage, &info, &words, 1,
                                            cases[i].mask);
         check_translated(code, &info, "issue 126 shader translates");
@@ -2087,7 +2166,7 @@ static void issue126_shader_modes(void) {
         }
         free(code);
     }
-    g_shader_texture_arrays = 0;
+    g_spirv_translate.texture_arrays = 0;
     /* One game's froxel volume: SUST.P.RGBA on a 3D surface (dimension 5), x, y and z in R0-R2, the texel from
        R8-R11, on the bindless handle MOV R4, c[0x2][0x128] */
     {
@@ -2475,7 +2554,7 @@ static void layer_capabilities(void) {
     const u64 write = 0xeff07f800647ff00ull; /* AST a[0x64], R0 */
     const u64 read = 0xe003ff864ff7ff00ull;  /* IPA R0, a[0x64] */
     for (int out = 0; out < 2; out++) {
-        g_shader_output_layer = out;
+        g_spirv_translate.output_layer = out;
         ShaderInfo info;
         size_t words = 0;
         u32* code = translate(&write, 1, ST_VS, &info, &words, 1);
@@ -2487,7 +2566,7 @@ static void layer_capabilities(void) {
         }
         free(code);
         for (int geometry = 0; geometry < 2; geometry++) {
-            g_shader_geometry = geometry;
+            g_spirv_translate.geometry = geometry;
             code = translate(&read, 1, ST_FS, &info, &words, 1);
             check_translated(code, &info, "a fragment program reading the layer translates");
             if (code) {
@@ -2499,7 +2578,7 @@ static void layer_capabilities(void) {
             free(code);
         }
     }
-    g_shader_output_layer = g_shader_geometry = 1;
+    g_spirv_translate.output_layer = g_spirv_translate.geometry = 1;
 }
 
 static void viewport_capabilities(void) {
@@ -2522,13 +2601,13 @@ static void viewport_capabilities(void) {
         }
         free(code);
     }
-    g_shader_viewport_index = 0;
+    g_spirv_translate.viewport_index = 0;
     ShaderInfo info = {0};
     size_t words = 0;
     u32* code = translate(&write, 1, ST_VS, &info, &words, 1);
     check_refused(code, &info, "viewport index output unavailable", "unsupported devices refuse viewport output");
     free(code);
-    g_shader_viewport_index = 3;
+    g_spirv_translate.viewport_index = 3;
 }
 
 /* The viewport transform off (SNX_SH_WINDOW_XY): the last stage before rasterization takes its position's x and y
@@ -3330,6 +3409,34 @@ static void beyond_eden(void) {
     u32* code = translate(&invalid_shared, 1, ST_CS, &info, &words, 1);
     check_refused(code, &info, "ATOMS", "unsupported shared compare-and-swap subop is refused");
     free(code);
+    /* uam compiles barrier() to BAR.SYNC with RZ for its barrier and its thread count (bits 43 and 44 clear): the
+       module the immediate form's 0 and 0 makes */
+    const u64 bar_imm = 0xf0a81b8000070000ull, bar_rz = 0xf0a803800ff7ff00ull;
+    size_t imm_words = 0;
+    u32* imm_code = translate(&bar_imm, 1, ST_CS, &info, &imm_words, 1);
+    check_translated(imm_code, &info, "BAR.SYNC 0x0, 0x0 translates");
+    code = translate(&bar_rz, 1, ST_CS, &info, &words, 1);
+    check_translated(code, &info, "BAR.SYNC RZ, RZ translates");
+    if (code && imm_code) {
+        check(count_opcode(code, words, 224, 0xffffffffu) == 1, "BAR.SYNC RZ, RZ is one control barrier");
+        check(words == imm_words && !memcmp(code, imm_code, words * sizeof *code),
+              "BAR.SYNC RZ, RZ makes the module BAR.SYNC 0x0, 0x0 makes");
+        save_fixture(beyond_paths[3], code, words);
+    }
+    free(imm_code);
+    free(code);
+    const u64 other_bars[] = {
+        0xf0a803800ff70100ull, /* BAR.SYNC R1, RZ: a barrier from a register */
+        0xf0a803800027ff00ull, /* BAR.SYNC RZ, R2: a thread count from a register */
+        0xf0a803801ff7ff00ull, /* BAR.SYNC RZ, RZ with bit 28 set, past the count's register */
+        0xf0a813800407ff00ull, /* BAR.SYNC RZ, 0x40: 64 threads */
+        0xf0a803810ff7ff00ull, /* BAR.ARV RZ, RZ */
+    };
+    for (size_t i = 0; i < sizeof other_bars / sizeof *other_bars; i++) {
+        code = translate(&other_bars[i], 1, ST_CS, &info, &words, 1);
+        check_refused(code, &info, "BAR", "a BAR other than barrier 0 for the whole block is refused");
+        free(code);
+    }
 }
 
 /* AL2P keeps byte offsets, including bit 10, and adds the register before an attribute access. */
@@ -3397,9 +3504,9 @@ static void transform_feedback_stores(void) {
     info.xfb.layout[1][0] = 32;
     info.xfb.count[1] = 1;
     info.xfb.stride[1] = 4;
-    g_shader_xfb_stores = 1;
+    g_spirv_translate.xfb_stores = 1;
     u32* spv = spirv_of(code, slots * sizeof *code, ST_VS, &info, &words, 0, 1, 1, 1);
-    g_shader_xfb_stores = 0;
+    g_spirv_translate.xfb_stores = 0;
     free(code);
     check_translated(spv, &info, "a transform feedback capture by stores translates");
     if (spv) {
@@ -3423,7 +3530,7 @@ static void transform_feedback_stores_fog(void) {
     u64* code = guest_program(instructions, 2, NULL, &slots);
     u32* spv[2] = {NULL, NULL};
     if (!code) return;
-    g_shader_xfb_stores = 1;
+    g_spirv_translate.xfb_stores = 1;
     for (int i = 0; i < 2; i++) {
         ShaderInfo info;
         memset(&info, 0, sizeof info);
@@ -3433,7 +3540,7 @@ static void transform_feedback_stores_fog(void) {
         spv[i] = spirv_of(code, slots * sizeof *code, ST_VS, &info, &words[i], 0, 1, 1, 1);
         check_translated(spv[i], &info, "a capture by stores of the fog translates");
     }
-    g_shader_xfb_stores = 0;
+    g_spirv_translate.xfb_stores = 0;
     check(spv[0] && spv[1] && words[0] == words[1] && !memcmp(spv[0], spv[1], words[0] * sizeof *spv[0]),
           "a capture by stores of the fog stores the component it moved to (x), as a capture of that generic does");
     free(spv[0]);
@@ -3896,20 +4003,20 @@ static void system_values(void) {
               count_opcode(code, words, 17, 2) == 1,
           "Layer and PrimitiveId share one Geometry capability");
     free(code);
-    g_shader_geometry = 0;
+    g_spirv_translate.geometry = 0;
     code = translate(fragment, 4, ST_FS, &info, &words, 0);
     check_translated(code, &info, "PrimitiveId with tessellation translates");
     check(code && has_builtin(code, words, 7) == 1 && count_opcode(code, words, 17, 3) == 1,
           "PrimitiveId uses Tessellation when Geometry is unavailable");
     free(code);
-    g_shader_tessellation = 0;
+    g_spirv_translate.tessellation = 0;
     code = translate(fragment, 4, ST_FS, &info, &words, 0);
     check_translated(code, &info, "PrimitiveId fallback translates");
     check(code && !info.unsupported && !has_builtin(code, words, 7),
           "PrimitiveId reads as zero when geometry and tessellation are unavailable");
     free(code);
-    g_shader_geometry = 1;
-    g_shader_tessellation = 1;
+    g_spirv_translate.geometry = 1;
+    g_spirv_translate.tessellation = 1;
     static const u64 compute[] = {
         0xf0c8000002070000ull, /* S2R R0, SR_TID */
         0xf0c8000005170001ull, /* S2R R1, SR_CLOCKHI */
@@ -3929,11 +4036,11 @@ static void system_values(void) {
     if (code) check(count_opcode(code, words, 5056, 0xffffffffu) == 1, "CS2R samples the clock once");
     if (code) check(clock_pair_extracts_both_words(code, words), "CS2R writes both words of one clock sample");
     free(code);
-    g_shader_clock_scopes = 0;
+    g_spirv_translate.clock_scopes = 0;
     code = translate(pair_clock, 1, ST_CS, &info, &words, 0);
     check_refused(code, &info, "shader clock unavailable", "CS2R refuses an unavailable shader clock");
     free(code);
-    g_shader_clock_scopes = 3;
+    g_spirv_translate.clock_scopes = 3;
     code = translate(compute, 2, ST_FS, &info, &words, 0);
     check_refused(code, &info, "S2R", "SR_TID is unavailable outside compute");
     free(code);
@@ -3954,7 +4061,7 @@ static void audit_shader_regressions(void) {
     };
     ShaderInfo info;
     size_t words = 0;
-    g_shader_texture_arrays = 1;
+    g_spirv_translate.texture_arrays = 1;
     u32* code = translate(indexed, 7, ST_FS, &info, &words, 1);
     check_translated(code, &info, "indexed shadow translates mixed depth/color table");
     if (code) {
@@ -4016,12 +4123,12 @@ static void audit_shader_regressions(void) {
         save_fixture(audit_paths[6], code, words);
     }
     free(code);
-    g_shader_texture_arrays = 0;
+    g_spirv_translate.texture_arrays = 0;
     const u64 instance = 0xefd800000007ff00ull | (0x2f8ull << 20);
     /* without draw parameters the instance ID is InstanceIndex less the guest's base instance, pushed; with them
        InstanceIndex less BaseInstance plus what the draw's first instance adds to the guest's base (a 3D engine draw
        that continues an earlier one's instances), so an indirect draw's base instance can come from the GPU */
-    g_shader_draw_parameters = 0;
+    g_spirv_translate.draw_parameters = 0;
     code = translate(&instance, 1, ST_VS, &info, &words, 1);
     check_translated(code, &info, "instance attribute translates with original guest base");
     if (code) {
@@ -4031,7 +4138,7 @@ static void audit_shader_regressions(void) {
         save_fixture(audit_paths[1], code, words);
     }
     free(code);
-    g_shader_draw_parameters = 1;
+    g_spirv_translate.draw_parameters = 1;
     code = translate(&instance, 1, ST_VS, &info, &words, 1);
     check_translated(code, &info, "instance attribute translates with draw parameters");
     if (code) {
@@ -4076,9 +4183,9 @@ static void audit_shader_regressions(void) {
 static void tlds_fp16(void) {
     static const u64 words[] = {0xD244012030570A02ull, 0xD252010040570A18ull, 0xD252014000570A1Aull,
                                 0xD25200E000B70A17ull, 0xD252014010B70A06ull};
-    int saved = g_shader_half_rounding;
+    int saved = g_spirv_translate.half_rounding;
     for (u32 backend = 0; backend < 3; backend++) {
-        g_shader_half_rounding = backend == 2 ? 3 : (int)backend;
+        g_spirv_translate.half_rounding = backend == 2 ? 3 : (int)backend;
         for (size_t i = 0; i < sizeof words / sizeof *words; i++) {
             ShaderInfo info;
             size_t size = 0;
@@ -4106,7 +4213,7 @@ static void tlds_fp16(void) {
             free(code);
         }
     }
-    g_shader_half_rounding = saved;
+    g_spirv_translate.half_rounding = saved;
 }
 
 /* OpTypeImage declarations of that dimensionality (0 1D, 1 2D, 2 3D, 3 cube) */
@@ -4434,8 +4541,12 @@ static void fswzadd_forms(void) {
     check_translated(code, &info, "FSWZADD translates outside fragment programs");
     if (code) check(count_opcode(code, words, 169, 0xffffffffu) == 1, "FSWZADD 0xcc selects b on the left lanes");
     free(code);
+    /* without fragment subgroups the lane is the pixel's place in its quad, FragCoord's parities */
     code = fswzadd_spirv(fswzadd(0xcc), ST_FS, 0, &info, &words);
-    check_refused(code, &info, "subgroup", "FSWZADD with lanes that differ needs the subgroup's lane");
+    check_translated(code, &info, "FSWZADD with lanes that differ translates without fragment subgroups");
+    if (code)
+        check(has_builtin(code, words, 15) && !has_builtin(code, words, 41) && count_opcode(code, words, 17, 61) == 0,
+              "FSWZADD without fragment subgroups takes its lane from FragCoord");
     free(code);
     int adds[4];
     for (u32 mode = 0; mode < 4; mode++) {
@@ -5234,14 +5345,14 @@ static void shfl_quad_forms(void) {
                   plain[k].what);
         free(code);
     }
-    g_shader_quad = 0;
+    g_spirv_translate.quad = 0;
     u32* code = shfl_spirv(shfl(0, 1, 0, 0x1c03), ST_FS, &info, &words);
     check_translated(code, &info, "SHFL in a quad translates on a device without quad operations");
     if (code)
         check(count_opcode(code, words, 345, 0xffffffffu) == 1 && count_opcode(code, words, 17, 68) == 0,
               "SHFL in a quad is a shuffle on a device without quad operations");
     free(code);
-    g_shader_quad = 1;
+    g_spirv_translate.quad = 1;
 }
 
 /* VOTE R<d>, P<out>, [!]P<in> in this mode (0 ALL, 1 ANY, 2 EQ) */
@@ -5269,11 +5380,12 @@ static int no_subgroup(const u32* code, size_t words) {
     return found == 0;
 }
 
-/* A vertex, evaluation or geometry program that votes or shuffles, on a device whose subgroups leave its stage out (an
-   Adreno 830 lists fragment and compute), runs each invocation as lane 0 alone, as the console runs a batch of one
-   vertex or primitive. The forms are those of a game's vertex programs, whose draws were skipped on that phone: a
+/* A vertex, evaluation, geometry or fragment program that votes or shuffles, on a device whose subgroups leave its
+   stage out (an Adreno 830 lists fragment and compute, an Adreno 610 under Turnip compute alone), runs each invocation
+   as one lane alone, as the console runs a batch of one vertex or primitive: a fragment's lane is its place in its
+   quad, from FragCoord. The forms are those of a game's vertex programs, whose draws were skipped on that phone: a
    warp-aggregated atomic (the ballot of the live lanes, whose highest adds their count) and a block branched around
-   when the whole warp agrees, plus SHFL and the other votes. Control and fragment programs still need the subgroup */
+   when the whole warp agrees, plus SHFL and the other votes. Control programs still need the subgroup */
 static void lone_lane_forms(void) {
     const u64 aggregated[] = {
         vote(0, 2, 7, 7, 0),   /* VOTE.ALL R2, PT, PT: the live lanes */
@@ -5298,7 +5410,7 @@ static void lone_lane_forms(void) {
     static const struct {
         int stage;
         const char* what;
-    } stages[] = {{ST_VS, "a vertex"}, {ST_TES, "an evaluation"}, {ST_GS, "a geometry"}};
+    } stages[] = {{ST_VS, "a vertex"}, {ST_TES, "an evaluation"}, {ST_GS, "a geometry"}, {ST_FS, "a fragment"}};
     const struct {
         const u64* instructions;
         int count;
@@ -5312,7 +5424,9 @@ static void lone_lane_forms(void) {
     int fixture = 0;
     for (size_t s = 0; s < sizeof stages / sizeof *stages; s++)
         for (size_t f = 0; f < sizeof forms / sizeof *forms; f++) {
-            u32* code = lone_lane_spirv(forms[f].instructions, forms[f].count, stages[s].stage, 0, &info, &words);
+            /* a fragment program stores no attribute: the branch's result stays in R10 */
+            int count = forms[f].count - (stages[s].stage == ST_FS && forms[f].instructions == uniform);
+            u32* code = lone_lane_spirv(forms[f].instructions, count, stages[s].stage, 0, &info, &words);
             snprintf(what, sizeof what, "%s in %s program translates without subgroups in its stage", forms[f].what,
                      stages[s].what);
             check_translated(code, &info, what);
@@ -5321,10 +5435,13 @@ static void lone_lane_forms(void) {
                          forms[f].what, stages[s].what);
                 check(no_subgroup(code, words), what);
                 check(!info.primitive_split_safe, "a program that votes is never split into primitives");
-                if (fixture < 9) save_fixture(lone_lane_paths[fixture++], code, words);
+                if (stages[s].stage == ST_FS)
+                    check(has_builtin(code, words, 15),
+                          "a fragment's lone lane is its place in its quad, from FragCoord");
+                if (fixture < 12) save_fixture(lone_lane_paths[fixture++], code, words);
             }
             free(code);
-            code = lone_lane_spirv(forms[f].instructions, forms[f].count, stages[s].stage, 1, &info, &words);
+            code = lone_lane_spirv(forms[f].instructions, count, stages[s].stage, 1, &info, &words);
             snprintf(what, sizeof what, "%s in %s program uses the subgroup where its stage has it", forms[f].what,
                      stages[s].what);
             check_translated(code, &info, what);
@@ -5338,21 +5455,94 @@ static void lone_lane_forms(void) {
         check_refused(code, &info, "subgroup ballot/shuffle unavailable", what);
         free(code);
     }
-    u32* code = lone_lane_spirv(others, 4, ST_FS, 0, &info, &words);
-    check_refused(code, &info, "subgroup ballot/shuffle unavailable", "SHFL in a fragment program needs the subgroup");
-    free(code);
-    /* FSWZADD's lanes are a quad's: the lone lane doesn't stand for them */
+    /* FSWZADD's lanes are a quad's: outside a fragment program the lone lane doesn't stand for them */
     const u64 swizzled[] = {vote(0, 2, 7, 7, 0), fswzadd(0xcc)};
+    u32* code = lone_lane_spirv(swizzled, 2, ST_FS, 0, &info, &words);
+    check_translated(code, &info, "VOTE and FSWZADD in a fragment program translate without fragment subgroups");
+    free(code);
     code = lone_lane_spirv(swizzled, 2, ST_VS, 0, &info, &words);
     check_refused(code, &info, "subgroup ballot/shuffle unavailable",
                   "FSWZADD with lanes that differ keeps the subgroup");
     free(code);
 }
 
+/* SHFL within a fragment program's quad, on a device without fragment subgroups (Turnip on an Adreno 610): the pixel
+   the lane would read is read through fine derivatives of the register's 16-bit halves as floats, one OpDPdxFine for
+   the pixel beside, one OpDPdyFine for the one above or below and both for the one across; a read of its own value
+   takes none, and a SHFL over the whole warp keeps its own. dFdx as the console computes it (SHFL.BFLY 1, then FSWZADD
+   0x99) is the form of a game's fragment program whose draws, 13% of a scene's, that phone skipped */
+static void fragment_quad_reads(void) {
+    static const struct {
+        u32 mode, index, mask;
+        int dx, dy;
+        const char* what;
+    } forms[] = {
+        {3, 1, 0x1c03, 1, 0, "SHFL.BFLY 1 reads the pixel beside"},
+        {3, 2, 0x1c03, 0, 1, "SHFL.BFLY 2 reads the pixel above or below"},
+        {3, 3, 0x1c03, 1, 1, "SHFL.BFLY 3 reads the pixel across"},
+        {0, 2, 0x1c03, 1, 2, "SHFL.IDX 2 reads lane 2's pixel from any of the four"},
+        {1, 1, 0x1c03, 1, 1, "SHFL.UP 1 reads the lane before it: beside, or across from the lower row"},
+        {2, 2, 0x1c03, 0, 1, "SHFL.DOWN 2 reads the lane two after it: below"},
+        {3, 0, 0x1c03, 0, 0, "SHFL.BFLY 0 keeps its own value"},
+        {3, 4, 0x1c03, 0, 0, "SHFL.BFLY 4 leaves the quad and keeps its own value"},
+        {0, 1, 0x1f, 0, 0, "SHFL.IDX over the whole warp keeps its own value"},
+    };
+    ShaderInfo info;
+    size_t words = 0;
+    char what[200];
+    for (size_t k = 0; k < sizeof forms / sizeof *forms; k++) {
+        const u64 instruction = shfl(forms[k].mode, 1, forms[k].index, forms[k].mask);
+        u32* code = lone_lane_spirv(&instruction, 1, ST_FS, 0, &info, &words);
+        snprintf(what, sizeof what, "%s without fragment subgroups", forms[k].what);
+        check_translated(code, &info, what);
+        if (code) {
+            int dx = count_opcode(code, words, 210, 0xffffffffu), dy = count_opcode(code, words, 211, 0xffffffffu);
+            if (dx != forms[k].dx || dy != forms[k].dy)
+                fprintf(stderr, "%s: %d OpDPdxFine and %d OpDPdyFine (expected %d and %d)\n", what, dx, dy, forms[k].dx,
+                        forms[k].dy);
+            check(dx == forms[k].dx && dy == forms[k].dy, what);
+            check(no_subgroup(code, words) && has_builtin(code, words, 15), "a quad's read takes no subgroup");
+            check(count_opcode(code, words, 17, 51) == (forms[k].dx || forms[k].dy),
+                  "DerivativeControl is declared where a fine derivative is read");
+            if (forms[k].mode == 0 && forms[k].mask == 0x1c03) save_fixture(quad_read_paths[0], code, words);
+        }
+        free(code);
+    }
+    /* with them, the quad operations stay */
+    const u64 broadcast = shfl(0, 1, 2, 0x1c03);
+    u32* code = lone_lane_spirv(&broadcast, 1, ST_FS, 1, &info, &words);
+    check_translated(code, &info, "SHFL.IDX 2 in a quad translates with fragment subgroups");
+    if (code)
+        check(count_opcode(code, words, 365, 0xffffffffu) == 1 && count_opcode(code, words, 210, 0xffffffffu) == 0,
+              "SHFL.IDX 2 with fragment subgroups is a quad broadcast, with no derivative");
+    free(code);
+    /* a guarded read runs unguarded, so that a pixel whose guard is false still gives the others its register, and
+       its writes keep their old values where the guard is false: no branch around it */
+    const u64 guarded = shfl(3, 1, 1, 0x1c03) & ~(7ull << 16); /* @P0 */
+    code = lone_lane_spirv(&guarded, 1, ST_FS, 0, &info, &words);
+    check_translated(code, &info, "@P0 SHFL.BFLY 1 translates without fragment subgroups");
+    if (code) {
+        check(count_opcode(code, words, 250, 0xffffffffu) == 0 && count_opcode(code, words, 210, 0xffffffffu) == 1,
+              "@P0 SHFL.BFLY 1 reads the pixel beside with no branch around the derivative");
+        save_fixture(quad_read_paths[1], code, words);
+    }
+    free(code);
+    /* dFdx(R1) into R0: SHFL.BFLY R0, R1, 1, 0x1c03, then FSWZADD R0, R0, R1, 0x99 (nouveau's handleDFDX) */
+    const u64 dfdx[] = {shfl(3, 1, 1, 0x1c03), 0x50F8000000070000ull | 0x99ull << 28 | 1ull << 20};
+    code = lone_lane_spirv(dfdx, 2, ST_FS, 0, &info, &words);
+    check_translated(code, &info, "dFdx as SHFL.BFLY 1 and FSWZADD 0x99 translates without fragment subgroups");
+    if (code) {
+        check(no_subgroup(code, words) && count_opcode(code, words, 210, 0xffffffffu) == 1,
+              "dFdx as SHFL.BFLY 1 and FSWZADD 0x99 reads the pixel beside through a fine derivative");
+        save_fixture(quad_read_paths[2], code, words);
+    }
+    free(code);
+}
+
 /* Real TCS builtins and nonzero geometry streams use distinct typed interfaces. */
 static void rendering_stage_features(const char* directory) {
-    int point_size_available = g_shader_stage_point_size;
-    g_shader_stage_point_size = 1;
+    int point_size_available = g_spirv_translate.stage_point_size;
+    g_spirv_translate.stage_point_size = 1;
     const u32 control_header[3] = {3u << 24, 0, 0};
     const u64 control[] = {0x01000003f807f000ull, 0xeff000000007ff00ull | (0x6cull << 20),
                            0xeff000000007ff00ull | (0x2c0ull << 20), 0xe30000000007000full};
@@ -5371,7 +5561,7 @@ static void rendering_stage_features(const char* directory) {
     check(code && info.reads_point_size && info.clip_input_mask == 1, "TES builtin input metadata is retained");
     if (code && directory) save_fixture(fixture_path(directory, "tes_builtin_inputs"), code, words);
     free(code);
-    g_shader_stage_point_size = point_size_available;
+    g_spirv_translate.stage_point_size = point_size_available;
 }
 
 /* whether the module has a 32-bit float constant of those bits */
@@ -5403,10 +5593,10 @@ static u32* flow_lod_spirv(const u64* instructions, int count, int can_subgroup,
     memset(info, 0, sizeof *info);
     info->advanced_blend = blend;
     if (blend) set_sph(code, 18, 15); /* the equation blends render target 0's RGBA */
-    int device = g_shader_maximal_reconvergence;
-    g_shader_maximal_reconvergence = reconverges;
+    int device = g_spirv_translate.maximal_reconvergence;
+    g_spirv_translate.maximal_reconvergence = reconverges;
     u32* result = spirv_of(code, slots * sizeof *code, ST_FS, info, words, 1, 1, 1, can_subgroup);
-    g_shader_maximal_reconvergence = device;
+    g_spirv_translate.maximal_reconvergence = device;
     free(code);
     return result;
 }
@@ -5455,6 +5645,39 @@ static int chosen_sample(const u64* program, int count, const u32 c2[4], const u
     free(spv);
     memcpy(x, &env.out[0][0], 4);
     return !*why;
+}
+/* A multisample TLD.B takes its handle in Rb and the sample after it, the order of Mesa's compilers since f9d385d77716
+   ("nouveau/codegen: Handle/indirect goes before sample index"). uam's codegen predates it and puts the sample first:
+   edenprobe's fetch through a table of four sample handles comes with the sample in R4 and the handle in R5 */
+static void bindless_multisample_order(void) {
+    u64 fetch[] = {
+        0xe003ff870ff7ff00ull, /* IPA R0, a[0x70] */
+        0x5cb0118000071a00ull, /* F2I.S32 R0, R0 */
+        0xe003ff874ff7ff01ull, /* IPA R1, a[0x74] */
+        0x5cb0118000171a05ull, /* F2I.S32 R5, R1: the sample */
+        0x3848000000470000ull, /* SHL R0, R0, 4 */
+        0xef94002000070004ull, /* LDC R4, c[2][R0]: the handle */
+        0x5c9807800ff70000ull, /* MOV R0, RZ */
+        0x5c9807800ff70001ull, /* MOV R1, RZ */
+        0xdd3c0007a0470000ull, /* TLD.B.MS R0, R0, R4 */
+    };
+    ShaderInfo info;
+    size_t words = 0;
+    g_spirv_translate.texture_arrays = 1; /* the device's non-uniform indexing, for the table */
+    u32* code = translate(fetch, 9, ST_FS, &info, &words, 1);
+    check_translated(code, &info, "a multisample TLD.B with its handle in Rb translates");
+    if (code)
+        check(info.ntex == 1 && info.tex[0].flags == (2 | SNX_TEX_INDEXED | 4 << 4) &&
+                  has_image_operands(code, words, 95, 0x40),
+              "it fetches a sample of a multisample element of the handle table, 16 bytes apart");
+    free(code);
+    fetch[3] = 0x5cb0118000171a04ull; /* F2I.S32 R4, R1 */
+    fetch[5] = 0xef94002000070005ull; /* LDC R5, c[2][R0] */
+    code = translate(fetch, 9, ST_FS, &info, &words, 1);
+    check_refused(code, &info, "untracked texture handle R4 of TLD.B",
+                  "uam's order, the sample in Rb, is not read as the handle");
+    free(code);
+    g_spirv_translate.texture_arrays = 0;
 }
 /* A TEX.B that chooses among the constant buffer handles that reach it keeps the sample of the one whose word the
    register holds when it runs: c[2][0] under P0, c[2][4] under !P0, and under P1 a value from elsewhere (MOV32I
@@ -5944,6 +6167,52 @@ static void window_origin_specialized(void) {
     }
 }
 
+/* Constant buffer words that whoever translates gives as constants (g_shader_cb_fold): a load at a constant place is
+   then that constant, whatever the buffer holds when the module runs; a word it leaves, and every word where nobody
+   is asked, is loaded. The word is asked for by its bank and its byte offset */
+static int fold_second_word(u32 idx, u32 off, u32* out) {
+    if (idx != 2 || off != 4) return 0;
+    *out = 0x3F800000u;
+    return 1;
+}
+static void constant_buffer_words_folded(void) {
+    const u64 reads[] = {0x4c98078800070001ull, 0x4c98078800170002ull}; /* MOV R1, c[2][0]; MOV R2, c[2][4] */
+    for (int folded = 0; folded < 2; folded++) {
+        ShaderInfo info = {0};
+        size_t words = 0, slots;
+        u64* code = guest_program(reads, 2, NULL, &slots);
+        if (!code) return;
+        set_sph(code, 18, 0xf); /* R1 is colour 0's green and R2 its blue */
+        g_shader_cb_fold = folded ? fold_second_word : NULL;
+        u32* spv = spirv_of(code, slots * sizeof *code, ST_FS, &info, &words, 0, 1, 1, 1);
+        g_shader_cb_fold = NULL;
+        free(code);
+        check_translated(spv, &info, "a fragment program loading two constant buffer words translates");
+        if (!spv) continue;
+        /* the buffer holds 0.25 where the constant is 1.0 */
+        const float held[4] = {5.0f, 0.25f, 0.0f, 0.0f}, one[4] = {1.0f, 1.0f, 1.0f, 0.0f};
+        u32 buffer[4], scale[4];
+        float green, blue;
+        SpvEvalEnv env = {0};
+        memcpy(buffer, held, sizeof held);
+        memcpy(scale, one, sizeof one);
+        env.ubo[2] = buffer;
+        env.ubo_words[2] = 4;
+        env.ubo[SNX_VKB_RS] = scale;
+        env.ubo_words[SNX_VKB_RS] = 4;
+        const char* why = spv_eval(spv, words, &env);
+        memcpy(&green, &env.out[0][1], 4);
+        memcpy(&blue, &env.out[0][2], 4);
+        if (why || green != 5.0f || blue != (folded ? 1.0f : 0.25f))
+            fprintf(stderr, "folded %d: %s, green %g and blue %g\n", folded, why ? why : "ran", (double)green,
+                    (double)blue);
+        check(!why && green == 5.0f && blue == (folded ? 1.0f : 0.25f),
+              folded ? "the word given is the module's constant, and the word left is loaded"
+                     : "where nobody is asked both words are loaded");
+        free(spv);
+    }
+}
+
 /* What the translator knows as it translates is settled there, not left for the driver's compiler: PT, the
    predicate most instructions name, is the constant true; a constant a register holds is a constant of the type it
    is read as; and a float a register holds is read back as that float, not through its bits */
@@ -6134,7 +6403,7 @@ static void settled_when_translated(void) {
 }
 
 int main(int argc, char** argv) {
-    g_shader_clock_scopes = 3; /* Exercise both optional Vulkan clock scopes in offline SPIR-V fixtures. */
+    g_spirv_translate.clock_scopes = 3; /* Exercise both optional Vulkan clock scopes in offline SPIR-V fixtures. */
     if (argc != 1 && argc != 2) {
         fprintf(stderr, "usage: %s [fixture directory] (got %d arguments)\n", argv[0], argc - 1);
         return 2;
@@ -6192,7 +6461,7 @@ int main(int argc, char** argv) {
             texture_paths[i] = fixture_path(argv[1], name);
         }
         arithmetic_path = fixture_path(argv[1], "arithmetic");
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             snprintf(name, sizeof name, "beyond_%d", i);
             beyond_paths[i] = fixture_path(argv[1], name);
         }
@@ -6241,9 +6510,13 @@ int main(int argc, char** argv) {
             snprintf(name, sizeof name, "window_%d", i);
             window_paths[i] = fixture_path(argv[1], name);
         }
-        for (int i = 0; i < 9; i++) {
+        for (int i = 0; i < 12; i++) {
             snprintf(name, sizeof name, "lone_lane_%d", i);
             lone_lane_paths[i] = fixture_path(argv[1], name);
+        }
+        for (int i = 0; i < 3; i++) {
+            snprintf(name, sizeof name, "quad_read_%d", i);
+            quad_read_paths[i] = fixture_path(argv[1], name);
         }
         if (g_fixtures.failed) {
             fprintf(stderr, "failed to allocate fixture paths\n");
@@ -6254,6 +6527,7 @@ int main(int argc, char** argv) {
     dc_color_compare();
     unfed_fragment_input();
     brx_length();
+    brx_adjacent_tables();
     subroutine_calls();
     invalid_ldc_bank();
     cbuf_integer_loads();
@@ -6280,6 +6554,7 @@ int main(int argc, char** argv) {
     immediate_sampler_handle();
     constant_buffers_past_the_limit();
     guarded_handle_merges();
+    recomputed_guard_handle();
     volume_surface_atomics();
     surface_atomic_operations();
     draw_buffer_surfaces();
@@ -6314,8 +6589,10 @@ int main(int argc, char** argv) {
     shfl_quad_forms();
     shfl_predicate();
     lone_lane_forms();
+    fragment_quad_reads();
     fragment_flow_derivatives();
     tex_b_chosen_handle();
+    bindless_multisample_order();
     helper_loop_exit();
     feedback_own_pixel();
     feedback_screen_uv();
@@ -6331,6 +6608,7 @@ int main(int argc, char** argv) {
     alpha_function_specialized();
     window_origin_specialized();
     inputs_loaded_once_a_block();
+    constant_buffer_words_folded();
     check(!g_fixtures.failed, "shader fixture paths allocated");
     for (size_t i = 0; i < g_fixtures.count; i++) free(g_fixtures.paths[i]);
     free(g_fixtures.paths);

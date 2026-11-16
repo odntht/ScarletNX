@@ -1057,6 +1057,18 @@ void romfs_init(void) {
     RNode* root;
     size_t i;
     int image = 0;
+    char own[sizeof g_datadir + 16], copying[sizeof g_datadir + 16],
+        extracting[sizeof g_exedir + sizeof g_gamename + 16];
+    /* the data folder's own RomFS, when a copy (romfs.copying beside it) or an extraction (<name>.extracting beside the
+       game) into it stopped before it ended: not all of it, though under its own name */
+    if (snprintf(own, sizeof own, "%sromfs", g_datadir) < (int)sizeof own && snx_is_dir(own) &&
+        snprintf(copying, sizeof copying, "%sromfs.copying", g_datadir) < (int)sizeof copying &&
+        snprintf(extracting, sizeof extracting, "%s%s.extracting", g_exedir, g_gamename) < (int)sizeof extracting &&
+        (snx_path_exists(copying) || snx_is_file(extracting))) {
+        LOG("RomFS: %s is not all of it: %s is there\n", own, snx_path_exists(copying) ? copying : extracting);
+        fatal("The game's RomFS is a copy that stopped before it ended: started from the launcher or scarletnx with "
+              "Extract dump, it is extracted again from the game's dump");
+    }
     if (!fs_tree_lookup(&g_hle.fs.tree, NULL, "romfs.bin", &node) && !node->is_dir) {
         if (node->fd >= 0)
             g_hle.fs.rimage = node;
@@ -1088,8 +1100,13 @@ void romfs_init(void) {
         LOG("RomFS: none in the game's dump\n");
     } else {
         LOG("RomFS: none in %s\n", g_datadir);
-        if (fs_tree_lookup(&g_hle.fs.tree, NULL, "exefs/main.nro", &node))
+        if (fs_tree_lookup(&g_hle.fs.tree, NULL, "exefs/main.nro", &node)) {
             WARN("Extract the game's RomFS into %sromfs/ before running it\n", g_datadir);
+            /* a console game reads its RomFS before its first frame: without it, it stops later on what it asks next */
+            if (game_title())
+                fatal("The game has no RomFS: started from the launcher or scarletnx with Extract dump, it is "
+                      "extracted from the game's dump before the game starts");
+        }
     }
     if (!folder && !g_hle.fs.nmromfs) {
         pm_unlock(&g_hle.fs.tree.lock);
@@ -1432,16 +1449,14 @@ static u64 fs_pace_ns(TlsFs* t, const void* storage, u64 off, u64 sz) {
     t->next = off + sz;
     return stream && sz <= FS_PACE_MAX_BYTES ? sz * 1000000000ull / FS_PACE_BYTES_PER_S : 0;
 }
-void fs_pace_read(const void* storage, u64 off, u64 sz) {
+u64 fs_pace_read(const void* storage, u64 off, u64 sz) {
     u64 ns = fs_pace_ns(&t_hle.fs, storage, off, sz);
-    if (!ns) return;
-    if (!__atomic_exchange_n(&g_host.fs.pace_told, 1, __ATOMIC_RELAXED))
+    if (ns && !__atomic_exchange_n(&g_host.fs.pace_told, 1, __ATOMIC_RELAXED))
         LOG("fs: storage reads of up to %u bytes that go on where the thread's last one ended take a console's time "
             "from here, %u bytes a second (this one %llu bytes, %llu us)\n",
             FS_PACE_MAX_BYTES, FS_PACE_BYTES_PER_S, (unsigned long long)sz, (unsigned long long)(ns / 1000));
-    plat_sleep_ns((i64)ns);
+    return ns;
 }
-
 
 static int file_truncate(FILE* f, u64 n, u64* actual) {
     if (fflush(f)) return -1;
@@ -1790,11 +1805,17 @@ static FsNode* save_part(FsNode* base, const char* name) { /* tree.lock held */
     FsNode* node;
     return !fs_tree_lookup(&g_hle.fs.tree, base, name, &node) && node->is_dir ? node : NULL;
 }
+/* the save's folder node holds something of the save's: an entry SNX_SAVE_HIDDEN does not take for a sync tool's */
+static int save_has_files(const FsNode* node) { /* tree.lock held */
+    const FsNode* c;
+    for (c = node->children; c && SNX_SAVE_HIDDEN(c->name); c = c->next) {}
+    return c != NULL;
+}
 /* path in the tree is a save as the versions before kept one: a folder with the game's own files in it, and so
    without the file that says it is laid out as the console's (SNX_SAVE_JOURNALED) */
 static int save_flat(const char* path) { /* tree.lock held */
     FsNode *node, *mark;
-    return !fs_tree_lookup(&g_hle.fs.tree, NULL, path, &node) && node->is_dir && node->children &&
+    return !fs_tree_lookup(&g_hle.fs.tree, NULL, path, &node) && node->is_dir && save_has_files(node) &&
            fs_tree_lookup(&g_hle.fs.tree, node, SNX_SAVE_JOURNALED, &mark);
 }
 
@@ -2395,7 +2416,7 @@ static void save_stray_said(FsNode* base, u8 type, const char* kind) { /* tree.l
     char host[FS_TREE_PATH_MAX];
     for (c = base->children; c; c = c->next) {
         if (!strcmp(c->name, SNX_SAVE_JOURNALED) || !strcmp(c->name, SNX_SAVE_COMMITTED) ||
-            !strcmp(c->name, SNX_SAVE_WORKING) || !strcmp(c->name, SAVE_SYNCING))
+            !strcmp(c->name, SNX_SAVE_WORKING) || !strcmp(c->name, SAVE_SYNCING) || SNX_SAVE_HIDDEN(c->name))
             continue;
         if (first) more++;
         if (!first) first = c;
@@ -2430,7 +2451,8 @@ u32 fs_save_root(u8 type, const u8 uid[16], u16 index, FsNode** root, int* noted
     u32 rc = save_folder(&attribute, p, sizeof p, stop, sizeof stop);
     if (!R_FAILED(rc) && !stop[0]) rc = tree_result(fs_tree_mkdirs(&g_hle.fs.tree, p, &base));
     if (!rc && base) {
-        *journaled = type != 4 && (!base->children || !fs_tree_lookup(&g_hle.fs.tree, base, SNX_SAVE_JOURNALED, &mark));
+        *journaled =
+            type != 4 && (!save_has_files(base) || !fs_tree_lookup(&g_hle.fs.tree, base, SNX_SAVE_JOURNALED, &mark));
         if (!*journaled) {
             *root = base;
             if (type != 4) save_flat_said(base, type, kind);

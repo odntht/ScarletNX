@@ -21,10 +21,10 @@ typedef struct {
 typedef struct {
     u32 kind;
     char name[NNFS_NAME + 1];
-    u32 opens;     /* files and directories open on it */
     u32 rom;       /* a RomFS mount's image in roms */
     u32 fss;       /* a save's root: its slot in g_hle.fs.fss */
     u32 read_only; /* MountSaveDataReadOnly's: no write mode and no change of its tree */
+    u32 save_type; /* a save's SaveDataAttribute type (1 account, 3 device, 4 temporary, 5 cache); 0 for the SD card */
 } NnfsMount;
 typedef struct {
     u32 used;
@@ -32,9 +32,8 @@ typedef struct {
     u32 mount;
     u32 mode;   /* the OpenMode: 1 read, 2 write, 4 allow append */
     u32 rom;    /* a RomFS file: its image in roms */
+    u32 entry;  /* and its entry in that image's file table */
     u32 slot;   /* a save's file: its slot in g_hle.fs.files */
-    u64 data;   /* a RomFS file: the image's offset of its data */
-    u64 size;   /* and its size */
     u32 wstate; /* the write state, as the SDK's file accessor keeps it (fs.c's WRITE_*) */
     u32 sticky; /* a failed write's Result, which every later operation on the file returns */
 } NnfsFile;

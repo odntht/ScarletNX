@@ -5,6 +5,7 @@
 #endif
 #include "common/gpu/vk/vk_common.h"
 #include "common/platform/file.h"
+#include "common/platform/thread.h"
 #include "common/utilities/common.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,8 +181,7 @@ uint32_t snx_vk_queue_family(VkPhysicalDevice phys, VkQueueFlags flags, VkSurfac
     return found;
 }
 
-/* the instance's physical devices, *count of them (calloc'd, NULL for none) */
-static VkPhysicalDevice* physical_devices(VkInstance instance, uint32_t* count) {
+VkPhysicalDevice* snx_vk_physical_devices(VkInstance instance, uint32_t* count) {
     uint32_t n = 0;
     *count = 0;
     if (vkEnumeratePhysicalDevices(instance, &n, NULL) != VK_SUCCESS || !n) return NULL;
@@ -193,57 +193,6 @@ static VkPhysicalDevice* physical_devices(VkInstance instance, uint32_t* count) 
     free(devices);
     return NULL;
 }
-bool snx_vk_first_device(VkInstance instance, uint32_t api_version, VkQueueFlags flags, VkSurfaceKHR surface,
-                         SnxVkMake make, void* user) {
-    uint32_t count = 0;
-    VkPhysicalDevice* devices = physical_devices(instance, &count);
-    bool made = false;
-    for (uint32_t i = 0; i < count && !made; ++i) {
-        VkPhysicalDeviceProperties p;
-        vkGetPhysicalDeviceProperties(devices[i], &p);
-        if (p.apiVersion < api_version) continue;
-        for (uint32_t f = snx_vk_queue_family(devices[i], flags, surface, 0); f != UINT32_MAX && !made;
-             f = snx_vk_queue_family(devices[i], flags, surface, f + 1))
-            made = make(devices[i], f, user);
-    }
-    free(devices);
-    return made;
-}
-VkPhysicalDevice snx_vk_best_device(VkInstance instance, uint32_t api_version, SnxVkScore score, void* user) {
-    uint32_t count = 0;
-    VkPhysicalDevice* devices = physical_devices(instance, &count);
-    VkPhysicalDevice best = VK_NULL_HANDLE;
-    int best_score = -1;
-    for (uint32_t i = 0; i < count; ++i) {
-        VkPhysicalDeviceProperties p;
-        vkGetPhysicalDeviceProperties(devices[i], &p);
-        if (p.apiVersion < api_version) continue;
-        int s = score(devices[i], &p, user);
-        if (s > best_score) {
-            best_score = s;
-            best = devices[i];
-        }
-    }
-    free(devices);
-    return best;
-}
-
-VkResult snx_vk_device_create(VkPhysicalDevice phys, uint32_t family, const void* features,
-                              const char* const* extensions, uint32_t extension_count, VkDevice* out) {
-    float priority = 1.0f;
-    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-                                  .queueFamilyIndex = family,
-                                  .queueCount = 1,
-                                  .pQueuePriorities = &priority};
-    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-                             .pNext = features,
-                             .queueCreateInfoCount = 1,
-                             .pQueueCreateInfos = &qi,
-                             .enabledExtensionCount = extension_count,
-                             .ppEnabledExtensionNames = extensions};
-    return vkCreateDevice(phys, &di, NULL, out);
-}
-
 void* snx_vk_chain(void* const* links, size_t count) {
     void* head = NULL;
     /* from the last one back, each pointing at the one after it: pNext is written as bytes at its offset, which every
@@ -344,6 +293,32 @@ VkPipelineCache snx_vk_pipeline_cache_load(VkDevice dev, const VkPhysicalDeviceP
     plat_file_unmap(&data); /* the cache copied it, and a mapped file can't be replaced on Windows */
     return cache;
 }
+int snx_vk_write_replace(const char* path, const void* data, size_t size, char* why, size_t n) {
+    if (n) *why = 0;
+#if defined(_WIN32)
+    unsigned long pid = (unsigned long)GetCurrentProcessId();
+#else
+    unsigned long pid = (unsigned long)getpid();
+#endif
+    char* tmp = snx_format("%s.%lu.tmp", path, pid);
+    if (!tmp) {
+        snprintf(why, n, "the name of a temporary file beside %s cannot be allocated", path);
+        return -1;
+    }
+    char os[256];
+    FILE* f = fopen(tmp, "wb");
+    int failed = !f || fwrite(data, 1, size, f) != size;
+    if (f && fclose(f)) failed = 1;
+    if (failed)
+        snprintf(why, n, "%s cannot be written (%s)", tmp, snx_os_error(os, sizeof os));
+    else if (plat_replace_file(tmp, path)) { /* the old file stays whole until this */
+        failed = 1;
+        snprintf(why, n, "%s cannot be moved over it (%s)", tmp, snx_os_error(os, sizeof os));
+    }
+    if (failed && f) remove(tmp);
+    free(tmp);
+    return failed ? -1 : 0;
+}
 int snx_vk_pipeline_cache_save(VkDevice dev, VkPipelineCache cache, const char* path, size_t* saved, char* why,
                                size_t n) {
     *saved = 0;
@@ -369,33 +344,27 @@ int snx_vk_pipeline_cache_save(VkDevice dev, VkPipelineCache cache, const char* 
         free(data);
         return -1;
     }
-#if defined(_WIN32)
-    unsigned long pid = (unsigned long)GetCurrentProcessId();
-#else
-    unsigned long pid = (unsigned long)getpid();
-#endif
-    char* tmp = snx_format("%s.%lu.tmp", path, pid);
-    char os[256];
-    FILE* f = fopen(tmp, "wb");
-    int failed = !f || fwrite(data, 1, size, f) != size;
-    if (f && fclose(f)) failed = 1;
-    if (failed)
-        snprintf(why, n, "%s cannot be written (%s)", tmp, snx_os_error(os, sizeof os));
-    else if (plat_replace_file(tmp, path)) { /* the old file stays whole until this */
-        failed = 1;
-        snprintf(why, n, "%s cannot be moved over it (%s)", tmp, snx_os_error(os, sizeof os));
-    }
-    if (failed && f) remove(tmp);
+    int failed = snx_vk_write_replace(path, data, size, why, n);
     if (!failed) *saved = size;
-    free(tmp);
     free(data);
-    return failed ? -1 : 0;
+    return failed;
 }
 
 VkResult snx_vk_shader_module(VkDevice dev, const uint32_t* words, size_t size, VkShaderModule* out) {
     VkShaderModuleCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size, .pCode = words};
     return vkCreateShaderModule(dev, &info, NULL, out);
+}
+static PMutex g_compile = PMUTEX_INIT;
+static int g_compile_serial;
+void snx_vk_compile_serial(int on) { __atomic_store_n(&g_compile_serial, on != 0, __ATOMIC_RELEASE); }
+int snx_vk_compile_enter(void) {
+    if (!__atomic_load_n(&g_compile_serial, __ATOMIC_ACQUIRE)) return 0;
+    pm_lock(&g_compile);
+    return 1;
+}
+void snx_vk_compile_leave(int entered) {
+    if (entered) pm_unlock(&g_compile);
 }
 static VkResult module_pipeline(VkDevice dev, VkPipelineCache cache, VkPipelineLayout layout, VkShaderModule module,
                                 const VkSpecializationInfo* spec, uint32_t subgroup, bool full, VkPipeline* out) {
@@ -412,7 +381,10 @@ static VkResult module_pipeline(VkDevice dev, VkPipelineCache cache, VkPipelineL
                   .pName = "main",
                   .pSpecializationInfo = spec},
         .layout = layout};
-    return vkCreateComputePipelines(dev, cache, 1, &info, NULL, out);
+    int entered = snx_vk_compile_enter();
+    VkResult r = vkCreateComputePipelines(dev, cache, 1, &info, NULL, out);
+    snx_vk_compile_leave(entered);
+    return r;
 }
 VkResult snx_vk_module_pipeline(VkDevice dev, VkPipelineCache cache, VkPipelineLayout layout, VkShaderModule module,
                                 const VkSpecializationInfo* spec, VkPipeline* out) {

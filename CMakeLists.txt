@@ -11,7 +11,9 @@
 #
 # After each build the runtime is copied next to every recompiled game in the data folder's games/ (SNX_DEPLOY), so a
 # runtime fix reaches the games without recompiling them.
-cmake_minimum_required(VERSION 3.25)
+# CMake 3.28 for CPMUtil (cmake/packages.cmake); the policies stay 3.25's, which the build is written and tested to
+cmake_minimum_required(VERSION 3.28)
+cmake_policy(VERSION 3.25)
 
 # Clang only: the runtime, the generated game code and the third-party libraries are built and tested with one
 # compiler. It is the default here, so a plain `cmake -B build` picks it over the system's cc
@@ -64,6 +66,7 @@ option(SNX_BUILD_GNUABI "Build the CPU-only Linux AArch64 runtime" ON)
 option(SNX_BUILD_3DS "Build the 3DS driver: extraction, the ARM11 AOT compiler and the runtime" ON)
 option(SNX_BUILD_VITA "Build the PS Vita driver: VPK extraction, the AArch32 AOT compiler and the runtime" ON)
 option(SNX_BUILD_AGB "Build the Game Boy Advance AGB board runtime" ON)
+option(SNX_BUILD_NDS "Build the DS driver: the ARM9 AOT compiler, the board and its Vulkan renderer" ON)
 # the Android app driver runs apps on a desktop's JVM: not in ScarletNX's own Android and iOS apps, which have none.
 # Its native bridge passes the guest's registers as an x86-64 or AArch64 host's (bridge/hle_libc.c)
 # By default only where a JDK 21 or later with include/jni.h is found (cmake/android_jdk.cmake); asked for with none,
@@ -133,7 +136,7 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
 endif()
 option(SNX_BUILD_GUI "Build the keyboard-driven SDL3 launcher" ${snx_gui_default})
 # The program, scarletnx, is every driver the build has (src/multicall): each driver is a library, and the program
-# runs the one its name says. scarletnx-switch, scarletnx-3ds, scarletnx-vita, scarletnx-gnuabi and scarletnx-agb are
+# runs the one its name says. scarletnx-switch, scarletnx-3ds, scarletnx-vita, scarletnx-gnuabi, scarletnx-agb and scarletnx-nds are
 # links to it on Linux and macOS
 if(DEFINED CACHE{SNX_MULTICALL}) # an option before, said and taken out of the cache
     message(STATUS "SNX_MULTICALL is no longer an option: scarletnx is every driver the build has")
@@ -210,7 +213,7 @@ endif()
 # the program, wherever the build has a driver: it links the drivers' libraries by name, the ones configured below too,
 # by the conditions their folders are configured by here (a build of the host tools has no Vita driver, and with the
 # Switch's tools it stops here)
-if(SNX_BUILD_NX OR SNX_BUILD_3DS OR SNX_BUILD_GNUABI OR SNX_BUILD_AGB OR SNX_BUILD_ANDROID OR
+if(SNX_BUILD_NX OR SNX_BUILD_3DS OR SNX_BUILD_GNUABI OR SNX_BUILD_AGB OR SNX_BUILD_NDS OR SNX_BUILD_ANDROID OR
    (SNX_BUILD_VITA AND NOT SNX_TOOLS_ONLY))
     add_subdirectory(src/multicall)
 endif()
@@ -231,6 +234,12 @@ if(SNX_BUILD_AGB)
     include(cmake/window_icon.cmake)
     include(cmake/pad_sdl.cmake)
     add_subdirectory(src/agb)
+endif()
+if(SNX_BUILD_NDS)
+    # the window's icon and the gamepads' controls, as the 3DS's: a target of src/nds compiles only src/nds
+    include(cmake/window_icon.cmake)
+    include(cmake/pad_sdl.cmake)
+    add_subdirectory(src/nds)
 endif()
 if(SNX_BUILD_GUI)
     add_subdirectory(src/gui)
@@ -279,8 +288,9 @@ endif()
 # and the driver (hactool among them), each in a folder named after it
 set(licenses "${CMAKE_INSTALL_DATADIR}/licenses/scarletnx")
 install(FILES LICENSE DESTINATION ${licenses})
-# FFmpeg's with the change made to it (cmake/ffmpeg-vp9-nvdec.patch), which its LGPL wants carried with the binaries
-install(FILES "${FFmpeg_SOURCE_DIR}/COPYING.LGPLv2.1" "${FFmpeg_SOURCE_DIR}/LICENSE.md" cmake/ffmpeg-vp9-nvdec.patch
+# FFmpeg's with the changes made to it (.patch/ffmpeg), which its LGPL wants carried with the binaries
+install(FILES "${FFmpeg_SOURCE_DIR}/COPYING.LGPLv2.1" "${FFmpeg_SOURCE_DIR}/LICENSE.md"
+              .patch/ffmpeg/0001-vp9-nvdec.patch .patch/ffmpeg/0002-h264-bigendian.patch
         DESTINATION ${licenses}/FFmpeg)
 if(TARGET snx_zlib) # in FFmpeg's PNG decoder and encoder
     install(FILES "${zlib_SOURCE_DIR}/LICENSE" DESTINATION ${licenses}/zlib)
@@ -288,12 +298,13 @@ endif()
 install(FILES dist/licenses/Noto/OFL.txt DESTINATION ${licenses}/Noto) # the shared fonts' stand-ins (pl.c)
 install(FILES dist/licenses/Montserrat/OFL.txt DESTINATION ${licenses}/Montserrat) # the 3DS shared font's stand-in
 install(FILES dist/licenses/Ryujinx/LICENSE.txt DESTINATION ${licenses}/Ryujinx) # the default Miis (misc.c)
-# a package the system gave (CPM_USE_LOCAL_PACKAGES) is not in the install: its license comes with its own package
+# a package the system gave (Vulkan-Headers_FORCE_SYSTEM) is not in the install: its license comes with its own package
 if(Vulkan-Headers_ADDED)
     install(FILES "${Vulkan-Headers_SOURCE_DIR}/LICENSE.md" DESTINATION ${licenses}/Vulkan-Headers)
     install(DIRECTORY "${Vulkan-Headers_SOURCE_DIR}/LICENSES" DESTINATION ${licenses}/Vulkan-Headers)
 endif()
 install(FILES "${volk_SOURCE_DIR}/LICENSE.md" DESTINATION ${licenses}/volk)
+install(FILES "${FidelityFX-FSR2_SOURCE_DIR}/LICENSE.txt" DESTINATION ${licenses}/FidelityFX-FSR2)
 # renderdoc_app.h's license is the comment at the top of the header
 file(READ "${renderdoc_app_SOURCE_DIR}/renderdoc_app.h" renderdoc_app)
 string(FIND "${renderdoc_app}" "*/" renderdoc_app_end)
@@ -312,6 +323,9 @@ endif()
 if(TARGET snx_enet)
     install(FILES "${enet_SOURCE_DIR}/LICENSE" DESTINATION ${licenses}/enet)
     install(FILES "${zstd_SOURCE_DIR}/LICENSE" DESTINATION ${licenses}/zstd)
+endif()
+if(TARGET snx_rnnoise)
+    install(FILES "${rnnoise_SOURCE_DIR}/COPYING" DESTINATION ${licenses}/rnnoise RENAME LICENSE)
 endif()
 if(SNX_SDL3_FROM_SOURCE)
     install(FILES "${SDL3_SOURCE_DIR}/LICENSE.txt" DESTINATION ${licenses}/SDL3)

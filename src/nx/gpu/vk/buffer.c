@@ -520,10 +520,10 @@ u64 vk_buf_pending_inspected(void) { return g_outx.inspected; }
 static VkPipelineStageFlags2 out_stages(void) {
     return VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT |
-           (g_shader_tessellation ? VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
-                                        VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT
-                                  : 0) |
-           (g_shader_geometry ? VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT : 0) |
+           (g_spirv_translate.tessellation ? VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
+                                                 VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT
+                                           : 0) |
+           (g_spirv_translate.geometry ? VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT : 0) |
            (g_vk.has_mesh ? VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT : 0) |
            (g_vk.has_task ? VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT : 0) |
            (g_vk.has_xfb ? VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT : 0);
@@ -1706,9 +1706,10 @@ static int gfx_gpu_src(u64 gva, u64 len, VkBuffer* buf, u64* off, int writable, 
            has no guest memory in its staging either, so a reader of it composes too */
         (match->org || !match->no_input) && (!writable || match->org || g_bind_log) &&
         (!writable || match->frame == vk_submit_number() || out_take_into_submit(match))) {
-        /* Maxwell bindings retain conservative read/write ordering. NVN permits overlapping draws and supplies
-           storage dependencies through explicit barriers; a writable view alone does not create a dependency.
-           Read-only consumers and new submissions retain their automatic visibility checks. */
+        /* Draws may overlap, and the game supplies their storage dependencies through explicit barriers (render.c
+           stage_set_): a writable view alone does not create a dependency, unless the setting asks for the
+           conservative order (ordered). Read-only consumers and new submissions retain their automatic visibility
+           checks. */
         u64 work = g_vk_drawn + g_vk_dispatches;
         int new_write = match->written > g_buffer.order.visible;
         /* A writable binding below stamps the next generation before its draw is recorded. Later bindings of
@@ -3347,7 +3348,7 @@ static int patch_apply(const Vb* e, Patch* pt) {
     u8* p;
     if (!pt->n) return 1;
     for (u32 k = 0; k < pt->n; k++) bytes += r[k].size; /* a whole one's span is more than its runs */
-    if (!(p = vk_stage_upload(bytes, vk_stage_align(), &sb, &so))) return 0;
+    if (!(p = vk_stream_upload(bytes, vk_stage_align(), &sb, &so))) return 0; /* read by the copy below alone */
     for (u32 k = 0; k < pt->n; k++) {
         memcpy(p + at, pt->src + r[k].dstOffset, r[k].size);
         r[k].srcOffset = so + at;
@@ -3504,6 +3505,22 @@ static int range_owned(u64 gva, u64 len) {
     return 0;
 }
 int vk_buf_owned(u64 gva, u64 len) { return range_owned(gva, len); }
+/* the first byte of [gva, gva + len) on a page that GPU-owned bytes or a watch are on (range_owned), or gva + len */
+static u64 range_first_owned(u64 gva, u64 len) {
+    if (!own_any()) return gva + len;
+    for (u64 o = 0; o < len;) {
+        u64 cpu = 0, n = gmmu_run(gva + o, len - o, &cpu);
+        if (!n) {
+            n = 0x1000 - ((gva + o) & 0xFFF);
+            if (n > len - o) n = len - o;
+        } else {
+            u64 at = own_first_trapped(cpu, n);
+            if (at < cpu + n) return gva + o + (at - cpu);
+        }
+        o += n;
+    }
+    return gva + len;
+}
 u64 vk_buf_ahead(void) { return g_buffer.ahead; }
 /* A range over bytes the GPU holds, with nothing landed. One owner holding it whole is bound where it is, as a dispatch
    binds it (compute.c res_bind): every write to an owner's buffer is recorded outside rendering passes and followed by
@@ -3559,8 +3576,10 @@ static int buf_get_owned(u32 i, Vb* e, u64 gva, u64 len, int strict, u32 epoch, 
     return 1;
 }
 /* inplace: IN_NO, the range is copied; IN_TRY, read in place in guest memory where it can be (uma.c), else copied;
-   IN_ONLY, in place or 0 (a window is copied instead) */
-enum { IN_NO, IN_TRY, IN_ONLY };
+   IN_ONLY, in place or 0 (a window is copied instead). With IN_DEAR (vertices, indices, windows and constant buffers):
+   copied where imports are dear (vk_uma_imports_dear), unless a write in place is pending over the range, whose bytes
+   only the import holds yet */
+enum { IN_NO, IN_TRY, IN_ONLY, IN_DEAR = 4 };
 /* the biggest copy engine's source that takes a buffer of its own at once (buf_get): a sixty-fourth of the budget */
 static u64 copy_src_at_once(void) {
     u64 usage, budget;
@@ -3589,6 +3608,7 @@ static int buf_get_(u64 gva, u64 len, VkBuffer* buf, u64* off, int strict, u64 a
     u32 i = 0, epoch = vk_ww_epoch(); /* before anything is checked or read */
     Vb* e = NULL;
     if (!len || len > 0xFFFFFFFFull) return 0; /* no buffer the GPU reads is 4 GB */
+    if (g_gfx_img_any) vk_gfx_image_read_need(gva, len); /* a kept storage image's owner holds older bytes */
     /* over writes of the GPU mirror's programs that haven't landed: read in the mirror, which has them, after them. At
        an offset the use can't bind (a draw's constants or vertices, a few bytes at any address, where a uniform
        buffer binds at 64), the bytes are copied on the GPU from the mirror into device memory that it can: landing
@@ -3659,11 +3679,13 @@ static int buf_get_(u64 gva, u64 len, VkBuffer* buf, u64* off, int strict, u64 a
     }
     /* no GPU result is pending over it: guest memory holds its bytes, which the GPU reads where they are on a device
        that shares memory with the CPU. Not GPU-owned bytes, which only the GPU holds */
-    if (inplace && vk_uma() && !range_owned(gva, len) && vk_uma_get(gva, len, align, buf, off)) {
+    if ((inplace & 3) && vk_uma() && !range_owned(gva, len) &&
+        !((inplace & IN_DEAR) && vk_uma_imports_dear() && !vk_uma_pending(gva, len)) &&
+        vk_uma_get(gva, len, align, buf, off)) {
         g_buf_kind = 16;
         return 1;
     }
-    if (inplace == IN_ONLY) return 0;
+    if ((inplace & 3) == IN_ONLY) return 0;
     /* The page cache (pagespace.c), which holds the bytes by guest page: a range it serves binds its region's buffer
        with no copy while its pages hold still, and takes no buffer of its own. GPU-owned bytes too where the cache
        is their owner, which a draw that wrote them in place made it (vk_pages_write): another owner's it refuses, and
@@ -3810,7 +3832,7 @@ static int buf_get_(u64 gva, u64 len, VkBuffer* buf, u64* off, int strict, u64 a
     u8* staged = NULL;
     if (!e || !e->own) {
         if (e) e->buf = VK_NULL_HANDLE; /* a failed allocation must not leave the old snapshot reusable */
-        if (!(staged = vk_stage_upload(len, vk_stage_align(), &sb, &so))) return 0;
+        if (!(staged = vk_stream_upload(len, vk_stage_align(), &sb, &so))) return 0;
         h = vk_hash_copy(staged, src, len);
     } else
         h = vk_hash(src, len);
@@ -3846,7 +3868,7 @@ static int buf_get_(u64 gva, u64 len, VkBuffer* buf, u64* off, int strict, u64 a
     }
     if (!e->own) {
         if (!staged) { /* its own buffer was dropped above: the bytes changed */
-            if (!(staged = vk_stage_upload(len, vk_stage_align(), &sb, &so))) return 0;
+            if (!(staged = vk_stream_upload(len, vk_stage_align(), &sb, &so))) return 0;
             memcpy(staged, src, len);
         }
         /* a big range takes its own buffer at once when writes are tracked: changes then patch it (patch_own). Not a
@@ -3884,7 +3906,7 @@ int vk_buf_get(u64 gva, u64 len, VkBuffer* buf, u64* off) {
    instead of composing it over guest memory. In one game 216,000 vertex buffer bindings in 600 frames were composed
    that way, each a copy of its range into staging and a GPU copy of the result over it */
 int vk_buf_get_input(u64 gva, u64 len, u64 align, VkBuffer* buf, u64* off) {
-    return buf_get(gva, len, buf, off, 0, align, IN_TRY);
+    return buf_get(gva, len, buf, off, 0, align, IN_TRY | IN_DEAR);
 }
 
 /* Windows: guest ranges that storage buffers with no size of their own (a bare address in a program's constant buffer,
@@ -3959,6 +3981,13 @@ static int win_get(u64 gva, u64 len, u64 align, VkBuffer* buf, u64* off) {
         if (copy_stats_on()) g_win_made++;
     }
     g_win[slot].used = g_vk_present;
+    /* A window over GPU-owned or watched pages (a render target's, own_watch) goes to buf_get_owned, which copies it
+       whole again at every submission, the CPU's bytes staged and the owners' copied on the GPU. A range with none of
+       those pages of its own is bound alone, where the cache keeps its bytes. In one game a 4 MiB vertex range of an
+       indirect draw shared a 64 MiB window with a watched target: 125 copies of the window a present, 7.9 GB, and
+       1.6 frames a second */
+    if (!range_owned(gva, len) && range_owned(g_win[slot].start, g_win[slot].end - g_win[slot].start))
+        return buf_get(gva, len, buf, off, 0, vk_stage_align(), IN_NO);
     if (!buf_get(g_win[slot].start, g_win[slot].end - g_win[slot].start, buf, &at, 0, vk_stage_align(), IN_NO))
         return 0;
     /* a binding's offset must be a multiple of the device's alignment: a range that would land off it is copied
@@ -3970,14 +3999,20 @@ static int win_get(u64 gva, u64 len, u64 align, VkBuffer* buf, u64* off) {
 }
 int vk_buf_get_window(u64 gva, u64 len, VkBuffer* buf, u64* off) {
     u64 align = g_vk.props.limits.minStorageBufferOffsetAlignment;
-    if (vk_uma() && buf_get(gva, len, buf, off, 0, align, IN_ONLY)) return 1; /* no window needed in place */
+    if (vk_uma() && buf_get(gva, len, buf, off, 0, align, IN_ONLY | IN_DEAR)) return 1; /* no window needed in place */
     return win_get(gva, len, align, buf, off);
 }
 /* A vertex or index range whose extent isn't known (an indirect draw's: the GPU reads the count), in a window as a
    bare storage buffer's: a binding reads on to the window's end, and draws over the same memory share its copy.
    align: the elements' */
 int vk_buf_get_window_input(u64 gva, u64 len, u64 align, VkBuffer* buf, u64* off) {
-    if (vk_uma() && buf_get(gva, len, buf, off, 0, align, IN_ONLY)) return 1;
+    if (vk_uma() && buf_get(gva, len, buf, off, 0, align, IN_ONLY | IN_DEAR)) return 1;
+    /* Its length is a guess, up to the game's limit. A range that starts in the CPU's bytes ends before the first
+       page the GPU's bytes or a watched target are on: the elements of one draw do not run on into a target's memory,
+       and those pages made the range a copy at every submission (buf_get_owned). In one game a 4 MiB index range ran
+       72 KB into a watched target, 8 copies of its 64 MiB window a present */
+    u64 first = range_first_owned(gva, len);
+    if (first > gva && first < gva + len) len = first - gva;
     return win_get(gva, len, align, buf, off);
 }
 /* A draw looks its buffers up one after another, and each lookup waited on two cache misses in a row, its index slot
@@ -4025,7 +4060,7 @@ int vk_buf_get_strict(u64 gva, u64 len, VkBuffer* buf, u64* off) {
 /* a constant buffer: read in place where it can be, as vertices are, but the pages the runtime wrote (uma.c's front,
    its constant buffer updates among them), which are copied as before */
 int vk_buf_get_uniform(u64 gva, u64 len, VkBuffer* buf, u64* off) {
-    return buf_get(gva, len, buf, off, 1, vk_stage_align(), IN_TRY);
+    return buf_get(gva, len, buf, off, 1, vk_stage_align(), IN_TRY | IN_DEAR);
 }
 int vk_buf_get_copy_src(u64 gva, u64 len, VkBuffer* buf, u64* off) {
     return buf_get(gva, len, buf, off, 2, vk_stage_align(), IN_NO);
@@ -4040,6 +4075,7 @@ u64 vk_buf_reclaim(u32 before, u64 want) {
         drop_own(i); /* the entry stays: its range is copied into a buffer again when next read */
         vk_defer_bytes(g_vb[i].len);
     }
+    if (freed < want) freed += vk_pages_reclaim(before, want - freed); /* then the page cache's idle granules */
     return freed;
 }
 /* A front end with explicit storage ordering supplies these barriers in command-stream order. */

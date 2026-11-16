@@ -100,6 +100,7 @@ is the best case for the GPU.
 | `topo_class` | VI | in the VI key. The topology is dynamic already (`VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY`) |
 | `polygon` | PR | dynamic with `extendedDynamicState3PolygonMode`, else in the PR key |
 | `depth_clamp` | PR | dynamic with `extendedDynamicState3DepthClampEnable`, else in the PR key |
+| `depth_clip` | PR | 0 without `VK_EXT_depth_clip_enable`. With it, 1 off and 2 on: dynamic with `extendedDynamicState3DepthClipEnable` where the clamp is dynamic too, else in the PR key |
 | `vi` | VI | in the VI key. All zero with dynamic vertex input, as now |
 | `ncolor`, `color[8]`, `depth`, `stencil` | FO | in the FO key (formats cannot be dynamic) |
 | `blend[8]` | FO | in the FO key |
@@ -134,6 +135,8 @@ goes into the command buffer only when it changes). Each one needs a `rec_CmdSet
 | conservative mode and its size | `vkCmdSetConservativeRasterizationModeEXT`, `vkCmdSetExtraPrimitiveOverestimationSizeEXT` | the two `extendedDynamicState3` members, with `has_conservative` |
 | patch control points | `vkCmdSetPatchControlPointsEXT` | `extendedDynamicState2PatchControlPoints` |
 | depth range of the clip volume | `vkCmdSetDepthClipNegativeOneToOneEXT` | `extendedDynamicState3DepthClipNegativeOneToOne`, with `depthClipControl` of `VK_EXT_depth_clip_control` |
+| depth clip | `vkCmdSetDepthClipEnableEXT` | `extendedDynamicState3DepthClipEnable`, with `VK_EXT_depth_clip_enable`, only where the depth clamp is dynamic too |
+| depth clamp range | `vkCmdSetDepthClampRangeEXT` | `depthClampControl` of `VK_EXT_depth_clamp_control`, on the whole-pipeline path too |
 
 Each state becomes dynamic only on the GPL path, and only when its feature is there. A state without its feature
 stays in the PR key, as a static value. This keeps the whole-pipeline path of today unchanged, and a device with
@@ -148,8 +151,14 @@ The depth range is in no key. Without its state, the last stage before rasteriza
 range and the push constant that turns the fix on stays 0. The log line at start says which, and what the device
 lacks.
 
-Depth clamp as dynamic state keeps the meaning of today. Without `VK_EXT_depth_clip_enable`, depth clip is the
-opposite of depth clamp, for a static value and for a dynamic one.
+Without `VK_EXT_depth_clip_enable`, depth clip is the opposite of depth clamp, for a static value and for a dynamic
+one. With it, the clip is a state of its own (`depth_clip`), as the console's clip control sets the clip and the
+clamp apart; a dynamic clamp without a dynamic clip would turn the clip the other way whatever the pipeline says
+(`vkCmdSetDepthClampEnableEXT`), so the extension is used with a dynamic clamp only where the clip is dynamic too.
+The clamp's range (`VK_EXT_depth_clamp_control`) is the viewport's clip range, or 0 to 1 where the clip control forces
+it (bit 0, the console's clamp off), set with the viewport on both paths and in no key. A driver that lists the
+extension and its feature but gives no `vkCmdSetDepthClampRangeEXT` (NVIDIA's 621.01) runs without the extension: the
+device is made again without it ([Driver bans](../../dev/development.md#driver-bans)).
 
 Each part lists only the dynamic states of its own subset in its `pDynamicState`, as vkd3d-proton does with its
 `VKD3D_VERTEX_INPUT_DYNAMIC_STATE_MASK` and `VKD3D_FRAGMENT_OUTPUT_DYNAMIC_STATE_MASK`. The link and the optimized
@@ -172,7 +181,7 @@ FS part must have one, and it must also match (06636, 06637). So:
 
 The layouts now are `vk_playout(arrays)`. They are 32 at most, one for each value of the five bits of `arrays`. Set
 N is `g_vk_dslayout[bit N][N]`, by `shader_vk_set`: set 0 vertex (and compute), set 1 fragment, sets 2 to 4
-tessellation control, tessellation evaluation and geometry. There is one push constant range of 80 bytes for
+tessellation control, tessellation evaluation and geometry. There is one push constant range of 128 bytes for
 `VK_PUSH_STAGES`.
 
 A link with a PR part and an FS part must use layouts that agree. Without `VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT`,
@@ -192,7 +201,8 @@ So the GPL path makes every graphics layout with `INDEPENDENT_SETS`:
 
 All three have the same push constant range, as the push constant VUIDs (06620, 06621) need. The null-set layouts
 come from a second table beside `g_pipeline.playouts`, keyed by the part (PR or FS) and the bits of the part. That is 16 PR
-layouts and 2 FS layouts at most.
+layouts and 2 FS layouts at most. A part is a library, so a device without pipeline libraries makes none, and every
+draw compiles whole there: `ship_warm` returns before it queues one.
 
 Vulkan calls two layouts compatible for set N only when both or neither have `INDEPENDENT_SETS`. Thus the binds of
 graphics descriptor sets must use the same family as the pipeline. They do: `render.c` binds with
@@ -501,7 +511,7 @@ the lowest queue, and keep them in the table of parts, so that a draw links them
 ## Commits
 
 What landed, in order. Each commit ran the full ctest. The commits that change a pipeline or a layout also ran the
-menus of an Ounce game under `--vk_validation=1` against the same run on feat/ounce.
+menus of an Ounce game under `--vk-validation=1` against the same run on feat/ounce.
 
 1. **`[gpu] Query graphics pipeline libraries and their dynamic state`**: `vk_gpl_choose` in `pipeline_parts.c`, the
    device query and enable, the setting `pipeline_libraries`, and the tests `vk_pipeline_parts`,
@@ -521,10 +531,11 @@ menus of an Ounce game under `--vk_validation=1` against the same run on feat/ou
 6. **`[gpu] Let one worker at most make optimized pipelines`**: the bound `PIPE_OPT_WORKERS`, the stats of the draws'
    waits for a worker, and the setting `vk_pipeline_cache` for cold runs.
 7. `[vk] Warm the large shipped programs' parts into the pipeline cache`: the pass warms the part of each shipped
-   program whose SPIR-V is 256 KiB or larger (step 8, below). One worker warms at a time (`WARM_WORKERS`), as the
-   optimized pipelines, and the parts are made into `g_pipeline.pcache` and dropped, so a draw that meets the program later
-   hits the cache by the SPIR-V. A warm-up of every shipped program is still not done: the 7,403 programs would cost
-   about 18 minutes of worker time in a first run (see [The warm-up of the shipped programs](#the-warm-up-of-the-shipped-programs-measured)).
+   vertex or fragment program whose SPIR-V is 256 KiB or larger (step 8, below). One worker warms at a time
+   (`WARM_WORKERS`), as the optimized pipelines, and the parts are made into `g_pipeline.pcache` and dropped, so a draw
+   that meets the program later hits the cache by the SPIR-V. A warm-up of every shipped program is still not done: the
+   7,403 programs would cost about 18 minutes of worker time in a first run (see
+   [The warm-up of the shipped programs](#the-warm-up-of-the-shipped-programs-measured)).
 
 ## Rejected alternatives
 

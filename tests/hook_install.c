@@ -106,6 +106,13 @@ int snx_hook_key_at(const char* name, const unsigned char build_id[32], SnxU64* 
     return (void)name, (void)build_id, (void)offset, 0;
 }
 void logf_(int lvl, const char* fmt, ...) { (void)lvl, (void)fmt; }
+/* hook.c takes its invalidation lock only when a hooked function's code changed */
+void pm_lock(PMutex* m) { (void)m; }
+void pm_unlock(PMutex* m) { (void)m; }
+/* ext_skyline.c's: no hook for a mod's trampoline */
+GuestFn hook_ext_skyline(const char* symbol, u32 sdk, const char** handler) {
+    return (void)symbol, (void)sdk, (void)handler, NULL;
+}
 void fatal(const char* fmt, ...) {
     fprintf(stderr, "fatal: %s\n", fmt);
     exit(1);
@@ -170,4 +177,9 @@ int main(void) {
     assert(allocations == 1);
     puts("hook_install: passed");
     return 0;
+}
+/* hook.c asks which families can run (family.c, not linked here): every one of this test's */
+const char* hook_family_unready(const char* family) {
+    (void)family;
+    return NULL;
 }

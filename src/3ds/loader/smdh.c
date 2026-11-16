@@ -3,6 +3,7 @@
    The icon's 8x8 tiles are read in Morton order as Azahar (Citra)'s video_core/utils.h GetMortonOffset does it:
    copyright 2014 to 2025 Citra Emulator Project / Azahar Emulator Project, GPLv2 or later (docs/CREDITS.md) */
 #include "3ds/loader/smdh.h"
+#include "common/utilities/endian.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -10,10 +11,14 @@
 #define SMDH_TITLES     0x8    /* the 16 titles' start, 0x200 bytes each */
 #define SMDH_TITLE_SIZE 0x200
 #define SMDH_LARGE      0x24c0 /* the 48x48 icon's start, RGB565 */
+#define SMDH_FLAGS      0x2028 /* the application settings' flags, a little-endian word */
 #define SMDH_SIDE       48
 
 int snx_ctr_smdh_valid(const unsigned char* smdh, size_t size) {
     return smdh && size >= SMDH_SIZE && !memcmp(smdh, "SMDH", 4);
+}
+int snx_ctr_smdh_new3ds_only(const unsigned char* smdh, size_t size) {
+    return smdh && size >= SMDH_FLAGS + 4 && !memcmp(smdh, "SMDH", 4) && (snx_ld_le32(smdh + SMDH_FLAGS) & 0x1000);
 }
 /* one title entry's short description, 0x40 UTF-16LE units at its start, as UTF-8; the bytes written, 0 for none */
 static size_t title_of(const unsigned char* entry, char* out, size_t out_size) {
@@ -30,7 +35,9 @@ static size_t title_of(const unsigned char* entry, char* out, size_t out_size) {
                 ++i;
             }
         }
-        if (cp == '\n' || cp == '\r') cp = ' ';       /* a title broken over two lines is one in a window's */
+        if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f))
+            cp = ' '; /* a title broken over two lines is one in a window's, and no control character reaches the
+                         log or the .ini's name= */
         if (cp >= 0xd800 && cp < 0xe000) cp = 0xfffd; /* a surrogate with no pair is not UTF-8 */
         len = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
         if (n + len >= out_size) break;

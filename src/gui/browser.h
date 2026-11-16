@@ -106,7 +106,9 @@ char* gui_folder_game(const char* directory, const char* name);
 bool gui_game_program(const char* path);
 /* Whether the game whose program is at path, a game of a folder of its own, plays from a file that is not there, as its
    driver plays it: a Switch game's dump or extracted folder (source= in its .ini, or an older version's <name>.source
-   link) that it reads in place, its ExeFS not extracted into its <name>_data; a GBA game's ROM, read at every run; a
+   link) that it reads in place, its ExeFS not extracted into its <name>_data, or with a RomFS there that is not whole
+   (snx_romfs_state), which the driver extracts again from it ("" into out when its .ini names none); a GBA game's ROM,
+   read at every run; a
    3DS game's file, its folder holding no extraction and work (the extractions' folder, NULL for none) no copy of it
    that the 3DS driver decrypted; a Vita game's dumped folder, which its app/ links. That file's path into out (size
    bytes, "" when false; out may be NULL). False for a game that plays without it, made from no file (an NRO's), one
@@ -152,5 +154,6 @@ bool gui_is_cia(const char* name);
 bool gui_is_vpk(const char* name);
 bool gui_is_gba(const char* name);
 bool gui_is_multiboot(const char* name);
+bool gui_is_nds(const char* name);
 bool gui_is_apk(const char* name);
 #endif

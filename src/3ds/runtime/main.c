@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 #include "3ds/board/board.h"
+#include "3ds/loader/ctr_image.h"
 #include "3ds/loader/ctr_loader.h"
 #include "3ds/loader/smdh.h"
 #include "3ds/aot/ctr_module.h"
@@ -29,13 +30,15 @@
 #define SNX_BUILD_DIR NULL
 #endif
 
-/* the common options scarletnx-3ds takes (common/utilities/cli.h): all but --frames, --shot and --headless, as the
-   3DS runtime has no frame count, screenshot or window-less run of its own */
-static const unsigned ctr_cli =
-    SNX_CLI_BIT(SNX_CLI_EXTRACT) | SNX_CLI_BIT(SNX_CLI_EXTRACT_CONTAINER) | SNX_CLI_BIT(SNX_CLI_RECOMPILE) |
-    SNX_CLI_BIT(SNX_CLI_GAME) | SNX_CLI_BIT(SNX_CLI_UPDATE) | SNX_CLI_BIT(SNX_CLI_DATA) | SNX_CLI_BIT(SNX_CLI_OUTDIR) |
-    SNX_CLI_BIT(SNX_CLI_OUTPUT) | SNX_CLI_BIT(SNX_CLI_KEYS) | SNX_CLI_BIT(SNX_CLI_SECONDS) |
-    SNX_CLI_BIT(SNX_CLI_SCRIPT) | SNX_CLI_BIT(SNX_CLI_FULLSCREEN) | SNX_CLI_BIT(SNX_CLI_HELP);
+/* the common options scarletnx-3ds takes (common/utilities/cli.h): every one, with --frames a count of the frames
+   decoded, --shot the last frame of both screens and -H a run with no window */
+static const unsigned ctr_cli = SNX_CLI_BIT(SNX_CLI_EXTRACT) | SNX_CLI_BIT(SNX_CLI_EXTRACT_CONTAINER) |
+                                SNX_CLI_BIT(SNX_CLI_RECOMPILE) | SNX_CLI_BIT(SNX_CLI_GAME) |
+                                SNX_CLI_BIT(SNX_CLI_UPDATE) | SNX_CLI_BIT(SNX_CLI_DATA) | SNX_CLI_BIT(SNX_CLI_OUTDIR) |
+                                SNX_CLI_BIT(SNX_CLI_OUTPUT) | SNX_CLI_BIT(SNX_CLI_KEYS) | SNX_CLI_BIT(SNX_CLI_SECONDS) |
+                                SNX_CLI_BIT(SNX_CLI_FRAMES) | SNX_CLI_BIT(SNX_CLI_SHOT) | SNX_CLI_BIT(SNX_CLI_SCRIPT) |
+                                SNX_CLI_BIT(SNX_CLI_FULLSCREEN) | SNX_CLI_BIT(SNX_CLI_HEADLESS) |
+                                SNX_CLI_BIT(SNX_CLI_HELP) | SNX_CLI_RECOMPILE_OPTIONS;
 static void usage(FILE* out) {
     fputs(
         "Usage: scarletnx-3ds [OPTIONS] game\n"
@@ -52,50 +55,69 @@ static void usage(FILE* out) {
     snx_cli_help(out, ctr_cli);
     fputs(
         "3DS options:\n"
-        "  --model old|new        The console to model (default old)\n"
+        "  --model old|new        The console to model. Without it, the one the game was played on before; on its\n"
+        "                         first run a New 3DS for a game that is New 3DS exclusive or asks for the New\n"
+        "                         3DS's 178 MiB memory mode, an Old 3DS for any other\n"
         "  --board-info           Print the board of the console --model names, and stop\n"
         "  --icon                 Write the game's SMDH icon as RGBA into --out DIR (icon.rgba, what Games draws),\n"
         "                         with -x and --data as the launcher asks for it\n"
         "  --out DIR              Where --icon writes it\n"
         "  --max-blocks N         Stop after N native blocks (default: run until the game exits or its window\n"
         "                         closes)\n"
-        "  --ipc-stubs L          With --ctr_auto_stub_ipc=0, still answer a service command the runtime lacks with\n"
-        "                         success for the services in L: all, or a comma list of srv, fs, apt, ptm, hid,\n"
-        "                         gsp, cfg, dsp, system. Given more than once, the lists add up\n"
+        "  --ipc-stubs L          With --ctr-auto-stub-ipc=0, still answer a service command the runtime lacks with\n"
+        "                         success for the services in L: all, or a comma list of srv, fs, apt, ptm, hid, gsp,\n"
+        "                         cfg, dsp, system, am, y2r, ldr, ir, irrst, mic, cam, csnd. Given more than once, the\n"
+        "                         lists add up\n"
         "  --KEY=VALUE            A setting of the 3DS display or debug table (g_ctr_display_ini, g_ctr_debug_ini\n"
-        "                         in src/nx/runtime/settings.txt): --ctr_separate_windows=1 puts each screen in a\n"
-        "                         window of its own, --ctr_top_resolution=2 and --ctr_bottom_resolution=2 render\n"
-        "                         them at twice the console's, --ctr_ipc_trace=1 logs each service request,\n"
-        "                         --ctr_jit_trace=1 each block compiled while the game runs, --ctr_auto_stub_ipc=0\n"
-        "                         stops at a service command the runtime lacks. And the Switch's --vk_memory=N, as\n"
+        "                         in src/nx/runtime/settings.txt): --ctr-separate-windows=1 puts each screen in a\n"
+        "                         window of its own, --ctr-top-resolution=2 and --ctr-bottom-resolution=2 render\n"
+        "                         them at twice the console's, --ctr-ipc-trace=1 logs each service request,\n"
+        "                         --ctr-jit-trace=1 each block compiled while the game runs, --ctr-auto-stub-ipc=0\n"
+        "                         stops at a service command the runtime lacks. And the Switch's --vk-memory=N, as\n"
         "                         it means there: 0 has the GPU work on a copy of the RAM in its own memory unless\n"
-        "                         it shares the system's, 1 on the copy, 2 on the RAM in place. --async_pipelines=1\n"
-        "                         skips what a new pipeline draws while it is made, on --pipeline_threads=N threads\n"
-        "                         (0: all the computer's but two, two to twelve). --vk_pipeline_cache=0 neither\n"
-        "                         reads nor writes the pipelines kept between runs (shader_cache of the game's\n"
-        "                         folder). --gamepad_swap_ab=1 swaps a\n"
-        "                         gamepad's A and B, --gamepad_deadzone=N is its sticks' dead zone in percent of\n"
-        "                         their travel (default 20), --gamepad_map=MAP the buttons its controls send\n"
+        "                         it shares the system's, 1 on the copy, 2 on the RAM in place. --async-pipelines=1\n"
+        "                         skips what a new pipeline draws while it is made, on --pipeline-threads=N threads\n"
+        "                         (0: all the computer's but two, two to twelve). --vk-pipeline-cache=0 neither\n"
+        "                         reads nor writes the pipelines or shaders kept between runs (shader_cache of the\n"
+        "                         game's folder). --vk-ext-shader-object=off draws through pipelines where the\n"
+        "                         device has shader objects, as each --vk-ext-*=off takes an extension away; a\n"
+        "                         driver known to break one has it taken away too, unless --vulkan-ban-ignore=KEY\n"
+        "                         names it. --gamepad-swap-ab=1 swaps a\n"
+        "                         gamepad's A and B, --gamepad-deadzone=N is its sticks' dead zone in percent of\n"
+        "                         their travel (default 20), --gamepad-map=MAP the buttons its controls send\n"
         "                         (south:B east:A ..., the Switch's names: Plus is Start, Minus Select). --touch=N\n"
         "                         is what reaches the touch screen: 2 a finger or the mouse's left button (the\n"
         "                         default), 1 a finger, 0 nothing. --vsync=0 shows the newest image at the\n"
         "                         display's next refresh, or at once, instead of each in turn at its refresh (the\n"
-        "                         default 1). --fullscreen=1 starts the window fullscreen, but for --seconds and\n"
-        "                         --max-blocks runs (F11 or Alt+Enter switches it while the game runs).\n"
+        "                         default 1). --fullscreen=1 starts the window fullscreen, but for --seconds, --frames\n"
+        "                         and --max-blocks runs (F11 or Alt+Enter switches it while the game runs).\n"
         "                         --anisotropy=N (2 to 16) filters a mipmapped texture the game filters linearly\n"
-        "                         anisotropically (default 0: as the game asks). --fps_limit=N runs the game at\n"
+        "                         anisotropically (default 0: as the game asks). --fps-limit=N runs the game at\n"
         "                         N/60 of the console's pace (the 3DS shows 60 frames a second), 0 as fast as it\n"
-        "                         goes, game the console's (the default), and F4 turns it off and on.\n"
-        "                         --aot_threads=N compiles the game's code on N threads (1 to 1024; the default 0:\n"
-        "                         the computer's cores with a quarter left free, or --aot_threads_most=N), as the\n"
-        "                         Switch's\n"
+        "                         goes, game the console's (the default), and F4 turns it off and on. --volume=N\n"
+        "                         plays the game's sound at N percent (0 to 100, the default 100; 0 mutes it)\n"
+        "                         --aot-threads=N compiles the game's code on N threads (0 to 1024; the default 0:\n"
+        "                         the computer's cores with a quarter left free, or --aot-threads-most=N), as the\n"
+        "                         Switch's, the same as --jobs N. KEY is the key with a - for each _; the key as\n"
+        "                         written, the older spelling, is still read, and said once\n"
+        "\n"
+        "On the 3DS, -O is the level of the static blocks' code and of the helpers they call. --chunk N puts N\n"
+        "instructions in a chunk, whole blocks (default: 512 blocks a chunk). --jit-cache FILE is the list of the\n"
+        "blocks a run compiled at run time that discovery starts from, another game folder's <title ID>.hints (default:\n"
+        "the game's own). --jit-only makes a module of no blocks, the run-time compiler compiling every one, and\n"
+        "--keep-ir keeps each chunk's IR in <title ID>_build of the game's folder.\n"
         "\n"
         "On the 3DS, --update takes an update's or a DLC's CIA (a bare NCCH for an update), given again for each.\n"
         "It is recorded beside the game in its folder and checked in its .ini's addons=, as a Switch game's are,\n"
         "then the game is played with it. An update or a DLC given alone, as game, is recorded beside its game,\n"
         "made already, the same way. --keys takes the 3DS AES keys in Azahar's aes_keys.txt format, to decrypt an\n"
         "encrypted game with (default ~/.3ds/aes_keys.txt). The user's data folder keeps work/ in its cache folder.\n"
-        "--script=ms:buttons,... is the setting ctr_script.\n"
+        "--script=ms:buttons,... is the setting ctr_script. --headless starts no SDL video, audio or gamepad subsystem\n"
+        "and opens no window, whatever display the host has: frames still decode, the dumps and audio.wav are still\n"
+        "written, and the script still presses. --frames N ends the run after N frames (the top screen's, or the\n"
+        "bottom screen's until the game first draws a top screen), and --seconds N after N host seconds, which are the\n"
+        "console's at the default pace. --shot PATH writes the last frame of both screens to exactly PATH when the run\n"
+        "ends, the top above the bottom, as one PPM image.\n"
         "\n"
         "Without --extract-container nothing of the game is extracted: its ExeFS and RomFS are read from the game\n"
         "itself, mapped read-only. An extraction and a compiled module already there are used as they are: the\n"
@@ -271,14 +293,21 @@ static SnxCtrExtractResult extract_into(const char* input, const char* folder, c
         snprintf(error, error_size, "cannot list %s: %s", done, snx_os_error(why, sizeof why));
         goto out;
     }
-    for (size_t i = 0; i < count; ++i) {
-        char *from = snx_path_join(done, names[i]), *to = snx_path_join(folder, names[i]);
-        /* only a stopped extraction's part can be in the way: the state has other names */
-        bool moved = !(snx_path_exists(to) && snx_remove_tree(to)) && !plat_replace_file(from, to);
-        if (!moved) snprintf(error, error_size, "cannot move %s to %s: %s", from, to, snx_os_error(why, sizeof why));
-        free(from);
-        free(to);
-        if (!moved) goto out;
+    /* exheader.bin is what holds_extraction takes as a complete extraction: it moves last, so a stop in the middle
+       leaves a folder that the next run extracts again */
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        for (size_t i = 0; i < count; ++i) {
+            bool last = !strcmp(names[i], "exheader.bin");
+            if ((pass == 0) == last) continue;
+            char *from = snx_path_join(done, names[i]), *to = snx_path_join(folder, names[i]);
+            /* only a stopped extraction's part can be in the way: the state has other names */
+            bool moved = !(snx_path_exists(to) && snx_remove_tree(to)) && !plat_replace_file(from, to);
+            if (!moved)
+                snprintf(error, error_size, "cannot move %s to %s: %s", from, to, snx_os_error(why, sizeof why));
+            free(from);
+            free(to);
+            if (!moved) goto out;
+        }
     }
     *published = snx_absolute(folder);
     if (*published)
@@ -295,8 +324,10 @@ out:
 /* The default: nothing extracted. The game is mapped and checked as the extraction checks it, its ExeFS and RomFS
    read where they lie, and folder keeps the title's state alone: an extraction an earlier --extract-container left
    there is taken away, as the game has all of it */
-static int play_game(const SnxCtrSource* game, const char* folder, SnxCtrModel model, uint64_t max_blocks, double seconds,
-                    unsigned flags, uint32_t ipc_stubs, const char* runtime, char* error, size_t error_size) {
+static int play_game(const SnxCtrSource* game, const char* folder, SnxCtrModel model, uint64_t max_blocks,
+                     double seconds, uint64_t frames, bool headless, const char* shot, unsigned flags,
+                     uint32_t ipc_stubs, const char* runtime, const SnxCliRecompile* asked, char* error,
+                     size_t error_size) {
     char *state = NULL, why[256];
     int status = 1;
     if (snx_is_link(folder))
@@ -318,7 +349,8 @@ static int play_game(const SnxCtrSource* game, const char* folder, SnxCtrModel m
             if (failed) goto done;
         }
     }
-    status = snx_ctr_aot_run(state, game, model, max_blocks, seconds, flags, ipc_stubs, runtime, error, error_size);
+    status = snx_ctr_aot_run(state, game, model, max_blocks, seconds, frames, headless, shot, flags, ipc_stubs, runtime,
+                             asked, error, error_size);
     if (status) fprintf(stderr, "scarletnx-3ds: %s\n", error);
 done:
     free(state);
@@ -378,13 +410,13 @@ done:
 /* The game played, extracted or compiled as the options say, in its folder extracted (freed): an extraction there
    already, else the game at input, which source is opened (NULL when it is not) */
 static int play(const char* input, SnxCtrSource* source, char* extracted, SnxCtrModel model, uint64_t max_blocks,
-                double seconds, bool recompile, bool extract_only, bool extract_container, uint32_t ipc_stubs,
-                const char* runtime) {
+                double seconds, uint64_t frames, bool headless, const char* shot, bool recompile, bool extract_only,
+                bool extract_container, uint32_t ipc_stubs, const char* runtime, const SnxCliRecompile* asked) {
     char error[1024]; /* the run's last line: a GX command's stop carries why the GPU did not start */
     unsigned flags = recompile ? SNX_CTR_RECOMPILE | SNX_CTR_COMPILE_ONLY : 0;
     if (source && !extract_container && !extract_only) { /* the game read where it lies, the folder keeping its state */
-        int status =
-            play_game(source, extracted, model, max_blocks, seconds, flags, ipc_stubs, runtime, error, sizeof error);
+        int status = play_game(source, extracted, model, max_blocks, seconds, frames, headless, shot, flags, ipc_stubs,
+                               runtime, asked, error, sizeof error);
         snx_ctr_source_close(source);
         free(extracted);
         return status;
@@ -409,8 +441,8 @@ static int play(const char* input, SnxCtrSource* source, char* extracted, SnxCtr
         free(extracted);
         return 0;
     }
-    int status =
-        snx_ctr_aot_run(extracted, NULL, model, max_blocks, seconds, flags, ipc_stubs, runtime, error, sizeof error);
+    int status = snx_ctr_aot_run(extracted, NULL, model, max_blocks, seconds, frames, headless, shot, flags, ipc_stubs,
+                                 runtime, asked, error, sizeof error);
     free(extracted);
     if (status) fprintf(stderr, "scarletnx-3ds: %s\n", error);
     return status;
@@ -438,8 +470,9 @@ bool snx_ctr_title_name(const char* path) {
    makes its games (snx_recompiled_game, which an older version's games/ still serves). Resolved, NULL with a line saying
    why */
 /* What the game's .ini (<folder>/<title ID>.ini) says: the game it plays (source=), *source the caller's, NULL
-   without one, and the console (model=), *model kept without one. False only when it cannot be read */
-static bool read_game_ini(const char* folder, char** source, SnxCtrModel* model) {
+   without one, and the console (model=), *model kept without one, *named (when given) whether it names one. False
+   only when it cannot be read */
+static bool read_game_ini_model(const char* folder, char** source, SnxCtrModel* model, bool* named) {
     char *path = snx_ctr_game_file(folder, ".ini"), *key, *value;
     size_t size;
     char* text = path ? (char*)snx_read_file(path, &size) : NULL;
@@ -451,11 +484,29 @@ static bool read_game_ini(const char* folder, char** source, SnxCtrModel* model)
         if (!strcmp(key, "source") && *value) {
             free(*source);
             *source = snx_strdup(value);
-        } else if (!strcmp(key, "model") && (!strcmp(value, "old") || !strcmp(value, "new")))
+        } else if (!strcmp(key, "model") && (!strcmp(value, "old") || !strcmp(value, "new"))) {
             *model = !strcmp(value, "old") ? SNX_CTR_OLD : SNX_CTR_NEW;
+            if (named) *named = true;
+        }
     free(text);
     free(path);
     return read;
+}
+static bool read_game_ini(const char* folder, char** source, SnxCtrModel* model) {
+    return read_game_ini_model(folder, source, model, NULL);
+}
+/* The console a game played for the first time runs on, when --model names none: a New 3DS for a title its icon data
+   marks New 3DS exclusive, which an Old 3DS refuses, or whose ExHeader asks for the 178 MiB memory mode, which only a
+   New 3DS has; else an Old 3DS. *why says what asked for a New 3DS, NULL for an Old 3DS */
+static SnxCtrModel model_of(const SnxCtrSource* source, const char** why) {
+    uint64_t size = 0;
+    const unsigned char* icon = snx_ctr_source_exefs(source, "icon", &size);
+    *why = NULL;
+    if (icon && snx_ctr_smdh_new3ds_only(icon, (size_t)size))
+        *why = "its icon data marks it a New 3DS exclusive";
+    else if (snx_ctr_exheader_new3ds_memory(snx_ctr_source_exheader(source)))
+        *why = "its ExHeader asks for the New 3DS's 178 MiB memory mode";
+    return *why ? SNX_CTR_NEW : SNX_CTR_OLD;
 }
 /* whether a line of the game's .ini sets one of the keys this file writes, which the new values replace */
 static bool game_ini_own_line(const char* line, size_t n) {
@@ -660,8 +711,9 @@ static char* own_game(const char* argv0) {
    the folder holds, else the game itself read where it lies, with the update and DLCs its addons= checks. runtime is
    owned too */
 static int play_folder(char* folder, SnxCtrModel model, bool model_set, const char* repo, const char* argv0,
-                       const char* keys, uint64_t max_blocks, double seconds, bool recompile, bool extract_only,
-                       bool extract_container, uint32_t ipc_stubs, char* runtime) {
+                       const char* keys, uint64_t max_blocks, double seconds, uint64_t frames, bool headless,
+                       const char* shot, bool recompile, bool extract_only, bool extract_container, uint32_t ipc_stubs,
+                       char* runtime, const SnxCliRecompile* asked) {
     SnxCtrSource* source = NULL;
     char error[512];
     int status;
@@ -694,16 +746,15 @@ static int play_folder(char* folder, SnxCtrModel model, bool model_set, const ch
         free(work);
         int decrypted = where ? readable_game(named, where, keys, &readable) : 1;
         free(where);
-        if (decrypted != 1) {
+        if (decrypted) {
             free(named);
-            if (decrypted) {
-                free(readable);
-                free(runtime);
-                free(folder);
-                return decrypted;
-            }
-            named = readable;
+            free(readable);
+            free(runtime);
+            free(folder);
+            return decrypted == 3 ? 3 : 1;
         }
+        free(named);
+        named = readable;
         SnxCtrExtractResult opened = snx_ctr_source_open(named, &source, error, sizeof error);
         if (opened != SNX_CTR_EXTRACT_OK) {
             fprintf(stderr, "scarletnx-3ds: %s\n", error);
@@ -722,8 +773,8 @@ static int play_folder(char* folder, SnxCtrModel model, bool model_set, const ch
         }
     }
     if (extract_container) addons_unplayed(folder);
-    status = play(named, source, folder, model, max_blocks, seconds, recompile, extract_only, extract_container,
-                  ipc_stubs, runtime);
+    status = play(named, source, folder, model, max_blocks, seconds, frames, headless, shot, recompile, extract_only,
+                  extract_container, ipc_stubs, runtime, asked);
     free(named);
     free(runtime);
     return status;
@@ -738,7 +789,7 @@ int snx_ctr_main(int argc, char** argv) {
     snx_tool_console();
     setvbuf(stdout, NULL, _IOLBF, 0);
     /* SNX_3DS_UDS_PACKET_TRACE, which an older version read (docs/user/deprecations.md): "1" is still ctr_uds_trace=1 for
-       this version, under the command line's --ctr_uds_trace. Removed with tests/architecture.py's ENV_DEPRECATED
+       this version, under the command line's --ctr-uds-trace. Removed with tests/architecture.py's ENV_DEPRECATED
        row */
     const char* old_trace = getenv("SNX_3DS_UDS_PACKET_TRACE");
     if (old_trace && !strcmp(old_trace, "1")) g_settings.ctr_uds_trace = 1;
@@ -762,6 +813,10 @@ int snx_ctr_main(int argc, char** argv) {
             ini_read(ini_find(g_ctr_debug_ini, "ctr_script"), cli.value[SNX_CLI_SCRIPT]);
         else if (common == SNX_CLI_FULLSCREEN)
             ini_read(ini_find(g_display_ini, "fullscreen"), cli.fullscreen ? "1" : "0");
+        else if (common == SNX_CLI_OPT) /* the Switch's settings, as --aot-threads= is: the last given counts */
+            ini_read(ini_find(g_recompile_ini, "opt"), cli.value[SNX_CLI_OPT]);
+        else if (common == SNX_CLI_JOBS)
+            g_settings.aot_threads = cli.jobs;
         if (common) continue;
         if (!positional && !strcmp(arg, "--"))
             positional = true;
@@ -786,7 +841,7 @@ int snx_ctr_main(int argc, char** argv) {
         } else if (!positional && !strcmp(arg, "--ipc-stubs")) {
             if (++i == argc || !snx_ctr_ipc_stub_mask(argv[i], &ipc_stubs)) {
                 fputs("scarletnx-3ds: --ipc-stubs requires all or a comma list of srv, fs, apt, ptm, hid, gsp, cfg, "
-                      "dsp, system, am\n",
+                      "dsp, system, am, y2r, ldr, ir, irrst, mic, cam, csnd\n",
                       stderr);
                 snx_cli_free(&cli);
                 return 2;
@@ -801,11 +856,11 @@ int snx_ctr_main(int argc, char** argv) {
             model_set = true;
         } else if (!positional && !strncmp(arg, "--", 2) && strchr(arg, '=')) {
             /* a setting of the 3DS display or debug table (g_ctr_display_ini, g_ctr_debug_ini, in
-               src/nx/runtime/settings.txt), or one of the Switch's the 3DS takes too (snx_ctr_shared_setting),
-               --key=value. gamepad_map is the input's to read: its row's setter keeps the map for a Switch game's
-               pads */
+               src/nx/runtime/settings.txt), one of the Switch's the 3DS takes too (snx_ctr_shared_setting), or a
+               Vulkan extension's (vk_ext_*, g_vk_extensions_ini), --key=value, its key's _ a - or not. gamepad_map
+               is the input's to read: its row's setter keeps the map for a Switch game's pads */
             char key[64];
-            const char* value = ini_arg(arg, key, sizeof key);
+            const char* value = settings_arg(arg, key, sizeof key);
             const IniOpt* o = NULL;
             bool map = false;
             /* the recompile's threads, the Switch's setting: a value it does not take stops here, as there */
@@ -825,6 +880,8 @@ int snx_ctr_main(int argc, char** argv) {
                 if (!o && snx_ctr_shared_setting(key)) o = ini_find(g_backend_ini, key);
                 if (!o && snx_ctr_shared_setting(key)) o = ini_find(g_graphics_ini, key);
                 if (!o && snx_ctr_shared_setting(key)) o = ini_find(g_display_ini, key);
+                if (!o && snx_ctr_shared_setting(key)) o = ini_find(g_audio_ini, key);
+                if (!o) o = ini_find(g_vk_extensions_ini, key);
                 map = !strcmp(key, "gamepad_map");
             }
             if (map)
@@ -850,15 +907,28 @@ int snx_ctr_main(int argc, char** argv) {
     bool recompile = cli.flags & SNX_CLI_BIT(SNX_CLI_RECOMPILE);
     bool extract_container = cli.flags & SNX_CLI_BIT(SNX_CLI_EXTRACT_CONTAINER);
     double seconds = cli.seconds; /* 0: no time limit */
+    uint64_t frames = cli.frames >= 0 ? (uint64_t)cli.frames : UINT64_MAX; /* UINT64_MAX: no frame limit */
+    bool headless = cli.flags & SNX_CLI_BIT(SNX_CLI_HEADLESS);
+    const char* shot = cli.value[SNX_CLI_SHOT]; /* the last frame's PPM, NULL for none */
     const char* updates[MAX_UPDATES]; /* --update's files, an update's or a DLC's each */
     unsigned update_count = 0;
-    if (seconds) budget_set = true;
+    if (seconds || cli.frames >= 0) budget_set = true;
     if (cli.update_count > MAX_UPDATES) {
         fprintf(stderr, "scarletnx-3ds: --update is given %d times at most\n", MAX_UPDATES);
         snx_cli_free(&cli);
         return 2;
     }
     for (int u = 0; u < cli.update_count; ++u) updates[update_count++] = cli.updates[u];
+    /* the recompile's options, for the game's code, which --board-info, --icon and -x make none of */
+    SnxCliRecompile asked = snx_cli_recompile(&cli);
+    if (asked.given && (info || icon || extract_only)) {
+        fprintf(stderr, "scarletnx-3ds: %s is the recompile's, and %s compiles no code\n", asked.given,
+                info   ? "--board-info"
+                : icon ? "--icon"
+                       : "-x");
+        snx_cli_free(&cli);
+        return 2;
+    }
     if (icon_out && !icon) {
         fputs("scarletnx-3ds: --out needs --icon\n", stderr);
         usage(stderr);
@@ -869,7 +939,7 @@ int snx_ctr_main(int argc, char** argv) {
         int status = 2;
         const char* refused = NULL;
         if (input && icon_out && !info && !game && !recompile && !extract_container && !update_count && !output &&
-            !outdir && !budget_set && !ipc_stubs) {
+            !outdir && !budget_set && !ipc_stubs && !shot) {
             if (!visible_path(input) || !visible_path(icon_out))
                 fputs("scarletnx-3ds: input/output paths may not contain control characters\n", stderr);
             else if ((refused = !game_path(input)         ? "is not a game of this system"
@@ -894,16 +964,17 @@ int snx_ctr_main(int argc, char** argv) {
     if (old_trace)
         snx_error("SNX_3DS_UDS_PACKET_TRACE=%s is deprecated, %s: ctr_uds_trace=%d (docs/user/deprecations.md)", old_trace,
                   strcmp(old_trace, "1")     ? "and only 1 did anything"
-                  : g_settings.ctr_uds_trace ? "and this run reads it as --ctr_uds_trace=1"
+                  : g_settings.ctr_uds_trace ? "and this run reads it as --ctr-uds-trace=1"
                                              : "and the command line gives ctr_uds_trace first",
                   g_settings.ctr_uds_trace);
     /* the game's own copy of the runtime plays it, or --game= names it */
     char* folder = game ? snx_strdup(game) : input || info ? NULL : own_game(argv[0]);
     /* --ipc-stubs only changes a run: with an option that does not run the game it is a mistake to report */
-    if ((!input && !info && !folder) || (folder && (input || output || outdir || keys || update_count)) ||
+    if ((!input && !info && !folder) || (folder && (input || output || outdir || update_count)) ||
         (update_count && (info || output || extract_only || extract_container)) ||
-        (info && (input || extract_only || extract_container || recompile || output || outdir || budget_set)) ||
-        (extract_only && (budget_set || recompile)) || (recompile && budget_set) ||
+        (info && (input || folder || extract_only || extract_container || recompile || output || outdir || budget_set ||
+                  shot)) ||
+        (extract_only && (budget_set || recompile || shot)) || (recompile && (budget_set || shot)) ||
         (ipc_stubs && (info || extract_only || recompile))) {
         free(folder);
         usage(stderr);
@@ -932,9 +1003,15 @@ int snx_ctr_main(int argc, char** argv) {
     free(runtime_dir);
     SnxCtrSource* source = NULL;
     int status;
+    if ((game && !visible_path(game)) || (shot && !visible_path(shot))) {
+        fputs("scarletnx-3ds: input/output paths may not contain control characters\n", stderr);
+        free(runtime);
+        free(folder);
+        return 2;
+    }
     if (folder)
-        return play_folder(folder, model, model_set, repo, argv[0], keys, max_blocks, seconds, recompile, extract_only,
-                           extract_container, ipc_stubs, runtime);
+        return play_folder(folder, model, model_set, repo, argv[0], keys, max_blocks, seconds, frames, headless, shot,
+                           recompile, extract_only, extract_container, ipc_stubs, runtime, &asked);
     /* Do not let a host filename inject progress/launch banners into the GUI. */
     if (!visible_path(input) || (output && !visible_path(output)) || (outdir && !visible_path(outdir))) {
         fputs("scarletnx-3ds: input/output paths may not contain control characters\n", stderr);
@@ -1002,8 +1079,8 @@ int snx_ctr_main(int argc, char** argv) {
                     input, addon_word(of, title), title, name, folder, input);
         } else if (!record_addon(folder, name, title, version, input)) {
             free(named);
-            return play_folder(folder, model, model_set, repo, argv[0], keys, max_blocks, seconds, recompile,
-                               extract_only, extract_container, ipc_stubs, runtime);
+            return play_folder(folder, model, model_set, repo, argv[0], keys, max_blocks, seconds, frames, headless,
+                               shot, recompile, extract_only, extract_container, ipc_stubs, runtime, &asked);
         }
         free(named);
         free(folder);
@@ -1033,15 +1110,21 @@ int snx_ctr_main(int argc, char** argv) {
         if (folder) move_old_folder(old, folder);
     }
     free(old);
-    if (folder && !model_set) { /* the console the game was played on before, when --model names none */
+    if (folder && !model_set) {
+        /* the console the game was played on before, when --model names none; for its first run, the one it asks for */
         char* recorded = NULL;
-        (void)read_game_ini(folder, &recorded, &model);
+        bool named = false;
+        (void)read_game_ini_model(folder, &recorded, &model, &named);
         free(recorded);
+        const char* why = NULL;
+        if (!named) model = model_of(source, &why);
+        if (why) printf("Played on a New 3DS: %s (--model old to try an Old 3DS)\n", why);
     }
-    bool made = folder && !extract_only && !snx_is_link(folder) && !snx_mkdirs(folder);
+    bool ready = folder && !extract_only && !snx_is_link(folder) && !snx_mkdirs(folder);
     /* the folder names the game the player picked, not the decrypted copy an encrypted one leaves in the cache: a
-       launcher asks whether it already made a game from that dump, and the cache's path matches none */
-    if (!folder || (made && !write_game_ini(folder, input, model))) {
+       launcher asks whether it already made a game from that dump, and the cache's path matches none. The .ini is
+       written on every run, so a game played again from another dump, or with another model, records it */
+    if (!folder || (ready && !write_game_ini(folder, input, model))) {
         snx_ctr_source_close(source);
         free(folder);
         free(readable);
@@ -1085,8 +1168,8 @@ int snx_ctr_main(int argc, char** argv) {
         free(runtime);
         return status;
     }
-    status = play(readable, source, folder, model, max_blocks, seconds, recompile, extract_only, extract_container,
-                  ipc_stubs, runtime);
+    status = play(readable, source, folder, model, max_blocks, seconds, frames, headless, shot, recompile, extract_only,
+                  extract_container, ipc_stubs, runtime, &asked);
     free(readable);
     free(runtime);
     return status;

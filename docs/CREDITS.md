@@ -13,6 +13,8 @@ Generated modules include runtime ABI code. Game assets, keys and firmware are e
 | libvpx's VP9 test vectors (the WebM project's test data, downloaded for the `nvdec_vp9_*` tests, not shipped) | BSD-3-Clause |
 | libaom's AV1 test vectors (AOMedia's test data, downloaded for the `vulkan_video_av1` test, not shipped) | BSD-2-Clause, libaom's: the test data carries no licence of its own |
 | jsmolka's gba-tests (test ROMs, downloaded for the `agb_gba_*` tests, not shipped) | MIT |
+| DenSinH's FuzzARM (test ROMs, downloaded for the `agb_fuzzarm_*` tests, not shipped) | GPL-3.0 |
+| mGBA's test suite (its ROM, downloaded for the `agb_mgba_*` tests when SNX_TEST_AGB_MGBA_SUITE is on, not shipped) | MIT |
 | hactool / ConvertUTF (`src/nx/runtime/driver/hactool`, with ScarletNX's changes) | ISC / Unicode license |
 | yyjson (the MCP server's JSON and the GPU driver packages' meta.json) | MIT |
 | LibHac storage code, ported into hactool (`src/nx/runtime/driver/hactool/storage.c`) | MIT |
@@ -33,18 +35,22 @@ Generated modules include runtime ABI code. Game assets, keys and firmware are e
 | xxHash 0.8.4 (XXH3 and its x86 dispatcher, the renderer's content hashes: `src/nx/gpu/vk/xxh3.c`) | BSD-2-Clause |
 | Vulkan-Headers | Apache 2.0 |
 | volk | MIT |
+| AMD FidelityFX Super Resolution 2.2.1 (the DLSS evaluations of Switch 2 games) | MIT |
 | KosmicKrisp (Mesa's Vulkan driver on Metal, which the macOS app carries with `SNX_KOSMICKRISP`) | MIT |
 | The Vulkan Loader (the macOS app carries it for KosmicKrisp) | Apache 2.0 |
 | SDL3 | zlib |
 | The HD rumble amplitude steps of a Switch controller (`src/nx/runtime/platform/backend/gamepad.c`), from SDL3's `src/joystick/hidapi/SDL_hidapi_switch.c`, Copyright (C) 1997-2026 Sam Lantinga, after dekuNukem's Nintendo_Switch_Reverse_Engineering `rumble_data_table.md` | zlib |
 | The AppImage's runtime (uruntime) and launcher (sharun, with Anylinux-sharun's `anylinux.so` and cross-libc-dlopen) | MIT |
 | Tracy (the profiler client, built only with `SNX_TRACY`) | BSD-3-Clause |
+| [CPMUtil](https://git.crueter.xyz/CMake/CPMUtil), crueter's, with its trimmed CPM.cmake (`cmake/cpmutil`, as Eden carries them, with four changes of ours: the configure fetches the third-party packages through it, not shipped) | LGPL-3.0-or-later ([text](../cmake/cpmutil/LICENSE)), CPM.cmake's MIT (in `cmake/cpmutil/CPM.cmake`) |
 | ENet / zstd (an Eden room's connection and its datagrams, `src/common/network/net_room.c`) | MIT / BSD-3-Clause |
 | miniz 3.1.2 (the zip around the launcher's Share Log, `src/gui/logzip.c`) | MIT |
 | libdeflate 1.26 (every deflate: Share Log's, the Vita driver's VPKs and eboot segments, the Android driver's APKs) | MIT |
 | HarfBuzz 15.0.0 (the Android driver's text shaping, `src/android/hwui/text.c`) | MIT ("Old MIT") |
 | SQLite 3.54.1 (the Android driver's `android.database.sqlite`, `src/android/db/sqlite_jni.c`) | Public domain |
 | OpenJDK (the JVM that the Android driver loads at run time from the installed JDK, not shipped) | GPL-2.0 with the Classpath Exception |
+| RNNoise 0.1.1 (the microphone's neural noise reduction, `src/nx/runtime/platform/audio_denoise.c`: its sources and model, 87503 weights of a byte, fetched by `cmake/dependencies.cmake` and built in) | BSD-3-Clause |
+| Speex DSP's preprocessor (the microphone's spectral noise reduction, `src/nx/runtime/platform/audio_denoise.c`, loaded at run time from the system's libspeexdsp, not shipped) | BSD-3-Clause |
 | lunasvg / plutovg (the splash's SVGs and the user's picture) | MIT / MIT, with FreeType's rasterizer and stroker (FreeType License) and stb (MIT or public domain) |
 | GUI menu icons (`src/gui/icons.hex`), drawn after Lucide 1.61.0's (some derived from Feather) | GPL-3.0-or-later, after Lucide's ISC and Feather's MIT (in `src/gui/FONT-NOTICE.txt`) |
 | GUI VGA BIOS font (SeaBIOS `vgafont16`, originally Joseph Gil's font collection) | Public domain |
@@ -84,11 +90,14 @@ a source keep that source's copyright lines and license, most with the revision 
 | `src/nx/runtime/nce/nce_patch.c` (the instructions that NCE patches, and the ordered forms of the exclusives) | Eden and yuzu (`src/core/arm/nce/patcher.cpp`, `instructions.h`) | GPL-3.0-or-later, GPL-2.0-or-later |
 | `src/3ds/gpu/shader.c`, `shader.h` and `pica.decode` (the opcodes, the instruction formats and their fields) | nihstro | BSD-3-Clause |
 | `src/agb/` (the board and its memory, the APU, the PPU, the HLE BIOS, the cartridge and the runner: the files whose header names the mGBA contributors) | mGBA | MPL-2.0 |
+| `src/agb/cpu/timing.c` and `src/agb/board/timers.c` (the bus accesses of each ARM7TDMI instruction and their order, the cartridge's prefetch unit, when a timer takes a write and where it starts counting; altered into C, the notice in the files) | NanoBoyAdvance's `ARM7TDMI.hh`, `Bus/Timing.cc` and `Timer/Timer.cc` (commit `2da64af`) | BSD-2-Clause |
+| `src/nds/` (the files whose header names the melonDS team: the geometry engine `gpu/gpu3d.c`, how the 3D picture is drawn `gpu/vk/render3d.c` with its shaders, the 2D engines' rules in `gpu/vk/shaders/compose.comp`, the texture formats in `shaders/texture.glsl`, the ARM7's services `hle/pxi.c`, the sound driver `hle/sound.c`, the sound hardware `audio/spu.c`; [its page](platforms/nds/README.md#source-provenance-and-licensing) names each file's source) | melonDS at `497aa6c`, and its `melonHLE` branch at `b42e2f4` (`HLE_Retail/IPC.cpp`, `Sound_Nitro.cpp`); original code copyright 2016 to 2026 melonDS team | GPL-3.0-or-later |
 | `src/common/cpu/` (the recompiler's instruction semantics: `recompiler/llvm/ir_int.c`, `ir_ldst.c`, `ir_fpu.c`, `ir_vec.c`, `ir_vec_fp.c` and `ir_vec_crypto.c`, the integer, branch, system, load/store, scalar floating-point and AdvSIMD emitters ported from `translate-a64.c`'s `trans_*` functions, `gengvec.c`, `vec_helper.c` and `translate.c`'s `asimd_imm_const`, and the A32/T32 block compiler) | QEMU's `target/arm/tcg/` | LGPL-2.1-or-later |
 | `src/common/cpu/aarch64/decode/a64.decode` (the A64 encodings, unmodified, from commit `a19f59a`, which `tools/decodetree` generates the decoder from; [README](../src/common/cpu/aarch64/decode/README.md)) | QEMU's `target/arm/tcg/a64.decode` | LGPL-2.1-or-later |
 | `src/common/cpu/arm/decode/` (`a32.decode`, `a32-uncond.decode`, `t32.decode`, `t16.decode`: the A32, T32 and T16 encodings, unmodified, from commit `a19f59a`, which `tools/decodetree` generates the decoders from; [README](../src/common/cpu/arm/decode/README.md)) and `src/common/cpu/arm/decodetree.h` (the decoders' `!function=` helpers) | QEMU's `target/arm/tcg/` (`*.decode`, `translate.c`) | LGPL-2.1-or-later |
 | `tools/decodetree/decodetree.c` (the `.decode` language, its parse, the decode tree and the generated C) | QEMU's `scripts/decodetree.py` | LGPL-2.1-or-later |
 | `src/common/utilities/decodetree.h` (the bit operations that the generated decoders call) | QEMU's `include/qemu/bitops.h` | LGPL-2.1-or-later |
+| `snx_arm_multiply_carry` in `src/common/cpu/arm/rt_helpers.c` (the ARM7TDMI's C after a multiply, from its Booth multiplier; altered into C, the notice in the file) | zaydlang's and calc84maniac's rule (2024), as NanoBoyAdvance's `ARM7TDMI.hh` carries it | zlib |
 | `src/common/cpu/aarch64/` (`cpu.h`, `cpu_helpers.c` and `helpers/`, the generated code's FP, SIMD, integer and crypto helpers) | QEMU's `target/arm/` and its softfloat, with the SoftFloat-2a notice | LGPL-2.1-or-later, SoftFloat-2a, BSD |
 | `src/common/cpu/aarch64/helpers/vector.c` (the SM4 S-box, GB/T 32907-2016's table) | OpenSSL's `crypto/sm4/sm4.c` | Apache 2.0 |
 | `src/nx/gpu/gpu.c` (the block linear offset), the Maxwell front end in `src/nx/gpu/maxwell/` (the 3D, compute, DMA, 2D and inline-to-memory engines, their register layouts, and the macro interpreter `mme.c`) with the GPFIFO puller's `src/nx/gpu/pushbuffer.h`, the registers' translation into the draw state in `src/nx/gpu/maxwell/draw_state.c`, and the DMA and 2D engines' CPU references in `tests/support/dma_ref.c` and `fermi2d_ref.c` | Eden and yuzu (`video_core/textures/decoders.cpp`, `dma_pusher.h`, `macro.cpp`, `engines/`: `maxwell_3d.cpp`, `draw_manager.cpp`, `kepler_compute.cpp`, `kepler_memory.cpp`, `engine_upload.h`, `puller.h`, `fermi_2d.cpp`, `maxwell_dma.cpp`, `sw_blitter/`) | GPL-3.0-or-later, GPL-2.0-or-later |
@@ -149,3 +158,4 @@ The ScarletNX-to-ScarletNX room transport is separate from Azahar's room protoco
 - [Azahar](https://github.com/azahar-emu/azahar) and Citra, for all of the 3DS emulation.
 - [Vita3K](https://github.com/Vita3K/Vita3K), for the PS Vita's GXM and shader translation, and [vita-headers](https://github.com/vitasdk/vita-headers) for its NIDs.
 - [mGBA](https://github.com/mgba-emu/mgba) as a direct reference for the AGB board.
+- [Cemu](https://github.com/cemu-project/Cemu), whose shader-set cache ([cemu-project/Cemu#1968](https://github.com/cemu-project/Cemu/pull/1968)) led to the batched check of the constant buffer words that a translation folds (`src/nx/gpu/vk/cb_fold.c`). No code was taken.

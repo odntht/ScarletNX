@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 #include <stdlib.h>
+#include "common/utilities/bits.h"
 #include "nx/gpu/vk/pending_pages.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/runtime/platform/log.h"
@@ -67,13 +68,37 @@ static void leaves_add(PendLeaf** leaf, u64 first, u64 last, int delta) {
         PendLeaf* l = leaf[li];
         if (!l && !(l = leaf[li] = calloc(1, sizeof *l))) fatal("vulkan: out of memory for pending result pages");
         i64 pages = 0;
-        for (u32 i = (u32)(p % LEAF_PAGES), e = (u32)(stop % LEAF_PAGES); i <= e; i++) {
+        for (u32 i = (u32)(p % LEAF_PAGES), e = (u32)(stop % LEAF_PAGES); i <= e;) {
+            if (!(i & 63u) && i + 63u <= e) {
+                /* a whole group of 64 pages: the counts in one pass the compiler vectorizes, the group's bits (a page
+                   with a count) from the counts after it, and the pages that gained or lost one from the bits. Page
+                   by page, one game's 16 MiB windows of storage written in place (4096 pages each, about 500 a
+                   present, in four tables, added and taken away) made this half of its GPU thread */
+                u32* c = &l->count[i];
+                const u64 was = l->group[i / 64];
+                u64 now = ~0ull;
+                if (delta > 0)
+                    for (u32 k = 0; k < 64; k++) c[k] += (u32)delta;
+                else {
+                    u64 zero = 0;
+                    for (u32 k = 0; k < 64; k++) {
+                        c[k] += (u32)delta;
+                        zero |= (u64)(c[k] == 0) << k;
+                    }
+                    now = ~zero;
+                }
+                l->group[i / 64] = now;
+                pages += (i64)snx_popcount64(now) - (i64)snx_popcount64(was);
+                i += 64;
+                continue;
+            }
             const u32 before = l->count[i], v = (u32)((i64)before + delta);
             l->count[i] = v;
             if (!before != !v) {
                 l->group[i / 64] ^= 1ull << (i & 63u);
                 pages += v ? 1 : -1;
             }
+            i++;
         }
         l->pages = (u32)((i64)l->pages + pages);
         p = stop + 1;
@@ -224,11 +249,16 @@ int pend_hit_guest(const PendPages* t, u64 a, u64 size) {
 /* GPU pages from gva on show guest pages from cpu on now: each takes their count */
 static void remap_piece(void* ctx, u64 gva, u64 cpu, u64 n) {
     PendPages* t = ctx;
+    int gained = 0;
     for (u64 k = 0; k < n >> 12; k++) {
         u64 c = (cpu >> 12) + k;
         u32 v = c < TABLE_PAGES ? leaf_count(t->leaf, c) : 0;
         if (v) leaf_set(t->gpu, (gva >> 12) + k, v);
+        gained |= v != 0;
     }
+    /* a GPU page that shows a counted guest page now is one more that a lookup by GPU address meets: what kept a
+       miss while adds stayed the same checks again */
+    count_add(t, gained);
 }
 void pend_remap(u64 gva, u64 size) {
     u64 r[4];

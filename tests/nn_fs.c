@@ -6,10 +6,21 @@
    any other; and a system archive mounted by its data id, with the cache size its tables need. Then a file of that
    archive opened, read and closed by a 64-bit game and by a 32-bit one through its table's adapters (fs.hook's a32):
    the handle and the bytes read take 8 bytes of the game's memory in the first and 4 in the second, and a handle
-   the SDK made goes back to the SDK's own code in both. A file's time stamps on a save's mount, and MountHost's
-   refusal in both games */
+   the SDK made goes back to the SDK's own code in both. A file's time stamps on a save's mount, MountHost's
+   refusal in both games, and IsMounted, which a native mount answers. The RomFS of the program at an index: this
+   program's, answered natively, and with "other-program" the stop for another program's. Commit of several mounts,
+   and with "commit-null" and "commit-eleven" its stops on no array and on more than 10 mounts. A file handle's low
+   bits, which a game may use as a pointer's and mask off, and with "handle-flags" the stop for a handle passed with
+   them. A file's data cache on each kind of mount, and with "cache-null", "cache-small" and "cache-path" the stops on
+   no buffer, a buffer smaller than the file and a path Disable cannot take. A save's Restore flag, clear on the
+   device's save, and with "restore-null", "restore-account" and "restore-card" the stops on no place for it and on a
+   mount with no save attribute, an account's save and the SD card. The SD card under MountSdCardForDebug's name, in
+   both games, after which a folder made on it is native. With "unmount-save", "unmount-rom" and "unmount-dir", the
+   stop of Unmount with files or directories open on the mount: each one logged with its path, then FileNotClosed, or
+   DirectoryNotClosed when only directories are open */
 #include "nx/nn/fs.c"
 #include "hle/hook/hooks.hook.inc" /* fs.hook's table, and a 32-bit game's */
+#include <stdarg.h>
 #include <stdio.h>
 
 static unsigned checks;
@@ -52,15 +63,17 @@ static int image_read(const u8* b, u64 off, void* dst, u64 size) {
 /* ---- the file server's core (fs.h), as far as these checks reach it */
 int romfs_peek(u64 off, void* dst, u64 size) { return image_read(game_image, off, dst, size); }
 int romfs_read_guest(u64 off, u64 addr, u64 size) { return image_read(game_image, off, mem + addr, size); }
-/* the reads the native ReadFile hands to fs.c's read pacing: how many, and the last one's storage and range */
+/* the reads the native ReadFile hands to fs.c's read pacing: how many, and the last one's storage and range; each
+   waits pace_wait ns */
 static unsigned paced;
 static const void* paced_storage;
-static u64 paced_off, paced_size;
-void fs_pace_read(const void* storage, u64 off, u64 sz) {
+static u64 paced_off, paced_size, pace_wait;
+u64 fs_pace_read(const void* storage, u64 off, u64 sz) {
     paced++;
     paced_storage = storage;
     paced_off = off;
     paced_size = sz;
+    return pace_wait;
 }
 static unsigned storages_open;
 u32 fs_storage_open(u64 data_id, FsStorage* out) {
@@ -117,8 +130,16 @@ u32 fs_save_commit(FsNode* work, int noted) {
     return commit_result;
 }
 void fs_root_commit(FsNode* root, int noted) { committed = root, committed_noted = noted, committed_journaled = 0; }
+/* the last folder made: its root and path */
+static FsNode* made_root;
+static char made_path[PATH_MAX_LEN + 1];
 u32 fs_root_create(FsNode* root, const char* path, i64 size, int dir) {
-    return (void)root, (void)path, (void)size, (void)dir, FSR(1);
+    if (dir) {
+        made_root = root;
+        snprintf(made_path, sizeof made_path, "%s", path);
+        return 0;
+    }
+    return (void)size, FSR(1);
 }
 u32 fs_root_remove(FsNode* root, const char* path, int dir, int recursive, int clean) {
     return (void)root, (void)path, (void)dir, (void)recursive, (void)clean, FSR(1);
@@ -135,10 +156,18 @@ u32 fs_root_time_stamp(FsNode* root, const char* path, u64* seconds) {
     return 0;
 }
 i64 fs_root_space(int total) { return (void)total, 0; }
+/* a save's file and the card's: /five, of 5 bytes, on either root, opened to read; nothing else is there. The opens
+   and closes are counted. Its parent is the save's root once a check needs its path */
+static char name_five[] = "five", name_folder[] = "folder", name_inner[] = "inner";
+static FsNode five = {.name = name_five, .size = 5};
+static unsigned files_open;
 u32 fs_file_open(FsNode* root, const char* path, u32 mode, FileData* out) {
-    return (void)root, (void)path, (void)mode, (void)out, FSR(1);
+    if ((root != save_root && root != sd_root) || strcmp(path, "/five") || mode != 1) return FSR(1);
+    *out = (FileData){.node = &five, .mode = mode};
+    files_open++;
+    return 0;
 }
-void fs_file_close(FileData* f) { (void)f; }
+void fs_file_close(FileData* f) { files_open -= f->node == &five; }
 u32 fs_file_flush(FileData* f) { return (void)f, 0; }
 u32 fs_file_read(FileData* f, u64 off, u64 addr, u64 size, u64* n) {
     return (void)f, (void)off, (void)addr, (void)size, (void)n, FSR(1);
@@ -147,8 +176,12 @@ u32 fs_file_write(FileData* f, u32 option, u64 off, u64 addr, u64 size) {
     return (void)f, (void)option, (void)off, (void)addr, (void)size, FSR(1);
 }
 u32 fs_file_set_size(FileData* f, i64 size) { return (void)f, (void)size, FSR(1); }
+/* a save's directory, /folder/inner, which is the one there; folder's parent is the save's root as five's is */
+static FsNode folder = {.name = name_folder, .is_dir = 1}, inner = {.name = name_inner, .parent = &folder, .is_dir = 1};
 u32 fs_dir_open(FsNode* root, const char* path, u32 mode, DirData* out) {
-    return (void)root, (void)path, (void)mode, (void)out, FSR(1);
+    if (root != save_root || strcmp(path, "/folder/inner")) return FSR(1);
+    *out = (DirData){.node = &inner, .filter = mode & 3};
+    return 0;
 }
 void fs_dir_close(DirData* d) { (void)d; }
 u64 fs_dir_count(const DirData* d) { return (void)d, 0; }
@@ -168,18 +201,55 @@ int snx_utf8_valid(const char* text, size_t n, char* hex, size_t hex_size) {
 void pm_init(PMutex* m) { (void)m; }
 void pm_lock(PMutex* m) { (void)m; }
 void pm_unlock(PMutex* m) { (void)m; }
-void logf_(int lvl, const char* fmt, ...) { (void)lvl, (void)fmt; }
+/* the log, on stderr once a check sets log_shown: the lines a stop logs first are part of what it says */
+static int log_shown;
+void logf_(int lvl, const char* fmt, ...) {
+    va_list ap;
+    (void)lvl;
+    if (!log_shown) return;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+/* the kernel's core and the platform's sleep, as a paced read waits: the sleeps, how many of them the thread spent off
+   its core, and whether it holds its core now */
+static KThread self;
+static int off_core;
+static unsigned slept, slept_off_core, core_misuse;
+static u64 slept_ns;
+KThread* kthread_cur(void) { return &self; }
+void core_leave(KThread* t) {
+    core_misuse += t != &self || off_core;
+    off_core = 1;
+}
+void core_enter(KThread* t) {
+    core_misuse += t != &self || !off_core;
+    off_core = 0;
+}
+void plat_sleep_ns(int64_t ns) {
+    slept++;
+    slept_off_core += off_core;
+    slept_ns = (u64)ns;
+}
 void fatal(const char* fmt, ...) {
-    fprintf(stderr, "fatal: %s\n", fmt);
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("fatal: ", stderr);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
     exit(1);
 }
+int g_program; /* main.c's: the game's own program unless a check says another */
 
-/* ---- hook.c's: each function is hooked somewhere, and the SDK's own code answers 0x77, counted by its symbol */
+/* ---- hook.c's: each function is hooked somewhere, and the SDK's own code answers own_answer (0x77 unless a check
+   sets another), counted by its symbol */
 static unsigned own_runs;
+static u64 own_answer = 0x77;
 static char own_symbol[96];
-static const char* site_symbol[12];
+static const char* site_symbol[16];
 u64 hook_site(const char* symbol) {
-    for (u64 i = 0; i < 12; i++) {
+    for (u64 i = 0; i < 16; i++) {
         if (!site_symbol[i]) site_symbol[i] = symbol;
         if (site_symbol[i] == symbol || !strcmp(site_symbol[i], symbol)) return 0x1000 + 4 * i;
     }
@@ -188,7 +258,7 @@ u64 hook_site(const char* symbol) {
 void hook_run_original(CPU* c, u64 addr) {
     own_runs++;
     snprintf(own_symbol, sizeof own_symbol, "%s", site_symbol[(addr - 0x1000) / 4]);
-    c->x[0] = 0x77;
+    c->x[0] = own_answer;
 }
 static int own(const char* symbol, unsigned runs) { return own_runs == runs && !strcmp(own_symbol, symbol); }
 /* a 32-bit game's: the own code of the function its thread is in, which answers 0x78 */
@@ -234,20 +304,108 @@ static void image_with_file(u8* b) {
     memcpy(b + files + 0x24, "hello", 5);
 }
 
+/* the archive's image with a folder, /d, that holds one file, /d/f, of the five bytes "hello" */
+static void image_with_folder(u8* b) {
+    u64 dirs = 0x54, file_hash = dirs + 0x34, files = file_hash + 4, data = files + 0x24;
+    u8 *d = b + dirs, *f = b + files;
+    memset(b, 0, 0x100);
+    snx_st_le64(b, 0x50);
+    snx_st_le64(b + 0x08, 0x50), snx_st_le64(b + 0x10, 4);
+    snx_st_le64(b + 0x18, dirs), snx_st_le64(b + 0x20, 0x34);
+    snx_st_le64(b + 0x28, file_hash), snx_st_le64(b + 0x30, 4);
+    snx_st_le64(b + 0x38, files), snx_st_le64(b + 0x40, 0x24);
+    snx_st_le64(b + 0x48, data);
+    memset(b + 0x50, 0xff, 4), memset(b + file_hash, 0xff, 4); /* empty buckets */
+    /* the root: its own parent, no sibling, the child /d at 0x18, no file; then /d, in the root, the file at 0 */
+    snx_st_le32(d, 0), snx_st_le32(d + 4, ROM_NONE), snx_st_le32(d + 8, 0x18), snx_st_le32(d + 12, ROM_NONE);
+    snx_st_le32(d + 16, ROM_NONE), snx_st_le32(d + 20, 0);
+    snx_st_le32(d + 24, 0), snx_st_le32(d + 28, ROM_NONE), snx_st_le32(d + 32, ROM_NONE), snx_st_le32(d + 36, 0);
+    snx_st_le32(d + 40, ROM_NONE), snx_st_le32(d + 44, 1);
+    memcpy(d + 48, "d\0\0\0", 4);
+    snx_st_le32(f, 0x18), snx_st_le32(f + 4, ROM_NONE);
+    snx_st_le64(f + 8, 0), snx_st_le64(f + 16, 5);
+    snx_st_le32(f + 24, ROM_NONE), snx_st_le32(f + 28, 1);
+    memcpy(f + 32, "f\0\0\0", 4);
+    memcpy(b + data, "hello", 5);
+}
+
 #define NAME  0x100u /* a mount name */
 #define PATH  0x140u /* a path */
 #define RESULT   0x200u /* a result's place, 0xee before each call */
 #define HAS_AT   0x220u
 #define CACHE 0x400u
+#define NAMES    0x700u /* an array of mount names */
+#define OTHER    0x740u /* a mount name the native layer does not know */
 static void text(u32 at, const char* s) { strcpy((char*)mem + at, s); }
 static void outs(void) { memset(mem + RESULT, 0xee, 0x40); }
 
-int main(void) {
+/* Unmount with entries open on the mount, each case one: "save" a save's file and folder, while the archive's mount
+   has a file open that is not the save's to name; "rom" the archive's file in its folder, the folder and the root;
+   "dir" only the folder, after its file was opened and closed */
+static void unmount_open(CPU* c, const char* which) {
+    image_with_folder(data_image_bytes);
+    text(NAME, "ng");
+    CHECK(nnfs_mount_system_data(c, NAME, SYSTEM_ID, CACHE, 0x100) == 0);
+    text(PATH, "ng:/d/f");
+    CHECK(nnfs_open_file(c, RESULT, PATH, 1) == 0);
+    if (!strcmp(which, "save")) {
+        save_given = 0;
+        five.parent = folder.parent = save_root;
+        text(NAME, "save");
+        CHECK(nnfs_mount_save_data(c, NAME, CACHE) == 0);
+        text(PATH, "save:/five");
+        CHECK(nnfs_open_file(c, RESULT, PATH, 1) == 0);
+        text(PATH, "save:/folder/inner");
+        CHECK(nnfs_open_directory(c, RESULT, PATH, 3) == 0);
+    } else if (!strcmp(which, "rom")) {
+        text(PATH, "ng:/d");
+        CHECK(nnfs_open_directory(c, RESULT, PATH, 3) == 0);
+        text(PATH, "ng:/");
+        CHECK(nnfs_open_directory(c, RESULT, PATH, 1) == 0);
+    } else {
+        nnfs_close_file(c, snx_ld_le64(mem + RESULT));
+        text(PATH, "ng:/d");
+        CHECK(nnfs_open_directory(c, RESULT, PATH, 2) == 0);
+    }
+    log_shown = 1;
+    nnfs_unmount(c, NAME);
+}
+
+int main(int argc, char** argv) {
     CPU* c = &cpu;
     cpu.mem = mem;
     nnfs_init();
     image(game_image, 4);
     image(data_image_bytes, 12);
+    /* the stops: the RomFS of a program that is not this one, a Commit of no array or of 11 mounts; handle-flags's
+       comes once a file is open, below */
+    if (argc > 1 && strcmp(argv[1], "handle-flags")) {
+        if (!strcmp(argv[1], "other-program")) nnfs_query_mount_rom_cache_size_program(c, RESULT, 1);
+        if (!strcmp(argv[1], "commit-null")) nnfs_commit_names(c, 0, 1);
+        if (!strcmp(argv[1], "commit-eleven")) nnfs_commit_names(c, NAMES, 11);
+        if (!strncmp(argv[1], "cache-", 6)) { /* on a system archive's file of 5 bytes */
+            image_with_file(data_image_bytes);
+            text(NAME, "ng");
+            text(PATH, "ng:/a");
+            CHECK(nnfs_mount_system_data(c, NAME, SYSTEM_ID, CACHE, 0x100) == 0);
+            if (!strcmp(argv[1], "cache-null")) nnfs_enable_individual_file_data_cache(c, PATH, 0, 5);
+            if (!strcmp(argv[1], "cache-small")) nnfs_enable_individual_file_data_cache(c, PATH, CACHE, 4);
+            text(PATH, "ng:/../a");
+            if (!strcmp(argv[1], "cache-path")) nnfs_disable_individual_file_data_cache(c, PATH);
+        }
+        /* the device's save asked with no place for the flag, or another mount asked */
+        if (!strncmp(argv[1], "restore-", 8)) {
+            text(NAME, "mnt");
+            save_given = 1, sd_there = 1;
+            if (!strcmp(argv[1], "restore-null")) CHECK(nnfs_mount_device_save_data(c, NAME) == 0);
+            if (!strcmp(argv[1], "restore-account")) CHECK(nnfs_mount_save_data(c, NAME, CACHE) == 0);
+            if (!strcmp(argv[1], "restore-card")) CHECK(nnfs_mount_sd_card(c, NAME) == 0);
+            nnfs_get_save_data_restore_flag(c, strcmp(argv[1], "restore-null") ? RESULT : 0, NAME);
+        }
+        if (!strncmp(argv[1], "unmount-", 8)) unmount_open(c, argv[1] + 8);
+        printf("nn_fs: %s was answered\n", argv[1]);
+        return 1;
+    }
 
     /* a commit of a native mount goes to the core as fs_save_root opened the save: a journaled save's to fs_save_commit,
        whose Result is the function's (WriteModeFileNotClosed, desc 6457, one the SDK stops on), and one whose files
@@ -261,6 +419,27 @@ int main(void) {
     commit_result = FSR(1);
     CHECK(nnfs_commit(c, NAME) == FSR(1) && abort_needed(FSR(6457)) && !abort_needed(FSR(1)));
     commit_result = 0;
+    /* several mounts committed at once, through fs.hook's table: each native one as Commit commits it, its Result the
+       call's; none for a count of 0; a name the native layer did not mount runs the SDK's own code for all of them */
+    {
+        u32 versions[HOOK_KEYS] = {0};
+        int first, k = hook_select(&hook_table, SYM_COMMIT_NAMES, versions, &first);
+        CHECK(k >= 0 && !strcmp(hook_handler[k], "nnfs_commit_names"));
+        text(OTHER, "other");
+        snx_st_le64(mem + NAMES, NAME), snx_st_le64(mem + NAMES + 8, OTHER);
+        committed = NULL;
+        c->x[0] = NAMES, c->x[1] = 1, c->x[30] = 0x9000, c->pc = 0;
+        hook_fn[k](c, 0);
+        CHECK(c->x[0] == 0 && c->pc == 0x9000 && committed == save_root && committed_journaled);
+        committed = NULL;
+        CHECK(nnfs_commit_names(c, NAMES, 0) == 0 && committed == NULL);
+        commit_result = FSR(1);
+        CHECK(nnfs_commit_names(c, NAMES, 1) == FSR(1));
+        commit_result = 0;
+        committed = NULL;
+        CHECK(nnfs_commit_names(c, NAMES, 2) == 0x77 && own(SYM_COMMIT_NAMES, 1) && committed == NULL);
+        own_runs = 0; /* the counts below are of their own calls */
+    }
     nnfs_unmount(c, NAME);
     save_given = 0;
     CHECK(nnfs_mount_cache_storage(c, NAME) == 0);
@@ -318,6 +497,34 @@ int main(void) {
     CHECK(storages_open == 0);
     CHECK(nnfs_is_path_mounted(c, PATH) == 1 && own_runs == 9); /* unmounted: the SDK's again */
 
+    /* the RomFS of the program at an index (the overloads with an int), through fs.hook's table: this program's, the
+       game's own (0) or a collection's other one (1), answered as the overloads without an index are, with nothing of
+       the SDK's run: the game's cache size, and its tables copied into the cache of a native mount */
+    {
+        u32 versions[HOOK_KEYS] = {0};
+        int first, query = hook_select(&hook_table, SYM_QUERY_ROM_PROGRAM, versions, &first),
+                   mount = hook_select(&hook_table, SYM_MOUNT_ROM_PROGRAM, versions, &first);
+        CHECK(query >= 0 && !strcmp(hook_handler[query], "nnfs_query_mount_rom_cache_size_program"));
+        CHECK(mount >= 0 && !strcmp(hook_handler[mount], "nnfs_mount_rom_program"));
+        for (int program = 0; program < 2; program++) {
+            g_program = program;
+            outs();
+            c->x[0] = RESULT, c->x[1] = (u64)program, c->x[30] = 0x9000, c->pc = 0;
+            hook_fn[query](c, 0);
+            CHECK(c->x[0] == 0 && c->pc == 0x9000 && snx_ld_le64(mem + RESULT) == 0x20 && mem[RESULT + 8] == 0xee);
+            text(NAME, "rom3");
+            memset(mem + CACHE, 0xee, 0x40);
+            c->x[0] = NAME, c->x[1] = (u64)program, c->x[2] = CACHE, c->x[3] = 0x20, c->x[30] = 0x9000, c->pc = 0;
+            hook_fn[mount](c, 0);
+            CHECK(c->x[0] == 0 && c->pc == 0x9000);
+            CHECK(!memcmp(mem + CACHE, game_image + 0x50, 0x20) && mem[CACHE + 0x20] == 0xee);
+            text(PATH, "rom3:/x");
+            CHECK(nnfs_is_path_mounted(c, PATH) == 1 && own_runs == 9);
+            nnfs_unmount(c, NAME);
+        }
+        g_program = 0;
+    }
+
     /* the device's save is asked of the file server as the save of type 3 that no user owns, an account's as type 1
        of its user; the server's answer (here: not there) is the function's */
     text(NAME, "dev");
@@ -339,13 +546,46 @@ int main(void) {
         CHECK(nnfs_read_file(c, RESULT, h, 1, 0x600, 16) == 0 && snx_ld_le64(mem + RESULT) == 4);
         CHECK(!memcmp(mem + 0x600, "ello", 4) && mem[RESULT + 8] == 0xee);
         /* the bytes read go to fs.c's read pacing, as the archive's own storage (not the game's RomFS) at their place
-           in its image */
+           in its image; one it doesn't time waits nothing and keeps the core */
         CHECK(paced == before + 1 && paced_size == 4 && paced_storage && paced_storage != (const void*)&g_hle.fs &&
               paced_off > 1);
+        CHECK(slept == 0 && !off_core && !core_misuse);
+        /* a timed one waits its time off the thread's core, as the console's storage read blocks the thread and its
+           core runs the others, and takes the core back */
+        pace_wait = 8192000;
+        CHECK(nnfs_read_file(c, RESULT, h, 1, 0x600, 16) == 0 && snx_ld_le64(mem + RESULT) == 4);
+        CHECK(paced == before + 2 && slept == 1 && slept_ns == pace_wait && slept_off_core == 1 && !off_core &&
+              !core_misuse);
+        pace_wait = 0;
+        before = paced;
         CHECK(nnfs_read_file(c, RESULT, 0x5000, 0, 0x600, 16) == 0x77 && own(SYM_READ_FILE, 10)); /* the SDK's */
-        CHECK(paced == before + 1); /* the SDK's own read is not timed here */
-        nnfs_close_file(c, h);
+        CHECK(paced == before); /* the SDK's own read is not timed here */
+        /* a handle keeps its low 4 bits clear, as the console's pointer does: a game that keeps flags there and masks
+           them off before CloseFile closes the file it opened, in every slot, so the mount has none left at Unmount */
+        u64 more[9];
+        more[0] = h;
+        for (int k = 1; k < 9; k++) {
+            CHECK(nnfs_open_file(c, RESULT, PATH, 1) == 0);
+            more[k] = snx_ld_le64(mem + RESULT);
+            CHECK(more[k] >> 63 && (more[k] & 0xf) == 0 && more[k] != more[k - 1]);
+        }
+        if (argc > 1 &&
+            !strcmp(argv[1], "handle-flags")) { /* a handle passed back with a flag of the game's: the stop */
+            nnfs_close_file(c, more[1] | 4);
+            puts("nn_fs: a handle with its low bits set was closed");
+            return 1;
+        }
+        for (int k = 8; k >= 0; k--) nnfs_close_file(c, (more[k] | 5) & ~(u64)7);
+        CHECK((LIST_HANDLE & 0xf) == 0);
     }
+    /* a file's data cache on a RomFS, which takes one: the file's size against the buffer's, the buffer left as it
+       was; a file that is not there, and a directory, give PathNotFound */
+    memset(mem + 0x600, 0xee, 16);
+    CHECK(nnfs_enable_individual_file_data_cache(c, PATH, 0x600, 5) == 0 && mem[0x600] == 0xee && own_runs == 10);
+    text(PATH, "ng:/b");
+    CHECK(nnfs_enable_individual_file_data_cache(c, PATH, 0x600, 5) == FSR(1));
+    text(PATH, "ng:/");
+    CHECK(nnfs_enable_individual_file_data_cache(c, PATH, 0x600, 5) == FSR(1) && own_runs == 10);
     nnfs_unmount(c, NAME);
 
     /* a file's time stamps. On no native mount they are the SDK's own. On a save's mount (here the SD card's) the
@@ -368,8 +608,42 @@ int main(void) {
     text(PATH, "sd:/none");
     outs();
     CHECK(nnfs_get_file_time_stamp(c, RESULT, PATH) == FSR(1) && mem[RESULT] == 0xee && own_runs == 12);
+    /* a file's data cache, through fs.hook's table. The card takes none, so the SDK checks nothing of the file there:
+       one that is not there answers 0 */
+    {
+        u32 versions[HOOK_KEYS] = {0};
+        int first, enable = hook_select(&hook_table, SYM_ENABLE_FILE_CACHE, versions, &first),
+                   disable = hook_select(&hook_table, SYM_DISABLE_FILE_CACHE, versions, &first);
+        CHECK(enable >= 0 && !strcmp(hook_handler[enable], "nnfs_enable_individual_file_data_cache"));
+        CHECK(disable >= 0 && !strcmp(hook_handler[disable], "nnfs_disable_individual_file_data_cache"));
+        c->x[0] = PATH, c->x[1] = CACHE, c->x[2] = 1, c->x[30] = 0x9000, c->pc = 0;
+        hook_fn[enable](c, 0);
+        CHECK(c->x[0] == 0 && c->pc == 0x9000 && files_open == 0 && own_runs == 12);
+        c->x[0] = PATH, c->x[30] = 0x9000, c->pc = 0;
+        hook_fn[disable](c, 0);
+        CHECK(c->pc == 0x9000 && own_runs == 12);
+    }
     nnfs_unmount(c, NAME);
     sd_there = 0;
+    /* on a save, which takes one: the file opened to read and closed, and its size against the buffer's; a file that
+       is not there gives the open's Result. The buffer is left as the game gave it, since every read is the host's */
+    text(NAME, "save");
+    save_given = 0;
+    CHECK(nnfs_mount_save_data(c, NAME, CACHE) == 0);
+    text(PATH, "save:/five");
+    memset(mem + 0x600, 0xee, 16);
+    CHECK(nnfs_enable_individual_file_data_cache(c, PATH, 0x600, 5) == 0 && files_open == 0 && mem[0x600] == 0xee);
+    text(PATH, "save:/none");
+    CHECK(nnfs_enable_individual_file_data_cache(c, PATH, 0x600, 5) == FSR(1) && files_open == 0);
+    nnfs_disable_individual_file_data_cache(c, PATH); /* a cache never made: nothing to end */
+    CHECK(own_runs == 12);
+    nnfs_unmount(c, NAME);
+    save_given = -1;
+    /* a path on no native mount is the SDK's, for both */
+    CHECK(nnfs_enable_individual_file_data_cache(c, PATH, 0x600, 5) == 0x77 && own(SYM_ENABLE_FILE_CACHE, 13));
+    nnfs_disable_individual_file_data_cache(c, PATH);
+    CHECK(own(SYM_DISABLE_FILE_CACHE, 14));
+    own_runs = 12; /* the counts below are of their own calls */
     /* a folder of the host PC: what the file server answers for the host's root, under either form's symbol */
     {
         static const char* const host[3] = {"_ZN2nn2fs9MountHostEPKcS2_",
@@ -396,7 +670,7 @@ int main(void) {
     module32.nmods = 0;
     g_arm_mod = &module32;
     a.mem = mem, a.mem_size = sizeof mem;
-    CHECK(HOOK32_COUNT == 43);
+    CHECK(HOOK32_COUNT == 44);
     /* each for the one 32-bit SDK read, 0.12.16, alone: a 32-bit game of another SDK has no hook here */
     for (int i = 0; i < HOOK32_COUNT; i++)
         CHECK(hook32_key[i] == HOOK_SDK && hook32_lo[i] == 0 && hook32_hi[i] == 0x10000);
@@ -453,7 +727,78 @@ int main(void) {
     CHECK(storages_open == 0 && own_runs32 == 1);
     /* MountHost there: the name and the folder in r0 and r1, the same refusal, nothing of the SDK's run */
     CHECK(call32("_ZN2nn2fs9MountHostEPKcS2_", NAME, PATH, 0, 0, 0, 0, 0) == FSR(1) && own_runs32 == 1);
+    /* the SD card under MountSdCardForDebug's name: the name in r0, the card mounted natively */
+    sd_there = 1;
+    CHECK(call32("_ZN2nn2fs19MountSdCardForDebugEPKc", NAME, 0, 0, 0, 0, 0, 0) == 0 && own_runs32 == 1);
+    CHECK(mount_named("ng") >= 0 && mount_root(mount_named("ng")) == sd_root);
+    call32("_ZN2nn2fs7UnmountEPKc", NAME, 0, 0, 0, 0, 0, 0);
+    sd_there = 0;
     g_arm_mod = NULL;
+
+    /* IsMounted: a native mount's name is mounted, with nothing of the SDK's run, as its own table (which answers 0
+       here) never holds a native mount; any other name, and the name once unmounted, are that table's */
+    {
+        unsigned runs = own_runs;
+        int hooked = 0;
+        for (int i = 0; i < HOOK_COUNT; i++)
+            hooked |= !strcmp(hook_symbol[i], SYM_IS_MOUNTED) && !strcmp(hook_handler[i], "nnfs_is_mounted");
+        CHECK(hooked);
+        own_answer = 0;
+        text(NAME, "rom2");
+        CHECK(nnfs_is_mounted(c, NAME) == 0 && own(SYM_IS_MOUNTED, runs + 1));
+        CHECK(nnfs_mount_rom_name(c, NAME) == 0);
+        CHECK(nnfs_is_mounted(c, NAME) == 1 && own_runs == runs + 1);
+        text(PATH, "aoc");
+        CHECK(nnfs_is_mounted(c, PATH) == 0 && own(SYM_IS_MOUNTED, runs + 2));
+        CHECK(nnfs_is_mounted(c, 0) == 0 && own(SYM_IS_MOUNTED, runs + 3));
+        nnfs_unmount(c, NAME);
+        CHECK(nnfs_is_mounted(c, NAME) == 0 && own(SYM_IS_MOUNTED, runs + 4));
+        own_answer = 0x77;
+    }
+    /* GetSaveDataRestoreFlag, through fs.hook's table: on the device's save the flag is clear, its one byte written,
+       with nothing of the SDK's run, whose own table never holds the mount; a name the native layer did not mount,
+       and the save's once unmounted, are the SDK's */
+    {
+        u32 versions[HOOK_KEYS] = {0};
+        int first, k = hook_select(&hook_table, SYM_RESTORE_FLAG, versions, &first);
+        unsigned runs = own_runs;
+        CHECK(k >= 0 && !strcmp(hook_handler[k], "nnfs_get_save_data_restore_flag"));
+        text(NAME, "deviceSave");
+        save_given = 1;
+        CHECK(nnfs_mount_device_save_data(c, NAME) == 0);
+        outs();
+        c->x[0] = RESULT, c->x[1] = NAME, c->x[30] = 0x9000, c->pc = 0;
+        hook_fn[k](c, 0);
+        CHECK(c->x[0] == 0 && c->pc == 0x9000 && mem[RESULT] == 0 && mem[RESULT + 1] == 0xee && own_runs == runs);
+        text(OTHER, "other");
+        CHECK(nnfs_get_save_data_restore_flag(c, RESULT, OTHER) == 0x77 && own(SYM_RESTORE_FLAG, runs + 1));
+        nnfs_unmount(c, NAME);
+        CHECK(nnfs_get_save_data_restore_flag(c, RESULT, NAME) == 0x77 && own(SYM_RESTORE_FLAG, runs + 2));
+        save_given = -1;
+    }
+    /* MountSdCardForDebug, through fs.hook's table, as a mod's loader calls it before it makes its folders: before it,
+       "sd" is no native mount, so a folder made there is the SDK's own code's, whose table has no "sd" either (a
+       game's stop on 2002-6905). After it the card is mounted under that name with nothing of the SDK's run, and the
+       folder is made on the card natively; the name mounted again is MountNameAlreadyExists, which the game gets */
+    {
+        u32 versions[HOOK_KEYS] = {0};
+        int first, k = hook_select(&hook_table, "_ZN2nn2fs19MountSdCardForDebugEPKc", versions, &first);
+        unsigned runs = own_runs;
+        CHECK(k >= 0 && !strcmp(hook_handler[k], "nnfs_mount_sd_card_for_debug"));
+        text(NAME, "sd");
+        text(PATH, "sd:/engage/mods");
+        CHECK(nnfs_create_directory(c, PATH) == 0x77 && own(SYM_CREATE_DIR, runs + 1) && !made_root);
+        sd_there = 1;
+        c->x[0] = NAME, c->x[30] = 0x9000, c->pc = 0;
+        hook_fn[k](c, 0);
+        CHECK(c->x[0] == 0 && c->pc == 0x9000 && own_runs == runs + 1);
+        CHECK(nnfs_create_directory(c, PATH) == 0 && made_root == sd_root && !strcmp(made_path, "/engage/mods"));
+        CHECK(nnfs_is_mounted(c, NAME) == 1 && own_runs == runs + 1);
+        CHECK(nnfs_mount_sd_card_for_debug(c, NAME) == R_MOUNT_EXISTS && own_runs == runs + 1);
+        nnfs_unmount(c, NAME);
+        CHECK(nnfs_create_directory(c, PATH) == 0x77 && own(SYM_CREATE_DIR, runs + 2));
+        sd_there = 0;
+    }
     printf("nn_fs: %u checks passed\n", checks);
     return 0;
 }

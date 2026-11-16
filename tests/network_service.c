@@ -281,6 +281,29 @@ static void test_addr_info(SvcObj* r) {
 }
 
 /* nifm IGeneralService with the network off */
+/* the blocklist (abi/blocked_hosts.inc, read here as a table so no domain is spelled twice): each domain and a name
+   under it, bare and with one and two final dots, is blocked; one that only ends with its letters, past no dot, and
+   an unrelated one are not */
+static const char* const test_blocked_domains[] = {
+#define BLOCKED_HOST(d) d,
+#include "nx/hle/services/network/abi/blocked_hosts.inc"
+};
+static void test_blocklist(void) {
+    static const char* const blocked_forms[] = {"%s", "%s.", "%s..", "sub.%s", "sub.%s.", "sub.%s.."};
+    char name[300];
+    size_t i, f;
+    CHECK(sizeof test_blocked_domains / sizeof test_blocked_domains[0] > 1);
+    for (i = 0; i < sizeof test_blocked_domains / sizeof test_blocked_domains[0]; i++) {
+        for (f = 0; f < sizeof blocked_forms / sizeof blocked_forms[0]; f++) {
+            snprintf(name, sizeof name, blocked_forms[f], test_blocked_domains[i]);
+            CHECK(blocked(name));
+        }
+        snprintf(name, sizeof name, "xy%s", test_blocked_domains[i]);
+        CHECK(!blocked(name));
+    }
+    CHECK(!blocked("example.invalid") && !blocked("example.invalid.") && !blocked(""));
+}
+
 static void test_nifm(void) {
     SvcObj* nifm = new_nifm();
     request(5); /* CreateGeneralService(pid) */
@@ -319,6 +342,22 @@ static void test_nifm(void) {
     CHECK(req->dispatch(req, &ctx) == 0 && state->signaled);
     request(0);
     CHECK(req->dispatch(req, &ctx) == 0 && reply(0) == REQ_INVALID);
+    /* the applet that tells the player: the network connection applet (0x0f) in the foreground, with an empty list of
+       storages for it, a u32 of ~0 in the SDK's buffer of 0x1000 */
+    memset(GP(OUT0), 0xee, 8);
+    request(21); /* GetAppletInfo */
+    arg32(0, 1); /* the theme color */
+    ctx.nb = 1;
+    ctx.b[0] = buf(OUT0, 0x1000);
+    CHECK(req->dispatch(req, &ctx) == 0 && ctx.out_size == 12);
+    CHECK(reply(0) == 0x0f && reply(4) == 0 && reply(8) == 4);
+    CHECK(snx_ld_le32(GP(OUT0)) == 0xffffffffu && GP(OUT0)[4] == 0xee);
+    /* a buffer with no room for the list's end: none, 0 bytes, which the SDK refuses itself */
+    memset(GP(OUT0), 0xee, 8);
+    request(21);
+    ctx.nb = 1;
+    ctx.b[0] = buf(OUT0, 3);
+    CHECK(req->dispatch(req, &ctx) == 0 && reply(0) == 0x0f && reply(8) == 0 && GP(OUT0)[0] == 0xee);
     svcobj_unref(req);
     svcobj_unref(g);
     svcobj_unref(nifm);
@@ -374,6 +413,7 @@ int main(void) {
         CHECK(network_reachable(&out));
         g_settings.network = 0;
     }
+    test_blocklist();
     SvcObj* r = new_sfdnsres();
     test_host_by_name(r);
     test_host_by_addr(r);

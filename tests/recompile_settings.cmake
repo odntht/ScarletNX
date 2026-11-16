@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright 2026 the ScarletNX contributors
-# scarletnx -r --KEY=VALUE, a setting of the recompile (settings.txt's recompile and llvm tables): a value the setting
-# does not take is refused before anything runs, saying what it takes; one it takes reaches the input's check. Run by
-# ctest as runtime_recompile_settings
+# scarletnx -r --KEY=VALUE, a setting of the recompile (settings.txt's recompile and llvm tables), KEY with a - for each
+# _ too: a value the setting does not take is refused before anything runs, saying what it takes by its key; one it
+# takes reaches the input's check; a KEY with some _ left is no setting. Run by ctest as runtime_recompile_settings
 set(dir "${CMAKE_CURRENT_BINARY_DIR}/recompile-settings")
 file(REMOVE_RECURSE "${dir}")
 file(MAKE_DIRECTORY "${dir}")
@@ -11,14 +11,20 @@ foreach(case "--aot_threads=abc|aot_threads=abc is not a whole number from 0 to 
              "--aot_threads=2000|aot_threads=2000 is not a whole number from 0 to 1024"
              "--aot_threads=|aot_threads= is not a whole number from 0 to 1024"
              "--llvm_inliner_threshold=50x|llvm_inliner_threshold=50x is not a whole number from -2147483647 to 2147483647"
-             "--opt=5|opt = 5: not 0, 1, 2, 3, s or z"
+             "--opt=5|--opt 5: not 0, 1, 2, 3, s or z"
              "--unit_cache_gb=-1|unit_cache_gb=-1 is not a whole number from 0 to 100000"
              "--unit_cache_gb=2.5|unit_cache_gb=2.5 is not a whole number from 0 to 100000"
              "--aot_threads=4|holds no exefs/main" "--llvm_inliner_threshold=50|holds no exefs/main"
              "--opt=z|holds no exefs/main" "--unit_cache_gb=0|holds no exefs/main"
              "--llvm_batch=fast|llvm_batch = fast: not full or ipo"
              "--opt=0 --llvm_batch=ipo|llvm_batch = ipo takes the place of -O1 to -O3, s and z's passes: opt = 0"
-             "--llvm_batch=ipo|holds no exefs/main" "--llvm_batch=full|holds no exefs/main")
+             "--llvm_batch=ipo|holds no exefs/main" "--llvm_batch=full|holds no exefs/main"
+             "--aot-threads=abc|aot_threads=abc is not a whole number from 0 to 1024"
+             "--unit-cache-gb=2.5|unit_cache_gb=2.5 is not a whole number from 0 to 100000"
+             "--llvm-inliner-threshold=50x|llvm_inliner_threshold=50x is not a whole number from -2147483647 to 2147483647"
+             "--aot-threads=4|holds no exefs/main" "--aot-threads-most=2|holds no exefs/main"
+             "--llvm-batch=fast|llvm_batch = fast: not full or ipo"
+             "--aot-threads_most=2|unknown option: --aot-threads_most (scarletnx -r -h lists them)")
     string(REPLACE "|" ";" case "${case}")
     list(GET case 0 option)
     list(GET case 1 expected)
@@ -35,10 +41,12 @@ foreach(case "--aot_threads=abc|aot_threads=abc is not a whole number from 0 to 
 endforeach()
 # AOT pack build: a prepared game, recompiled with the cache the launcher names. --jit-cache and
 # --hook-direct-calls are the recompiler's, not extra dump inputs; before this case the automatic
-# preparation check took them for game arguments and stopped with "accepts one dump file".
+# preparation check took them for game arguments and stopped with "accepts one dump file". Its _data
+# keeps an ExeFS, as a game made from its extraction's does (empty: the recompiler's own check answers);
+# with none and no dump the driver stops before the recompiler (driver_workflow)
 set(aot "${dir}/aot")
 set(aot_game "${aot}/0100000000000000")
-file(MAKE_DIRECTORY "${aot_game}" "${aot_game}/0100000000000000_data")
+file(MAKE_DIRECTORY "${aot_game}" "${aot_game}/0100000000000000_data/exefs")
 file(WRITE "${aot_game}/0100000000000000" "")
 file(WRITE "${aot}/profile.jitcache" "")
 execute_process(COMMAND "${CMAKE_COMMAND}" -E env --unset=DISPLAY --unset=WAYLAND_DISPLAY SDL_VIDEO_DRIVER=dummy

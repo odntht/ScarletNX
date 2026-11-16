@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nx/gpu/vk/tex_report.h"
+#include "nx/gpu/vk/pagespace.h"
 #include "common/utilities/bits.h"
 #include "nx/gpu/guest_textures.h"
 #include "nx/gpu/vk/range_shape.h"
@@ -146,7 +147,13 @@ static void census_texture(void* ctx, const Surf* t) {
     /* an ASTC texture the device samples as it is: one row for all its block sizes, which the ASTC sums tell apart */
     const int native = is_astc(t->f.vk);
     vk_tex_formats_add(&c->formats, (u32)(native ? VK_FORMAT_ASTC_4x4_UNORM_BLOCK : t->f.vk), t->bytes);
-    const int held = is_bc7(t->f.vk) ? VK_ASTC_AS_BC7 : VK_ASTC_AS_RGBA8; /* one decoded: format.c's TA */
+    /* one decoded: format.c's TA, or texture.c's BC1, BC4 or BC5 by its blocks' kind */
+    const u32 bcn = t->f.conv == VKC_ASTC ? vk_astc_bcn(t->f.vk) : 0;
+    const int held = is_bc7(t->f.vk) ? VK_ASTC_AS_BC7
+                     : bcn == 1      ? VK_ASTC_AS_BC1
+                     : bcn == 4      ? VK_ASTC_AS_BC4
+                     : bcn == 5      ? VK_ASTC_AS_BC5
+                                     : VK_ASTC_AS_RGBA8;
     if (native || t->f.conv == VKC_ASTC)
         vk_astc_sizes_add(&c->astc, t->f.bw, t->f.bh, native ? VK_ASTC_AS_ASTC : held, t->bytes);
     if (!t->sparse && !t->bricks) return;
@@ -215,7 +222,7 @@ static void line_add(char* line, size_t size, size_t* at, const char* fmt, ...) 
 
 /* the sums by host format, the most bytes first, and by ASTC block size */
 static void formats_log(Census* c) {
-    static const char* const as_name[VK_ASTC_AS_N] = {"BC7", "RGBA8", "ASTC"};
+    static const char* const as_name[VK_ASTC_AS_N] = {"BC7", "RGBA8", "ASTC", "BC1", "BC4", "BC5"};
     char line[768], name[24];
     size_t at = 0;
     VkTexFormatRow rest = c->formats.other;
@@ -237,7 +244,9 @@ static void formats_log(Census* c) {
         for (u32 bh = 0; bh < VK_ASTC_SIDES; bh++) {
             const u64* b = c->astc.bytes[bw][bh];
             const char* join = "";
-            if (!b[VK_ASTC_AS_BC7] && !b[VK_ASTC_AS_RGBA8] && !b[VK_ASTC_AS_ASTC]) continue;
+            u64 any = 0;
+            for (u32 as = 0; as < VK_ASTC_AS_N; as++) any |= b[as];
+            if (!any) continue;
             line_add(line, sizeof line, &at, "%s %ux%u", at ? "," : "", bw + 4, bh + 4);
             for (u32 as = 0; as < VK_ASTC_AS_N; as++) {
                 if (!b[as]) continue;
@@ -292,6 +301,29 @@ void vk_tex_report_log(void) {
             (unsigned long long)(g_tex_report.reloads - g_tex_report.reported),
             (unsigned long long)g_tex_report.evictions);
     g_tex_report.reported = g_tex_report.reloads;
+    u64 sys_out, sys_back, sys_bytes;
+    vk_tex_sysmem_stats(&sys_out, &sys_back, &sys_bytes);
+    if (vk_pages_system() || vk_mirror_system())
+        LOG("vulkan: granules in system memory where the GPU's had no room so far: %llu of the page cache, %llu of the "
+            "GPU mirror\n",
+            (unsigned long long)vk_pages_system(), (unsigned long long)vk_mirror_system());
+    if (sys_out)
+        LOG("vulkan: %llu textures moved into system memory for room in place of an eviction (texture_sysmem), %llu "
+            "moved back; %llu MB there now\n",
+            (unsigned long long)sys_out, (unsigned long long)sys_back, MB(sys_bytes));
+    u64 shed_made, shed_bytes, shed_coarser, shed_finer;
+    vk_tex_shed_stats(&shed_made, &shed_bytes, &shed_coarser, &shed_finer);
+    if (shed_made)
+        LOG("vulkan: %llu textures made sparse for their levels (texture_shed, %llu MB whole); %llu levels given way for "
+            "room, %llu taken back\n",
+            (unsigned long long)shed_made, MB(shed_bytes), (unsigned long long)shed_coarser,
+            (unsigned long long)shed_finer);
+    u64 half_made, half_bytes;
+    vk_tex_half_stats(&half_made, &half_bytes);
+    if (half_made)
+        LOG("vulkan: %llu textures made at half their resolution under memory pressure (texture_half_res), %llu MB of "
+            "finest levels left unbound\n",
+            (unsigned long long)half_made, MB(half_bytes));
     const u64 *idle = g_tex_report.idle, *back = g_tex_report.back;
     if (idle[0] | idle[1] | idle[2] | idle[3] | back[0] | back[1] | back[2] | back[3])
         LOG("vulkan: since the last report the cache evicted %llu textures unused for under 60 presents, %llu for 60 "
