@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2026 the ScarletNX contributors
+# The H.264 decoder's SEI picture hashes (libavcodec/h274.c) call ff_bswapdsp_init on a big-endian host, which
+# configure doesn't select for the decoder: a build with only the decoders NVDEC handles (cmake/ffmpeg.cmake) fails
+# to link there. Applied on every host: on a little-endian one nothing calls it, so the object stays out of the link.
+#
+# CPMUtil applies it, without fuzz, to the release it extracts (cpmfile.json's "patches"). To change it, edit a copy of
+# the pristine file and rebuild the hunks with `diff -u --label a/<file> --label b/<file>`.
+--- a/configure
++++ b/configure
+@@ -3215,7 +3215,7 @@
+ h263i_decoder_select="h263_decoder"
+ h263p_decoder_select="h263_decoder"
+ h263p_encoder_select="h263_encoder"
+-h264_decoder_select="cabac golomb h264chroma h264dsp h264parse h264pred h264qpel h264_sei videodsp"
++h264_decoder_select="bswapdsp cabac golomb h264chroma h264dsp h264parse h264pred h264qpel h264_sei videodsp"
+ h264_decoder_suggest="error_resilience"
+ hap_decoder_select="snappy texturedsp"
+ hap_encoder_deps="libsnappy"

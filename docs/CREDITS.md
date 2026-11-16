@@ -42,12 +42,15 @@ Generated modules include runtime ABI code. Game assets, keys and firmware are e
 | The HD rumble amplitude steps of a Switch controller (`src/nx/runtime/platform/backend/gamepad.c`), from SDL3's `src/joystick/hidapi/SDL_hidapi_switch.c`, Copyright (C) 1997-2026 Sam Lantinga, after dekuNukem's Nintendo_Switch_Reverse_Engineering `rumble_data_table.md` | zlib |
 | The AppImage's runtime (uruntime) and launcher (sharun, with Anylinux-sharun's `anylinux.so` and cross-libc-dlopen) | MIT |
 | Tracy (the profiler client, built only with `SNX_TRACY`) | BSD-3-Clause |
+| [CPMUtil](https://git.crueter.xyz/CMake/CPMUtil), crueter's, with its trimmed CPM.cmake (`cmake/cpmutil`, as Eden carries them, with four changes of ours: the configure fetches the third-party packages through it, not shipped) | LGPL-3.0-or-later ([text](../cmake/cpmutil/LICENSE)), CPM.cmake's MIT (in `cmake/cpmutil/CPM.cmake`) |
 | ENet / zstd (an Eden room's connection and its datagrams, `src/common/network/net_room.c`) | MIT / BSD-3-Clause |
 | miniz 3.1.2 (the zip around the launcher's Share Log, `src/gui/logzip.c`) | MIT |
 | libdeflate 1.26 (every deflate: Share Log's, the Vita driver's VPKs and eboot segments, the Android driver's APKs) | MIT |
 | HarfBuzz 15.0.0 (the Android driver's text shaping, `src/android/hwui/text.c`) | MIT ("Old MIT") |
 | SQLite 3.54.1 (the Android driver's `android.database.sqlite`, `src/android/db/sqlite_jni.c`) | Public domain |
 | OpenJDK (the JVM that the Android driver loads at run time from the installed JDK, not shipped) | GPL-2.0 with the Classpath Exception |
+| RNNoise 0.1.1 (the microphone's neural noise reduction, `src/nx/runtime/platform/audio_denoise.c`: its sources and model, 87503 weights of a byte, fetched by `cmake/dependencies.cmake` and built in) | BSD-3-Clause |
+| Speex DSP's preprocessor (the microphone's spectral noise reduction, `src/nx/runtime/platform/audio_denoise.c`, loaded at run time from the system's libspeexdsp, not shipped) | BSD-3-Clause |
 | lunasvg / plutovg (the splash's SVGs and the user's picture) | MIT / MIT, with FreeType's rasterizer and stroker (FreeType License) and stb (MIT or public domain) |
 | GUI menu icons (`src/gui/icons.hex`), drawn after Lucide 1.61.0's (some derived from Feather) | GPL-3.0-or-later, after Lucide's ISC and Feather's MIT (in `src/gui/FONT-NOTICE.txt`) |
 | GUI VGA BIOS font (SeaBIOS `vgafont16`, originally Joseph Gil's font collection) | Public domain |
@@ -155,3 +158,4 @@ The ScarletNX-to-ScarletNX room transport is separate from Azahar's room protoco
 - [Azahar](https://github.com/azahar-emu/azahar) and Citra, for all of the 3DS emulation.
 - [Vita3K](https://github.com/Vita3K/Vita3K), for the PS Vita's GXM and shader translation, and [vita-headers](https://github.com/vitasdk/vita-headers) for its NIDs.
 - [mGBA](https://github.com/mgba-emu/mgba) as a direct reference for the AGB board.
+- [Cemu](https://github.com/cemu-project/Cemu), whose shader-set cache ([cemu-project/Cemu#1968](https://github.com/cemu-project/Cemu/pull/1968)) led to the batched check of the constant buffer words that a translation folds (`src/nx/gpu/vk/cb_fold.c`). No code was taken.

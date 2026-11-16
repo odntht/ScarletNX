@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nx/gpu/gpu.h"
+#include "nx/gpu/renderer.h"
 #include "nx/memory/mem.h"
 #include "nx/memory/own.h"
 #include "nx/hle/services/nvdrv.h"
@@ -44,14 +45,22 @@ typedef struct {
     /* each valid page's write tracking clock before it was last brought up to date: only a binding's own pages are,
        as the others may not be mapped any more */
     u32 synced[MIR_PAGES];
-    /* the pages [ck_lo, ck_hi) all valid and brought up to date in the stream's epoch ck_epoch (vk_ww_epoch): a binding
-       inside them needs nothing more in that epoch (vk_mirror_slice). Emptied when a page loses its shadow */
+    /* the pages [ck_lo, ck_hi) all valid and brought up to date in the stream's epoch ck_epoch (vk_ww_epoch), and
+       with the GPU-side writes up to generation ck_gen (gpu_mem_generation): a binding inside them needs nothing more
+       in that epoch while no GPU-side write lands there (vk_mirror_slice). Emptied when a page loses its shadow */
     u32 ck_epoch, ck_lo, ck_hi;
+    u64 ck_gen;
     u32 used; /* the present a binding last took it at (vk_mirror_idle) */
 } Gran;
 
 /* the guest pages programs wrote in the mirror that haven't landed (vk_mirror_wrote to vk_mirror_done) */
 static PendPages g_mir_pend = {.also = &g_pend_any};
+/* the pending pages gain or lose a write, and g_mir_any says whether any is left: a read of guest memory looks at the
+   flag before it asks the mirror for anything (gpu.c's gmem_need) */
+static void mir_pend_pages(u64 first, u64 last, int delta) {
+    pend_add_pages(&g_mir_pend, first, last, delta);
+    g_mir_any = g_mir_pend.total != 0;
+}
 static struct {
     int on; /* -1 until vk_mirror_init has decided */
     VkBuffer buf, mask;
@@ -130,6 +139,12 @@ int vk_mirror_on(void) {
 VkBuffer vk_mirror_buffer(void) { return g_mir.buf; }
 VkBuffer vk_mirror_mask(void) { return g_mir.mask; }
 
+static u64 g_mir_system; /* granules that took system memory, the GPU's having none */
+u64 vk_mirror_system(void) { return g_mir_system; }
+/* the granules' binds signal one, the landings' submissions the other, each under vk_lock: a sparse bind is not
+   ordered against a command buffer, so the two can't share a timeline */
+static VkHostTimeline g_mir_bound, g_mir_landed;
+
 /* memory for granule g bound into the mirror and its mask, the mask cleared; 0 out of memory */
 static Gran* gran_bind(u64 g) {
     Gran* r = calloc(1, sizeof *r);
@@ -142,11 +157,22 @@ static Gran* gran_bind(u64 g) {
     req[1].size = MIR_MASK_G;
     DevMemWant aci = {.at = DM_DEVICE};
     DevMemInfo info[2];
-    if (!r->shadow || !VK_OK(vk_devmem_alloc(&req[0], &aci, &r->mem, &info[0]))) goto fail;
-    if (!VK_OK(vk_devmem_alloc(&req[1], &aci, &r->mask, &info[1]))) {
-        vk_devmem_free(r->mem);
-        goto fail;
+    if (!r->shadow) goto fail;
+    /* the GPU's memory, else system memory, where the programs read and write it over the bus: a granule that found
+       none left its dispatches the slow way each time, under a frame a second for seconds in Mario Kart World on a GPU
+       of 2 GB. Its mask goes with it */
+    int got = 0;
+    for (int at = 0; at < 2 && !got; at++) {
+        aci.at = at ? DM_SYSTEM : DM_DEVICE;
+        if (vk_devmem_alloc(&req[0], &aci, &r->mem, &info[0]) != VK_SUCCESS) continue;
+        if (vk_devmem_alloc(&req[1], &aci, &r->mask, &info[1]) != VK_SUCCESS) {
+            vk_devmem_free(r->mem);
+            continue;
+        }
+        got = 1;
+        g_mir_system += at;
     }
+    if (!got) goto fail;
     vk_mem_track(r->mem, VK_OWN_MIRROR);
     vk_mem_track(r->mask, VK_OWN_MIRROR);
     VkSparseMemoryBind b[2] = {
@@ -156,18 +182,9 @@ static Gran* gran_bind(u64 g) {
          .memory = info[1].memory,
          .memoryOffset = info[1].offset}};
     VkSparseBufferMemoryBindInfo bb[2] = {{g_mir.buf, 1, &b[0]}, {g_mir.mask, 1, &b[1]}};
+    /* bound before any work that reads it is submitted: once a granule, so a wait is no cost */
     VkBindSparseInfo bi = {.sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, .bufferBindCount = 2, .pBufferBinds = bb};
-    VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VkFence fence;
-    int ok = VK_OK(vkCreateFence(g_vk.dev, &fi, NULL, &fence));
-    if (ok) {
-        /* bound before any work that reads it is submitted: once a granule, so a wait is no cost */
-        vk_queue_lock(g_vk.gfx);
-        ok = VK_OK(vkQueueBindSparse(g_vk.gfx, 1, &bi, fence));
-        vk_queue_unlock(g_vk.gfx);
-        ok = ok && vk_wait_fence(fence);
-        vkDestroyFence(g_vk.dev, fence, NULL);
-    }
+    int ok = vk_host_bind_sparse(&g_mir_bound, &bi);
     if (!ok) fatal("vulkan: could not bind memory into the GPU mirror");
     vk_render_end();
     rec_CmdFillBuffer(vk_cmd(), g_mir.mask, g * MIR_MASK_G, MIR_MASK_G, 0);
@@ -333,12 +350,23 @@ static u64 span_bits(u64 w, u64 lo, u64 hi) {
     if (hi < a + 64) m &= (1ull << (hi - a)) - 1;
     return m;
 }
+/* a run of GPU-side writes by GPU address (gpu_mem_dirty_runs), compared as diff_run compares the tracking's runs:
+   from the GPU address to the binding's guest bytes, then to the offset from the first page it checks */
+typedef struct {
+    Diff* d;
+    u64 gva, cpu, first;
+} LandedRuns;
+static void landed_run(void* user, u64 at, u64 n) {
+    const LandedRuns* lr = user;
+    diff_run(lr->d, lr->cpu + (at - lr->gva) - lr->first, n);
+}
 /* A slice is a binding's granules, up to 16 MiB of them for each storage buffer of each draw and dispatch: their pages
    are looked at by the 64 of a mask word, as a loop over each page's bit was a fourteenth of one game's GPU thread */
 int vk_mirror_slice(u64 gva, u64 len, VkBuffer* buf, u64* off) {
     u64 cpu = 0;
     if (!vk_mirror_on() || !len || gmmu_run(gva, len, &cpu) != len || cpu + len > AS_SIZE) return 0;
     u32 now = vk_ww_now(), epoch = vk_ww_epoch(); /* before any byte is read */
+    u64 gen = gpu_mem_generation();
     u64 g0 = cpu / MIR_G, g1 = (cpu + len - 1) / MIR_G;
     Up u = {0};
     int owners = 0, fresh = 0;
@@ -359,7 +387,15 @@ int vk_mirror_slice(u64 gva, u64 len, VkBuffer* buf, u64* off) {
            cache that trusts a check for its epoch has them (vk_ww_epoch). A draw binds the same 16 MiB ranges as the
            draws before it, and the walks below over their 4096 pages, three of them at each binding, were 8% of an
            Ounce game's GPU thread */
-        if (r->ck_epoch == epoch && r->ck_lo <= lo && hi <= r->ck_hi) continue;
+        /* Nor do the renderer's own writes since the check: results of draws and dispatches outside the mirror land in
+           guest memory in the middle of an epoch (gpu_mem_written), and the stream orders them before this binding.
+           One game's particle programs share an allocation counter, some in the mirror and some not; the mirror's took
+           the counter of before the others' results and handed out the same records again, and a list of them linked
+           to itself, which the next pass over it walked until the GPU stopped */
+        u64 a = base + lo * 4096 > cpu ? base + lo * 4096 : cpu;
+        u64 b = base + hi * 4096 < cpu + len ? base + hi * 4096 : cpu + len;
+        int landed = r->ck_gen && gpu_mem_dirty_since(r->ck_gen, gva + (a - cpu), b - a);
+        if (r->ck_epoch == epoch && r->ck_lo <= lo && hi <= r->ck_hi && !landed) continue;
         /* the binding's valid pages written since the oldest of them was brought up to date: the bytes the CPU
            changed, those that differ from the shadow (a page brought up to date later compares equal). Owned pages
            aren't watched: their owners are copied in below */
@@ -384,8 +420,14 @@ int vk_mirror_slice(u64 gva, u64 len, VkBuffer* buf, u64* off) {
         }
         u32 oldest = now - age;
         int written = any ? vk_written_since(GP(base + lo * 4096), (hi - lo) * 4096, oldest) : 0;
+        Diff d = {r, base, lo, &u};
+        /* the runs those writes stamped, compared whatever the write tracking says of them: the stamps are the
+           renderer's own record of its landings */
+        if (landed && written >= 0) {
+            LandedRuns lr = {&d, gva, cpu, base + lo * 4096};
+            gpu_mem_dirty_runs(r->ck_gen, gva + (a - cpu), b - a, landed_run, &lr);
+        }
         if (written) {
-            Diff d = {r, base, lo, &u};
             if (written > 0)
                 vk_written_runs(GP(base + lo * 4096), (hi - lo) * 4096, oldest, diff_run, &d);
             else /* pages the tracking doesn't watch: all of them compared */
@@ -409,12 +451,15 @@ int vk_mirror_slice(u64 gva, u64 len, VkBuffer* buf, u64* off) {
                 r->valid[w] |= 1ull << (p % 64);
             }
         if (whole && r->ck_epoch == epoch && lo <= r->ck_hi && r->ck_lo <= hi) { /* touching this epoch's: one */
+            /* its generation the older's, unless this binding checked all of it again */
+            if (lo <= r->ck_lo && r->ck_hi <= hi) r->ck_gen = gen;
             if (lo < r->ck_lo) r->ck_lo = (u32)lo;
             if (hi > r->ck_hi) r->ck_hi = (u32)hi;
         } else if (whole) {
             r->ck_epoch = epoch;
             r->ck_lo = (u32)lo;
             r->ck_hi = (u32)hi;
+            r->ck_gen = gen;
         }
     }
     int copied = u.n != 0;
@@ -486,7 +531,7 @@ void vk_mirror_wrote(u64 cpu, u64 len) {
     }
     MirRange r = {cpu >> 12, (cpu + len + 4095) >> 12};
     g_mir_now[g_mir_nnow++] = r;
-    pend_add_pages(&g_mir_pend, r.first, r.end - 1, 1);
+    mir_pend_pages(r.first, r.end - 1, 1);
 }
 int vk_mirror_pending(u64 gva, u64 len) { return g_mir.on > 0 && len && pend_hit(&g_mir_pend, gva, len); }
 int vk_mirror_holds(u64 gva, u64 len) {
@@ -687,8 +732,8 @@ void vk_mirror_harvest(VkCommandBuffer cb, u64 submit) {
     memcpy(r, g_mir_now, (size_t)n0 * sizeof *r);
     u32 n = ranges_join(g_mir_now, g_mir_nnow);
     if (n < n0) {
-        for (u32 i = 0; i < n; i++) pend_add_pages(&g_mir_pend, g_mir_now[i].first, g_mir_now[i].end - 1, 1);
-        for (u32 i = 0; i < n0; i++) pend_add_pages(&g_mir_pend, r[i].first, r[i].end - 1, -1);
+        for (u32 i = 0; i < n; i++) mir_pend_pages(g_mir_now[i].first, g_mir_now[i].end - 1, 1);
+        for (u32 i = 0; i < n0; i++) mir_pend_pages(r[i].first, r[i].end - 1, -1);
     }
     free(r);
     if (!own_traps()) { /* no traps: every page lands with its bytes once done */
@@ -791,7 +836,7 @@ static void own_entries(const u32* out, u32 n) {
     g_mir_nq += n;
     for (u32 i = 0; i < n; i++) {
         u64 pg = out[MIR_HEAD + i * MIR_ENTRY_PAGE];
-        pend_add_pages(&g_mir_pend, pg, pg, 1);
+        mir_pend_pages(pg, pg, 1);
     }
 }
 /* First the CPU's changes to the pages since they were brought up to date, the bytes their programs didn't log, go
@@ -889,7 +934,7 @@ void vk_mirror_publish(void) {
         vk_own_publish_submitted(cpu, len, res, cpu);
         i = j;
     }
-    for (u32 i = 0; i < n; i++) pend_add_pages(&g_mir_pend, pages[i], pages[i], -1);
+    for (u32 i = 0; i < n; i++) mir_pend_pages(pages[i], pages[i], -1);
     vk_own_res_unref(res);
     g_mir_stats.owned_pages += n;
     free(pages);
@@ -956,17 +1001,21 @@ static void harvest_left(const u32* left, u32 n) {
     if (!harvest_record(g_mir_cb, r, k, out, 0, size, n, MIR_ENTRY, dpool))
         fatal("vulkan: no descriptor set left to land the GPU mirror's writes");
     VK_OK(vkEndCommandBuffer(g_mir_cb));
-    VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VkFence fence;
-    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_mir_cb};
-    int ok = VK_OK(vkCreateFence(g_vk.dev, &fi, NULL, &fence));
-    if (ok) {
-        vk_queue_lock(g_vk.gfx);
-        ok = VK_OK(vkQueueSubmit(g_vk.gfx, 1, &si, fence));
-        vk_queue_unlock(g_vk.gfx);
-        ok = ok && vk_wait_fence(fence);
-        vkDestroyFence(g_vk.dev, fence, NULL);
-    }
+    vk_queue_lock(g_vk.gfx);
+    u64 value = vk_host_next(&g_mir_landed); /* makes the semaphore at the first use */
+    VkCommandBufferSubmitInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = g_mir_cb};
+    VkSemaphoreSubmitInfo done = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                                  .semaphore = g_mir_landed.sem,
+                                  .value = value,
+                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                        .commandBufferInfoCount = 1,
+                        .pCommandBufferInfos = &ci,
+                        .signalSemaphoreInfoCount = 1,
+                        .pSignalSemaphoreInfos = &done};
+    int ok = value && VK_OK(vkQueueSubmit2(g_vk.gfx, 1, &si, VK_NULL_HANDLE));
+    vk_queue_unlock(g_vk.gfx);
+    ok = ok && vk_host_wait(&g_mir_landed, value);
     if (!ok || !VK_OK(vk_devmem_invalidate(mem, 0, VK_WHOLE_SIZE)))
         fatal("vulkan: could not land the GPU mirror's writes");
     vkDestroyDescriptorPool(g_vk.dev, dpool, NULL); /* its work is done */
@@ -1011,7 +1060,7 @@ void vk_mirror_done(u64 done) {
         }
         vk_result_end();
         g_mir_stats.pages += n;
-        for (u32 i = 0; i < m->n; i++) pend_add_pages(&g_mir_pend, m->r[i].first, m->r[i].end - 1, -1);
+        for (u32 i = 0; i < m->n; i++) mir_pend_pages(m->r[i].first, m->r[i].end - 1, -1);
         free(m->r);
     }
     busy = 0;
@@ -1068,18 +1117,21 @@ static int gran_release(u64 g) {
    100 of its 117 granules, bound by the programs of its menus, took no binding through most of a race, 225 MB of the
    device's memory, while its textures were evicted for room. One bound again later takes guest memory's bytes
    whole, as a new one does. A few a call, each a part of the granules: a landing is a round trip to the GPU */
-#define MIR_IDLE    600
+#define MIR_IDLE       600
+#define MIR_IDLE_TIGHT 120 /* past nine tenths of the budget: a granule bound again takes system memory where the GPU's
+                              has none, so letting it go sooner costs a copy of its bytes, not a stall */
 #define MIR_RELEASE 8
 void vk_mirror_trim(void) {
     if (g_mir.on <= 0 || !g_mir.bound || vk_rec_unsafe()) return;
     u64 usage, budget;
     vk_mem_use(&usage, &budget);
     if (usage < budget / 5 * 4) return;
+    const u32 idle = usage >= budget / 10 * 9 ? MIR_IDLE_TIGHT : MIR_IDLE;
     u32 done = 0;
     for (u64 n = 0; n < g_mir.granules / 8 && done < MIR_RELEASE; n++) {
         u64 g = g_mir.trim_at++ % g_mir.granules;
         const Gran* r = g_mir.gran[g];
-        if (r && (u32)(g_vk_present - r->used) >= MIR_IDLE) {
+        if (r && (u32)(g_vk_present - r->used) >= idle) {
             gran_release(g);
             done++;
         }

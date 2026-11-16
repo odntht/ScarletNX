@@ -28,6 +28,7 @@
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/ledger.h"
 #include "nx/gpu/vk/descriptors.h"
+#include "nx/gpu/vk/pagespace.h"
 #include "nx/gpu/vk/hdr_swapchain.h"
 #include "nx/gpu/vk/resource_stats.h"
 #include "nx/gpu/vk/tex_report.h"
@@ -45,7 +46,22 @@ static u32 g_last_x, g_last_y, g_last_w, g_last_h;
 static u32 g_last_transform;
 /* vk_lock once around the hooks: each takes it again only as a depth count. Each took and dropped it on its own, and
    every drop let the lock go (vk_let_go) on the GPU thread's writes, the constant buffer uploads before most draws */
+/* Each hook below only lands what the renderer holds over the bytes and hasn't written to guest memory yet: buffer and
+   compute results, storage images, the mirror's writes, queued releases (all of them count their pages in g_pend_any),
+   render targets (g_rt_pages), and unified memory's imports. Where none covers the bytes, every hook does nothing, so
+   the write doesn't take vk_lock for them: the GPU thread's constant buffer uploads, 14,000 a frame of one or two words
+   in one game's town, took it and asked each hook in turn, about 43 ns each. The tables are read under pend_lock, as
+   vkr_mem_pending reads them: their changes take it too. A result added after the answer and before the write is the
+   race there was after vk_unlock below, before the write, too */
+static int before_write_needed(u64 gva, u64 size) {
+    if (!size || vk_uma()) return 1;
+    pend_lock();
+    int hit = pend_hit(&g_pend_any, gva, size) || vk_rt_pages_hit(gva, size);
+    pend_unlock();
+    return hit;
+}
 static void vkr_before_write(u64 gva, u64 size) {
+    if (!before_write_needed(gva, size)) return;
     vk_lock();
     if (size) vk_release_need(gva, size);
     vk_buf_before_write(gva, size);
@@ -62,6 +78,11 @@ static void vkr_before_write(u64 gva, u64 size) {
    (pending_pages.h) */
 static int vkr_mem_pending(u64 gva, u64 size) {
     int hit;
+    /* every change of the tables holds vk_lock as well (pending_pages.h): a thread that holds it reads them as they
+       are. The renderer's thread asks this of the guest memory each draw reads, and took the tables' lock for it:
+       about 1.5% of its time in one game's busy scene was the system's code for that lock, and the game's threads
+       waited for it there */
+    if (vk_lock_held()) return pend_hit(&g_pend_any, gva, size);
     /* the tables' lock, not vk_lock: the game's threads ask this of each read they make through the GPU's address
        space (gmem_read), and waited here for vk_lock while the GPU thread held it across its waits for the GPU */
     pend_lock();
@@ -257,6 +278,12 @@ static int vkr_samples_report(u32 owner, u64 gva, u32 len, u64 ticks) {
     vk_unlock();
     return r;
 }
+/* where vkr_method_barrier recorded its last full barrier: the submission, and vk_cmd_uses after it (vk_lock) */
+static struct {
+	u64 submit, uses;
+	u64 images; /* vk_gfx_image_adds after it */
+} g_full_barrier;
+u64 g_vk_barriers_merged, g_vk_barriers_in_pass;
 static void vkr_method_barrier(int kind)
 {
 	/* a fragment barrier, and the 3D engine's texture data cache invalidation (kind 2), make earlier draws' writes
@@ -284,18 +311,36 @@ static void vkr_method_barrier(int kind)
 	 * sampled while it is drawn gets one in the pass after this barrier
 	 * (vk_render_fragment_barrier, feedback_order), and
 	 * draws that read results of earlier ones get one there (buffer.c
-	 * gfx_gpu_src). Ended here, the pass ended about 120 times a frame in one
-	 * game's open world. Writes that none of those track (stores into guest
-	 * memory read in place) are not covered yet, so it is skipped only where
-	 * the device runs graphics descriptor buffers or heaps, which the
-	 * vk_descriptors_mode setting asks for: a device that has neither draws with
-	 * descriptor sets and keeps every fragment barrier.
+	 * gfx_gpu_src). The texture data cache invalidation (kind 2) orders the
+	 * same reads. Where the device runs graphics descriptor buffers or heaps,
+	 * a fragment barrier stays in the pass as it always did.
+	 *
+	 * Elsewhere, the barrier from all work stays after storage writes or reads
+	 * still pending since the last such barrier (vk_buf_order_pending: storage
+	 * and texel buffers, transform feedback), guest memory bound in place in
+	 * this submission (vk_pages_order_pending), and storage image results added
+	 * since this function's last barrier (vk_gfx_image_adds). Without any of
+	 * them, what came before it is ordered elsewhere: targets and storage
+	 * images where a later command binds them (vk_surf_use), buffer results
+	 * where a draw reads them (gfx_gpu_src), and DMA, 2D and query copies by
+	 * their own barriers. That is what a fragment barrier on descriptor buffers
+	 * or heaps always relied on, so the pass stays open. In one game's open
+	 * world, 97.7% of these barriers came after none of them, and they made
+	 * 730 barrier gaps a frame against 120.
 	 */
-	if (kind == 0 && (g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support)) {
+	if (kind == 0 || kind == 2) {
 		vk_lock();
-		vk_render_fragment_barrier();
+		if ((kind == 0 && (g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support)) ||
+		    !(vk_buf_order_pending(0) || vk_pages_order_pending() ||
+		      vk_gfx_image_adds() != g_full_barrier.images)) {
+			vk_render_fragment_barrier();
+			/* the storage writes before it, which later draws' writes no longer order (render.c stage_set_) */
+			vk_buf_order_request(0);
+			g_vk_barriers_in_pass++;
+			vk_unlock();
+			return;
+		}
 		vk_unlock();
-		return;
 	}
 	if (kind == 1 || kind == 3)
 		return;
@@ -319,8 +364,18 @@ static void vkr_method_barrier(int kind)
 		return;
 	}
 	vk_render_end();
-	/* CPU-visible releases wait for completion in the release path. */
-	rec_CmdPipelineBarrier2(vk_cmd(), &di);
+	/* The barrier is from all commands to all commands. When nothing was recorded since the last one in this
+	 * submission, the last one already orders all that this one would, and the pass stays ended. One game's open
+	 * world gives a texture data cache invalidation just after each of its fragment barriers. */
+	if (g_full_barrier.submit != vk_submit_number() || g_full_barrier.uses != vk_cmd_uses()) {
+		/* CPU-visible releases wait for completion in the release path. */
+		rec_CmdPipelineBarrier2(vk_cmd(), &di);
+		g_full_barrier.submit = vk_submit_number();
+		g_full_barrier.uses = vk_cmd_uses();
+		g_full_barrier.images = vk_gfx_image_adds();
+	} else {
+		g_vk_barriers_merged++;
+	}
 	vk_buf_ordered();
 	vk_unlock();
 }
@@ -740,6 +795,7 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
         vk_tex_frame();
         vk_buf_frame();
         vk_own_trim(); /* before the caches' trim: what it lands is room the trim then need not make */
+        vk_bl_scratch_trim();
         vk_mem_trim(0, 0);
         vk_astc_auto_present(); /* after the trim: Exact again for astc_mode's Auto where the room is back */
         if (g_vk_present % 600 == 0) {
@@ -762,6 +818,17 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                 (unsigned long long)g_vk_dset_new, (unsigned long long)g_vk_dset_reused, vk_desc_pools(),
                 (unsigned long long)vk_desc_array_sets(), (unsigned long long)g_vk_draw_kept,
                 (unsigned long long)g_vk_draw_checked, (unsigned long long)g_vk_targets_kept);
+            if (g_vk_depth_apart_draws) {
+                static u64 apart_was, moved_was;
+                LOG("vulkan: %llu draws of the last 600 frames clip and clamp depth, as the console's clamp off does, "
+                    "%llu of them writing their own depth or taking a depth bias: depth past the viewport's range %s\n",
+                    (unsigned long long)(g_vk_depth_apart_draws - apart_was),
+                    (unsigned long long)(g_vk_depth_apart_moved - moved_was),
+                    g_vk.has_depth_clip_enable ? "is clamped (VK_EXT_depth_clip_enable)"
+                                               : "is undefined without VK_EXT_depth_clip_enable");
+                apart_was = g_vk_depth_apart_draws;
+                moved_was = g_vk_depth_apart_moved;
+            }
             {
                 static u64 synced_was;
                 if (g_rec_barriers_synced != synced_was)
@@ -906,11 +973,13 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
             vk_tex_report_log();
             LOG("vulkan: %llu draws sampled a target they render to in place (%llu barriers in passes, %llu passes "
                 "begun again, %llu drawn two times, %llu feedback draws kept in place), %llu through a copy; %llu "
-                "copies of targets written\n",
+                "copies of targets written; %llu guest barriers that the barrier before them covered, %llu kept in the "
+                "pass with nothing for a barrier from all work to order\n",
                 (unsigned long long)g_vk_fb_draws, (unsigned long long)g_vk_fb_barriers,
                 (unsigned long long)g_vk_fb_restarts, (unsigned long long)g_vk_predraws,
                 (unsigned long long)g_vk_predraw_refused,
-                (unsigned long long)g_vk_rt_copies, (unsigned long long)g_vk_rt_copy_writes);
+                (unsigned long long)g_vk_rt_copies, (unsigned long long)g_vk_rt_copy_writes,
+                (unsigned long long)g_vk_barriers_merged, (unsigned long long)g_vk_barriers_in_pass);
             vk_predraw_report();
             if (g_vk_capture_draws || g_vk_capture_capped)
                 LOG("vulkan: %llu draws captured a primitive at a time (%llu primitives), %llu skipped past %u "
@@ -1075,6 +1144,51 @@ static void vkr_refresh(void) {
 
 /* a part of a surface (x, y, w x h), blitted to RGBA8 at dw x dh, scaled on the GPU, and read back: the pixels, good
    until the next readback, or NULL */
+/* With no device memory for surf_read's image (a game that fills the GPU's: Mario Kart World on 2 GB got no
+   screenshot after its first, and the driver puts no such image in system memory): an RGBA8 surface's part read as
+   it is, its pixels taken nearest to the size asked on the CPU. NULL where it is turned, or of another format */
+static const u8* surf_read_direct(Surf* s, u32 x, u32 y, u32 w, u32 h, u32 transform, u32 dw, u32 dh) {
+    static u8* sized;
+    static u64 sized_cap;
+    if (transform || s->msaa != DS_MSAA_1X1 ||
+        (s->f.vk != VK_FORMAT_R8G8B8A8_UNORM && s->f.vk != VK_FORMAT_R8G8B8A8_SRGB))
+        return NULL;
+    /* x, y, w and h are in the image's own pixels (a scaled target's, as presents keep them) */
+    const u32 sx = x, sy = y, sw = w, sh = h;
+    if (!sw || !sh || sx + sw > s->sw || sy + sh > s->sh) return NULL;
+    VkBuffer buf;
+    u8* p = vk_readback_buffer((u64)sw * sh * 4, &buf);
+    if (!p) return NULL;
+    vk_render_end();
+    VkCommandBuffer cb = vk_cmd();
+    vk_surf_use(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBufferImageCopy c = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                           .imageOffset = {(i32)sx, (i32)sy, 0},
+                           .imageExtent = {sw, sh, 1}};
+    rec_CmdCopyImageToBuffer(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    rec_CmdPipelineBarrier2(cb, &di);
+    vk_finish();
+    vk_readback_ready();
+    if (sw == dw && sh == dh) return p;
+    const u64 need = (u64)dw * dh * 4;
+    if (need > sized_cap) {
+        u8* n = realloc(sized, need);
+        if (!n) return NULL;
+        sized = n;
+        sized_cap = need;
+    }
+    for (u32 j = 0; j < dh; j++)
+        for (u32 i = 0; i < dw; i++)
+            memcpy(sized + ((u64)j * dw + i) * 4, p + ((u64)(j * sh / dh) * sw + i * sw / dw) * 4, 4);
+    return sized;
+}
 static const u8* surf_read(Surf* s, u32 x, u32 y, u32 w, u32 h, u32 transform, u32 dw, u32 dh) {
     /* blit to an RGBA8 image, whatever the target's format, then read that back. sRGB to sRGB, so the bytes stay
        encoded as the display shows them */
@@ -1092,7 +1206,7 @@ static const u8* surf_read(Surf* s, u32 x, u32 y, u32 w, u32 h, u32 transform, u
     DevMemWant aci = {.at = DM_DEVICE};
     VkImage tmp;
     DevMem tmem;
-    if (!VK_OK(vk_devmem_image(&ii, &aci, &tmp, &tmem))) return NULL;
+    if (!VK_OK(vk_devmem_image(&ii, &aci, &tmp, &tmem))) return surf_read_direct(s, x, y, w, h, transform, dw, dh);
     vk_mem_track(tmem, VK_OWN_IMAGE_OTHER);
     VkBuffer buf;
     u8* p = vk_readback_buffer((u64)dw * dh * 4, &buf);
@@ -1306,6 +1420,7 @@ const Renderer vk_renderer = {
     .release_need = vk_release_need,
     .release_read = vk_release_read,
     .release_value = vk_release_value,
+    .release_value_at_least = vk_release_value_at_least,
     .render_predicate = vk_render_predicate,
     .render_predicate_drop = vk_render_predicate_drop,
     .release_retire = vk_release_retire,

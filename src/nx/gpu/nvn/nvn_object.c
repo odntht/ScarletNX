@@ -306,11 +306,11 @@ u64 nvn_DeviceGetTexelFetchHandle(CPU* c, u64 d, i32 id) {
     (void)d;
     return (u64)(i64)id | 1ull << 32;
 }
-/* a counter's timestamp is in the GPU's 19.2 MHz ticks */
+/* a counter's timestamp is in the graphics unit's ticks (runtime/clock.h) */
 u64 nvn_DeviceGetTimestampInNanoseconds(CPU* c, u64 d, u64 counter) {
     (void)c;
     (void)d;
-    return NVN_OBJ(NVNcounterData, counter)->timestamp * 625 / 12;
+    return snx_gpu_ns_of_ticks(NVN_OBJ(NVNcounterData, counter)->timestamp);
 }
 /* fast clear values are hints to the hardware's compression */
 int nvn_DeviceRegisterFastClearColor(CPU* c, u64 d, u64 color, i32 format) {
@@ -2090,7 +2090,8 @@ static int set_shaders(u64 p, i32 n, u64 sd, u64 stride) {
         }
         /* geometry, else tessellation evaluation, else control, else vertex: the driver's order */
         stage = ounce_section(control) ? stage11(data, control) : gr32(control + 0x714);
-        if (gr32(control + 8) >= 7 && GP(control)[0x7c0]) subroutine_mask |= 1u << stage;
+        /* not an Ounce section's, which is 0xd8 bytes: the byte was another section's, or past the mapping's end */
+        if (!ounce_section(control) && gr32(control + 8) >= 7 && GP(control)[0x7c0]) subroutine_mask |= 1u << stage;
         if (stage == NVN_SHADER_STAGE_TESS_CONTROL) tess_controls[0] = control;
         if (stage == NVN_SHADER_STAGE_TESS_EVALUATION) tess_controls[1] = control;
         if (stage == NVN_SHADER_STAGE_FRAGMENT && !ounce_section(control)) fragment = control;
@@ -3041,11 +3042,11 @@ i32 nvn_DeviceGetDepthMode(CPU* c, u64 d) {
     (void)c;
     return (i32)NVN_OBJ(const NvnDevice, d)->depth_mode;
 }
-/* the GPU's timestamp now, in nanoseconds: its 19.2 MHz ticks, as GetTimestampInNanoseconds converts a counter's */
+/* the GPU's timestamp now, in nanoseconds: its ticks, as GetTimestampInNanoseconds converts a counter's */
 u64 nvn_DeviceGetCurrentTimestampInNanoseconds(CPU* c, u64 d) {
     (void)c;
     (void)d;
-    return guest_gpu_ticks() * 625 / 12;
+    return snx_gpu_ns_of_ticks(guest_gpu_ticks());
 }
 
 /* ============================================================ builder getters: what was set */

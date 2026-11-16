@@ -110,6 +110,7 @@ typedef struct {
     u32 big;    /* a buffer for a request bigger than a chunk */
     u32 bar;    /* made for the output ring's share of the window (bar_room) and in device memory the CPU maps: on a
                    GPU that shares system memory every buffer is in such memory, asked for there or not */
+    u32 spilled; /* the device ring's, in system memory for want of the device's: gone once its slot is done */
 } Chunk;
 static struct {
     Chunk* chunk;
@@ -119,6 +120,7 @@ static struct {
                                                  the one being recorded */
     u32 itook;
     u64 made; /* chunks and big buffers made since the start (statistics, tests) */
+    u64 spilled; /* the device ring's chunks made in system memory since the start, for want of the device's */
     u32 recycles; /* frame slots recycled since the start (tests) */
     /* The stream: the chunk it hands out of (plus one) and the bytes handed out of that. Its chunks are no frame's:
        each has the number of a submission, and is handed out again once that submission is done */
@@ -319,12 +321,11 @@ static int bar_room(const DevMemBudget* b, u64 add, int back) {
 /* The driver gives the GPU's own report of a fault (VK_EXT_device_fault, record.c's fault_dump) only once it has
    declared the device lost, and a GPU that stopped is not lost yet: the driver's own timeout comes later than
    VK_GPU_STUCK_NS. A stopped GPU gets 20 s more to become a lost one, so that the report has the fault */
-static void stopped_wait_lost(VkSemaphore sem, u64 value, VkFence fence) {
+static void stopped_wait_lost(VkSemaphore sem, u64 value) {
     VkSemaphoreWaitInfo wi = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &sem, .pValues = &value};
     for (u32 i = 0; i < 20; i++) {
-        VkResult r = sem ? vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull)
-                         : vkWaitForFences(g_vk.dev, 1, &fence, VK_TRUE, 1000000000ull);
+        VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull);
         if (r == VK_ERROR_DEVICE_LOST) LOG("vulkan: the driver declared the stopped GPU's device lost\n");
         if (r != VK_TIMEOUT) return;
     }
@@ -365,7 +366,7 @@ void vk_wait_semaphore(VkSemaphore sem, u64 value) {
             idle = 0;
             moved = plat_ns();
         } else if (plat_ns() - moved >= VK_GPU_STUCK_NS) {
-            stopped_wait_lost(sem, value, VK_NULL_HANDLE);
+            stopped_wait_lost(sem, value);
             vk_checkpoint_dump("GPU stopped");
             vk_ck_report(); /* what the submissions it has not finished hold */
             fatal("vulkan: the GPU stopped responding: no work finished for %llu s (at submission %llu, waiting for "
@@ -375,25 +376,50 @@ void vk_wait_semaphore(VkSemaphore sem, u64 value) {
     }
 }
 
-/* a fence's wait, the same way: no fence of the runtime's own (a bind of sparse memory, a landing) takes seconds */
-/* the fence waits since the last statistics and their time, from whichever thread waited (a bind of sparse memory, a
-   granule of the mirror, a landing): each is a round trip to the GPU that vk_finish's sites and the timeline's waits
-   do not count */
-static u64 g_fence_waits, g_fence_wait_ns;
-int vk_wait_fence(VkFence fence) {
+/* the waits on a path's own timeline since the last statistics and their time, from whichever thread waited (a bind
+   of sparse memory, a granule of the mirror, a landing): each is a round trip to the GPU that vk_finish's sites and
+   the graphics timeline's waits do not count */
+static u64 g_host_waits, g_host_wait_ns;
+u64 vk_host_next(VkHostTimeline* t) {
+    if (!t->sem) {
+        VkSemaphoreTypeCreateInfo tci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                         .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+        VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &tci};
+        if (!VK_OK(vkCreateSemaphore(g_vk.dev, &sci, NULL, &t->sem))) return 0;
+    }
+    return ++t->value;
+}
+int vk_host_bind_sparse(VkHostTimeline* t, const VkBindSparseInfo* bi) {
+    vk_queue_lock(g_vk.gfx);
+    u64 value = vk_host_next(t);
+    VkTimelineSemaphoreSubmitInfo ts = {.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+                                        .signalSemaphoreValueCount = 1,
+                                        .pSignalSemaphoreValues = &value};
+    VkBindSparseInfo b = *bi;
+    b.pNext = &ts;
+    b.signalSemaphoreCount = 1;
+    b.pSignalSemaphores = &t->sem;
+    int ok = value && VK_OK(vkQueueBindSparse(g_vk.gfx, 1, &b, VK_NULL_HANDLE));
+    vk_queue_unlock(g_vk.gfx);
+    return ok && vk_host_wait(t, value);
+}
+/* no submission of the runtime's own paths takes seconds: a wait that does is a stopped GPU */
+int vk_host_wait(const VkHostTimeline* t, u64 value) {
+    VkSemaphoreWaitInfo wi = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &t->sem, .pValues = &value};
     u64 t0 = plat_ns();
     for (;;) {
-        VkResult r = vkWaitForFences(g_vk.dev, 1, &fence, VK_TRUE, 1000000000ull);
+        VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull);
         if (r != VK_TIMEOUT) {
-            __atomic_fetch_add(&g_fence_waits, 1, __ATOMIC_RELAXED);
-            __atomic_fetch_add(&g_fence_wait_ns, plat_ns() - t0, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_host_waits, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_host_wait_ns, plat_ns() - t0, __ATOMIC_RELAXED);
             return VK_OK(r);
         }
         if (plat_ns() - t0 >= VK_GPU_STUCK_NS) {
-            stopped_wait_lost(VK_NULL_HANDLE, 0, fence);
+            stopped_wait_lost(t->sem, value);
             vk_checkpoint_dump("GPU stopped");
             vk_ck_report();
-            fatal("vulkan: the GPU stopped responding: a fence wasn't signaled for %llu s",
+            fatal("vulkan: the GPU stopped responding: a submission of the runtime's own wasn't done for %llu s",
                   VK_GPU_STUCK_NS / 1000000000ull);
         }
     }
@@ -501,8 +527,11 @@ int vk_cmd_ready(void) {
     return vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done) == VK_SUCCESS && done >= last;
 }
 
+static u64 g_cmd_uses;
+u64 vk_cmd_uses(void) { return g_cmd_uses; }
 VkCommandBuffer vk_cmd(void) {
     Frame* f = &g_fr[g_cur];
+    g_cmd_uses++;
     if (!f->recording) {
         /* not inside a landing: the slot's results may be the ones landing, out of the rings its recycling hands
            back, and the recycling's own landing would recycle the slot again under itself. What a landing records in
@@ -563,8 +592,9 @@ void vk_stage_report(void) {
                        (unsigned long long)(g_xfer[r][XFER_MAPPED] >> 20),
                        (unsigned long long)(g_xfer[r][XFER_DEVICE] >> 20));
     LOG("vulkan: ring MB over 600 presents (in host/mapped device/device memory):%s; the rings hold %llu MiB, %llu "
-        "buffers made for them in all\n",
-        line, (unsigned long long)(vk_ring_bytes() >> 20), (unsigned long long)g_cmd.made);
+        "buffers made for them in all, %llu of the device ring's in system memory for want of the device's\n",
+        line, (unsigned long long)(vk_ring_bytes() >> 20), (unsigned long long)g_cmd.made,
+        (unsigned long long)g_cmd.spilled);
     memset(g_xfer, 0, sizeof g_xfer);
     for (u32 i = 0; i < DEVICE_SITES && g_device_sites[i].file; i++) {
         const char* f = strrchr(g_device_sites[i].file, '/');
@@ -619,7 +649,26 @@ static u32 chunk_new(u32 ring, u64 size, int bar, u32 slot) {
         g_cmd.chunk = grown;
         g_cmd.capchunk = cap;
     }
-    if (!VK_OK(vk_buffer_create(&bci, &aci, &buf, &mem, &info))) return 0;
+    /* The device ring's chunk without device memory: the kept results' pool gives back what it can (owned.c), and then
+       the chunk is made in system memory, which the GPU reads and writes across the bus. What stages through the ring
+       then still happens: without a chunk a copy engine's copy was skipped ("could not stage its source"), and the
+       texture or the buffer it fills kept the bytes it had */
+    u32 spilled = 0;
+    VkResult made = vk_buffer_create(&bci, &aci, &buf, &mem, &info);
+    if (made != VK_SUCCESS && ring == XRING_DEVICE && g_vk.mem_model != VK_MEM_UMA) {
+        if (vk_own_make_room()) made = vk_buffer_create(&bci, &aci, &buf, &mem, &info);
+        if (made != VK_SUCCESS) {
+            aci.at = DM_HOST;
+            made = vk_buffer_create(&bci, &aci, &buf, &mem, &info);
+            spilled = made == VK_SUCCESS;
+            g_cmd.spilled += spilled;
+            if (spilled)
+                LOG_LIMIT(1, "vulkan: no device memory for a chunk of the device ring (%llu MiB): it is in system "
+                             "memory until its frame is done, as each one is that finds none\n",
+                          (unsigned long long)(size >> 20));
+        }
+    }
+    if (!VK_OK(made)) return 0;
     vk_mem_track(mem, VK_OWN_STAGING);
     if (ring == XRING_STAGE && !g_cmd.stage_told) {
         const VkPhysicalDeviceMemoryProperties* mp;
@@ -638,7 +687,8 @@ static u32 chunk_new(u32 ring, u64 size, int bar, u32 slot) {
                              .ring = ring,
                              .in = xfer_where(&info),
                              .slot = slot,
-                             .bar = bar && xfer_where(&info) == XFER_MAPPED};
+                             .bar = bar && xfer_where(&info) == XFER_MAPPED,
+                             .spilled = spilled};
     g_cmd.made++;
     return i + 1;
 }
@@ -841,7 +891,7 @@ static void pool_recycle(Frame* f) {
             held[c->ring][c->big]++;
             continue;
         }
-        if ((!c->big && c->size != size) || (c->bar && !bar_room(budget, 0, 0)))
+        if ((!c->big && c->size != size) || (c->bar && !bar_room(budget, 0, 0)) || c->spilled)
             chunk_destroy(c);
         else {
             if (c->slot) c->freed = g_frame_id;
@@ -1209,11 +1259,12 @@ void vk_finishes_log(void) {
         g_finish_sites[best].n = 0;
     }
     for (u32 i = 0; i < FINISH_SITES && g_finish_sites[i].file; i++) g_finish_sites[i].n = g_finish_sites[i].ns = 0;
-    u64 fences = __atomic_exchange_n(&g_fence_waits, 0, __ATOMIC_RELAXED),
-        fence_ns = __atomic_exchange_n(&g_fence_wait_ns, 0, __ATOMIC_RELAXED);
-    if (fences)
-        LOG("vulkan:   %llu waits for a fence (%.1f ms): sparse binds, the mirror's granules and landings\n",
-            (unsigned long long)fences, (double)fence_ns / 1e6);
+    u64 hosts = __atomic_exchange_n(&g_host_waits, 0, __ATOMIC_RELAXED),
+        host_ns = __atomic_exchange_n(&g_host_wait_ns, 0, __ATOMIC_RELAXED);
+    if (hosts)
+        LOG("vulkan:   %llu waits for a timeline of its own (%.1f ms): sparse binds, the mirror's granules and "
+            "landings\n",
+            (unsigned long long)hosts, (double)host_ns / 1e6);
     if (g_cmd.big_n)
         LOG("vulkan:   %llu requests for big buffers asked %llu MiB and took %llu MiB of size classes (each %llu KiB to "
             "%llu KiB)\n",

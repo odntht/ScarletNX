@@ -419,7 +419,7 @@ static int xfb_control_stores(u32* end, u64 control, u32 what, u32 stride) {
 }
 int vk_render_xfb_control(u32 owner_id, u64 control, u32 what, u32 stride, DrawOwner* owner) {
     if ((owner_id & 0x7fffffff) >= GPU_CHANNELS) return 0;
-    if (g_shader_xfb_stores) {
+    if (g_spirv_translate.xfb_stores) {
         if (!xfb_control_stores(g_xfb.end[xfb_counter_offset(owner_id) / 16], control, what, stride)) return 0;
     } else {
         if (!g_vk.has_xfb || !xfb_counters()) return 0;
@@ -438,7 +438,7 @@ int vk_render_xfb_control(u32 owner_id, u64 control, u32 what, u32 stride, DrawO
 /* whether a draw captures its vertices (DsPrograms.xfb_on): by the extension once its counters exist, or by stores */
 static int xfb_wanted(int on) {
     if (!on) return 0;
-    return g_vk.has_xfb ? xfb_counters() : g_shader_xfb_stores;
+    return g_vk.has_xfb ? xfb_counters() : g_spirv_translate.xfb_stores;
 }
 
 /* a draw's capture by stores: the vertex stage's bindings and where each buffer's capture ends */
@@ -494,7 +494,13 @@ static int xfb_bind(const DsState* ds, const DrawOwner* o, const VkSh* vs, int i
     x->size[4] = sizeof params;
     for (u32 b = 0; b < 4; b++) {
         if (!(r->declared >> b & 1)) continue;
-        if (!(r->bound >> b & 1)) { /* nothing stored: a buffer for the binding */
+        if (!(r->bound >> b & 1)) { /* nothing stored: a null buffer, or a buffer for the binding */
+            if (vk_null_descriptors()) {
+                x->buf[b] = VK_NULL_HANDLE;
+                x->off[b] = 0;
+                x->size[b] = VK_WHOLE_SIZE;
+                continue;
+            }
             if (!vk_buf_copy(0, 16, &x->buf[b], &x->off[b])) return 0;
             x->size[b] = 16;
             continue;
@@ -1194,6 +1200,29 @@ static u32 tex_handle(const DsState* ds, int stage, u32 tcb, const ShaderInfo* s
     if (si->tex[i].flags & SNX_TEX_MEMORY) return memh_handle(ds, stage, si, i);
     return tex_handle_cb(ds, stage, tcb, &si->tex[i]);
 }
+/* a slot whose handle is one word of the texture bank tcb (tex_handle_cb's first word, and no second one) */
+static int tex_handle_plain(const ShTex* st, u32 tcb) {
+    return !(st->flags & SNX_TEX_MEMORY) && !(st->bindless && st->bl2) && (!st->bindless || (st->bl_cbuf & 31) == tcb);
+}
+#define TEX_HANDLE_SPAN 256 /* words of the texture bank read at once */
+/* the handles of si's first n texture slots, as tex_handle gives them: those in the texture bank in guest memory read
+   in one read of the words they span. A read of a word there took the general path of guest memory (its pending
+   results' lock, the queued releases, the owners) once for each texture of each draw: in one game half of the
+   fragment textures' keying, about 0.1 us a draw */
+static void tex_handles(const DsState* ds, int stage, u32 tcb, const ShaderInfo* si, int n, u32* out) {
+    u32 lo = ~0u, hi = 0, words[TEX_HANDLE_SPAN];
+    for (int i = 0; i < n; i++)
+        if (tex_handle_plain(&si->tex[i], tcb)) {
+            if (si->tex[i].cbuf_off < lo) lo = si->tex[i].cbuf_off;
+            if (si->tex[i].cbuf_off > hi) hi = si->tex[i].cbuf_off;
+        }
+    u64 a = tcb < DS_CBUFS ? ds->bind.cb_addr[stage][tcb] : 0;
+    int span = lo <= hi && hi - lo < TEX_HANDLE_SPAN && a && !ds_cb_inline(ds, stage, tcb).bytes;
+    if (span) gmem_read(a + (u64)lo * 4, words, ((u64)hi - lo + 1) * 4);
+    for (int i = 0; i < n; i++)
+        out[i] = span && tex_handle_plain(&si->tex[i], tcb) ? snx_ld_le32((const u8*)&words[si->tex[i].cbuf_off - lo])
+                                                             : tex_handle(ds, stage, tcb, si, i);
+}
 
 /* a texture binding of a draw: the headers its handle names, and the texture */
 typedef struct {
@@ -1473,8 +1502,11 @@ VkImageView vk_storage_image_view(Surf* t, const ShaderInfo* si, int i, u64* byt
                 : t->depth3d != 1 || (si->img[i].type != 3 && si->img[i].type != 4)) ||
         !*bytes || *bytes > UINT32_MAX)
         return VK_NULL_HANDLE;
+    /* an sRGB surface is written through its linear twin (vk_tex_storage_view's view, surf_create_'s EXTENDED_USAGE):
+       NVN's image stores convert no sRGB, so the program's bytes land as it wrote them. One game's upscaler stores
+       its already encoded frame into an RGBA8 sRGB image, and refused, its whole frame stayed black */
     if (kind == 1 ? t->f.vk != VK_FORMAT_R32_UINT
-                  : !vk_format_storage_write(t->f.vk) || kind != (t->f.is_int ? t->f.sint ? 3 : 2 : 0))
+                  : !vk_format_storage_write(vk_srgb_as(t->f.vk, 0)) || kind != (t->f.is_int ? t->f.sint ? 3 : 2 : 0))
         return VK_NULL_HANDLE;
     /* a 2D array surface sees every layer of the image, a single layer one too */
     return vk_tex_storage_view(t, vk_storage_image_type(si, i));
@@ -1619,9 +1651,11 @@ static void fs_key(const DsState* ds, const VkSh* s0, TexRes* res, u32 last_out,
     u32 nd = 0;
     *fk = (FsKey){.rm = rt_int, .rs = rt_sint, .unfed = s0->si.in_mask & ~last_out};
     int nt = s0->si.ntex > SH_MAXTEX ? SH_MAXTEX : s0->si.ntex;
+    u32 handles[SH_MAXTEX];
+    tex_handles(ds, 4, ds->bind.tex_bank, &s0->si, nt, handles);
     for (int i = 0; i < nt; i++) {
         const ShTex* st = &s0->si.tex[i];
-        tex_resolve(ds, tex_handle(ds, 4, ds->bind.tex_bank, &s0->si, i), &res[i]);
+        tex_resolve(ds, handles[i], &res[i]);
         if (!(st->flags & (SNX_TEX_INDEXED | 1)) && vk_tic_unnormalized(res[i].tic) == 1) fk->rect |= 1ull << i;
         /* a texture only a TXQ names: a 2D query until the header says what it is (a 3D query answers its depth,
            which a 2D slot can't bind) */
@@ -2028,9 +2062,7 @@ static u32 cb_range(const DsState* ds, int stage, const VkSh* s, int i) {
     u32 sz = ds->bind.cb_size[stage][i];
     if (sz > 65536 || !sz) sz = 65536;
     if (s->si.cbuf_max[i] && sz > s->si.cbuf_max[i]) sz = s->si.cbuf_max[i]; /* only the bytes the shader reads */
-    sz = (sz + 15) & ~15u;
-    if (sz > g_vk.props.limits.maxUniformBufferRange) sz = g_vk.props.limits.maxUniformBufferRange;
-    return sz;
+    return vk_cb_range(sz);
 }
 /* A third of a draw's constant buffers miss cb_get's entries, and each of those looks its range up in the buffer
    cache: two cache misses in a row, the index's slot and then the entry it names, which were most of buf_get's time
@@ -2281,12 +2313,12 @@ static int indexed_uniform(DescWrites* writes, VkDescriptorSet set, int stage, u
     return 1;
 }
 
-/* The elements of SNX_VKB_TEXARRAY (g_shader_tex_array of them), from an indexed texture slot: SNX_TEX_ARRAY handles
-   from the slot's offset on, (1 << shift) bytes apart, or as many as the slot says, its stride apart. A handle past the
-   constant buffer's size, or with a header or sampler index past its pool's limit (no texture on hardware either),
-   reads as its kind's null texture. So does a texture of another kind than the slot's. Targets use snapshots refreshed after a draw changes
-   them. Tables of different kinds share the binding, each element viewed as the kind of the table that names it: a
-   handle that two kinds name has an element for each. */
+/* The elements of SNX_VKB_TEXARRAY (g_spirv_translate.tex_array of them), from an indexed texture slot: SNX_TEX_ARRAY
+   handles from the slot's offset on, (1 << shift) bytes apart, or as many as the slot says, its stride apart. A handle
+   past the constant buffer's size, or with a header or sampler index past its pool's limit (no texture on hardware
+   either), reads as its kind's null texture. So does a texture of another kind than the slot's. Targets use snapshots
+   refreshed after a draw changes them. Tables of different kinds share the binding, each element viewed as the kind of
+   the table that names it: a handle that two kinds name has an element for each. */
 static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int* first, int count, Surf** rt, Surf* zt,
                           u32 n, VkImageLayout layout, DescWrites* d, VkDescriptorSet set) {
     /* each table's kind, named by the first table of that kind; a non-shadow kind's elements fill the depth binding
@@ -2330,8 +2362,9 @@ static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int
                other (edenprobe's bindless case samples it) */
             if ((!cba && !in.bytes) || at + 4 > size) {
                 if (tk->id == TEX_NO_ENTRY) {
-                    if (used == g_shader_tex_array) {
-                        LOG_LIMIT(4, "vulkan: indexed texture tables exceed %u unique handles\n", g_shader_tex_array);
+                    if (used == g_spirv_translate.tex_array) {
+                        LOG_LIMIT(4, "vulkan: indexed texture tables exceed %u unique handles\n",
+                                  g_spirv_translate.tex_array);
                         return 0;
                     }
                     tk->id = used++;
@@ -2351,8 +2384,9 @@ static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int
             u32 id = vk_indexed_handle_find(handle_slots, SNX_TEX_ARRAY, handles, element_kind, used, handle,
                                             (u8)kind_of[table], 8);
             if (id == used) {
-                if (used == g_shader_tex_array) {
-                    LOG_LIMIT(4, "vulkan: indexed texture tables exceed %u unique handles\n", g_shader_tex_array);
+                if (used == g_spirv_translate.tex_array) {
+                    LOG_LIMIT(4, "vulkan: indexed texture tables exceed %u unique handles\n",
+                              g_spirv_translate.tex_array);
                     return 0;
                 }
                 handles[id] = handle;
@@ -2411,7 +2445,7 @@ static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int
         }
     }
     /* the first kind's null texture in every entry left: the binding is read whole */
-    for (u32 k = used; k < g_shader_tex_array; k++) {
+    for (u32 k = used; k < g_spirv_translate.tex_array; k++) {
         d->table[k] = kinds[0].info;
         if (depth_fill) {
             d->depth_table[k] = depth_fill->depth;
@@ -2422,7 +2456,7 @@ static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int
     *w = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                 .dstSet = set,
                                 .dstBinding = SNX_VKB_TEXARRAY,
-                                .descriptorCount = g_shader_tex_array,
+                                .descriptorCount = g_spirv_translate.tex_array,
                                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                 .pImageInfo = d->table};
     if (depth_fill) {
@@ -2438,6 +2472,54 @@ static int tex_tables_set(const DsState* ds, int stage, const VkSh* s, const int
     return 1;
 }
 
+/* the words of global buffer desc's descriptor (SH_GBUF_*) into v: NVN's descriptors in cbuf 0 (the address and the
+   size), or one of the program's own constant buffers (a bare address) */
+static void gbuf_words(const DsState* ds, int stage, u32 desc, u32 v[3]) {
+    DsCbBlock in = ds_cb_inline(ds, stage, SH_GBUF_BANK(desc));
+    u64 cb = in.bytes ? 0 : ds->bind.cb_addr[stage][SH_GBUF_BANK(desc)];
+    if (cb && SH_GBUF_BANK(desc)) vk_buf_mem_need(cb + SH_GBUF_OFFSET(desc), 8);
+    if (cb) { /* words of a constant buffer, not a header: a pending write there is waited for */
+        gmem_read(cb + SH_GBUF_OFFSET(desc), v, SH_GBUF_BANK(desc) ? 8 : 12);
+        snx_le32_array(v, SH_GBUF_BANK(desc) ? 2 : 3);
+    }
+    for (u32 w = 0; in.bytes && w < (SH_GBUF_BANK(desc) ? 2u : 3u); w++)
+        v[w] = ds_inline_word(in, SH_GBUF_OFFSET(desc) + 4 * w);
+}
+/* The windows of the pointer table in the storage buffer whose descriptor is parent (SH_GBUF_TABLE_SSBO), as many as
+   the program has for it: the buffer's words, read from guest memory (its first 1 MiB, where a pending write is
+   waited for), are the pointers, and each window binds ShaderInfo.table_reach bytes past those in it. Two runs are
+   joined only where the memory between them is all mapped: a draw's window is copied as one range. One game's reset
+   of its terrain's records reads 1485 of the 15000 pointers in its table, which only the first 4 KiB held 512 of */
+#define TABLE_SSBO_MAX (1u << 20)
+static void table_ssbo_windows(const DsState* ds, const VkSh* sh, int stage, u32 parent, u64* base, u32* len) {
+    u32 windows = 0, v[3] = {0, 0, 0};
+    for (int i = 0; i < sh->si.ngbuf && i < 16; i++)
+        windows += SH_GBUF_TABLE_SSBO(sh->si.gbuf_cbuf_off[i]) && SH_GBUF_PARENT(sh->si.gbuf_cbuf_off[i]) == parent;
+    if (windows > SH_GBUF_TABLE_MAX) windows = SH_GBUF_TABLE_MAX;
+    u64 addr = 0;
+    gbuf_words(ds, stage, parent, v);
+    u32 bytes = vk_gbuf_desc(sh->stage, parent, v, &addr) & ~7u, n = 0;
+    if (bytes > TABLE_SSBO_MAX) bytes = TABLE_SSBO_MAX;
+    /* the words read into a buffer kept from draw to draw (draws hold vk_lock), through gmem_read, which takes the
+       table's runs of guest memory wherever they are and reads what isn't mapped as zero */
+    static u64* words;
+    static u32 words_size;
+    if (addr && bytes > words_size) {
+        u64* grown = realloc(words, bytes);
+        if (grown) words = grown, words_size = bytes;
+    }
+    if (addr && bytes && bytes <= words_size) {
+        vk_buf_mem_need(addr, bytes);
+        gmem_read(addr, words, bytes);
+        for (n = 0; n < bytes / 8; n++) words[n] = snx_ld_le64(words + n);
+    }
+    u32 runs = vk_pointer_windows(words, n, windows, sh->si.table_reach, 1, base, len);
+    if (runs)
+        LOG_LIMIT(1,
+                  "vulkan: a program's pointer table in memory has %u runs of mapped memory that its %u windows can't "
+                  "hold: the pointers in the others reach nothing\n",
+                  runs, windows);
+}
 /* the global memory each stage of the draw reads or writes, sh[] by stage (vertex, the tessellation stages, geometry,
    fragment) */
 static void draw_storage_read(const DsState* ds, VkDrawStorage* draw, VkSh* const sh[VK_DRAW_STAGES]) {
@@ -2448,24 +2530,29 @@ static void draw_storage_read(const DsState* ds, VkDrawStorage* draw, VkSh* cons
         u64 cb0 = ds_cb_inline(ds, stage, 0).bytes ? 0 : ds->bind.cb_addr[stage][0];
         draw->n[s] = sh[s]->si.ngbuf < 16 ? sh[s]->si.ngbuf : 16;
         if (cb0 && draw->n[s]) vk_buf_mem_need(cb0, 0x610);
+        u32 table = 0; /* the parent + 1 whose windows tw_ holds */
+        u64 tw_base[SH_GBUF_TABLE_MAX];
+        u32 tw_len[SH_GBUF_TABLE_MAX];
         for (int i = 0; i < draw->n[s]; i++) {
             VkDrawGbuf* b = &draw->b[s][i];
             u32 v[3] = {0, 0, 0}, desc = sh[s]->si.gbuf_cbuf_off[i];
+            b->writable = (sh[s]->si.gbuf_wmask >> i) & 1;
+            if (SH_GBUF_TABLE_SSBO(desc)) { /* a window of a pointer table in memory, its base in SNX_VKB_MBASE */
+                if (table != SH_GBUF_PARENT(desc) + 1) {
+                    table_ssbo_windows(ds, sh[s], stage, SH_GBUF_PARENT(desc), tw_base, tw_len);
+                    table = SH_GBUF_PARENT(desc) + 1;
+                }
+                b->addr = tw_base[SH_GBUF_TABLE_WINDOW(desc)];
+                b->size = (tw_len[SH_GBUF_TABLE_WINDOW(desc)] + 3) & ~3u;
+                b->bare = 1;
+                continue;
+            }
             /* the constant buffer holding the address (SH_GBUF_*): NVN's descriptors in cbuf 0, or one of the
                program's own. An indirect buffer's is its parent's, which vk_gbuf_desc follows to the pointer, and it
                takes the memory mapped from there, as a bare address does */
-            DsCbBlock in = ds_cb_inline(ds, stage, SH_GBUF_BANK(desc));
-            u64 cb = in.bytes ? 0 : ds->bind.cb_addr[stage][SH_GBUF_BANK(desc)];
-            if (cb && SH_GBUF_BANK(desc)) vk_buf_mem_need(cb + SH_GBUF_OFFSET(desc), 8);
-            if (cb) { /* words of a constant buffer, not a header: a pending write there is waited for */
-                gmem_read(cb + SH_GBUF_OFFSET(desc), v, SH_GBUF_BANK(desc) ? 8 : 12);
-                snx_le32_array(v, SH_GBUF_BANK(desc) ? 2 : 3);
-            }
-            for (u32 w = 0; in.bytes && w < (SH_GBUF_BANK(desc) ? 2u : 3u); w++)
-                v[w] = ds_inline_word(in, SH_GBUF_OFFSET(desc) + 4 * w);
+            gbuf_words(ds, stage, desc, v);
             b->size = vk_gbuf_desc(sh[s]->stage, desc, v, &b->addr);
             b->bare = SH_GBUF_BANK(desc) != 0 || SH_GBUF_INDIRECT(desc);
-            b->writable = (sh[s]->si.gbuf_wmask >> i) & 1;
         }
     }
 }
@@ -2614,7 +2701,12 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
         if (!root_get(ds, sz, &b, &o)) return VK_NULL_HANDLE;
         dw_buffer(&d, set, SNX_VKB_ROOT, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, b, o, sz);
     }
-    int ordered = !(ds->owner & 0x80000000u) || !g_settings.nvn_storage_ordering;
+    /* Two draws' stores to one buffer are not ordered on the console: a game orders them with a barrier
+       (WAIT_FOR_IDLE, FRAGMENT_BARRIER and the texture data cache invalidation of Maxwell, NVN's barriers), and
+       method_barrier gives each of those. A read of an earlier draw's writes still gets its barrier here. One game
+       draws about 600 times a frame into one result buffer, and each of those draws ended the pass for a barrier
+       before it. nvn_storage_order 0 keeps that order for comparisons */
+    int ordered = !g_settings.nvn_storage_ordering;
     for (int i = 0; i < s->si.ngbuf && i < 16; i++) {
         const VkDrawGbuf* gb = &draw->b[stage][i];
         u64 addr = gb->addr;
@@ -2622,13 +2714,35 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
         u64 sa = g_vk.props.limits.minStorageBufferOffsetAlignment; /* an earlier draw's result is read in place */
         VkBuffer b;
         u64 o;
-        int ok = gb->aliased            ? (b = gb->buf, o = gb->off, 1)
-                 : addr && gb->writable ? vk_buf_copy_writable(addr, size, &b, &o, ordered)
-                 : addr && gb->bare     ? vk_buf_get_window(addr, size, &b, &o)
-                 : addr                 ? vk_buf_get_input(addr, size, sa, &b, &o)
-                                        : vk_buf_copy(0, size, &b, &o);
+        /* no address: a null buffer where the device has them, which reads zero, else a staging copy of zeros */
+        int ok = gb->aliased             ? (b = gb->buf, o = gb->off, 1)
+                 : addr && gb->writable  ? vk_buf_copy_writable(addr, size, &b, &o, ordered)
+                 : addr && gb->bare      ? vk_buf_get_window(addr, size, &b, &o)
+                 : addr                  ? vk_buf_get_input(addr, size, sa, &b, &o)
+                 : vk_null_descriptors() ? (b = VK_NULL_HANDLE, o = 0, 1)
+                                         : vk_buf_copy(0, size, &b, &o);
         if (!ok) return VK_NULL_HANDLE;
-        dw_buffer(&d, set, SNX_VKB_SSBO + i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, b, o, gb->aliased ? gb->range : size);
+        u64 range = !b ? VK_WHOLE_SIZE : gb->aliased ? gb->range : size;
+        dw_buffer(&d, set, SNX_VKB_SSBO + i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, b, o, range);
+    }
+    /* each pointer table window's base and length, at its buffer's slot: 16 vec4 of words (SNX_VKB_MBASE, which is
+       the fragment stage's SNX_VKB_RS: the translator makes no table for a fragment program) */
+    u32 mb[64] = {0}, tables = 0;
+    for (int i = 0; i < s->si.ngbuf && i < 16; i++)
+        if (SH_GBUF_TABLE(s->si.gbuf_cbuf_off[i])) {
+            mb[4 * i] = (u32)draw->b[stage][i].addr;
+            mb[4 * i + 1] = (u32)(draw->b[stage][i].addr >> 32);
+            mb[4 * i + 2] = draw->b[stage][i].size;
+            tables = 1;
+        }
+    if (tables) {
+        VkBuffer mbase;
+        u64 mo;
+        u8* p = vk_stage(sizeof mb, vk_stage_align(), &mbase, &mo);
+        if (!p) return VK_NULL_HANDLE;
+        memcpy(p, mb, sizeof mb);
+        snx_le32_array(p, sizeof mb / 4); /* the shader reads the words little-endian */
+        dw_buffer(&d, set, SNX_VKB_MBASE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, mbase, mo, sizeof mb);
     }
     if (s->si.ngbuf)
         dw_buffer(&d, set, SNX_VKB_SMAP, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, draw->map_buf[stage], draw->map_off[stage],
@@ -2701,6 +2815,9 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
         !tex_tables_set(ds, stage, s, table_first, table_count, rt, zt, n,
                         images->sampled_general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, &d, set))
         return VK_NULL_HANDLE;
+    /* a stage fs_key didn't key: its handles in one read (tex_handles) */
+    u32 handles[SH_MAXTEX];
+    if (!res && nt) tex_handles(ds, stage, tcb, &s->si, nt, handles);
     for (int i = 0; i < nt; i++) {
         ShTex* st = &s->si.tex[i];
         if (st->flags & SNX_TEX_INDEXED) continue;
@@ -2717,6 +2834,7 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
         int predrawn = g_predraw.phase == 1 && stage == ST_FS && predraw_k < g_predraw.n;
         u32 handle = predrawn                ? g_predraw.tex[predraw_k].handle
                      : res && res[i].have ? res[i].handle
+                     : !res               ? handles[i]
                                           : tex_handle(ds, stage, tcb, &s->si, i);
         /* what fs_key resolved, unless it is a render target or a copy of one: a crop of the same target at
            another size, for another stage, replaces it. Other textures stay until the next present */
@@ -2885,13 +3003,18 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
             if (!dw_buffer_image(&d, set, stage, i, tic, kind, handle)) return VK_NULL_HANDLE;
             continue;
         }
-        /* a slot with nothing bound (an empty header): an empty image, which nothing writes back, as a dispatch
-           takes one (compute.c's vk_dispatch), where the draw was skipped */
+        /* a slot with nothing bound (an empty header): a null descriptor (vk_null_descriptors), or else an empty
+           image, which nothing writes back, as a dispatch takes one (compute.c's vk_dispatch), where the draw was
+           skipped */
         VkImageView null_view = VK_NULL_HANDLE;
-        Surf* null_image =
-            vk_tic_empty(tic) ? vk_null_storage(vk_storage_image_type(&s->si, i), kind, &null_view) : NULL;
-        if (null_image) {
-            vk_surf_use(vk_cmd(), null_image, VK_IMAGE_LAYOUT_GENERAL, image_stages[stage], VK_STORAGE_IMAGE_ACCESS);
+        int null_slot = vk_tic_empty(tic) && vk_null_descriptors();
+        Surf* null_image = vk_tic_empty(tic) && !null_slot
+                               ? vk_null_storage(vk_storage_image_type(&s->si, i), kind, &null_view)
+                               : NULL;
+        if (null_image || null_slot) {
+            if (null_image)
+                vk_surf_use(vk_cmd(), null_image, VK_IMAGE_LAYOUT_GENERAL, image_stages[stage],
+                            VK_STORAGE_IMAGE_ACCESS);
             u32 binding = SNX_VKB_IMG + (u32)i;
             d.ii[binding] = (VkDescriptorImageInfo){VK_NULL_HANDLE, null_view, VK_IMAGE_LAYOUT_GENERAL};
             d.w[d.n++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -2976,7 +3099,8 @@ static struct {
     VkDescriptorSet sets[5];
     u64 set_binds; /* vk_rec_set_binds when sets were: a set bound the old way since unbinds descriptor buffers */
     u32 fb, cull, front, topo, restart, discard, bias_on, dt, dw, dcmp, dbounds, st;
-    u32 polygon, clamp, provoking, conservative, patch; /* g_vk.dyn_pr's, as PipeKey holds them */
+    u32 polygon, clamp, clip, provoking, conservative, patch; /* g_vk.dyn_pr's, as PipeKey holds them */
+    VkDepthClampRangeEXT clamp_range;                         /* with has_depth_clamp_range */
     u32 minus_one;                                      /* and its depth range, which no key holds: from -1 */
     VkViewport vp[GUEST_VIEWPORTS];
     VkRect2D sc[GUEST_VIEWPORTS];
@@ -3013,6 +3137,8 @@ static void pr_dynamic(VkCommandBuffer cb, const PipeKey* k, int minus_one, int 
     if (d & VK_DYN_PR_POLYGON) DYN(polygon, k->polygon, rec_CmdSetPolygonModeEXT(cb, (VkPolygonMode)k->polygon));
     if (d & VK_DYN_PR_DEPTH_CLAMP)
         DYN(clamp, k->depth_clamp, rec_CmdSetDepthClampEnableEXT(cb, k->depth_clamp ? VK_TRUE : VK_FALSE));
+    if (d & VK_DYN_PR_DEPTH_CLIP)
+        DYN(clip, k->depth_clip, rec_CmdSetDepthClipEnableEXT(cb, k->depth_clip == 2 ? VK_TRUE : VK_FALSE));
     if (d & VK_DYN_PR_PROVOKING)
         DYN(provoking, k->provoking_last,
             rec_CmdSetProvokingVertexModeEXT(cb, k->provoking_last ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT
@@ -3027,6 +3153,9 @@ static void pr_dynamic(VkCommandBuffer cb, const PipeKey* k, int minus_one, int 
     if ((d & VK_DYN_PR_PATCH) && k->tes) DYN(patch, k->patch, rec_CmdSetPatchControlPointsEXT(cb, k->patch));
 }
 u64 g_vk_drawn, g_vk_skipped, g_vk_mesh_draws, g_vk_mesh_drawn;
+/* draws whose depth the console both clips and clamps (its clamp off), and of them those that write their own depth or
+   take a depth bias, whose depth may leave the viewport's range: undefined there without VK_EXT_depth_clip_enable */
+u64 g_vk_depth_apart_draws, g_vk_depth_apart_moved;
 u64 g_vk_capture_draws, g_vk_capture_primitives, g_vk_capture_capped;
 
 /* The viewport's size with the transform off: the surface clip's, at most the device's viewport dimensions at the
@@ -3216,6 +3345,15 @@ static struct {
     u32 topology;          /* the draw's argument, before tessellation makes it a patch list */
     u32 epoch;             /* vk_ww_epoch */
     u64 shader_generation; /* instruction invalidations also expire kept draws */
+    /* A program can have more than one translation, each with other constant buffer words folded (cb_fold.h), and
+       vk_shader_get takes the one that folds the most words of those that hold. A kept shader still holds when
+       another translation of its program starts to hold, because it doesn't read the words that the other folds. So
+       fold_gen is vk_shader_fold_gen when the state was kept (no translation came since), and not_top has a bit for
+       each shader of used_shaders that another translation of its program folded more than then. draw_kept
+       asks vk_shader_chosen for those. Without these checks, draw_state_check=1 found 0.22% of the kept draws in one
+       game's town with a fragment program that folded no word, where a lookup gave one that folded a word: the game
+       had set that word to the value the other translation folded */
+    u32 fold_gen, not_top;
     DrawShaders sh;        /* the rest holds when sh.vs is set */
     FsKey fkey;
     VkSh* fs;
@@ -3237,6 +3375,16 @@ static void draw_differs(const char* what) {
                "vulkan: draw_state_check=1: a draw that kept the last draw's state has another %s when it is made "
                "again (%llu draws checked)\n",
                what, (unsigned long long)g_vk_draw_checked);
+}
+/* the kept shaders that hold their constant buffer words: the stages, the fragment program and its variant */
+static void used_shaders(const VkSh* used[6]) {
+    const DrawShaders* s = &g_draw.sh;
+    used[0] = s->vs;
+    used[1] = s->tcs;
+    used[2] = s->tes;
+    used[3] = s->gs;
+    used[4] = s->fs0;
+    used[5] = g_draw.fs;
 }
 /* whether the vertex format f is, in what the kept state read of it, the one it was made from: the attributes the
    vertex program reads, the streams they name, and which of all 32 attributes are integers (they key the program) */
@@ -3263,6 +3411,7 @@ static int draw_kept(const DsState* ds, u32 topology, int mesh, u32 epoch) {
     const DrawShaders* s = &g_draw.sh;
     if (s->mesh != mesh) return 0;
     if (g_draw.shader_generation != g_vk.shader_generation) return 0;
+    if (g_draw.fold_gen != vk_shader_fold_gen()) return 0; /* a translation came that a lookup may take instead */
     if (g_draw.k.heaps != (u32)g_vk.has_descriptor_heaps) return 0;
     if (!s->vs || g_draw.ch_id != ds->owner || g_draw.topology != topology || g_draw.epoch != epoch) return 0;
     for (u32 i = 0; i < sizeof g_draw_groups; i++)
@@ -3275,9 +3424,15 @@ static int draw_kept(const DsState* ds, u32 topology, int mesh, u32 epoch) {
     if (s->xfb_on != xfb_wanted(ds->prog.xfb_on)) return 0; /* capture began or ended, or its counters were made */
     if (s->window_xy != !ds->vp.transform_on) return 0; /* the viewports' group keys no shader otherwise */
     if (s->swizzle != vk_viewport_swizzle_key(&ds->vp)) return 0;
-    const VkSh* used[6] = {s->vs, s->tcs, s->tes, s->gs, s->fs0, g_draw.fs};
-    for (int i = 0; i < 6; i++)
-        if (used[i] && used[i]->cbr.n && !vk_shader_cb_hold(ds, used[i])) return 0;
+    const VkSh* used[6];
+    used_shaders(used);
+    for (int i = 0; i < 6; i++) {
+        if (!used[i]) continue;
+        if (g_draw.not_top >> i & 1) {
+            if (!vk_shader_chosen(ds, used[i])) return 0;
+        } else if (used[i]->cbr.n && !vk_shader_cb_hold(ds, used[i]))
+            return 0;
+    }
     return 1;
 }
 static int draw_shaders_same(const DrawShaders* a, const DrawShaders* b) {
@@ -3406,8 +3561,12 @@ static int draw_shaders(const DsState* ds, u32 topology, int mesh, DrawShaders* 
                  : NULL;
     if (tes_on && !tcs_on)
         o->tcs = vk_tess_passthrough(ds->rkey.patch_vertices ? ds->rkey.patch_vertices : 1, o->vs, o->tes);
+    /* the generics the stage before writes, which an SM86 passthrough program forwards (and no others). A Maxwell
+       program doesn't read them: 0 keeps its key one for each program */
+    const VkSh* before = tes_on ? o->tes : o->vs;
+    u32 before_out = g_shader_sm86 && before && !before->failed ? before->si.out_mask : 0;
     o->gs = gs_on ? vk_shader_get(ds, p->code[4], 0, ST_GS, 0, 0, gs_input_vertices(topology, tes_on, p->tess_params),
-                                  0, clip, 0, 0, 0, 0, xfb_key ? xfb : NULL, NULL, 0, 0, 0, 0)
+                                  before_out, clip, 0, 0, 0, 0, xfb_key ? xfb : NULL, NULL, 0, 0, 0, 0)
                   : NULL;
     VkSh** middle[3] = {&o->tcs, &o->tes, &o->gs};
     for (int i = 0; i < 3; i++) {
@@ -3554,9 +3713,13 @@ static int draw_key(const DsState* ds, const DrawShaders* sh, const VkSh* fs, Su
     memset(pl, 0, sizeof *pl);
     k->vs = vs->mod;
     k->fs = fs ? fs->mod : VK_NULL_HANDLE;
-    k->depth_clamp = g_vk.feat.depthClamp && rk->depth_clamp;
-    if (!g_vk.feat.depthClamp && rk->depth_clamp)
-        LOG_LIMIT(1, "vulkan: depth clamp requested but unavailable on this device\n");
+    /* with VK_EXT_depth_clip_enable, the clamp and the clip as the console has them apart; without it one switch,
+       where clamping turns clipping off: a fragment's depth past the viewport's range is undefined then with the clamp
+       off (the specification's Depth Clamping and Range Adjustment), which the console clamps to 0 to 1 */
+    int clamp = g_vk.has_depth_clip_enable ? rk->depth_pixel_clamp : rk->depth_clamp;
+    k->depth_clamp = g_vk.feat.depthClamp && clamp;
+    if (g_vk.has_depth_clip_enable) k->depth_clip = rk->depth_no_clip ? 1 : 2;
+    if (!g_vk.feat.depthClamp && clamp) LOG_LIMIT(1, "vulkan: depth clamp requested but unavailable on this device\n");
     k->provoking_last = rk->provoking_last && g_vk.has_provoking_last;
     if (rk->provoking_last && !g_vk.has_provoking_last)
         LOG_LIMIT(1, "vulkan: flat inputs take the first vertex of a primitive, not the last the game asks for\n");
@@ -5292,9 +5455,16 @@ retry:
         g_draw.topology = draw_topo;
         g_draw.epoch = epoch;
         g_draw.shader_generation = g_vk.shader_generation;
+        /* the translations as they are after this draw's lookups, which can have made some */
+        g_draw.fold_gen = vk_shader_fold_gen();
         g_draw.sh = sh;
         g_draw.fkey = fk;
         g_draw.fs = fs;
+        const VkSh* used[6];
+        used_shaders(used);
+        g_draw.not_top = 0;
+        for (int i = 0; i < 6; i++)
+            if (used[i] && !vk_shader_fold_top(used[i])) g_draw.not_top |= 1u << i;
         g_draw.tf = tf;
         if (pl != &g_draw.plan) g_draw.plan = *pl;
         if (k != &g_draw.k) g_draw.k = *k;
@@ -5504,6 +5674,29 @@ retry:
         rec_CmdSetScissorWithCount(cb, viewports, scissor);
     }
     g_dyn.viewports = viewports;
+    /* The console clamps a fragment's depth to the viewport's clip range (SET_VIEWPORT_CLIP_MIN_Z and MAX_Z), which
+       need not be the transform's minDepth to maxDepth: NVK, which drives the same registers, turns the clamp off on
+       these GPUs by setting that range to -inf..inf. Where the clip control forces 0 to 1 (its bit 0, deko3d's clamp
+       off) the range is that. Vulkan's range is one for every viewport: viewport 0's */
+    if (g_vk.has_depth_clamp_range) {
+        float zn = ds->rkey.depth_zero_one ? 0.0f : ds->vp.z_near[0],
+              zf = ds->rkey.depth_zero_one ? 1.0f : ds->vp.z_far[0];
+        VkDepthClampRangeEXT range = {zn < zf ? zn : zf, zn < zf ? zf : zn};
+        int numbers = zn == zn && zf == zf;
+        if (!g_vk.has_depth_range_unrestricted) {
+            range.minDepthClamp = range.minDepthClamp < 0 ? 0 : range.minDepthClamp > 1 ? 1 : range.minDepthClamp;
+            range.maxDepthClamp = range.maxDepthClamp < 0 ? 0 : range.maxDepthClamp > 1 ? 1 : range.maxDepthClamp;
+        }
+        if (!numbers) range = (VkDepthClampRangeEXT){0, 0}; /* the viewport's range: the mode below says so */
+        if (!ds->rkey.depth_zero_one && viewports > 1 && (ds->vp.z_near[1] != zn || ds->vp.z_far[1] != zf))
+            LOG_LIMIT(1,
+                      "vulkan: viewport 1 clamps depth to %g..%g and viewport 0 to %g..%g: every viewport takes 0's\n",
+                      (double)ds->vp.z_near[1], (double)ds->vp.z_far[1], (double)zn, (double)zf);
+        DYNV(clamp_range, range,
+             rec_CmdSetDepthClampRangeEXT(
+                 cb, numbers ? VK_DEPTH_CLAMP_MODE_USER_DEFINED_RANGE_EXT : VK_DEPTH_CLAMP_MODE_VIEWPORT_RANGE_EXT,
+                 &range));
+    }
     /* Triangle facing has its own window-origin control, independent of viewport scale and swizzle. */
     {
         VkCullModeFlags cull = ds->dyn.cull;
@@ -5535,6 +5728,10 @@ retry:
                                                                                          : 2) &
                                     1;
         DYN(bias_on, bias_on, rec_CmdSetDepthBiasEnable(cb, bias_on));
+        if (ds->rkey.depth_pixel_clamp && !ds->rkey.depth_no_clip) {
+            g_vk_depth_apart_draws++;
+            if (bias_on || (sh.fs0 && (sh.fs0->si.sph[19] & 2u))) g_vk_depth_apart_moved++;
+        }
     }
     {
         float bias[3];

@@ -145,6 +145,10 @@ typedef struct Renderer {
        waits for it (release_need). dst gets guest bytes, as from gmem_read */
     int (*release_read)(u64 a, void* dst, u64 n);
     u32 (*release_value)(u32 id); /* completed and queued increments, read consistently */
+    /* release_value read with no lock: never less than it, more while an increment moves from queued to completed.
+       For a check that only says when the value is short (gpu.c's job_end, after each submission), which waited for the
+       release thread's lock in one game's busy scene. Optional */
+    u32 (*release_value_at_least)(u32 id);
     /* the render enable (3D 0x556 IF_EQUAL when equal is set, else IF_NOT_EQUAL) compares the count at a with the one
        at a + 16, one side a samples-passed count not known yet, the other zero or a count of the same counter not
        known yet either: NVN's occlusion test. Values that results the GPU hasn't landed hold (a compute program's)
@@ -243,6 +247,7 @@ extern _Atomic int g_cs_any;      /* compute results are pending somewhere */
 extern _Atomic int g_gfx_any;     /* graphics storage-buffer results are pending somewhere */
 extern _Atomic int g_gfx_img_any; /* graphics storage-image results are pending somewhere */
 extern _Atomic int g_uma_any;     /* writes into guest memory in place are pending somewhere (gpu/vk/uma.c) */
+extern _Atomic int g_mir_any;     /* writes of the GPU mirror's programs are pending somewhere (gpu/vk/mirror.c) */
 extern u64 g_tex_cache_hits, g_tex_cache_misses, g_tex_upload_bytes, g_tex_frees; /* added to atomically */
 
 #endif

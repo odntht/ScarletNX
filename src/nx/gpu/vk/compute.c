@@ -21,6 +21,7 @@
 #include "common/utilities/spirv_emit.h" /* SPV_CAPABILITY_COOPERATIVE_MATRIX_KHR, the scanner's */
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
+#include "common/platform/thread.h" /* plat_thread_note */
 #include "nx/gpu/vk/lookup_ways.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/ledger.h"
@@ -118,6 +119,7 @@ static u64 g_cval;
 static int g_ar_gfx;
 static u64 g_org_cap;
 u64 g_vk_dispatches, g_vk_cs_batches, g_vk_cs_wait_ns;
+u64 g_vk_cs_open, g_vk_cs_left; /* vk.h */
 /* A program's window: 80 zero bytes in place of a header, then the bytes of its code that cs_read_code reads, and zeros
    after them. It takes as much code as a graphics program's window (pipeline.c's SH_CODE): an Ounce game has a
    compute program of 256,160 bytes. In a window of 64 KiB that program had no end, and each of its dispatches was
@@ -289,6 +291,9 @@ static int arena_fit(u64 need) {
     if (g_ar) vk_defer_buffer(g_ar, g_ar_mem); /* draws may still read it */
     u64 cap = g_ar_want;
     while (cap < need) cap *= 2;
+    /* no allocation is bigger than the driver gives (memory.c): an arena that holds the dispatch within that, not the
+       next power of two, which found no memory */
+    if (cap > g_vk.alloc_cap && need <= g_vk.alloc_cap) cap = g_vk.alloc_cap;
     u32 fam[2] = {g_vk.gfx_family, g_vk.compute_family};
     VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                               .size = cap,
@@ -304,7 +309,17 @@ static int arena_fit(u64 need) {
     DevMemInfo info;
     g_ar = VK_NULL_HANDLE;
     g_ar_cap = 0;
-    if (!VK_OK(vk_buffer_create(&bci, &aci, &g_ar, &g_ar_mem, &info))) return 0;
+    /* one the driver has no memory for in one allocation, though the heap has: again within what it gives, while
+       that holds the dispatch (memory.c) */
+    VkResult made;
+    while ((made = vk_buffer_create(&bci, &aci, &g_ar, &g_ar_mem, &info)) != VK_SUCCESS) {
+        if (!vk_alloc_cap_lower(cap) || need > g_vk.alloc_cap) {
+            VK_OK(made); /* said, with what holds the memory */
+            g_ar = VK_NULL_HANDLE;
+            return 0;
+        }
+        bci.size = cap = g_vk.alloc_cap;
+    }
     vk_mem_track(g_ar_mem, VK_OWN_ARENA);
     g_ar_ptr = info.ptr;
     g_ar_cap = cap;
@@ -590,21 +605,94 @@ static void cs_land(void) {
 /* The windows a dispatch binds for a pointer table in constant buffer bank (SH_GBUF_TABLE), base[w] and len[w] for
    each of windows: the bank's 64-bit words that map are its pointers, and so are the 64-bit words at the cells
    (ShaderInfo.table_cells, bit k: the 8 bytes at 8 * k) of the memory each of them points to, which the program loads
-   pointers from. Each run of memory mapped from the lowest pointer not in an earlier run (at most 16 MiB, as
-   vk_gbuf_desc binds a bare address) holds those below its end. With more runs than windows, the two runs closest
-   together are bound as one, the memory between them too, until they fit: copy_runs reads what isn't mapped as zero.
-   A window the table has no run for has base 0, with the 16 bytes an unbound buffer gets. One game's culling programs
-   keep 20 pointers in cbuf 4, in 11 runs over two stretches of about 2 MiB, and one of them has 9 buffer slots left
-   for them. Four of those pointers are to records whose first 8 bytes point to the instances of a kind of plant,
-   which the program reads through them */
+   pointers from. vk_pointer_windows makes the windows: copy_runs reads what isn't mapped between two runs it joined as
+   zero. One game's culling programs keep 20 pointers in cbuf 4, in 11 runs over two stretches of about 2 MiB, and one
+   of them has 9 buffer slots left for them. Four of those pointers are to records whose first 8 bytes point to the
+   instances of a kind of plant, which the program reads through them */
 static int u64_order(const void* a, const void* b) {
     u64 x = *(const u64*)a, y = *(const u64*)b;
     return x < y ? -1 : x > y;
 }
 static int table_pointer(u64 x) { return x && !(x & 3) && !(x >> 40); } /* the GPU's addresses have 40 bits */
+typedef struct {
+    u64 from, to;
+    u32 parent, lo, hi; /* the group it is in (run_root), and a group's first and last runs */
+} PtrRun;
+typedef struct {
+    u64 gap;
+    u32 k;
+} RunGap;
+static int gap_order(const void* a, const void* b) {
+    const RunGap *x = a, *y = b;
+    return x->gap < y->gap ? -1 : x->gap > y->gap ? 1 : (x->k > y->k) - (x->k < y->k);
+}
+static u32 run_root(PtrRun* r, u32 k) {
+    while (r[k].parent != k) k = r[k].parent = r[r[k].parent].parent;
+    return k;
+}
+/* the runs and gaps of vk_pointer_windows, kept from call to call: its callers (a dispatch's and a draw's binding)
+   hold vk_lock */
+static void* g_ptr_scratch;
+static size_t g_ptr_scratch_size;
+u32 vk_pointer_windows(u64* v, u32 n, u32 windows, u32 reach, int whole, u64* base, u32* len) {
+    u32 runs = 0, m = 0;
+    for (u32 w = 0; w < windows; w++) base[w] = 0, len[w] = 16;
+    for (u32 i = 0; i < n; i++)
+        if (table_pointer(v[i])) v[m++] = v[i];
+    if (!m) return 0;
+    qsort(v, m, sizeof *v, u64_order);
+    size_t need = (size_t)m * (sizeof(PtrRun) + sizeof(RunGap));
+    if (need > g_ptr_scratch_size) {
+        void* grown = realloc(g_ptr_scratch, need);
+        if (!grown) return m;
+        g_ptr_scratch = grown;
+        g_ptr_scratch_size = need;
+    }
+    PtrRun* r = g_ptr_scratch;
+    RunGap* gaps = (RunGap*)(r + m);
+    reach = (reach + 3) & ~3u;
+    for (u32 i = 0; i < m;) {
+        u64 cpu = 0, run = gmmu_run(v[i], 16u << 20, &cpu) & ~3ull;
+        if (!run) { /* no memory there: a word that is no pointer */
+            i++;
+            continue;
+        }
+        u64 end = v[i] + run;
+        PtrRun* at = &r[runs];
+        *at = (PtrRun){v[i], reach && reach < run ? v[i] + reach : end, runs, runs, runs};
+        runs++;
+        for (; i < m && v[i] < at->to; i++)
+            if (reach && v[i] + reach > at->to) at->to = v[i] + reach < end ? v[i] + reach : end;
+    }
+    /* the closest runs joined first, as one window of at most 16 MiB (with whole, only over mapped memory), until
+       they fit: each run a group, joined to its neighbour across the smallest gaps */
+    u32 groups = runs;
+    for (u32 k = 0; k + 1 < runs; k++) gaps[k] = (RunGap){r[k + 1].from - r[k].to, k};
+    qsort(gaps, runs ? runs - 1 : 0, sizeof *gaps, gap_order);
+    for (u32 g = 0; g + 1 < runs && groups > windows; g++) {
+        u32 k = gaps[g].k, a = run_root(r, k), b = run_root(r, k + 1);
+        u64 cpu = 0, span = r[r[b].hi].to - r[r[a].lo].from;
+        if (span > (16u << 20) || (whole && gaps[g].gap && gmmu_run(r[k].to, gaps[g].gap, &cpu) < gaps[g].gap))
+            continue;
+        r[b].parent = a;
+        r[a].hi = r[b].hi;
+        groups--;
+    }
+    u32 w = 0;
+    for (u32 k = 0; k < runs; k++) {
+        u32 root = run_root(r, k);
+        if (r[root].lo != k) continue; /* inside a group: its first run stands for it */
+        if (w < windows) {
+            base[w] = r[k].from;
+            len[w] = (u32)(r[r[root].hi].to - r[k].from);
+        }
+        w++;
+    }
+    return groups > windows ? runs : 0;
+}
 static void table_windows(u32 bank, u32 cells, u32 windows, u64* base, u32* len) {
-    u64 v[512], from[64], to[64];
-    u32 n = 0, runs = 0, unused;
+    u64 v[512];
+    u32 n = 0, unused;
     for (u32 w = 0; w < windows; w++) base[w] = 0, len[w] = 16;
     if (bank >= QMD_NUM_CONST_BUFFERS) return;
     /* a bank a pending write in place covers isn't in g_cb yet (g_cb_later): the windows are made of its words, so it
@@ -625,36 +713,12 @@ static void table_windows(u32 bank, u32 cells, u32 windows, u64* base, u32* len)
             u64 x = snx_le32(q[0]) | (u64)snx_le32(q[1]) << 32;
             if (table_pointer(x)) v[n++] = x;
         }
-    qsort(v, n, sizeof *v, u64_order);
-    for (u32 i = 0; i < n && runs < 64;) {
-        u64 cpu = 0, run = gmmu_run(v[i], 16u << 20, &cpu) & ~3ull;
-        if (!run) { /* no memory there: a word that is no pointer */
-            i++;
-            continue;
-        }
-        from[runs] = v[i];
-        to[runs++] = v[i] + run;
-        while (i < n && v[i] < to[runs - 1]) i++;
-    }
-    while (runs > windows) { /* the two runs closest together, as one window of at most 16 MiB */
-        u32 best = runs;
-        for (u32 k = 0; k + 1 < runs; k++)
-            if (to[k + 1] - from[k] <= (16u << 20) && (best == runs || from[k + 1] - to[k] < from[best + 1] - to[best]))
-                best = k;
-        if (best == runs) break;
-        to[best] = to[best + 1] > to[best] ? to[best + 1] : to[best];
-        for (u32 k = best + 1; k + 1 < runs; k++) from[k] = from[k + 1], to[k] = to[k + 1];
-        runs--;
-    }
-    if (runs > windows)
+    u32 runs = vk_pointer_windows(v, n, windows, 0, 0, base, len);
+    if (runs)
         LOG_LIMIT(1,
                   "vulkan: a compute program's pointer table in constant buffer %u has %u runs of mapped memory "
                   "that its %u windows can't hold: the pointers in the others read 0\n",
                   bank, runs, windows);
-    for (u32 w = 0; w < runs && w < windows; w++) {
-        base[w] = from[w];
-        len[w] = (u32)(to[w] - from[w]);
-    }
 }
 /* A descriptor can fail after its inputs were copied into the arena. No command references those inputs yet. */
 static void cs_abandon_binding(u8* originals[8]) {
@@ -732,6 +796,7 @@ u64 vk_compute_put_aside(void) {
 void vk_compute_wait(u64 value) {
     if (value) cs_wait(value);
 }
+u64 vk_compute_number(void) { return g_cval + (g_recording ? 1 : 0); }
 void vk_compute_progress(u64* submitted, u64* done) {
     *submitted = __atomic_load_n(&g_cval, __ATOMIC_RELAXED);
     *done = 0;
@@ -961,9 +1026,14 @@ static CsPipe* cs_make(const u8* code, u32 blen, u64 key, u32 flow_base, u32 lx,
     /* subgroups of 32 for one that reads other lanes (cs_reads_lanes), whole where the block's x is whole subgroups (as
        Vulkan asks of the flag) */
     int warp = g_vk.has_cs_warp32 && cs_reads_lanes(spv, nw);
+    /* the crash report's note while the driver compiles it (plat_thread_note) */
+    plat_thread_note("making the compute pipeline %016llx (%zu KB of SPIR-V, a block of %ux%ux%u, %u bytes of shared "
+                     "memory)",
+                     (unsigned long long)key, nw / 256, lx, ly, lz, (unsigned)p->si.shared_size);
     if (!VK_OK(snx_vk_compute_pipeline_subgroups(g_vk.dev, vk_pipeline_cache(), g_vk.cs_playout, spv, (size_t)nw * 4,
                                                  warp ? 32 : 0, warp && lx % 32 == 0, &p->p)))
         p->failed = 1;
+    plat_thread_note_clear();
     free(spv);
     /* as a draw's program says it (pipeline.c): the textures a compute program samples as none */
     if (!p->failed && p->si.memh_none)
@@ -1286,7 +1356,9 @@ void vk_dispatch(const DispatchState* d) {
     u64 tic_key_base;
     VkBufImg bimg[8] = {0};
     int i;
+    SNX_ZONE(z_dispatch, "dispatch");
     vk_frame_check();
+    vk_own_room();
     if (d->indirect) gx = gy = gz = 1; /* the GPU's: these only say there is a grid */
     if (!gx || !gy || !gz || !lx || !ly || !lz) return;
     const VkPhysicalDeviceLimits* lim = &g_vk.props.limits;
@@ -1666,13 +1738,11 @@ rebind:
     u32 nw = 0;
     for (int i = 0; i < 8; i++)
         if (p->si.cbuf_mask & (1u << i)) {
-            /* only the bytes the shader reads (robust buffer access keeps reads past them in bounds, of undefined
-               value) */
+            /* only the bytes the shader reads, zeros after the guest's: reads past the range are zero with
+               robustBufferAccess2, and stay in bounds, of undefined value, with robust buffer access alone */
             u32 range = g_cbn[i];
             if (p->si.cbuf_max[i] && range > p->si.cbuf_max[i]) range = p->si.cbuf_max[i];
-            range = (range + 15) & ~15u;
-            if (!range) range = 16;
-            if (range > g_vk.props.limits.maxUniformBufferRange) range = g_vk.props.limits.maxUniformBufferRange;
+            range = vk_cb_range(range); /* a whole checked step, within the limit; the tail is zeroed below */
             u32 n = g_cbn[i] < range ? g_cbn[i] : range;
             VkBuffer cbuf = g_ar;
             u64 o;
@@ -1711,7 +1781,7 @@ rebind:
             nw++;
         }
     if (p->si.root_max) { /* an Ounce program's root tables, the bytes it reads (SNX_VKB_ROOT) */
-        u32 range = (p->si.root_max + 15u) & ~15u;
+        u32 range = vk_cb_range(p->si.root_max); /* a uniform buffer: the same checked step as a constant buffer */
         VkBuffer rbuf = g_ar;
         u64 o;
         u8* dst;
@@ -1725,7 +1795,8 @@ rebind:
             o = arena_alloc(range);
             dst = g_ar_ptr + o;
         }
-        memcpy(dst, d->root, range);
+        memcpy(dst, d->root, p->si.root_max); /* only the real bytes; the rest of the step is zeroed, not read past */
+        memset(dst + p->si.root_max, 0, range - p->si.root_max);
         bi[nw] = (VkDescriptorBufferInfo){rbuf, o, range};
         w[nw] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                        .dstSet = set,
@@ -1766,6 +1837,7 @@ rebind:
     for (int i = 0; i < ng; i++) {
         VkBuffer sbuf = g_ar;
         u64 o;
+        u32 srange = ss[i]; /* the bound range: a whole storage step where the arena zero-fills the tail below */
         int alias = -1;
         for (int k = 0; k < i && resident && alias < 0; k++)
             if (sa[k] && sa[k] == sa[i] && ss[k] == ss[i]) alias = k; /* one range bound twice names one buffer */
@@ -1808,20 +1880,24 @@ rebind:
             so[i] = o;
         } else {
             if (chain[i] >= 0) chained = 1;
-            o = so[i] = chain[i] >= 0 ? (u64)chain[i] : arena_alloc(ss[i]);
+            /* a chained buffer reads an earlier dispatch's in place: its range stays ss[i]. A fresh one spans a whole
+               checked step, the tail zeroed, so reads past ss[i] in it are zero, not a neighbour's in the arena */
+            if (chain[i] < 0) srange = vk_sb_round(ss[i]);
+            o = so[i] = chain[i] >= 0 ? (u64)chain[i] : arena_alloc(srange);
             if (chain[i] >= 0)
                 ; /* written by an earlier dispatch of the batch, read in place */
             /* read: its bytes copied in. So are those of one written and not logged: its result is what differs from
                them after the dispatch, and a store of the bytes zeroed in their place would differ from nothing */
-            else if (sa[i] && (((p->si.gbuf_rmask >> i) & 1) || !(log && p->si.gbuf_mark[i])))
+            else if (sa[i] && (((p->si.gbuf_rmask >> i) & 1) || !(log && p->si.gbuf_mark[i]))) {
                 gmem_read(sa[i], g_ar_ptr + o, ss[i]);
-            else {
+                memset(g_ar_ptr + o + ss[i], 0, srange - ss[i]);
+            } else {
                 if (sa[i]) gmem_need(sa[i], ss[i]); /* write-only: results pending there land, but nothing is read */
-                memset(g_ar_ptr + o, 0, ss[i]);
+                memset(g_ar_ptr + o, 0, srange);
             }
         }
         bi_buf[i] = sbuf;
-        bi[nw] = (VkDescriptorBufferInfo){sbuf, o, ss[i]};
+        bi[nw] = (VkDescriptorBufferInfo){sbuf, o, srange}; /* outputs still write back ss[i] bytes (g_out) */
         w[nw] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                        .dstSet = set,
                                        .dstBinding = SNX_VKB_SSBO + i,
@@ -1985,18 +2061,20 @@ rebind:
                 return;
             }
             vk_gmem_words(tic_base + (h & 0xFFFFF) * 32ull, tic, 8);
-            /* a slot with nothing bound (an empty header): an empty image, which nothing writes back. One game's
-               program that makes a texture's levels from its first has seven image slots, one for each level, and
-               the game leaves those past the texture's last level empty (images 4 to 6 of a texture of 4 levels).
-               Skipped whole for them, the dispatch left levels 1 to 3 zero, and the trilinear lookups of the
-               texture drew a dark square under the game's kart */
+            /* a slot with nothing bound (an empty header): a null descriptor (vk_null_descriptors), or else an empty
+               image, which nothing writes back. One game's program that makes a texture's levels from its first has
+               seven image slots, one for each level, and the game leaves those past the texture's last level empty
+               (images 4 to 6 of a texture of 4 levels). Skipped whole for them, the dispatch left levels 1 to 3 zero,
+               and the trilinear lookups of the texture drew a dark square under the game's kart */
             VkImageView null_view = VK_NULL_HANDLE;
-            Surf* null_image = vk_tic_empty(tic)
+            int null_slot = vk_tic_empty(tic) && vk_null_descriptors();
+            Surf* null_image = vk_tic_empty(tic) && !null_slot
                                    ? vk_null_storage(vk_storage_image_type(&p->si, i), p->si.img[i].kind, &null_view)
                                    : NULL;
-            if (null_image) {
-                vk_surf_use(vk_cmd(), null_image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                            VK_STORAGE_IMAGE_ACCESS);
+            if (null_image || null_slot) {
+                if (null_image)
+                    vk_surf_use(vk_cmd(), null_image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_STORAGE_IMAGE_ACCESS);
                 ii[p->si.ntex + i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, null_view, VK_IMAGE_LAYOUT_GENERAL};
                 w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                                  .dstSet = set,
@@ -2285,7 +2363,9 @@ rebind:
            once, the GPU runs it while the stream goes on, and a reader of its results waits for that submit alone,
            not for the draws recorded after it: Pokemon Legends Z-A writes command lists with a dispatch and fetches
            them a little later (a GPFIFO entry with SYNC), once a frame */
+        vk_uma_writer(p->key);
         vk_buf_writable_commit();
+        vk_uma_writer(0);
         for (i = 0; i < p->si.nimg && i < 8; i++)
             if (bufimg_view[i]) vk_defer_buffer_view(bufimg_view[i]);
         /* the storage images' texels over their guest bytes, after the dispatch on the GPU */
@@ -2300,7 +2380,18 @@ rebind:
         /* Not one in the GPU mirror: its results land only where the CPU first touches them, and that read submits
            what is open (vk_mirror_mem_need's finish). Submitted each, one game's Ounce programs made about 300
            submissions a present, each with a harvest of the mirror, and the GPU idled between them */
-        if (!mir) vk_submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+        if (mir) return;
+        /* On unified memory a dispatch with nothing staged for the host waits in the submission being recorded for
+           the end of the game's GPU submission (vk_release_submit) or whatever submits first, as the console's GPU
+           runs what a flush handed it. Submitted each, one game's battle map made 350 to 390 submissions a present
+           by the GPU profiler, and 22 to 24 so. A program a CPU reader waited for while its writes were still
+           unsubmitted (vk_uma_read_soon) is submitted at once, as above */
+        if (vk_uma() && !vk_buf_pending_unsubmitted() && !vk_uma_read_soon(p->key)) {
+            g_vk_cs_open = vk_submit_number();
+            g_vk_cs_left++;
+            return;
+        }
+        vk_submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
         return;
     }
     /* results visible to the host */
