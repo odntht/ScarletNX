@@ -17,12 +17,15 @@ void logf_(int lvl, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
         if (g_settings.log_level >= 2) logf_(2, __VA_ARGS__);                                                          \
     } while (0)
 
-/* Say something at most n times per call site, for a message a game could otherwise trigger every frame. Each site
-   counts in its own static int (relaxed: only the count matters), and stops adding once past the limit */
+/* Say something at most n times per call site (16 n at log=2, where a run logs the most it can), for a message a game
+   could otherwise trigger every frame. Each site counts in its own static int (relaxed: only the count matters), and
+   stops adding once past the limit. The level is read only once the site is past n */
 #define SNX_LOG_AT_MOST_(said, n, lvl, ...)                                                                            \
     do {                                                                                                               \
         static int said;                                                                                               \
-        if (__atomic_load_n(&said, __ATOMIC_RELAXED) < (n) && __atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < (n))    \
+        int said##_n = __atomic_load_n(&said, __ATOMIC_RELAXED), said##_max = (n);                                     \
+        if (said##_n >= said##_max && g_settings.log_level >= 2) said##_max *= 16;                                     \
+        if (said##_n < said##_max && __atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < said##_max)                      \
             logf_(lvl, __VA_ARGS__);                                                                                   \
     } while (0)
 #define LOG_LIMIT(n, ...)  SNX_LOG_AT_MOST_(log_limit_said_, n, 1, __VA_ARGS__)

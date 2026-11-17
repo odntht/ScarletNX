@@ -993,6 +993,8 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                 (unsigned long long)vk_buf_ahead());
             vk_pass_ends_log();
             vk_finishes_log();
+            vk_waits_log();
+            vk_render_predicate_log();
             vk_ww_stats(600);
             vk_descriptors_stats();
             /* what the GPU engines keep on the GPU (docs/layers/gpu/ownership.md), and what the CPU had to wait for */

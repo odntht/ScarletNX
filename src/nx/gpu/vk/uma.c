@@ -1204,7 +1204,7 @@ static const Out* newest_out(u64 cpu, u64 n) {
 static const Out* newer_out(const Out* a, const Out* b) { return !b || (a && a->sub >= b->sub) ? a : b; }
 /* until the GPU has done o's submit, its writes landed through it: the one being recorded is submitted first, and o's
    program is submitted at once from then on (compute.c), as a reader of its results comes before the stream's end */
-static void wait_out_why(const Out* o, int why) {
+static void wait_out_why_at(const Out* o, int why, const char* file, int line) {
     if (!o) return;
     const u64 sub = o->sub;
     __atomic_add_fetch(&g_uma.wait_by[why], 1, __ATOMIC_RELAXED);
@@ -1212,12 +1212,13 @@ static void wait_out_why(const Out* o, int why) {
     if (sub > vk_last_submit()) {
         g_uma.open_waits++;
         read_soon_add(o->prog);
-        vk_finish();
+        vk_finish_at(file, line);
     } else {
-        vk_wait_submit(sub);
+        vk_wait_submit_at(sub, file, line);
         vk_land_through(sub);
     }
 }
+#define wait_out_why(o, why) wait_out_why_at(o, why, __FILE__, __LINE__) /* the caller names the wait */
 /* The writes in place pending in the regions over guest memory [lo, hi) done, before their pages change or move back:
    a region's buffer is the guest's memory until then, and its readers are waited for by nobody (quiesce), as the buffer
    keeps the bytes they read; a write landing after the change would land in the buffer alone (vk_lock held) */

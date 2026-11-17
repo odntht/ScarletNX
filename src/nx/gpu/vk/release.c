@@ -15,6 +15,7 @@
    draws after it read the next frame's slots there, and vertices flew to other characters. So the stream holds its
    releases until it stops, at its end or at a wait (vk_release_submit), when the commands after them have read guest
    memory, and the ones no GPU work holds are performed then. */
+#include <stdio.h>
 #include <string.h>
 #include "common/utilities/common.h"
 #include "common/utilities/endian.h"
@@ -705,6 +706,42 @@ static int compare_queued(i64 ia, i64 ib, int equal, u32* pred) {
     }
     return k == PRED_ZERO || k == PRED_NONZERO ? (k == PRED_ZERO) == !!equal : -1;
 }
+/* vk_render_predicate's cases since the last stats, under vk_lock. The two last are the pairs of compare_queued */
+enum {
+    RP_NO_PRED,
+    RP_NONE_GPU,
+    RP_NONE_CPU,
+    RP_ONE_GPU,
+    RP_ONE_KNOWN,
+    RP_ONE_CPU,
+    RP_BOTH_CPU,
+    RP_OTHER_CPU,
+    RP_BOTH_GPU,
+    RP_BOTH_KNOWN,
+    RP_N
+};
+static u64 g_rp_cases[RP_N];
+void vk_render_predicate_log(void) {
+    static const char* const name[RP_N] = {"no predicate support (CPU)", "neither queued, on the GPU",
+                                           "neither queued (CPU)",         "one queued, on the GPU",
+                                           "one queued, known",            "one queued (CPU)",
+                                           "both queued (CPU)",            "other (CPU)",
+                                           "both queued, on the GPU",      "both queued, known"};
+    char line[512];
+    int at = 0;
+    u64 total = 0;
+    if (g_settings.log_level < 2) return;
+    vk_lock();
+    for (int i = 0; i < RP_N; i++) {
+        total += g_rp_cases[i];
+        if (g_rp_cases[i] && at < (int)sizeof line)
+            at += snprintf(line + at, sizeof line - (size_t)at, "%s %llu %s", at ? "," : "",
+                           (unsigned long long)g_rp_cases[i], name[i]);
+        g_rp_cases[i] = 0;
+    }
+    vk_unlock();
+    if (total) LOG("vulkan: %llu render enables:%s\n", (unsigned long long)total, line);
+}
 int vk_render_predicate(u64 a, int equal, u32* pred) {
     i64 ia, ib, at;
     u32 slot = 0;
@@ -712,11 +749,13 @@ int vk_render_predicate(u64 a, int equal, u32* pred) {
     if (!__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE)) {
         vk_lock();
         got = vk_query_pred_ok() ? compare_on_gpu(a, equal, pred) : -1;
+        g_rp_cases[!vk_query_pred_ok() ? RP_NO_PRED : got == 2 ? RP_NONE_GPU : RP_NONE_CPU]++;
         vk_unlock();
         return got;
     }
     vk_lock();
     if (!vk_query_pred_ok()) { /* outside g_rlock, which the game's threads take: it may make the shader */
+        g_rp_cases[RP_NO_PRED]++;
         vk_unlock();
         return -1;
     }
@@ -728,6 +767,7 @@ int vk_render_predicate(u64 a, int equal, u32* pred) {
     pm_unlock(&g_rlock);
     if (pair) {
         got = compare_queued(ia, ib, equal, pred);
+        g_rp_cases[got == 2 ? RP_BOTH_GPU : got >= 0 ? RP_BOTH_KNOWN : RP_BOTH_CPU]++;
         vk_unlock();
         return got;
     }
@@ -738,6 +778,9 @@ int vk_render_predicate(u64 a, int equal, u32* pred) {
         at = ib;
     else {
         got = ia == -1 && ib == -1 ? compare_on_gpu(a, equal, pred) : -1;
+        g_rp_cases[ia == -1 && ib == -1 ? (got == 2 ? RP_NONE_GPU : RP_NONE_CPU)
+                   : ia >= 0 && ib >= 0 ? RP_BOTH_CPU
+                                        : RP_OTHER_CPU]++; /* other: a -2, or a side queued over a count not zero */
         vk_unlock();
         return got;
     }
@@ -783,6 +826,7 @@ int vk_render_predicate(u64 a, int equal, u32* pred) {
         got = 2;
     } else if (k == PRED_ZERO || k == PRED_NONZERO)
         got = (k == PRED_ZERO) == !!equal;
+    g_rp_cases[got == 2 ? RP_ONE_GPU : got >= 0 ? RP_ONE_KNOWN : RP_ONE_CPU]++;
     vk_unlock();
     return got;
 }

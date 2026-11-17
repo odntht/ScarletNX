@@ -638,9 +638,11 @@ static void own_land(const OwnRange* r, u8* const* dst, u32 n) {
         VkResult sr = vkQueueSubmit2(queue, 1, &si, VK_NULL_HANDLE);
         if (apart || finished) vk_queue_unlock(queue);
         if (!VK_OK(sr)) fatal("vulkan: could not submit ownership readback");
-        gpu_wait_note("GPU-owned memory readback", 0);
+        u64 t0 = plat_ns();
+        int mine = gpu_wait_note("GPU-owned memory readback", 0);
         int ok = vk_host_wait(&g_owned.done, value);
         gpu_wait_note(NULL, 0);
+        if (mine) vk_wait_site(__FILE__, __LINE__, plat_ns() - t0);
         if (!ok) { /* a GPU fault (Xid 109's CTX SWITCH TIMEOUT, say): name the draw that hung, from its checkpoints */
             vk_checkpoint_dump("device lost");
         }

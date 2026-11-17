@@ -52,6 +52,7 @@ void vk_query_pred_drop(u32);
 int vk_query_pred_compare(u64, u32*);
 int vk_render_predicate(u64 a, int equal, u32* pred);
 void vk_render_predicate_drop(u32 pred);
+void vk_render_predicate_log(void);
 typedef struct {
     u32 counter, at, len;
     u64 first, end;

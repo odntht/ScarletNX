@@ -433,14 +433,17 @@ static void cs_submit(void) {
         VK_OK(vkSignalSemaphore(g_vk.dev, &ss));
     }
 }
-static void cs_wait(u64 value) {
+/* file and line: the caller's site, for vk_wait_site */
+static void cs_wait(u64 value, const char* file, int line) {
     u64 t0 = plat_ns();
     SNX_ZONE_C(z, "vk compute wait", 0xb05252);
     SNX_ZONE_VALUE(z, value);
-    gpu_wait_note("a compute batch", value);
+    int mine = gpu_wait_note("a compute batch", value);
     vk_wait_semaphore(g_vk_csem, value);
     gpu_wait_note(NULL, 0);
-    __atomic_add_fetch(&g_vk_cs_wait_ns, plat_ns() - t0, __ATOMIC_RELAXED);
+    u64 ns = plat_ns() - t0;
+    __atomic_add_fetch(&g_vk_cs_wait_ns, ns, __ATOMIC_RELAXED);
+    if (mine) vk_wait_site(file, line, ns);
 }
 /* the arena's results into guest memory, after its batch is done: of a logged one the bytes its dispatch wrote, each
    of them and no other, its reference to the log dropped then; of another, the bytes that changed */
@@ -486,7 +489,7 @@ static void cs_any_update(void) {
 static void cs_land_oldest(void) {
     CsBatch* b = &g_pend[g_ptail % CS_PENDING];
     int was = g_landing;
-    cs_wait(b->cval);
+    cs_wait(b->cval, __FILE__, __LINE__);
     g_landing = 1;
     vk_gpuprof_compute_land(&b->ops);
     cs_write_back(b->ar_mem, b->ar_ptr, b->org, b->out, b->nout);
@@ -582,7 +585,7 @@ static void cs_land(void) {
     if (!g_recording && !g_inflight) return;
     g_landing = 1;
     cs_submit();
-    cs_wait(g_cval);
+    cs_wait(g_cval, __FILE__, __LINE__);
     g_inflight = 0;
     vk_gpuprof_compute_land(&g_ops);
     cs_write_back(g_ar_mem, g_ar_ptr, g_org, g_out, g_nout);
@@ -793,8 +796,8 @@ u64 vk_compute_put_aside(void) {
     vk_unlock();
     return gate;
 }
-void vk_compute_wait(u64 value) {
-    if (value) cs_wait(value);
+void vk_compute_wait_at(u64 value, const char* file, int line) {
+    if (value) cs_wait(value, file, line);
 }
 u64 vk_compute_number(void) { return g_cval + (g_recording ? 1 : 0); }
 void vk_compute_progress(u64* submitted, u64* done) {

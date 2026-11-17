@@ -425,9 +425,58 @@ int vk_host_wait(const VkHostTimeline* t, u64 value) {
     }
 }
 
+int vk_site_add(VkSite* t, u32 cap, const char* file, int line, u64 ns) {
+    for (u32 i = 0; i < cap; i++) {
+        if (!t[i].file) {
+            t[i].file = file;
+            t[i].line = line;
+        }
+        if (t[i].file == file && t[i].line == line) {
+            t[i].n++;
+            t[i].ns += ns;
+            return 1;
+        }
+    }
+    return 0;
+}
+const VkSite* vk_site_take(VkSite* t, u32 cap, u64* n, u64* ns) {
+    u32 best = cap;
+    for (u32 i = 0; i < cap && t[i].file; i++)
+        if (t[i].n && (best == cap || t[i].n > t[best].n)) best = i;
+    if (best == cap) return NULL;
+    *n = t[best].n;
+    *ns = t[best].ns;
+    t[best].n = t[best].ns = 0;
+    return &t[best];
+}
+
+/* the GPU thread's alone (gpu_wait_note's), which writes them: the waits since the last stats, by site */
+#define WAIT_SITES 64
+static VkSite g_wait_sites[WAIT_SITES];
+static u64 g_wait_sites_lost; /* waits of sites past a full table */
+void vk_wait_site(const char* file, int line, u64 ns) {
+    if (g_settings.log_level >= 2 && !vk_site_add(g_wait_sites, WAIT_SITES, file, line, ns)) g_wait_sites_lost++;
+}
+void vk_waits_log(void) {
+    u64 n, ns, total = 0;
+    const VkSite* w;
+    if (g_settings.log_level < 2) return;
+    for (u32 k = 0; k < 8 && (w = vk_site_take(g_wait_sites, WAIT_SITES, &n, &ns)); k++) {
+        const char* f = strrchr(w->file, '/');
+        LOG("vulkan:   %llu waits for the GPU, %.1f ms, at %s:%d\n", (unsigned long long)n, (double)ns / 1e6,
+            f ? f + 1 : w->file, w->line);
+    }
+    while (vk_site_take(g_wait_sites, WAIT_SITES, &n, &ns)) total += n; /* the rest, zeroed */
+    if (total || g_wait_sites_lost)
+        LOG("vulkan:   %llu waits for the GPU at other sites, %llu at sites past the table\n",
+            (unsigned long long)total, (unsigned long long)g_wait_sites_lost);
+    g_wait_sites_lost = 0;
+}
+
 u64 g_vk_wait_ns[VK_WAIT_N], g_vk_waits[VK_WAIT_N]; /* the GPU thread's alone, which writes them */
-/* kind: VK_WAIT_*, for the statistics */
-static void timeline_wait(u64 value, int kind) {
+/* kind: VK_WAIT_*, for the statistics. file and line: the caller's site, for vk_wait_site (NULL: a vk_finish, which
+   counts in g_finish_sites alone) */
+static void timeline_wait(u64 value, int kind, const char* file, int line) {
     u64 t0 = plat_ns(), done = 0;
     SNX_ZONE_C(z_wait, "vk timeline wait", 0xb05252);
     /* a wait for work already done is no stall */
@@ -439,8 +488,10 @@ static void timeline_wait(u64 value, int kind) {
     SNX_ZONE_END(z);
     gpu_wait_note(NULL, 0);
     if (mine) {
-        g_vk_wait_ns[kind] += plat_ns() - t0;
+        u64 ns = plat_ns() - t0;
+        g_vk_wait_ns[kind] += ns;
         g_vk_waits[kind]++;
+        if (file) vk_wait_site(file, line, ns);
     }
 }
 /* the storage results of every submission up to value, which has finished, land in guest memory, in order */
@@ -483,7 +534,7 @@ void vk_frame_ready(void) {
     vk_submit_progress(&submitted, &done);
     if (at > submitted || at <= done) return; /* not handed to the GPU yet (frame_recycle waits then), or done */
     SNX_ZONE(z, "vk frame ready");
-    timeline_wait(at, VK_WAIT_RECYCLE);
+    timeline_wait(at, VK_WAIT_RECYCLE, __FILE__, __LINE__);
 }
 static void pool_recycle(Frame* f);
 /* the frame's previous use is done, its results landed and what it held freed, before it records again. The landing
@@ -493,7 +544,7 @@ static void frame_recycle(Frame* f) {
     SNX_ZONE(z, "vk frame recycle");
     __atomic_store_n(&g_recycle_at, 0, __ATOMIC_RELEASE);
     while ((done = f->last > f->hold ? f->last : f->hold) != landed) {
-        timeline_wait(done, VK_WAIT_RECYCLE);
+        timeline_wait(done, VK_WAIT_RECYCLE, __FILE__, __LINE__); /* one site: any vk_cmd */
         land_through(done);
         landed = done;
     }
@@ -1205,7 +1256,7 @@ void vk_submit_recorded(void) {
    draw is set up: that draw starts its setup again on the new submission number */
 void vk_submit_upload_wait(void) {
     if (g_fr[g_cur].recording) submit(NULL, NULL, 0, VK_SUB_OTHER);
-    timeline_wait(g_gval, VK_WAIT_FINISH);
+    timeline_wait(g_gval, VK_WAIT_FINISH, __FILE__, __LINE__);
 }
 void vk_submit_after(VkSemaphore sem, u64 wait, u64 signal) {
     g_after[0] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = sem,
@@ -1218,47 +1269,28 @@ u64 g_vk_finishes, g_vk_finish_ns;
 /* the finishes since the last stats by their call site (a file's literal and a line), with their time, under vk_lock
    as vk_finish is: one game made nine a frame, a round trip each with the GPU idle after it */
 #define FINISH_SITES 32
-static struct {
-    const char* file;
-    int line;
-    u64 n, ns;
-} g_finish_sites[FINISH_SITES];
+static VkSite g_finish_sites[FINISH_SITES];
 void vk_finish_at(const char* file, int line) {
     u64 t0 = plat_ns();
     SNX_ZONE(z_finish, "vk finish");
     submit_why(VK_NULL_HANDLE, 0, VK_NULL_HANDLE, VK_SUB_FINISH);
-    timeline_wait(g_gval, VK_WAIT_FINISH);
+    timeline_wait(g_gval, VK_WAIT_FINISH, NULL, 0);
     land_through(g_gval);
     u64 ns = plat_ns() - t0;
     g_vk_finishes++;
     g_vk_finish_ns += ns;
-    for (u32 i = 0; i < FINISH_SITES; i++) {
-        if (!g_finish_sites[i].file) {
-            g_finish_sites[i].file = file;
-            g_finish_sites[i].line = line;
-        }
-        if (g_finish_sites[i].file == file && g_finish_sites[i].line == line) {
-            g_finish_sites[i].n++;
-            g_finish_sites[i].ns += ns;
-            break;
-        }
-    }
+    vk_site_add(g_finish_sites, FINISH_SITES, file, line, ns);
 }
 void vk_finishes_log(void) {
-    u64 total = 0;
+    u64 total = 0, n, ns;
+    const VkSite* w;
     for (u32 i = 0; i < FINISH_SITES && g_finish_sites[i].file; i++) total += g_finish_sites[i].n;
-    for (u32 k = 0; total && k < 8; k++) {
-        u32 best = FINISH_SITES;
-        for (u32 i = 0; i < FINISH_SITES && g_finish_sites[i].file; i++)
-            if (g_finish_sites[i].n && (best == FINISH_SITES || g_finish_sites[i].n > g_finish_sites[best].n)) best = i;
-        if (best == FINISH_SITES) break;
-        const char* f = strrchr(g_finish_sites[best].file, '/');
-        LOG("vulkan:   %llu finishes (%.0f%%, %.0f ms) at %s:%d\n", (unsigned long long)g_finish_sites[best].n,
-            100.0 * (double)g_finish_sites[best].n / (double)total, (double)g_finish_sites[best].ns / 1e6,
-            f ? f + 1 : g_finish_sites[best].file, g_finish_sites[best].line);
-        g_finish_sites[best].n = 0;
+    for (u32 k = 0; total && k < 8 && (w = vk_site_take(g_finish_sites, FINISH_SITES, &n, &ns)); k++) {
+        const char* f = strrchr(w->file, '/');
+        LOG("vulkan:   %llu finishes (%.0f%%, %.0f ms) at %s:%d\n", (unsigned long long)n,
+            100.0 * (double)n / (double)total, (double)ns / 1e6, f ? f + 1 : w->file, w->line);
     }
-    for (u32 i = 0; i < FINISH_SITES && g_finish_sites[i].file; i++) g_finish_sites[i].n = g_finish_sites[i].ns = 0;
+    while (vk_site_take(g_finish_sites, FINISH_SITES, &n, &ns)) {} /* the rest, zeroed */
     u64 hosts = __atomic_exchange_n(&g_host_waits, 0, __ATOMIC_RELAXED),
         host_ns = __atomic_exchange_n(&g_host_wait_ns, 0, __ATOMIC_RELAXED);
     if (hosts)
@@ -1389,7 +1421,7 @@ void vk_submit_progress(u64* submitted, u64* done) {
     *done = 0;
     if (g_gsem) VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, done));
 }
-void vk_wait_submit(u64 value) { timeline_wait(value, VK_WAIT_SUBMIT); }
+void vk_wait_submit_at(u64 value, const char* file, int line) { timeline_wait(value, VK_WAIT_SUBMIT, file, line); }
 void vk_land_through(u64 value) { land_through(value < g_gval ? value : g_gval); }
 u64 vk_frame_id(void) { return g_frame_id; }
 void vk_frame_hold(u64 frame_id) {
