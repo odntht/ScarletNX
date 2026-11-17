@@ -689,6 +689,10 @@ msgid "Tap here to abort and return to menu"
 msgstr ""
 
 #: src/gui/main.c
+msgid "No games yet. In the Menu, Load Switch NSP/XCI/NRO and pick a game to prepare it."
+msgstr ""
+
+#: src/gui/main.c
 msgid "No games in recompiled/ or dumps/: put a game's .nro, .xci or .nsp in dumps/."
 msgstr ""
 

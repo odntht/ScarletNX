@@ -913,8 +913,8 @@ static void pool_recycle(Frame* f) {
             }
     memset(f->ring, 0, sizeof f->ring);
     f->filled = 0;
-    f->made_at = g_cmd.made;
     stream_trim();
+    f->made_at = g_cmd.made;
 }
 
 /* size bytes of the frame's ring at *off of *buf, the chunk's memory in *mem: the chunk, NULL when none could be had.
