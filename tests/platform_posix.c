@@ -71,6 +71,7 @@ static void* alias_test_mremap(void* address, size_t old_size, size_t new_size, 
 #include <stdio.h>
 #include <sys/resource.h> /* RLIMIT_NPROC: a thread the system refuses */
 #include <sys/wait.h>
+#include <stdatomic.h>
 #if defined(__linux__)
 #include <sys/prctl.h> /* PR_SET_VMA_ANON_NAME, for test_foreign */
 #endif
@@ -141,42 +142,43 @@ static u64 scan(void) {
 
 /* ---- written-page tracking by protection (SNX_WW=signal, or a host without Linux's): mapping changes, the freeze,
    and writers on other threads racing the scans */
-static u64 g_seen; /* bit n: page n reported by a scan since the last check */
+static _Atomic u64 g_seen; /* bit n: page n reported by a scan since the last check */
 static void on_seen(u8* p, u64 size) {
     u64 a;
     for (a = (u64)(p - g_base) >> 12; a < (u64)(p - g_base + size) >> 12; a++)
-        if (a < 64) __atomic_fetch_or(&g_seen, 1ull << a, __ATOMIC_RELAXED);
+        if (a < 64) atomic_fetch_or_explicit(&g_seen, 1ull << a, memory_order_relaxed);
 }
 #define WRITERS 4
-static int g_writers_run = 1, g_writers_stop, g_writer_idle[WRITERS];
-static u64 g_writes;
+static _Atomic int g_writers_run = 1, g_writers_stop, g_writer_idle[WRITERS];
+static _Atomic u64 g_writes;
 static void* writer(void* arg) {
     int id = (int)(intptr_t)arg;
     u32 x = 0x9e3779b9u * (u32)(id + 1);
-    while (!__atomic_load_n(&g_writers_stop, __ATOMIC_SEQ_CST)) {
-        if (!__atomic_load_n(&g_writers_run, __ATOMIC_SEQ_CST)) {
-            __atomic_store_n(&g_writer_idle[id], 1, __ATOMIC_SEQ_CST);
-            while (!__atomic_load_n(&g_writers_run, __ATOMIC_SEQ_CST) &&
-                   !__atomic_load_n(&g_writers_stop, __ATOMIC_SEQ_CST))
+    while (!atomic_load_explicit(&g_writers_stop, memory_order_seq_cst)) {
+        if (!atomic_load_explicit(&g_writers_run, memory_order_seq_cst)) {
+            atomic_store_explicit(&g_writer_idle[id], 1, memory_order_seq_cst);
+            while (!atomic_load_explicit(&g_writers_run, memory_order_seq_cst) &&
+                   !atomic_load_explicit(&g_writers_stop, memory_order_seq_cst))
                 sched_yield();
-            __atomic_store_n(&g_writer_idle[id], 0, __ATOMIC_SEQ_CST);
+            atomic_store_explicit(&g_writer_idle[id], 0, memory_order_seq_cst);
             continue;
         }
         x ^= x << 13, x ^= x >> 17, x ^= x << 5;
         /* pages 32 to 63, each writer its own bytes of them, and one counter they all add to: the threads fault on
            its page at once, again and again, and only one of them opens it each time */
-        __atomic_fetch_add(&g_base[(32 + (x & 31)) * 4096 + ((x >> 5) & 1023) * 4 + (u32)id], 1, __ATOMIC_RELAXED);
-        __atomic_fetch_add((u32*)(void*)&g_base[33 * 4096 + 4092], 1, __ATOMIC_SEQ_CST);
-        __atomic_fetch_add(&g_writes, 1, __ATOMIC_RELAXED);
+        atomic_fetch_add_explicit((_Atomic u8*)&g_base[(32 + (x & 31)) * 4096 + ((x >> 5) & 1023) * 4 + (u32)id], 1,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit((_Atomic u32*)(void*)&g_base[33 * 4096 + 4092], 1, memory_order_seq_cst);
+        atomic_fetch_add_explicit(&g_writes, 1, memory_order_relaxed);
     }
-    __atomic_store_n(&g_writer_idle[id], 1, __ATOMIC_SEQ_CST);
+    atomic_store_explicit(&g_writer_idle[id], 1, memory_order_seq_cst);
     return NULL;
 }
 static void writers_pause(void) {
     int i;
-    __atomic_store_n(&g_writers_run, 0, __ATOMIC_SEQ_CST);
+    atomic_store_explicit(&g_writers_run, 0, memory_order_seq_cst);
     for (i = 0; i < WRITERS; i++)
-        while (!__atomic_load_n(&g_writer_idle[i], __ATOMIC_SEQ_CST)) sched_yield();
+        while (!atomic_load_explicit(&g_writer_idle[i], memory_order_seq_cst)) sched_yield();
 }
 /* the marks that let a scan skip a group of unwritten pages: a whole group's scan takes its mark, and a scan of a part
    of it leaves the mark for the pages it didn't read. The first 64 pages are the reservation's first group */
@@ -184,29 +186,32 @@ static void test_scan_marks(void) {
     printf("written-page tracking by protection: the marks of groups of pages\n");
     CHECK(g_wp_marks != NULL && g_base == g_wp_base, "no marks, or the test's pages are not the first group");
     scan();
-    CHECK(!__atomic_load_n(&g_wp_marks[0], __ATOMIC_RELAXED), "a whole group's scan left its mark");
+    CHECK(!atomic_load_explicit(&g_wp_marks[0], memory_order_relaxed), "a whole group's scan left its mark");
     g_base[3 * 4096] = 1;
-    CHECK(__atomic_load_n(&g_wp_marks[0], __ATOMIC_RELAXED), "a written page left no mark");
-    __atomic_store_n(&g_seen, 0, __ATOMIC_RELAXED);
+    CHECK(atomic_load_explicit(&g_wp_marks[0], memory_order_relaxed), "a written page left no mark");
+    atomic_store_explicit(&g_seen, 0, memory_order_relaxed);
     plat_ww_scan(g_base + 8 * 4096, 8 * 4096, on_seen);
-    CHECK(!__atomic_load_n(&g_seen, __ATOMIC_RELAXED), "a scan of other pages reported a page");
-    CHECK(__atomic_load_n(&g_wp_marks[0], __ATOMIC_RELAXED), "a scan of a part of a group took its mark");
+    CHECK(!atomic_load_explicit(&g_seen, memory_order_relaxed), "a scan of other pages reported a page");
+    CHECK(atomic_load_explicit(&g_wp_marks[0], memory_order_relaxed), "a scan of a part of a group took its mark");
     CHECK(scan() == 1ull << 3, "the written page was lost to the scan of a part of its group");
-    CHECK(!__atomic_load_n(&g_wp_marks[0], __ATOMIC_RELAXED) && scan() == 0, "the page was reported twice");
+    CHECK(!atomic_load_explicit(&g_wp_marks[0], memory_order_relaxed) && scan() == 0, "the page was reported twice");
     /* a scan that starts inside a group takes the written page it reads, and the next finds nothing */
     g_base[60 * 4096] = 2;
-    __atomic_store_n(&g_seen, 0, __ATOMIC_RELAXED);
+    atomic_store_explicit(&g_seen, 0, memory_order_relaxed);
     plat_ww_scan(g_base + 56 * 4096, 8 * 4096, on_seen);
-    CHECK(__atomic_load_n(&g_seen, __ATOMIC_RELAXED) == 1ull << 60, "a scan of a part of a group missed its page");
+    CHECK(atomic_load_explicit(&g_seen, memory_order_relaxed) == 1ull << 60,
+          "a scan of a part of a group missed its page");
     CHECK(scan() == 0, "a page that a scan of a part of its group took was reported again");
 }
 /* system calls that write guest memory while another thread scans it: the pages plat_ww_open opened stay writable
    until plat_ww_close, so the kernel's write never meets a page a scan protected again (EFAULT, a short read) */
-static int g_kernel_fd = -1, g_kernel_stop;
-static u64 g_kernel_reads, g_kernel_failed;
+static int g_kernel_fd = -1;
+static _Atomic int g_kernel_stop;
+static _Atomic u64 g_kernel_reads;
+static u64 g_kernel_failed;
 static void* kernel_reader(void* arg) {
     (void)arg;
-    while (!__atomic_load_n(&g_kernel_stop, __ATOMIC_SEQ_CST)) {
+    while (!atomic_load_explicit(&g_kernel_stop, memory_order_seq_cst)) {
         u8* at = g_base + 16 * 4096 + (g_kernel_reads % 8) * 4096 + 4000; /* over two pages */
         plat_ww_open(at, 1000);
         if (pread(g_kernel_fd, at, 1000, 0) != 1000) g_kernel_failed++;
@@ -226,11 +231,11 @@ static void test_kernel_writes(const char* dir) {
     CHECK(g_kernel_fd >= 0 && write(g_kernel_fd, data, sizeof data) == (ssize_t)sizeof data, "no file to read");
     unlink(path);
     CHECK(!pthread_create(&t, NULL, kernel_reader, NULL), "no reader");
-    while (__atomic_load_n(&g_kernel_reads, __ATOMIC_RELAXED) < 20000) {
+    while (atomic_load_explicit(&g_kernel_reads, memory_order_relaxed) < 20000) {
         plat_ww_scan(g_base + 16 * 4096, 16 * 4096, on_seen);
         scans++;
     }
-    __atomic_store_n(&g_kernel_stop, 1, __ATOMIC_SEQ_CST);
+    atomic_store_explicit(&g_kernel_stop, 1, memory_order_seq_cst);
     pthread_join(t, NULL);
     close(g_kernel_fd);
     CHECK(g_kernel_failed == 0, "a read into opened guest memory failed");
@@ -239,11 +244,11 @@ static void test_kernel_writes(const char* dir) {
 }
 /* a system call into memory being moved (plat_freeze) waits for the move: opened before it, the kernel would write
    the old pages, which the move has copied already */
-static int g_open_done;
+static _Atomic int g_open_done;
 static void* frozen_opener(void* arg) {
     (void)arg;
     plat_ww_open(g_base + 12 * 4096, 100);
-    __atomic_store_n(&g_open_done, 1, __ATOMIC_SEQ_CST);
+    atomic_store_explicit(&g_open_done, 1, memory_order_seq_cst);
     g_base[12 * 4096] = 7; /* as the kernel's write would */
     plat_ww_close(g_base + 12 * 4096, 100);
     return NULL;
@@ -255,7 +260,7 @@ static void test_open_frozen(void) {
     plat_freeze(g_base + 12 * 4096, 2 * 4096);
     CHECK(!pthread_create(&t, NULL, frozen_opener, NULL), "no opener");
     plat_sleep_ns(50000000);
-    CHECK(!__atomic_load_n(&g_open_done, __ATOMIC_SEQ_CST), "plat_ww_open did not wait for the thaw");
+    CHECK(!atomic_load_explicit(&g_open_done, memory_order_seq_cst), "plat_ww_open did not wait for the thaw");
     plat_thaw();
     pthread_join(t, NULL);
     CHECK(g_open_done && g_base[12 * 4096] == 7, "the write after the thaw did not land");
@@ -264,17 +269,17 @@ static void test_open_frozen(void) {
 /* a protection change that fails for want of mappings lets every held page go (wp_shed): writable without a fault,
    written for the next scan, and the budget halved */
 static void test_shed(void) {
-    u64 budget = __atomic_load_n(&g_wp_budget, __ATOMIC_RELAXED);
+    u64 budget = atomic_load_explicit(&g_wp_budget, memory_order_relaxed);
     printf("written-page tracking by protection: letting every page go\n");
     scan();
     g_base[0] = 1;
     g_base[2 * 4096] = 1;
     scan();
-    CHECK(__atomic_load_n(&g_wp_held, __ATOMIC_RELAXED) >= 64, "a scan held no pages");
+    CHECK(atomic_load_explicit(&g_wp_held, memory_order_relaxed) >= 64, "a scan held no pages");
     wp_shed();
-    CHECK(__atomic_load_n(&g_wp_held, __ATOMIC_RELAXED) == 0, "pages still held after the shed");
+    CHECK(atomic_load_explicit(&g_wp_held, memory_order_relaxed) == 0, "pages still held after the shed");
     CHECK(scan() == ~0ull >> (64 - 64), "the pages let go were not reported written");
-    __atomic_store_n(&g_wp_budget, budget, __ATOMIC_RELAXED); /* as it was, for what follows */
+    atomic_store_explicit(&g_wp_budget, budget, memory_order_relaxed); /* as it was, for what follows */
 }
 static void test_protection_tracking(void) {
     static u8 before[32 * 4096];
@@ -303,9 +308,9 @@ static void test_protection_tracking(void) {
     g_seen = 0;
     for (i = 0; i < WRITERS; i++) CHECK(!pthread_create(&t[i], NULL, writer, (void*)(intptr_t)i), "no writer");
     for (iter = 0; iter < 200; iter++) {
-        u64 from = __atomic_load_n(&g_writes, __ATOMIC_RELAXED);
+        u64 from = atomic_load_explicit(&g_writes, memory_order_relaxed);
         /* scans while the writers write some thousands of times */
-        while (__atomic_load_n(&g_writes, __ATOMIC_RELAXED) - from < 4000) {
+        while (atomic_load_explicit(&g_writes, memory_order_relaxed) - from < 4000) {
             u64 had = g_seen;
             g_seen = 0;
             plat_ww_scan(g_base + 32 * 4096, 32 * 4096, on_seen);
@@ -319,14 +324,14 @@ static void test_protection_tracking(void) {
             if (memcmp(before + k * 4096, g_base + (32 + k) * 4096, 4096) && !(g_seen >> (32 + k) & 1)) missed++;
         memcpy(before, g_base + 32 * 4096, sizeof before);
         g_seen = 0;
-        __atomic_store_n(&g_writers_run, 1, __ATOMIC_SEQ_CST);
+        atomic_store_explicit(&g_writers_run, 1, memory_order_seq_cst);
         for (i = 0; i < WRITERS; i++) /* every writer going again before the next check */
-            while (__atomic_load_n(&g_writer_idle[i], __ATOMIC_SEQ_CST)) sched_yield();
+            while (atomic_load_explicit(&g_writer_idle[i], memory_order_seq_cst)) sched_yield();
     }
-    __atomic_store_n(&g_writers_stop, 1, __ATOMIC_SEQ_CST);
+    atomic_store_explicit(&g_writers_stop, 1, memory_order_seq_cst);
     for (i = 0; i < WRITERS; i++) pthread_join(t[i], NULL);
     CHECK(missed == 0, "a scan missed a page another thread wrote");
-    CHECK(__atomic_load_n(&g_wp_held, __ATOMIC_RELAXED) <= g_wp_pages, "the held pages' count went wrong");
+    CHECK(atomic_load_explicit(&g_wp_held, memory_order_relaxed) <= g_wp_pages, "the held pages' count went wrong");
     CHECK(reported > 32 * iter, "the writers' pages were not reported again and again");
     printf("  %llu writes, %llu scans reporting %llu pages, %llu checks: %llu pages missed\n",
            (unsigned long long)g_writes, (unsigned long long)scans, (unsigned long long)reported,
@@ -334,8 +339,84 @@ static void test_protection_tracking(void) {
 }
 
 /* page n's hot count, and whether the tracking holds it read only */
-static u8 hot_count(u64 n) { return __atomic_load_n(&g_wp_hot[n], __ATOMIC_RELAXED); }
-static int held(u64 n) { return (__atomic_load_n(&g_wp[n], __ATOMIC_RELAXED) & WP_PROT) != 0; }
+static u8 hot_count(u64 n) { return atomic_load_explicit(&g_wp_hot[n], memory_order_relaxed); }
+static int held(u64 n) { return (atomic_load_explicit(&g_wp[n], memory_order_relaxed) & WP_PROT) != 0; }
+/* The pool's contents read back into guest memory (plat_alias_read, as mem.c gives a view's source its own pages
+   again): the kernel writes them, so the pages a scan protected since they were committed open for it, no scan
+   protects one again while it reads, and the thread that moves the range (plat_freeze) reads without waiting for its
+   own thaw. Pages 24 to 27, and the pool's second megabyte */
+#define POOL_AT   (24 * 4096)
+#define POOL_SIZE (4 * 4096)
+#define POOL_OFF  0x100000ull
+typedef struct {
+    u8 bytes[POOL_SIZE]; /* what the pool holds */
+    _Atomic int stop, moved;
+    _Atomic u64 reads;
+    u64 failed; /* the reader's, then the mover's: read once each has ended */
+} PoolRead;
+static void* pool_reader(void* arg) {
+    PoolRead* r = (PoolRead*)arg;
+    while (!atomic_load_explicit(&r->stop, memory_order_seq_cst)) {
+        /* fresh pages each time, as the reservation's own are when the pool's go: the read faults each one in */
+        plat_vm_decommit(g_base + POOL_AT, POOL_SIZE);
+        if (plat_vm_commit(g_base + POOL_AT, POOL_SIZE) || plat_alias_read(POOL_OFF, g_base + POOL_AT, POOL_SIZE) ||
+            memcmp(g_base + POOL_AT, r->bytes, POOL_SIZE))
+            r->failed++;
+        atomic_fetch_add_explicit(&r->reads, 1, memory_order_relaxed);
+    }
+    return NULL;
+}
+static void* pool_mover(void* arg) {
+    PoolRead* r = (PoolRead*)arg;
+    plat_freeze(g_base + POOL_AT, POOL_SIZE);
+    /* the pages a failed move leaves: committed again, and protected by a scan before the pool's contents come */
+    if (plat_vm_commit(g_base + POOL_AT, POOL_SIZE)) r->failed++;
+    plat_ww_scan(g_base + POOL_AT, POOL_SIZE, on_seen);
+    if (plat_alias_read(POOL_OFF, g_base + POOL_AT, POOL_SIZE)) r->failed++;
+    plat_thaw();
+    atomic_store_explicit(&r->moved, 1, memory_order_seq_cst);
+    return NULL;
+}
+static void test_pool_read(void) {
+    PoolRead r = {0};
+    pthread_t t;
+    u64 scans = 0, i;
+    printf("the pool's contents read back into guest memory\n");
+    if (plat_alias_init(2 * POOL_OFF)) {
+        printf("  no alias pool on this host: nothing to read back\n");
+        return;
+    }
+    for (i = 0; i < POOL_SIZE; i++) r.bytes[i] = (u8)(i * 13 + i / 4096 + 1);
+    CHECK(!plat_alias_write(POOL_OFF, r.bytes, POOL_SIZE), "the pool took no bytes");
+    /* written, then scanned: where protection tracks the writes the pages are read only now */
+    memset(g_base + POOL_AT, 0xEE, POOL_SIZE);
+    CHECK((scan() >> 24 & 0xF) == 0xF, "the written pages were not reported");
+    if (g_wp && g_wp_track) CHECK(held(24) && held(27), "the scan left the pages writable");
+    CHECK(!plat_alias_read(POOL_OFF, g_base + POOL_AT, POOL_SIZE), "the read into pages a scan protected failed");
+    CHECK(!memcmp(g_base + POOL_AT, r.bytes, POOL_SIZE), "the pages do not hold the pool's bytes");
+    CHECK(scan() == 0xFull << 24, "the pages the kernel wrote were not reported alone");
+    /* a scan on another thread, as the renderer's scanner, while the pages are committed and read again and again */
+    CHECK(!pthread_create(&t, NULL, pool_reader, &r), "no reader");
+    while (atomic_load_explicit(&r.reads, memory_order_relaxed) < 5000) {
+        plat_ww_scan(g_base + POOL_AT, POOL_SIZE, on_seen);
+        scans++;
+    }
+    atomic_store_explicit(&r.stop, 1, memory_order_seq_cst);
+    pthread_join(t, NULL);
+    CHECK(r.failed == 0, "a read of the pool into guest memory failed under another thread's scans");
+    printf("  %llu reads, %llu failed, %llu scans\n", (unsigned long long)r.reads, (unsigned long long)r.failed,
+           (unsigned long long)scans);
+    /* the mover's own read, inside its freeze */
+    r.failed = 0;
+    CHECK(!pthread_create(&t, NULL, pool_mover, &r), "no mover");
+    for (i = 0; i < 5000 && !atomic_load_explicit(&r.moved, memory_order_seq_cst); i++) plat_sleep_ns(1000000);
+    CHECK(atomic_load_explicit(&r.moved, memory_order_seq_cst), "the mover's read waited for its own thaw");
+    if (!atomic_load_explicit(&r.moved, memory_order_seq_cst)) plat_thaw(); /* so that it ends */
+    pthread_join(t, NULL);
+    CHECK(r.failed == 0 && !memcmp(g_base + POOL_AT, r.bytes, POOL_SIZE),
+          "the mover's read into pages a scan protected failed");
+    scan();
+}
 /* page n written, then scanned, k times: 1 when every scan reported it */
 static int written_scans(u64 n, int k) {
     int all = 1;
@@ -350,14 +431,14 @@ static int written_scans(u64 n, int k) {
    table of counts of its own when the setting left none */
 static void test_hot_pages(void) {
     static u8 before[32 * 4096];
-    u8* own = NULL;
+    _Atomic u8* own = NULL;
     pthread_t t[WRITERS];
     u64 missed = 0, inexact = 0, scans = 0, cools = 0, most_hot = 0, iter, k;
     int i;
     printf("hot pages%s\n", g_wp_hot ? "" : " (on a table of counts of the test's own)");
     if (!g_wp_hot) {
-        own = (u8*)mmap(NULL, (size_t)g_wp_pages, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                        -1, 0);
+        own = (_Atomic u8*)mmap(NULL, (size_t)g_wp_pages, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         CHECK(own != MAP_FAILED, "no table of counts");
         if (own == MAP_FAILED) return;
         g_wp_hot = own;
@@ -417,21 +498,21 @@ static void test_hot_pages(void) {
        nothing (what a target's baseline needs) */
     memcpy(before, g_base + 32 * 4096, sizeof before);
     g_seen = 0;
-    __atomic_store_n(&g_writers_stop, 0, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&g_writers_run, 1, __ATOMIC_SEQ_CST);
+    atomic_store_explicit(&g_writers_stop, 0, memory_order_seq_cst);
+    atomic_store_explicit(&g_writers_run, 1, memory_order_seq_cst);
     for (i = 0; i < WRITERS; i++) { /* the last writers ended idle */
-        __atomic_store_n(&g_writer_idle[i], 0, __ATOMIC_SEQ_CST);
+        atomic_store_explicit(&g_writer_idle[i], 0, memory_order_seq_cst);
         CHECK(!pthread_create(&t[i], NULL, writer, (void*)(intptr_t)i), "no writer");
     }
     for (iter = 0; iter < 200; iter++) {
-        u64 from = __atomic_load_n(&g_writes, __ATOMIC_RELAXED), hot;
-        while (__atomic_load_n(&g_writes, __ATOMIC_RELAXED) - from < 4000) {
+        u64 from = atomic_load_explicit(&g_writes, memory_order_relaxed), hot;
+        while (atomic_load_explicit(&g_writes, memory_order_relaxed) - from < 4000) {
             plat_ww_scan(g_base + 32 * 4096, 32 * 4096, on_seen);
             if (++scans % 8 == 0) { /* a target's baseline over them, with the writers going */
                 plat_ww_cool(g_base + 32 * 4096, 32 * 4096, on_seen);
                 cools++;
             }
-            hot = __atomic_load_n(&g_wp_hot_n, __ATOMIC_RELAXED);
+            hot = atomic_load_explicit(&g_wp_hot_n, memory_order_relaxed);
             if (hot > most_hot) most_hot = hot;
         }
         writers_pause();
@@ -444,11 +525,11 @@ static void test_hot_pages(void) {
         if (g_written) inexact++;
         memcpy(before, g_base + 32 * 4096, sizeof before);
         g_seen = 0;
-        __atomic_store_n(&g_writers_run, 1, __ATOMIC_SEQ_CST);
+        atomic_store_explicit(&g_writers_run, 1, memory_order_seq_cst);
         for (i = 0; i < WRITERS; i++)
-            while (__atomic_load_n(&g_writer_idle[i], __ATOMIC_SEQ_CST)) sched_yield();
+            while (atomic_load_explicit(&g_writer_idle[i], memory_order_seq_cst)) sched_yield();
     }
-    __atomic_store_n(&g_writers_stop, 1, __ATOMIC_SEQ_CST);
+    atomic_store_explicit(&g_writers_stop, 1, memory_order_seq_cst);
     for (i = 0; i < WRITERS; i++) pthread_join(t[i], NULL);
     CHECK(missed == 0, "a scan or a cool missed a page another thread wrote, with hot pages");
     CHECK(inexact == 0, "a scan right after a cool, with the writers held, reported pages");
@@ -460,13 +541,14 @@ static void test_hot_pages(void) {
     plat_ww_cool(g_base, 64 * 4096, on_written); /* exact again for what follows */
     if (own) {
         g_wp_hot = NULL;
-        __atomic_store_n(&g_wp_hot_n, 0, __ATOMIC_RELAXED);
+        atomic_store_explicit(&g_wp_hot_n, 0, memory_order_relaxed);
         munmap(own, (size_t)g_wp_pages);
     }
 }
 
-static int g_ran; /* the sum of what the threads read: both must finish before main returns, since they read its arg */
-static void thread_fn(void* arg) { __atomic_fetch_add(&g_ran, *(int*)arg, __ATOMIC_RELEASE); }
+static _Atomic int
+    g_ran; /* the sum of what the threads read: both must finish before main returns, since they read its arg */
+static void thread_fn(void* arg) { atomic_fetch_add_explicit(&g_ran, *(int*)arg, memory_order_release); }
 
 /* written-page tracking and decommit, in a reservation of guest memory */
 static void test_guest_memory(const char* dir) {
@@ -497,7 +579,7 @@ static void test_guest_memory(const char* dir) {
         printf("written-page tracking unavailable here: only checking that it says so\n");
         CHECK(scan() == ~0ull, "a scan without tracking did not fail");
     } else {
-        u8* hot = g_wp_hot; /* the checks below are of exact reports: hot pages have theirs (test_hot_pages) */
+        _Atomic u8* hot = g_wp_hot; /* the checks below are of exact reports: hot pages have theirs (test_hot_pages) */
         g_wp_hot = NULL;
         scan();
         CHECK(scan() == 0, "pages reported written twice");
@@ -528,9 +610,10 @@ static void test_guest_memory(const char* dir) {
             test_open_frozen();
             test_shed();
         }
+        test_pool_read();
         if (hot) { /* back, counted from zero: the scans without it left its counts behind */
             memset(hot, 0, (size_t)g_wp_pages);
-            __atomic_store_n(&g_wp_hot_n, 0, __ATOMIC_RELAXED);
+            atomic_store_explicit(&g_wp_hot_n, 0, memory_order_relaxed);
             g_wp_hot = hot;
         }
         if (g_wp && g_wp_track) test_hot_pages();
@@ -887,7 +970,7 @@ static void bench_ww(void) {
     static const u32 patterns[][2] = {{64, 16}, {256, 64}, {1024, 64}}; /* hot, cold pages an epoch */
     const u32 epochs = 200;
     struct sigaction mine;
-    u8 *hot_table = g_wp_hot, *own = NULL;
+    _Atomic u8 *hot_table = g_wp_hot, *own = NULL;
     int wrapped = 0;
     printf("written-page tracking, benchmarked: %u epochs a pattern over %u pages\n", epochs, BENCH_PAGES);
     u8* base = plat_vm_reserve((u64)1 << 30);
@@ -914,8 +997,8 @@ static void bench_ww(void) {
         wrapped = 1;
     }
     if (g_wp_track && !hot_table) {
-        own = (u8*)mmap(NULL, (size_t)g_wp_pages, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                        -1, 0);
+        own = (_Atomic u8*)mmap(NULL, (size_t)g_wp_pages, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         CHECK(own != MAP_FAILED, "no table of counts");
         if (own == MAP_FAILED) own = NULL;
         hot_table = own;
@@ -931,7 +1014,7 @@ static void bench_ww(void) {
         CHECK(prot.missed == 0, "a scan missed a page written before it");
         if (!g_wp_track || !hot_table) continue;
         memset(hot_table, 0, (size_t)g_wp_pages); /* counted from zero */
-        __atomic_store_n(&g_wp_hot_n, 0, __ATOMIC_RELAXED);
+        atomic_store_explicit(&g_wp_hot_n, 0, memory_order_relaxed);
         g_wp_hot = hot_table;
         bench_arm(&warm, hot, cold, epochs);
         g_wp_hot = NULL;
@@ -943,7 +1026,7 @@ static void bench_ww(void) {
                100.0 * (double)warm.ns / (double)(prot.ns ? prot.ns : 1));
     }
     if (hot_table) memset(hot_table, 0, (size_t)g_wp_pages);
-    __atomic_store_n(&g_wp_hot_n, 0, __ATOMIC_RELAXED);
+    atomic_store_explicit(&g_wp_hot_n, 0, memory_order_relaxed);
     g_wp_hot = own ? NULL : hot_table; /* the setting's table, if any, counted from zero */
     if (own) munmap(own, (size_t)g_wp_pages);
     if (wrapped) {
@@ -1101,8 +1184,8 @@ int main(int argc, char** argv) {
     pm_unlock(&mu);
 
     CHECK(!plat_thread(thread_fn, &arg, 0) && !plat_thread(thread_fn, &arg, 1024), "threads did not start");
-    for (i = 0; i < 5000 && __atomic_load_n(&g_ran, __ATOMIC_ACQUIRE) != 14; i++) plat_sleep_ns(1000000);
-    CHECK(__atomic_load_n(&g_ran, __ATOMIC_ACQUIRE) == 14, "a thread did not run");
+    for (i = 0; i < 5000 && atomic_load_explicit(&g_ran, memory_order_acquire) != 14; i++) plat_sleep_ns(1000000);
+    CHECK(atomic_load_explicit(&g_ran, memory_order_acquire) == 14, "a thread did not run");
 
     /* an exit through plat_exit_now deletes the start's mark (common/utilities/run_mark.h), which _exit would leave */
     printf("start mark\n");

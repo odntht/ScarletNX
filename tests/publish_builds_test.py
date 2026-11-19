@@ -31,6 +31,7 @@ FILES = [
     'ScarletNX-linux-riscv64.AppImage',
     'ScarletNX-linux-loongarch64.AppImage',
     'ScarletNX-windows-x86_64.zip',
+    'ScarletNX-windows-aarch64.zip',
     'ScarletNX-android-universal.apk',
     'ScarletNX-macos-arm64.zip',
     'ScarletNX-ios-arm64.ipa',
@@ -43,8 +44,9 @@ ZSYNC = [
     'ScarletNX-linux-riscv64.AppImage.zsync',
     'ScarletNX-linux-loongarch64.AppImage.zsync',
 ]
-# what a pull request's run builds: the cross AppImages but big-endian PowerPC64's are a nightly's alone
-NIGHTLY_ONLY = ('ppc64le', 'riscv64', 'loongarch64')
+# what a pull request's run makes: every cross AppImage is a nightly's alone, big-endian PowerPC64's built and tested
+# there without its AppImage
+NIGHTLY_ONLY = ('ppc64le', 'ppc64', 'riscv64', 'loongarch64')
 PR_FILES = [name for name in FILES + ZSYNC if not any(f'-{arch}.' in name for arch in NIGHTLY_ONLY)]
 failures = []
 
@@ -137,6 +139,7 @@ with tempfile.TemporaryDirectory() as temporary:
                 'ScarletNX-linux-loongarch64.AppImage.zsync': 'zsync loong',
             },
             f'ScarletNX-windows-x86_64-{short}': {'bin/scarletnx.exe': 'MZ', 'share/licenses/LICENSE': 'GPL'},
+            f'ScarletNX-windows-aarch64-{short}': {'bin/scarletnx.exe': 'MZ arm64', 'share/licenses/LICENSE': 'GPL'},
             f'ScarletNX-android-universal-{short}.apk': {f'ScarletNX-android-universal-{short}.apk': 'PK apk'},
             # skip-decompress: the macOS zip lands at the artifact's own path, the IPA inside its folder
             f'ScarletNX-macos-arm64-{short}.zip': {'': 'PK app'},
@@ -542,15 +545,19 @@ with tempfile.TemporaryDirectory() as temporary:
         pre
         and '| **Windows** | x86-64 | not built, [see the run](https://github.com/owner/repo/actions/runs/50) |  |'
         in pre['body']
+        and '| **Windows** | ARM64 | not built, [see the run](https://github.com/owner/repo/actions/runs/50) |  |'
+        in pre['body']
         and '- **Windows**' not in pre['body']
-        and len(pre['assets']) == len(PR_FILES) - 1,
+        and len(pre['assets']) == len(PR_FILES) - 2,
         pre,
     )
     check(
-        'no row for what only a nightly builds, a row for the big-endian PowerPC64 a pull request builds',
+        'no row for what only a nightly makes: no cross AppImage, the big-endian PowerPC64 one either',
         pre
-        and all(f'| {arch} |' not in pre['body'] for arch in ('PowerPC64 LE', 'RISC-V 64', 'LoongArch64'))
-        and '| **Linux** | PowerPC64 BE | [AppImage (Linux programs)]' in pre['body'],
+        and all(
+            f'| {arch} |' not in pre['body'] for arch in ('PowerPC64 LE', 'PowerPC64 BE', 'RISC-V 64', 'LoongArch64')
+        )
+        and '| **Linux** | x86-64 |' in pre['body'],
         pre and pre['body'],
     )
     check(
@@ -686,7 +693,8 @@ with tempfile.TemporaryDirectory() as temporary:
 
 server.shutdown()
 
-# the packages a pull request's notes leave out are those build.yml's appimage-cross makes for a nightly's run alone
+# the packages a pull request's notes leave out are those build.yml's appimage-cross makes for a nightly's run alone:
+# the legs a pull request's run has not, and the others too where it skips their bundle
 spec = importlib.util.spec_from_file_location('publish_builds', SCRIPT)
 publish_builds = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(publish_builds)
@@ -694,14 +702,65 @@ workflow = (SCRIPT.parent.parent / '.github' / 'workflows' / 'build.yml').read_t
 cross = workflow[workflow.index('\n  appimage-cross:\n') :]
 legs = re.search(r"github\.event_name == 'pull_request' && '(\[.*?\])' \|\| '(\[.*?\])'", cross, re.S)
 check("build.yml's appimage-cross has a pull request's legs and the others", legs, cross[:400])
+bundle = re.search(r'\n      - name: Bundle the AppImage\n        if: ([^\n]*)\n', cross)
 if legs:
     pull_arches, every_arch = ({leg['arch'] for leg in json.loads(text)} for text in legs.groups())
-    expected = {f'ScarletNX-linux-{arch}.AppImage' for arch in every_arch - pull_arches}
+    pull_made = set() if bundle and bundle[1] == "github.event_name != 'pull_request'" else pull_arches
+    expected = {f'ScarletNX-linux-{arch}.AppImage' for arch in every_arch - pull_made}
     check(
-        "NIGHTLY_ONLY is what build.yml's appimage-cross builds for a nightly's run and not a pull request's",
-        getattr(publish_builds, 'NIGHTLY_ONLY', None) == expected and set(NIGHTLY_ONLY) == every_arch - pull_arches,
+        "NIGHTLY_ONLY is what build.yml's appimage-cross makes for a nightly's run and not a pull request's",
+        getattr(publish_builds, 'NIGHTLY_ONLY', None) == expected and set(NIGHTLY_ONLY) == every_arch - pull_made,
         f'NIGHTLY_ONLY {sorted(getattr(publish_builds, "NIGHTLY_ONLY", ()))}, build.yml {sorted(expected)}',
     )
+
+
+def installed_checks(text):
+    """{job id: what is wrong with when it runs} of build.yml's checks of the packages as installed, the steps named
+    "Run ... as a user would" at the end of the jobs that make them: a version's release waits on them (a run that
+    builds everywhere), so they run on every push, main's and a tag's, the nightly and a run by hand, and never on a
+    pull request"""
+    out = {}
+    jobs = text[text.index('\njobs:\n') :]
+    for block in re.split(r'\n(?=  [\w-]+:\n)', jobs)[1:]:
+        for step in re.finditer(r'^      - name: Run [^\n]* as a user would\n((?:        .*\n)*)', block + '\n', re.M):
+            cond = re.search(r'^        if: (.*)$', step[1], re.M)
+            cond = cond[1] if cond else ''
+            wrong = []
+            if "github.event_name != 'pull_request'" not in cond:
+                wrong.append('runs on a pull request')
+            if 'refs/heads' in cond or "'push'" in cond or "'schedule'" in cond:
+                wrong.append(f'leaves out a push, a tag or the nightly: {cond}')
+            out.setdefault(block.split(':', 1)[0].strip(), []).extend(wrong)
+    if "tags: ['v*']" not in text[: text.index('\njobs:\n')]:
+        out['on'] = ["a version's tag starts no Build"]
+    return out
+
+
+got = installed_checks(workflow)
+check(
+    "the checks as installed, in the jobs that make the packages, run on every push, a version's tag's among them, and"
+    ' on no pull request',
+    sorted(got) == ['appimage', 'appimage-cross', 'windows'] and not any(got.values()),
+    got,
+)
+for what, copy in {
+    'on pull requests too': workflow.replace(
+        "      - name: Run the AppImage as a user would\n        if: github.event_name != 'pull_request'\n",
+        '      - name: Run the AppImage as a user would\n',
+    ),
+    "on main's pushes alone": workflow.replace(
+        "      - name: Run the zip's scarletnx.exe as a user would\n        if: github.event_name != 'pull_request'\n",
+        "      - name: Run the zip's scarletnx.exe as a user would\n"
+        "        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'\n",
+    ),
+    'without the tags': workflow.replace("tags: ['v*']", 'tags: []'),
+}.items():
+    check(
+        f'a build.yml whose checks as installed run {what} is named wrong',
+        copy != workflow and any(installed_checks(copy).values()),
+        what,
+    )
+
 for failure in failures:
     print('FAIL:', failure)
 print('publish-builds:', 'FAILED' if failures else 'ok')

@@ -20,10 +20,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include "common/utilities/common.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/runtime/options.h"
 #include "nx/runtime/platform/log.h"
+#include "nx/runtime/platform/hotkeys.h"
 #include "nx/runtime/platform/overlay.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/runtime/platform/stats.h"
@@ -66,11 +68,11 @@ typedef struct {
     int secs; /* at is a time */
 } RdFrame;
 static struct {
-    RENDERDOC_API_1_1_2* api; /* NULL: RenderDoc isn't in the process */
+    RENDERDOC_API_1_1_2* _Atomic api; /* NULL: RenderDoc isn't in the process */
     RdFrame frames[RD_FRAMES];
     int nframes;
     int open;  /* a capture of ours runs, to end at the next present */
-    int asked; /* the capture key's or the menu's: the main thread sets it, the next present arms it */
+    _Atomic int asked; /* the capture key's or the menu's: the main thread sets it, the next present arms it */
     /* asked a present ago: the capture starts at this one, so the frame shown while it is written was drawn after the
        ask, with RD_CAPTURING over it */
     int armed;
@@ -81,12 +83,14 @@ static struct {
     PMutex lock;
     unsigned writing, writes;
     u64 since;
-    int ready; /* a capture can be taken: RenderDoc is in the process, or (iOS) renderdoc= names a usable stem */
+    _Atomic int ready; /* a capture can be taken: RenderDoc is in the process, or (iOS) renderdoc= names a usable stem */
     /* iOS: the captures written this run, the stem renderdoc= gives under Documents, and the running capture's bundle */
     unsigned metal_n;
     char metal_stem[STATS_PATH];
     char metal_path[STATS_PATH];
 } g_renderdoc = {.lock = PMUTEX_INIT};
+/* a notice's line over the game, after the capture key's icon */
+static void rd_notice(const char* text) { overlay_notice(overlay_key_icon(HOTKEY_CAPTURE), text); }
 
 void vk_renderdoc_load(void) {
     const char *prefix = g_settings.render_doc_captures, *frames = g_settings.render_doc_frames, *p;
@@ -166,14 +170,14 @@ void vk_renderdoc_load(void) {
         started ? "in the process (RenderDoc's program started the game)" : "loaded",
         g_settings.render_doc_capture_shortcut, *g_settings.render_doc_capture_shortcut ? " or " : "",
         g_renderdoc.nframes, *prefix ? prefix : rd->GetCaptureFilePathTemplate());
-    __atomic_store_n(&g_renderdoc.api, rd, __ATOMIC_RELAXED); /* ready's release below publishes it */
+    atomic_store_explicit(&g_renderdoc.api, rd, memory_order_relaxed); /* ready's release below publishes it */
 #endif
-    __atomic_store_n(&g_renderdoc.ready, 1, __ATOMIC_RELEASE); /* the main thread's capture key reads it */
+    atomic_store_explicit(&g_renderdoc.ready, 1, memory_order_release); /* the main thread's capture key reads it */
     stats_capture(&(SnxStatsCapture){.ready = 1});
 }
 
 int vk_renderdoc_capture(int ask) {
-    if (!__atomic_load_n(&g_renderdoc.ready, __ATOMIC_ACQUIRE)) {
+    if (!atomic_load_explicit(&g_renderdoc.ready, memory_order_acquire)) {
         if (ask)
 #if defined(SNX_IOS)
             LOG("renderdoc: no frame is captured: renderdoc= is empty or not usable (see the log above)\n");
@@ -184,8 +188,8 @@ int vk_renderdoc_capture(int ask) {
         return 0;
     }
     if (ask) {
-        __atomic_store_n(&g_renderdoc.asked, 1, __ATOMIC_RELEASE);
-        overlay_notice(RD_CAPTURING);
+        atomic_store_explicit(&g_renderdoc.asked, 1, memory_order_release);
+        rd_notice(RD_CAPTURING);
         LOG("renderdoc: a capture is asked: the frame after the next present\n");
     }
     return 1;
@@ -258,7 +262,7 @@ static void rd_shown(const char* path, u64 bytes, int sized, unsigned n, u64 sec
         snprintf(line, sizeof line, "%s%s (%s)", lead, name, size);
     else
         snprintf(line, sizeof line, "%s...%s (%s)", lead, name + len - (room - 3), size);
-    overlay_notice(line);
+    rd_notice(line);
     stats_capture(&shown);
 }
 /* a capture that wrote no file after secs, what it held, n captures written before it: in the log with what to read,
@@ -275,7 +279,7 @@ static void rd_failed(unsigned n, u64 secs, const char* what, const char* why) {
         snprintf(line, sizeof line, "RenderDoc: capture failed after %llu s, no file written (see its log)",
                  (unsigned long long)secs);
     }
-    overlay_notice(line);
+    rd_notice(line);
     stats_capture(&(SnxStatsCapture){.ready = 1, .taken = n, .failed = 1});
 }
 #if !defined(SNX_IOS)
@@ -371,14 +375,14 @@ static int rd_metal_start(u64 present) {
    capture of this frame ends here, and the next frame's starts */
 void vk_renderdoc_present(u64 present) {
     int want;
-    if (!__atomic_load_n(&g_renderdoc.ready, __ATOMIC_ACQUIRE) || !g_vk.instance) return;
+    if (!atomic_load_explicit(&g_renderdoc.ready, memory_order_acquire) || !g_vk.instance) return;
 #if !defined(SNX_IOS)
-    RENDERDOC_API_1_1_2* rd = __atomic_load_n(&g_renderdoc.api, __ATOMIC_RELAXED);
+    RENDERDOC_API_1_1_2* rd = atomic_load_explicit(&g_renderdoc.api, memory_order_relaxed);
     void* dev = RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(g_vk.instance);
     if (g_renderdoc.theirs) rd_theirs(rd);
 #endif
     want = rd_wanted(present) || g_renderdoc.armed; /* listed once: it takes the frame it answers for */
-    g_renderdoc.armed = __atomic_exchange_n(&g_renderdoc.asked, 0, __ATOMIC_ACQ_REL);
+    g_renderdoc.armed = atomic_exchange_explicit(&g_renderdoc.asked, 0, memory_order_acq_rel);
     if (g_renderdoc.open || want) vk_rec_sync(); /* the frame's commands are recorded within the capture */
     if (g_renderdoc.open) {                      /* the back end writes it here, the game stopped */
         char what[48];
@@ -414,7 +418,7 @@ void vk_renderdoc_present(u64 present) {
         /* RenderDoc's own, its program's: it writes it in the swapchain's present that ends the frame */
         g_renderdoc.theirs = 1;
         g_renderdoc.before = rd->GetNumCaptures();
-        overlay_notice(RD_CAPTURING);
+        rd_notice(RD_CAPTURING);
         LOG("renderdoc: RenderDoc's own capture runs, from present %llu: the game stops while it writes\n",
             (unsigned long long)present);
         rd_write_begin();

@@ -69,7 +69,7 @@ int vk_written_since(const u8* host, u64 len, u32 since) { /* no write tracking 
     return -1;
 }
 
-int g_gpu_releases;
+_Atomic int g_gpu_releases;
 static unsigned lock_depth, landing_calls, payload_writes, submits, query_reads, events_signaled;
 static int events_due;
 static u64 next_compute, next_graphics = 1, waited_compute, waited_graphics;
@@ -144,6 +144,7 @@ u32 syncpt_read(u32 id) { return id < 128 ? completed[id] : 0; }
 /* under vk_lock, so the events it reaches wait for vk_unlock (memory/own.c's traps are answered under vk_lock) */
 /* the GPU mirror's pages landed submits wrote, not yet GPU-owned: no release may let the game read them */
 static int mirror_unpublished;
+void gpu_kick_polls(void) {}
 void syncpt_add_quiet(u32 id, u32 n) {
     assert(lock_depth && vk_result_landing());
     assert(!mirror_unpublished);
@@ -167,6 +168,13 @@ int gmem_write(u64 address, const void* data, u64 size) {
     payload_writes++;
     return 1;
 }
+/* the same write, of a writer the stand-in does not record */
+int gmem_write_by(u64 address, const void* data, u64 size, int kind, u32 format, u64 surface) {
+    (void)kind;
+    (void)format;
+    (void)surface;
+    return gmem_write(address, data, size);
+}
 u8* gmem_ptr(u64 address, u64 size) {
     (void)size;
     return writeback_direct ? memory + gmmu_translate(address) : NULL;
@@ -180,9 +188,11 @@ int gmem_read(u64 address, void* data, u64 size) {
     memcpy(data, memory + gmmu_translate(address), size);
     return 1;
 }
+static unsigned shader_writes; /* the landings that told the GPU side's write tracking of their bytes */
 void gpu_mem_written_shader(u64 address, u64 size) {
     (void)address;
     (void)size;
+    shader_writes++;
 }
 void vk_rt_before_write(u64 address, u64 size) {
     (void)address;
@@ -345,6 +355,20 @@ static void check_runs(const u8 *result, const u8 *original, u32 n)
 	assert(nruns_seen == nwant && !memcmp(runs_seen, want, nwant * sizeof *want));
 }
 
+/* the bytes a landing takes (those it changes in memory), and their runs: written once each through gmem_write, a
+   run that goes on across granules, and across a granule over a page boundary, as one write */
+static void taken_runs(const u8 *current, const u8 *expected, u32 n, unsigned *runs, u64 *bytes)
+{
+	*runs = 0;
+	*bytes = 0;
+	for (u32 i = 0; i < n; i++) {
+		if (expected[i] == current[i])
+			continue;
+		*runs += !i || expected[i - 1] == current[i - 1];
+		(*bytes)++;
+	}
+}
+
 static void check_writeback_merge(void)
 {
 	u8 original[4099], result[4099], current[4099], expected[4099];
@@ -364,25 +388,38 @@ static void check_writeback_merge(void)
 				expected[i] = result[i] != original[i] && current[i] == original[i]
 					      ? result[i] : current[i];
 			}
-			for (u32 k = 0; k < sizeof lengths / sizeof *lengths; k++) {
-				u32 n = lengths[k];
+			/* at a page, and 4 bytes after one: a granule across the next page goes byte by byte */
+			for (u32 at = 0; at <= 4; at += 4) {
+				for (u32 k = 0; k < sizeof lengths / sizeof *lengths; k++) {
+					u32 n = lengths[k];
+					unsigned runs, writes = payload_writes, told = shader_writes;
+					u64 bytes, changed = g_wb_chg_bytes;
 
-				memcpy(memory + mapping, current, sizeof current);
-				vk_lock();
-				vk_write_changed(0x31000, result, original, n);
-				vk_unlock();
-				assert(!memcmp(memory + mapping, expected, n));
-				assert(!memcmp(memory + mapping + n, current + n, sizeof current - n));
-				assert(!vk_result_landing());
-				/* the same landing telling its runs */
-				memcpy(memory + mapping, current, sizeof current);
-				nruns_seen = 0;
-				vk_lock();
-				vk_write_changed_runs(0x31000, result, original, n, collect_run, NULL);
-				vk_unlock();
-				assert(!memcmp(memory + mapping, expected, n));
-				assert(!memcmp(memory + mapping + n, current + n, sizeof current - n));
-				check_runs(result, original, n);
+					taken_runs(current, expected, n, &runs, &bytes);
+					memcpy(memory + mapping + at, current, sizeof current);
+					vk_lock();
+					vk_write_changed(0x31000 + at, result, original, n);
+					vk_unlock();
+					assert(!memcmp(memory + mapping + at, expected, n));
+					assert(!memcmp(memory + mapping + at + n, current + n, sizeof current - n));
+					assert(!vk_result_landing());
+					assert(g_wb_chg_bytes - changed == bytes);
+					assert(payload_writes - writes == (direct ? 0 : runs));
+					assert(shader_writes - told == (bytes != 0));
+					/* the same landing telling its runs */
+					memcpy(memory + mapping + at, current, sizeof current);
+					nruns_seen = 0;
+					writes = payload_writes;
+					changed = g_wb_chg_bytes;
+					vk_lock();
+					vk_write_changed_runs(0x31000 + at, result, original, n, collect_run, NULL);
+					vk_unlock();
+					assert(!memcmp(memory + mapping + at, expected, n));
+					assert(!memcmp(memory + mapping + at + n, current + n, sizeof current - n));
+					check_runs(result, original, n);
+					assert(g_wb_chg_bytes - changed == bytes);
+					assert(payload_writes - writes == (direct ? 0 : runs));
+				}
 			}
 		}
 	}

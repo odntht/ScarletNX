@@ -58,8 +58,12 @@ set(CMAKE_C_EXTENSIONS ON)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
-# The strict ISO C (RFC #142: the driver, swipc, the build info and their tests) builds as C99 with -pedantic-errors
-# and without extensions (C_STANDARD 99, C_EXTENSIONS OFF on those targets)
+# No C++ here or in a package uses modules. A package whose own policies scan for them (SDL3's Android hidapi) would
+# otherwise build `import std` where the host's libstdc++ ships the std module, and on Android from the host's
+# headers: the NDK's scan then stops on stdbit.h
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+# The strict ISO C (RFC #142: the driver, swipc, the build info and their tests) builds as C23 with -pedantic-errors
+# and without extensions (C_EXTENSIONS OFF on those targets)
 
 option(SNX_BUILD_NX "Build the Switch Horizon/Maxwell runtime" ON)
 option(SNX_BUILD_GNUABI "Build the CPU-only Linux AArch64 runtime" ON)
@@ -129,7 +133,7 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${SNX_OPT_FLAGS}")
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
-option(SNX_TOOLS_ONLY "Build the C99 extraction/recompilation driver without the runtime" OFF)
+option(SNX_TOOLS_ONLY "Build the ISO C extraction/recompilation driver without the runtime" OFF)
 set(snx_gui_default OFF)
 if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     set(snx_gui_default ON)
@@ -175,7 +179,7 @@ if(NOT SNX_BUILD_TESTING)
 endif()
 # Before the dependencies: the tests' network fixtures link ENet and zstd, whatever the build
 include(CTest)
-# Before the sources: the C99 driver of a tools-only build links LZ4 too
+# Before the sources: the ISO C driver of a tools-only build links LZ4 too
 include(cmake/dependencies.cmake)
 # every local include is a path from src/ ("nx/hle/kernel/ipc.h"); generated and third-party headers come with their
 # targets, but for the SPIR-V headers (cmake/glsl.cmake), which are paths from src/ in the build tree
@@ -356,7 +360,12 @@ endif()
 # No -fno-strict-aliasing or -fwrapv in ScarletNX's own code, once every target is defined (cmake/banned_flags.cmake)
 include(cmake/banned_flags.cmake)
 snx_check_project_flags()
+# Every access to an _Atomic object in src/ names its order, once every target is defined (cmake/atomic_explicit.cmake)
+include(cmake/atomic_explicit.cmake)
+snx_atomic_explicit()
 # plat_posix.c's power watcher needs both Apple frameworks named by every target that compiles it, once every
 # target is defined (cmake/power_frameworks.cmake)
 include(cmake/power_frameworks.cmake)
 snx_check_power_frameworks()
+# `cmake --build <tree> --target cppcheck`, on demand only (cmake/cppcheck.cmake)
+include(cmake/cppcheck.cmake)

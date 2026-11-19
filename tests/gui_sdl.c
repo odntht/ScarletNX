@@ -5,11 +5,20 @@
 #include "gui/main.c"
 #define SNX_SCREEN_TEST "gui_sdl.c"
 #include "gui_screen.h"
+/* whether More's box (screen_more, the foot's own past its first three) holds the sentence label, its key key */
+static bool more_has(const App* app, const char* key, const char* label) {
+    GuiMore more;
+    screen_more(app, &more);
+    for (int i = 0; i < more.n; ++i)
+        if (!strcmp(more.key[i], key) && !strcmp(more.label[i], label)) return true;
+    return false;
+}
 #include "support/sdl_real_pads.h"
 #include "support/crc_forge.h"
 #include "common/cpu/aarch64/cpu.h" /* SNX_ABI, which a save state names */
 #include <assert.h>
 #include <miniz.h> /* Share Log's zip, read back */
+#include <stdatomic.h>
 #ifdef _WIN32
 #include "win32_crash.h"
 #include <windows.h> /* the queue's recompile's priority class */
@@ -25,7 +34,7 @@
 #define APP_INI_HEAD "; Settings > App and Games' View in the launcher, as they were left\n[app]\n"
 #define GAMES_DEFAULTS                                                                                                 \
     "recent_games = on\ngames_dumps = on\ngames_sort = title\ngames_view = list\ngames_icons = medium\n"
-/* app.ini's probe_mode as edenprobe Mode leaves it by default: Quick */
+/* app.ini's probe_mode as Amberlith Mode leaves it by default: Quick */
 #define PROBE_DEFAULTS "probe_mode = quick\n"
 /* the default theme's colours, as the checks below name them */
 static const SDL_Color normal = {220, 220, 220, 255}, yellow = {255, 255, 0, 255}, red = {255, 0, 0, 255},
@@ -271,6 +280,19 @@ static int keys_red(App* app, Uint64 clock) {
     b = menu_entry_box(app, &m, GUI_KEYS);
     return same_colour(pixel(app, (float)(b.x + b.w - 3 * app->scale - 1), (float)(b.y + b.h / 2)),
                        rgb(app->theme.failure));
+}
+/* the screen as drawn now into SNX_TEST_SHOTS/name.png, when that names a folder: for a person to look at, never a
+   check */
+static void foot_shot(App* app, const char* name) {
+    const char* folder = getenv("SNX_TEST_SHOTS");
+    char path[1024];
+    SDL_Surface* image;
+    if (!folder || !*folder) return;
+    render(app);
+    image = SDL_RenderReadPixels(app->renderer, NULL);
+    snprintf(path, sizeof path, "%s/%s.png", folder, name);
+    if (!image || !SDL_SavePNG(image, path)) fprintf(stderr, "foot_shot: %s not written: %s\n", path, SDL_GetError());
+    SDL_DestroySurface(image);
 }
 static int near_colour(SDL_Color a, SDL_Color b, int by) {
     return abs(a.r - b.r) <= by && abs(a.g - b.g) <= by && abs(a.b - b.b) <= by;
@@ -1240,7 +1262,8 @@ static void only_rows(App* app) {
     info = (UiRowInfo){0};
     assert(form_row_info(app, &app->editor, 1, form_labels(&app->editor), 0, &info) && (info.attr & UI_ATTR_OFF) &&
            strstr(info.label, "MoltenVK " GUI_CHANGED_MARK " macOS only"));
-    assert(gui_settings_options(&app->settings, 0, options) == 1 && !strcmp(options[0], "--vulkan-driver=moltenvk"));
+    assert(gui_settings_options(&app->settings, 0, NULL, options) == 2 &&
+           !strcmp(options[0], "--vulkan-driver=moltenvk"));
     app->editor.row = 1;
     key(app, SDLK_RETURN);
     assert(strstr(app->editor.note, "and it stays MoltenVK") && setting_is(app, "vulkan_driver", "moltenvk"));
@@ -1521,35 +1544,36 @@ static void button_map(App* app) {
         free(folder);
     }
 }
-/* every section of settings.txt has its group's icon (group_icon, by group_title's name), none another group's (App's
-   among them), and every page its row's (page_icon), but Controllers' Player, a row that steps the player and opens
-   none: one without, or two groups with one, are named */
+/* every section of settings.txt has its group's icon (gui/icons.h's gui_group_icon, by gui_group_name's name), none
+   another group's (App's among them), and every page its row's (gui_page_icon), but Controllers' Player, a row that
+   steps the player and opens none: one without, or two groups with one, are named */
 static void icons_named(void) {
     size_t size;
     char* text = (char*)snx_read_file(SNX_GUI_SETTINGS_TXT, &size);
     const char* line;
-    char group[32][64] = {"App"}; /* the groups so far, the launcher's own first: group_title's names */
+    char group[32][64] = {"App"}; /* the groups so far, the launcher's own first: gui_group_name's names */
     int sections = 0, pages = 0, groups = 1;
-    assert(text && group_icon("App") != GUI_ICON_NONE);
+    assert(text && gui_group_icon("App") != GUI_ICON_NONE);
     icons_are();
     for (line = text; line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
         char name[64], rest[256];
         const char* page;
         unsigned icon;
         if (sscanf(line, "section %63[^:]: %255[^\n]", name, rest) != 2) continue;
-        icon = group_icon(group_title(name));
+        icon = gui_group_icon(gui_group_name(name));
         if (icon == GUI_ICON_NONE) {
-            fprintf(stderr, "settings.txt's section %s has no icon in main.c's group_icon\n", name);
+            fprintf(stderr, "settings.txt's section %s has no icon in gui/icons.h's gui_group_icon\n", name);
             assert(!"a group's icon");
         }
         for (int g = 0; g < groups; ++g)
-            if (group_icon(group[g]) == icon) {
-                fprintf(stderr, "the Settings' groups %s and %s have the same icon, U+%04X, in main.c's group_icon\n",
-                        group[g], group_title(name), icon);
+            if (gui_group_icon(group[g]) == icon) {
+                fprintf(stderr,
+                        "the Settings' groups %s and %s have the same icon, U+%04X, in gui/icons.h's gui_group_icon\n",
+                        group[g], gui_group_name(name), icon);
                 assert(!"a group's own icon");
             }
         assert(groups < (int)SDL_arraysize(group));
-        snprintf(group[groups++], sizeof group[0], "%s", group_title(name));
+        snprintf(group[groups++], sizeof group[0], "%s", gui_group_name(name));
         ++sections;
         for (page = strchr(rest, '/'); page; page = strchr(page + 1, '/')) {
             char p[64];
@@ -1557,8 +1581,8 @@ static void icons_named(void) {
             if (strstr(p, "  ")) *strstr(p, "  ") = 0; /* the section's words after its tables: backend, launcher */
             while (p[0] && p[strlen(p) - 1] == ' ') p[strlen(p) - 1] = 0;
             if (!strcmp(p, "Player")) continue;
-            if (page_icon(p) == GUI_ICON_NONE) {
-                fprintf(stderr, "settings.txt's page %s of %s has no icon in main.c's page_icon\n", p, name);
+            if (gui_page_icon(p) == GUI_ICON_NONE) {
+                fprintf(stderr, "settings.txt's page %s of %s has no icon in gui/icons.h's gui_page_icon\n", p, name);
                 assert(!"a page's icon");
             }
             ++pages;
@@ -1797,8 +1821,17 @@ static void view_box(App* app, const char* temporary) {
     render(app);
     shows(app, "Recent Games", rgb(app->theme.soft));
     shows(app, "dumps", rgb(app->theme.soft)); /* the side box's folders, dumps/ with them, wrapped at a slash */
-    shows_foot(app, "V", yellow);              /* its key, then what it does; its word presses V as the key does */
-    shows_foot(app, "view", normal);
+    /* the foot's own past its first three in More's box (F3), V among them: its key, then what it does, its icon */
+    shows_foot(app, "F3", yellow);
+    shows_foot(app, "more", normal);
+    {
+        GuiMore more;
+        int i, v = 0;
+        screen_more(app, &more);
+        for (i = 0; i < more.n; ++i)
+            v += !strcmp(more.key[i], "V") && !strcmp(more.label[i], "V: view") && more.icon[i] == GUI_ICON_EYE;
+        assert(v == 1);
+    }
     assert(hint_keys[hint_pick("V", 0, false)].key == SDLK_V && !hint_keys[hint_pick("V", 0, false)].mod);
     assert(hint_keys[hint_pick("View", 1, false)].key == SDLK_V); /* a phone's: the word alone */
     assert(strstr(screen_said(app, true, said, sizeof said), "V: view."));
@@ -2563,9 +2596,10 @@ static void add_mod(App* app, const char* temporary) {
          *file = snx_path_join(root, "x");
     char *to = snx_path_join(mods, "Better Fonts"), *to_first = snx_path_join(mods, "A first"), want[2048];
     const char* cloud = "content://com.example.cloud.documents/tree/abc%3Amods";
-    static const int tail[] = {ROW_ADD_MOD,     ROW_MODS_FOLDER, ROW_ADD_CHEATS,  ROW_CHEATS_FOLDER,
-                               ROW_OPEN_FOLDER, ROW_STATES,      ROW_CLEAN_CACHE, ROW_GPU_DRIVER,
-                               ROW_FREEDRENO,   ROW_SAVE,        ROW_PLAY};
+    static const int tail[] = {ROW_ADD_MOD,     ROW_MODS_FOLDER,  ROW_ADD_CHEATS,   ROW_CHEATS_FOLDER,
+                               ROW_OPEN_FOLDER, ROW_EXPORT_SAVES, ROW_IMPORT_SAVES, ROW_STATES,
+                               ROW_CLEAN_CACHE, ROW_GPU_DRIVER,   ROW_FREEDRENO,    ROW_SETTINGS,
+                               ROW_SAVE,        ROW_PLAY};
     size_t index = 0;
     int i, nx, ny;
     while (index < app->games.count &&
@@ -3084,7 +3118,7 @@ static void gpu_drivers(App* app, const char* temporary) {
     app->editor.row = GUI_APP_DRIVERS;
     render(app);
     key(app, SDLK_RETURN);
-    /* System driver, picked, Download Driver, Add Driver, edenprobe Mode and Run edenprobe; this device's line, which
+    /* System driver, picked, Download Driver, Add Driver, Amberlith Mode and Run Amberlith; this device's line, which
        says packages do not load here */
     assert(app->form == GUI_FORM_DRIVERS && gui_editor_rows(&app->editor) == 5 && !app->editor.row);
     assert(!strcmp(app->drivers_form.value[0], "(*)") && strstr(app->editor.note, "This device: Linux x86_64: ") &&
@@ -3611,7 +3645,7 @@ static void download_driver(App* app, const char* temporary) {
     free(zip);
     app->https_get = NULL;
 }
-/* Run edenprobe's launches through the fake driver, each let end as it starts (its .go), until the box */
+/* Run Amberlith's launches through the fake driver, each let end as it starts (its .go), until the box */
 static void probe_ran(App* app, const char* argv_file) {
     char* go = snx_format("%s.go", argv_file);
     Uint64 until = SDL_GetTicks() + 20000;
@@ -3624,12 +3658,12 @@ static void probe_ran(App* app, const char* argv_file) {
     remove(go);
     free(go);
 }
-/* GPU Drivers' edenprobe Mode, kept in app.ini's probe_mode, and Run edenprobe: its NRO asked for where it goes; then
+/* GPU Drivers' Amberlith Mode, kept in app.ini's probe_mode, and Run Amberlith: its NRO asked for where it goes; then
    played through the fake driver in its own data folder with quick's words and the build's machine=, which its NRO
    knows, launched again after a launch that ended before the summary, its counts in a box; a new run, which a launch
    that adds no case ends; Continue, shown for that run, going on with it to its summary; Clear Crash List, asked
    first, shown while a crash list is there */
-static void run_edenprobe(App* app, const char* temporary) {
+static void run_amberlith(App* app, const char* temporary) {
     char *was = app->state_dir, *folder, *nro, *data, *argv_file = snx_path_join(temporary, "probe argv"),
          *plan = snx_path_join(temporary, "probe plan"), *kept, *mode, *launches, *ini, *words;
     size_t size;
@@ -3638,19 +3672,19 @@ static void run_edenprobe(App* app, const char* temporary) {
                 : snx_strdup(GUI_PROBE_QUICK " machine=scarletnx\n");
     app->state_dir = snx_path_join(temporary, "probe state");
     folder = snx_path_join(app->state_dir, "probe");
-    nro = snx_path_join(folder, "edenprobe.nro");
+    nro = snx_path_join(folder, "amberlith.nro");
     data = snx_path_join(folder, ".scarletnx");
-    mode = snx_path_join(data, "recompiled/edenprobe/edenprobe_data/sdmc/edenprobe/mode");
-    launches = snx_path_join(data, "recompiled/edenprobe/edenprobe_data/sdmc/edenprobe/runs/abc1234/launches");
+    mode = snx_path_join(data, "recompiled/amberlith/amberlith_data/sdmc/amberlith/mode");
+    launches = snx_path_join(data, "recompiled/amberlith/amberlith_data/sdmc/amberlith/runs/abc1234/launches");
     open_drivers(app, NULL, NULL, 0);
-    assert(gui_editor_rows(&app->editor) == 5 && !strcmp(app->drivers_label[3], "edenprobe Mode") &&
-           !strcmp(app->drivers_form.value[3], "Quick") && !strcmp(app->drivers_label[4], "Run edenprobe") &&
+    assert(gui_editor_rows(&app->editor) == 5 && !strcmp(app->drivers_label[3], "Amberlith Mode") &&
+           !strcmp(app->drivers_form.value[3], "Quick") && !strcmp(app->drivers_label[4], "Run Amberlith") &&
            strstr(app->drivers_about[4], folder));
     render(app);
-    /* edenprobe Mode: Full, kept at once, then Quick again; a word app.ini's probe_mode does not know, named */
+    /* Amberlith Mode: Full, kept at once, then Quick again; a word app.ini's probe_mode does not know, named */
     app->editor.row = 3;
     key(app, SDLK_RETURN);
-    assert(app->probe_full && !strcmp(app->editor.note, "edenprobe Mode: Full") &&
+    assert(app->probe_full && !strcmp(app->editor.note, "Amberlith Mode: Full") &&
            !strcmp(app->drivers_form.value[3], "Full") && app->editor.row == 3);
     kept = (char*)snx_read_file(app->app_file, &size);
     assert(kept && strstr(kept, "\nprobe_mode = full\n"));
@@ -3667,24 +3701,26 @@ static void run_edenprobe(App* app, const char* temporary) {
     free(kept);
     key(app, SDLK_RETURN);
     assert(!app->probe_full && !strcmp(app->drivers_form.value[3], "Quick"));
-    /* Run edenprobe without its NRO: where it goes, nothing run */
+    /* Run Amberlith without its NRO: where it goes, nothing run */
     app->editor.row = 4;
     key(app, SDLK_RETURN);
-    ini = snx_format("Run edenprobe needs %s: edenprobe.nro from github.com/scarletnx/edenprobe/releases", nro);
+    ini = snx_format("Run Amberlith needs %s: a release's amberlith-<version>.nro from "
+                     "github.com/scarletnx/amberlith/releases, saved under that name",
+                     nro);
     assert(!app->menu.running && !app->probe_launch && !strcmp(app->editor.note, ini));
     free(ini);
     /* with it: the first launch ends before the summary, the second goes on to it; the box's counts */
-    assert(!snx_mkdirs(folder) && !snx_write_file(nro, "NRO0 machine=", 13));
+    assert(!snx_mkdirs(folder) && !snx_write_file(nro, "NRO0 sdmc:/amberlith machine=", 29));
     ini = snx_strdup("pass=2\npass=1 fail=astc summary=2,1,0,0\n");
     assert(!snx_write_file(plan, ini, strlen(ini)));
     free(ini);
     set_env("SNX_TEST_PROBE", plan);
-    driver_will(argv_file, 0, "edenprobe");
+    driver_will(argv_file, 0, "amberlith");
     key(app, SDLK_RETURN);
     assert(app->menu.running && app->probe_launch == 1);
     render(app);
     probe_ran(app, argv_file);
-    ini = snx_format("edenprobe 0.9.0 (abc1234): 2 passed, 1 failed (astc 1), 0 skipped, 0 crashed. The report: %s",
+    ini = snx_format("Amberlith 1.0.0 (abc1234): 2 passed, 1 failed (astc 1), 0 skipped, 0 crashed. The report: %s",
                      data); /* and the run's folder's report in it */
     assert(app->confirm.shown && app->confirm.ask == GUI_ASK_ERROR && !strncmp(app->error_line, ini, strlen(ini)) &&
            strstr(app->error_line, "report.jsonl"));
@@ -3705,7 +3741,7 @@ static void run_edenprobe(App* app, const char* temporary) {
     assert(!snx_write_file(plan, "pass=1\n\n", 8));
     key(app, SDLK_RETURN);
     probe_ran(app, argv_file);
-    ini = snx_strdup("edenprobe 0.9.0 (abc1234): no summary, 1 case reported after 2 launches, the last adding no "
+    ini = snx_strdup("Amberlith 1.0.0 (abc1234): no summary, 1 case reported after 2 launches, the last adding no "
                      "case. The report: ");
     assert(app->confirm.shown && !strncmp(app->error_line, ini, strlen(ini)));
     free(ini);
@@ -3721,7 +3757,7 @@ static void run_edenprobe(App* app, const char* temporary) {
     key(app, SDLK_RETURN);
     probe_ran(app, argv_file);
     assert(app->confirm.shown &&
-           !strncmp(app->error_line, "edenprobe 0.9.0 (abc1234): 2 passed, 0 failed, 0 skipped, 0 crashed. ", 69));
+           !strncmp(app->error_line, "Amberlith 1.0.0 (abc1234): 2 passed, 0 failed, 0 skipped, 0 crashed. ", 69));
     kept = (char*)snx_read_file(mode, &size);
     assert(kept && !strcmp(kept, words));
     free(kept);
@@ -3730,7 +3766,7 @@ static void run_edenprobe(App* app, const char* temporary) {
     assert(gui_editor_rows(&app->editor) == 5 && app->drivers_continue < 0); /* a whole run: nothing to go on with */
     /* Clear Crash List: shown while one is there, asked first, Cancel keeping it */
     {
-        char* crashes = snx_path_join(data, "recompiled/edenprobe/edenprobe_data/sdmc/edenprobe/crashes");
+        char* crashes = snx_path_join(data, "recompiled/amberlith/amberlith_data/sdmc/amberlith/crashes");
         assert(!snx_write_file(crashes, "gpu a case\nindex another\n", 25));
         drivers_show(app, 4);
         assert(gui_editor_rows(&app->editor) == 6 && app->drivers_clear == 5 &&
@@ -3791,6 +3827,80 @@ static void run_edenprobe(App* app, const char* temporary) {
     free(plan);
     free(argv_file);
 }
+/* a game's box's Settings: its own Settings, the runtime's sections and Reset to Global last, none of the launcher's
+   own groups; each row Global and the launcher's until picked, a pick kept in its picks file beside its .ini at once
+   and Del taking it out (no file with none); its row in Games with the sliders after its name and the side panel
+   saying its own; Reset to Global asked first, with how many; Back from its groups to its box. And the game box's
+   Settings opens the same, Back going to Games */
+static void game_own_settings(App* app) {
+    char *game = snx_strdup(app->addons_game), *title = snx_strdup(app->addons_title), *ini = game_ini_of(game);
+    char *picks = snx_game_picks(ini), *text, value[256], label[512];
+    size_t size, index;
+    int row, groups;
+    addons_open(app, game, title, true);
+    for (row = 0; row < addons_rows(app) && addons_row(app, row) != ROW_SETTINGS; ++row) {}
+    assert(row < addons_rows(app));
+    app->addons_focus = row;
+    key(app, SDLK_RETURN);
+    assert(!app->addons_shown && app->editing && app->form == GUI_FORM_SETTINGS && app->own_picks &&
+           !strcmp(app->own_picks, picks) && screen_settings(app) == &app->game_settings);
+    groups = app->groups;
+    assert(groups == 5 && !strcmp(app->group_keys[0].key, "Display") && !strcmp(app->group_keys[3].key, "User") &&
+           !strcmp(app->group_keys[4].key, "Reset to Global") && app->group_first[4] < 0);
+    screen_title(app, label, sizeof label); /* the game's name, as the other titles are, in capitals */
+    snprintf(value, sizeof value, "SCARLETNX  /  SETTINGS  /  %s", title);
+    for (char* c = value; *c; ++c) *c = (char)SDL_toupper((unsigned char)*c);
+    assert(!strcmp(label, value));
+    key(app, SDLK_RETURN); /* Display */
+    assert(app->form == GUI_FORM_GROUP && app->editor.object == (char*)app->game_settings.values);
+    app->editor.row = 0; /* Fullscreen: Global and the launcher's */
+    setting_shown(app, setting_of(app, 0), value, sizeof value);
+    assert(!strncmp(value, "Global (", 8) && !snx_path_exists(picks));
+    key(app, SDLK_RIGHT);
+    assert(!strcmp(gui_settings_value(&app->game_settings, "fullscreen"), "0"));
+    assert((text = (char*)snx_read_file(picks, &size)) && strstr(text, "[Display]\nfullscreen=0\n"));
+    free(text);
+    assert(game_own(game, value, sizeof value) == 1 && !strcmp(value, "fullscreen=0"));
+    assert(strstr(shown_keys(app, label, sizeof label), "Del: Global.")); /* the foot: Del back to Global */
+    key(app, SDLK_DELETE);
+    assert(!gui_settings_value(&app->game_settings, "fullscreen") && !snx_path_exists(picks));
+    key(app, SDLK_RIGHT);
+    key(app, SDLK_ESCAPE);
+    assert(app->form == GUI_FORM_SETTINGS && app->own_picks);
+    app->editor.row = groups - 1; /* Reset to Global, asked first: Cancel in focus changes none */
+    key(app, SDLK_RETURN);
+    assert(app->confirm.shown && app->confirm.ask == GUI_ASK_RESET &&
+           !strncmp(app->ask_line, "Reset to Global? 1 setting of ", 30));
+    key(app, SDLK_RETURN);
+    assert(!app->confirm.shown && snx_path_exists(picks));
+    key(app, SDLK_ESCAPE); /* back to its box: the sliders on its row, its own in the side panel */
+    assert(!app->editing && app->addons_shown && !app->own_picks && !strcmp(app->addons_game, game));
+    for (index = 0; index < app->games.count && !(app->games.paths[index] && snx_same_file(app->games.paths[index], game));
+         ++index) {}
+    assert(index < app->games.count && app->games_own[index]);
+    game_label(app, &app->games, index, label, sizeof label);
+    assert(strstr(label, GUI_OWN_MARK));
+    side_focus_update(app);
+    assert(!strcmp(app->own_focus, "fullscreen=0"));
+    /* Reset to Global taken: no picks file, no sliders */
+    app->addons_focus = row;
+    key(app, SDLK_RETURN);
+    app->editor.row = groups - 1;
+    key(app, SDLK_RETURN);
+    key(app, SDLK_DOWN);
+    key(app, SDLK_RETURN);
+    assert(!app->confirm.shown && !snx_path_exists(picks) && !strcmp(app->editor.note, "1 setting back to Global"));
+    key(app, SDLK_RETURN);
+    assert(!strcmp(app->editor.note, "Every setting of this game is Global"));
+    key(app, SDLK_ESCAPE);
+    assert(app->addons_shown && !app->games_own[index]);
+    game_label(app, &app->games, index, label, sizeof label);
+    assert(!strstr(label, GUI_OWN_MARK));
+    free(picks);
+    free(ini);
+    free(title);
+    free(game);
+}
 /* a game's box's GPU Driver. On a desktop: greyed, saying Android only on the row, Enter saying this device's line
    with the box staying; but for a game set to a package, whose row stays to take the pick back. On a phone with an
    Adreno GPU: Global and the launcher's first, then the game's own pick kept in its .ini (System driver, gpu_driver=
@@ -3840,7 +3950,7 @@ static void game_gpu_driver(App* app) {
     option = gui_run_option("gpu_driver", ini, "Turnip_v32");
     assert(!option); /* its own pick: the run reads it */
     app->editor.row = 0;
-    key(app, SDLK_RETURN); /* Global again: taken as the pick, never edenprobe's Continue nor its Clear Crash List */
+    key(app, SDLK_RETURN); /* Global again: taken as the pick, never the probe's Continue nor its Clear Crash List */
     assert(!snx_ini_has(ini, "gpu_driver") && !strcmp(app->drivers_form.value[0], "(*)") && !app->confirm.shown &&
            !app->probe_launch && strstr(app->editor.note, ": the GPU driver for every game (System driver)"));
     option = gui_run_option("gpu_driver", ini, "Turnip_v32");
@@ -5038,16 +5148,47 @@ static bool wait_taken(const char* path) {
     }
     return false;
 }
-/* Run edenprobe's game as the fake driver plays it (SNX_TEST_PROBE): edenprobe's report in the card of the game made
-   in the --data folder, a launch a line of the plan, each line's words "pass=N", "fail=SUITE" and
-   "summary=P,F,S,C"; the launches counted beside the report, each after its lines are there */
+/* Run Amberlith's game as the fake driver plays it (SNX_TEST_PROBE): the probe's report in the card of the game made
+   in the --data folder, named by its NRO, a launch a line of the plan, each line's words "pass=N", "fail=SUITE" and
+   "summary=P,F,S,C"; the launches counted beside the report, each after its lines are there. An NRO that carries
+   "sdmc:/amberlith" is Amberlith 1.0.0, which runs from sdmc:/amberlith but from sdmc:/edenprobe while only that one
+   holds a mode file or runs; another is edenprobe 0.9.0, which knows only sdmc:/edenprobe */
 static void fake_probe(int argc, char** argv) {
-    char *card = NULL, *runs, *report, *counter, *part, *plan, *line, *word, *last, *text;
-    int launch, i;
+    char *card = NULL, *runs, *report, *counter, *part, *plan, *line, *word, *last, *text, *nro = NULL, *bytes;
+    int launch, i, amberlith = 0;
     size_t size;
+    for (i = 1; i < argc; ++i)
+        if (snx_ends_with_nocase(argv[i], ".nro")) nro = argv[i];
+    assert(nro);
+    bytes = (char*)snx_read_file(nro, &size);
+    assert(bytes);
+    for (size_t at = 0; !amberlith && at + 15 <= size; ++at) amberlith = !memcmp(bytes + at, "sdmc:/amberlith", 15);
+    free(bytes);
     for (i = 1; i + 1 < argc; ++i)
-        if (!strcmp(argv[i], "--data"))
-            card = snx_format("%s/recompiled/edenprobe/edenprobe_data/sdmc/edenprobe", argv[i + 1]);
+        if (!strcmp(argv[i], "--data")) {
+            char* name = snx_strdup(snx_path_leaf(nro));
+            *strrchr(name, '.') = 0;
+            card = snx_format("%s/recompiled/%s/%s_data/sdmc/amberlith", argv[i + 1], name, name);
+            if (amberlith) {
+                char *mode = snx_path_join(card, "mode"), *runs_new = snx_path_join(card, "runs"),
+                     *old = snx_format("%s/recompiled/%s/%s_data/sdmc/edenprobe", argv[i + 1], name, name),
+                     *old_mode = snx_path_join(old, "mode"), *old_runs = snx_path_join(old, "runs");
+                if (!snx_path_exists(mode) && !snx_path_exists(runs_new) &&
+                    (snx_path_exists(old_mode) || snx_path_exists(old_runs))) {
+                    free(card);
+                    card = snx_strdup(old);
+                }
+                free(old_runs);
+                free(old_mode);
+                free(old);
+                free(runs_new);
+                free(mode);
+            } else {
+                free(card);
+                card = snx_format("%s/recompiled/%s/%s_data/sdmc/edenprobe", argv[i + 1], name, name);
+            }
+            free(name);
+        }
     assert(card);
     runs = snx_path_join(card, "runs/abc1234");
     report = snx_path_join(runs, "report.jsonl");
@@ -5061,7 +5202,9 @@ static void fake_probe(int argc, char** argv) {
     assert(plan);
     for (line = plan, i = 0; i < launch && strchr(line, '\n'); ++i) line = strchr(line, '\n') + 1;
     if (strchr(line, '\n')) *strchr(line, '\n') = 0;
-    text = snx_strdup(launch ? "" : "{\"type\":\"note\",\"text\":\"edenprobe 0.9.0 (abc1234) starting\"}\n");
+    text = snx_strdup(!launch && amberlith ? "{\"type\":\"note\",\"text\":\"Amberlith 1.0.0 (abc1234) starting\"}\n"
+                      : !launch            ? "{\"type\":\"note\",\"text\":\"edenprobe 0.9.0 (abc1234) starting\"}\n"
+                                           : "");
     for (word = strtok(line, " "); word; word = strtok(NULL, " ")) {
         char* more = NULL;
         if (!strncmp(word, "pass=", 5))
@@ -5777,14 +5920,16 @@ int main(int argc, char** argv) {
         }
         return status;
     }
-    if (argc == 3 && !strcmp(argv[1], "--fullscreen=1") && !strcmp(argv[2], "--controls=2")) {
+    if (argc == 4 && !strcmp(argv[1], "--fullscreen=1") && !strcmp(argv[2], "--controls=2") &&
+        !strcmp(argv[3], "--launcher-picks=1")) {
         puts("prepared game stdout");
         fputs("prepared game stderr\n", stderr);
         return 0;
     }
     if (argc > 1 && strstr(argv[1], "option flags")) {
         int i = 2;
-        assert(argc == 8 && !strcmp(argv[i++], "--fullscreen=1") && !strcmp(argv[i++], "--controls=2"));
+        assert(argc == 9 && !strcmp(argv[i++], "--fullscreen=1") && !strcmp(argv[i++], "--controls=2"));
+        assert(!strcmp(argv[i++], "--launcher-picks=1"));
         assert(!strcmp(argv[i++], "-S") && !strcmp(argv[i++], "-s"));
         assert(!strcmp(argv[i++], "--data") && argv[i++][0] && i == argc);
         puts("Recompiling option flags\nScarletNX - option flags"); /* the runner's banner: now loading */
@@ -5816,13 +5961,14 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc > 1 && strstr(argv[1], "folder game")) { /* a game in a folder of its own, through the menu's driver */
-        assert(strstr(argv[0], "runtime") && argc == 6 && snx_is_file(argv[1]) && !strcmp(argv[2], "--fullscreen=1") &&
-               !strcmp(argv[3], "--controls=2") && !strcmp(argv[4], "--data") && argv[5][0]);
+        assert(strstr(argv[0], "runtime") && argc == 7 && snx_is_file(argv[1]) && !strcmp(argv[2], "--fullscreen=1") &&
+               !strcmp(argv[3], "--controls=2") && !strcmp(argv[4], "--launcher-picks=1") &&
+               !strcmp(argv[5], "--data") && argv[6][0]);
         puts("Recompiling folder game (1 modules)\nBuilt folder game\nScarletNX - folder game");
         return 0;
     }
     if (argc > 1) {
-        assert(argc == 2 || argc == 6);
+        assert(argc == 2 || argc == 7);
         assert(snx_is_file(argv[1]));
         if (strstr(argv[1], "Game00")) {
             assert(argc == 2 && strstr(argv[0], "gnuabi"));
@@ -5832,8 +5978,8 @@ int main(int argc, char** argv) {
         assert(strstr(argv[1], "game with spaces"));
         bool nx = strstr(argv[0], "runtime") != NULL; /* the program the menu is part of */
         if (nx)
-            assert(argc == 6 && !strcmp(argv[2], "--fullscreen=1") && !strcmp(argv[3], "--controls=2") &&
-                   !strcmp(argv[4], "--data") && argv[5][0]);
+            assert(argc == 7 && !strcmp(argv[2], "--fullscreen=1") && !strcmp(argv[3], "--controls=2") &&
+                   !strcmp(argv[4], "--launcher-picks=1") && !strcmp(argv[5], "--data") && argv[6][0]);
         else
             assert(argc == 2);
         size_t size;
@@ -6604,7 +6750,7 @@ int main(int argc, char** argv) {
         key(&app, SDLK_SPACE);
         assert(app.space && app.free_bytes);
         render(&app);
-        while (!__atomic_load_n(&app.space->done, __ATOMIC_ACQUIRE) && SDL_GetTicks() < until) SDL_Delay(5);
+        while (!atomic_load_explicit(&app.space->done, memory_order_acquire) && SDL_GetTicks() < until) SDL_Delay(5);
         for (int i = 0; i < GUI_SPACE_DIRS; ++i) total += gui_tree_size(app.space->dirs[i], &app.space->stop);
         assert(app.space->done && app.space->used == total && same_path(app.space->dirs[0], app.games_dir));
         gui_size_text(used, sizeof used, total);
@@ -6963,7 +7109,7 @@ int main(int argc, char** argv) {
     assert(app.form == GUI_FORM_APP && app.editor.row == GUI_APP_THEME && GUI_APP_ROWS == 13);
     gpu_drivers(&app, temporary); /* GPU Drivers and Freedreno Settings, then back to the App's first row */
     download_driver(&app, temporary);
-    run_edenprobe(&app, temporary);
+    run_amberlith(&app, temporary);
     app.editor.row = GUI_APP_THEME;
     {
         char first[64], line[1024];
@@ -7747,6 +7893,41 @@ int main(int argc, char** argv) {
         hides(&app, "Clean Old Settings: 3 done", title);
         key(&app, SDLK_RETURN);
         assert(!app.confirm.shown && !strncmp(app.editor.note, "Nothing to clean", 16));
+        /* a game's own picks keeping a key no setting takes: asked with them, the games' own in focus; Back and Keep
+           the Games' Own leave the file, With the Games' Own writes it without the key, an entry of the report */
+        {
+            char* picks = snx_path_join(app.games_dir, "Old game.picks");
+            const char* own = "[Display]\nfullscreen=1\n[Other]\nnewer_key=5\n";
+            assert(!snx_write_file(picks, own, strlen(own)));
+            key(&app, SDLK_RETURN);
+            assert(app.confirm.shown && app.confirm.ask == GUI_ASK_CLEAN_OWN && app.confirm.selected == 1 &&
+                   !strcmp(app.ask_line, "Clean Old Settings? The games' own settings keep 1 old key."));
+            {
+                UiRowInfo keep = {0}, with = {0};
+                app.choices_of = GUI_CHOICES_ASK;
+                assert(ui_choices_rows_get_row_info(&app, 0, 0, &keep) && !strcmp(keep.label, "Keep the Games' Own") &&
+                       ui_choices_rows_get_row_info(&app, 1, 0, &with) && !strcmp(with.label, "With the Games' Own"));
+            }
+            key(&app, SDLK_ESCAPE); /* Back */
+            assert(!app.confirm.shown && (kept = (char*)snx_read_file(picks, &size)) && !strcmp(kept, own));
+            free(kept);
+            key(&app, SDLK_RETURN);
+            key(&app, SDLK_LEFT); /* Keep the Games' Own */
+            key(&app, SDLK_RETURN);
+            assert(!app.confirm.shown && (kept = (char*)snx_read_file(picks, &size)) && !strcmp(kept, own));
+            free(kept);
+            key(&app, SDLK_RETURN);
+            key(&app, SDLK_RETURN); /* With the Games' Own, in focus */
+            assert(!app.confirm.shown && app.cleaned_shown && app.cleaned.count == 1 && app.cleaned.done == 1 &&
+                   strstr(app.cleaned.text, "\tRemoved newer_key=5\n"));
+            assert((kept = (char*)snx_read_file(picks, &size)) && strstr(kept, "\n[Display]\nfullscreen=1\n") &&
+                   !strstr(kept, "newer_key"));
+            free(kept);
+            key(&app, SDLK_LEFT); /* the report closed */
+            assert(!app.cleaned_shown);
+            remove(picks);
+            free(picks);
+        }
         /* a runtime that listed no settings: every key of settings.ini would look old, and none is taken out */
         {
             GuiSettings listed = app.settings;
@@ -9490,7 +9671,8 @@ int main(int argc, char** argv) {
     {
         size_t size;
         char* kept = (char*)snx_read_file(app.run_log, &size);
-        char* line = snx_format("game with spaces;literal.nro --fullscreen=1 --controls=2 --data %s\n", app.data_dir);
+        char* line = snx_format(
+            "game with spaces;literal.nro --fullscreen=1 --controls=2 --launcher-picks=1 --data %s\n", app.data_dir);
         assert(kept && line && !app.run_out && !strncmp(kept, "$ ", 2) && strstr(kept, line));
         free(line);
         assert(strstr(kept, "driver stdout") && strstr(kept, "driver stderr") && strstr(kept, "\n[ended, status 0]\n"));
@@ -10716,7 +10898,7 @@ int main(int argc, char** argv) {
         assert(gui_settings_set(&app.settings, "java_home", "/opt/jdk 21"));
         {
             const char** options = calloc((size_t)app.settings.count + 1, sizeof *options);
-            size_t count = options ? gui_settings_recompile(&app.settings, 0, options) : 0;
+            size_t count = options ? gui_settings_recompile(&app.settings, 0, NULL, options) : 0;
             assert(options);
             for (size_t k = 0; k < count; ++k) assert(!strstr(options[k], "java"));
             free(options);
@@ -11051,7 +11233,15 @@ int main(int argc, char** argv) {
     key(&app, SDLK_F5);
     assert(app.games.count == 35 && app.browser.count == 35 && !strcmp(app.message, "Refreshed: 35 games"));
     app.message[0] = 0;
-    press_key(&app, "F5", 0, false, yellow);
+    { /* the foot's Refresh in More's box (F3) on a game's row, its own three before it: taken there, as F5 */
+        int i;
+        more_open(&app);
+        for (i = 0; i < app.more.n && strcmp(app.more.key[i], "F5"); ++i) {}
+        assert(app.picks_shown && app.picks_of == GUI_PICKS_MORE && i < app.more.n &&
+               !strcmp(app.more.label[i], "F5: refresh") && app.more.icon[i] == GUI_ICON_REFRESH_CW);
+        pick_take(&app, i);
+        assert(!app.picks_shown);
+    }
     assert(app.games.count == 35 && !strcmp(app.message, "Refreshed: 35 games"));
     app.message[0] = 0;
     app.browser.activated = true; /* which a new listing would reset */
@@ -11349,8 +11539,7 @@ int main(int argc, char** argv) {
     render(&app);
     hides(&app, "- Add Folder", yellow);
     hides(&app, "Back [ESC]", normal);
-    shows_foot(&app, "P", yellow);
-    shows_foot(&app, "folders", normal);
+    assert(more_has(&app, "P", "P: folders")); /* in More's box, the foot's own three before it */
     {
         GuiGamesBoxes g;
         games_boxes(&app, &g);
@@ -11579,8 +11768,37 @@ int main(int argc, char** argv) {
 #ifndef SDL_PLATFORM_ANDROID
                 assert(strstr(said, "S: save states."));
 #endif
-                assert(strstr(shown_keys(&app, said, sizeof said), "R: recompile.") && strstr(said, "B: AOT pack.") &&
-                       strstr(said, "P: folders.") && strstr(said, "ESC: back."));
+                /* the foot: back, the game's first three, More and help, with an icon each; the rest in More's box */
+                {
+                    unsigned icons[GUI_FOOT_ICONS];
+                    assert(foot_icons(&app, shown_keys(&app, said, sizeof said), icons) == icons);
+                    assert(strstr(said, "ESC: back.\x1fL: play. R: recompile. M: mods. F3: more. F1: help.") &&
+                           icons[0] == GUI_ICON_ARROW_LEFT && icons[1] == GUI_ICON_PLAY &&
+                           icons[2] == GUI_ICON_HAMMER && icons[4] == GUI_ICON_ELLIPSIS && icons[5] == GUI_ICON_INFO);
+                    assert(more_has(&app, "B", "B: AOT pack") && more_has(&app, "P", "P: folders") &&
+                           more_has(&app, "V", "V: view") && more_has(&app, "F5", "F5: refresh"));
+                }
+                { /* its box (a right click, a held finger) has AOT Pack too, as B builds it */
+                    int n = 0;
+                    game_box_open(&app);
+                    while (app.game_picks[n]) ++n;
+                    assert(app.picks_shown && n > 0 && !strcmp(app.game_picks[n - 1], SAY_GAME_AOT));
+                    app.picks_shown = false;
+                }
+                { /* a finger's foot: its own words past the first three in More's box, "More." last */
+                    static const char* const parts[] = {
+                        "Play.",   "Recompile.", "Mods.", "Save states.", "Tap: open. Drag: scroll. Refresh. Back.",
+                        "Folders."};
+                    char words[512];
+                    GuiMore more = {0};
+                    unsigned icons[GUI_FOOT_ICONS] = {0};
+                    touch_said(parts, 6, words, sizeof words, icons, GUI_FOOT_ICONS, &more);
+                    snprintf(said, sizeof said, "Play. Recompile. Mods. Tap: open. Drag: scroll. Back. %s",
+                             snx_tr(SAY_MORE));
+                    assert(!strcmp(words, said) && icons[0] == GUI_ICON_PLAY && icons[6] == GUI_ICON_ELLIPSIS);
+                    assert(more.n == 3 && !strcmp(more.key[0], "Save states") && !strcmp(more.label[1], "Refresh") &&
+                           !strcmp(more.key[2], "Folders") && more.icon[1] == GUI_ICON_REFRESH_CW);
+                }
                 { /* F1's box of them, the most rows it has: an icon each, the keyboard's and a pad's, Games' own keys
                      first, then under "Every screen" those every screen has; a window short of them shows those that
                      fit, Up/Down, PgUp/PgDn and the wheel going over them as far as the last and moving nothing under
@@ -11618,6 +11836,33 @@ int main(int argc, char** argv) {
                            !strcmp(what, "move"));
                     shows(&app, "Right stick", yellow);
                     app.pad_driven = false;
+                    { /* the foot names what was pressed last: a pad's button its buttons, a key of the keyboard
+                         its keys (a pad's own key downs, GUI_PAD_KEYBOARD's, keep the pad's), a mouse that barely
+                         moves nothing */
+                        SDL_Event in;
+                        char said[1024];
+                        SDL_zero(in);
+                        in.type = SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+                        assert(!input_seen(&app, &in) && app.pad_driven);
+                        assert(strstr(screen_said(&app, false, said, sizeof said), "Select: help.") &&
+                               !strstr(said, "F1: help."));
+                        foot_shot(&app, "launcher-foot-pad");
+                        SDL_zero(in);
+                        in.type = SDL_EVENT_KEY_DOWN;
+                        in.key.which = GUI_PAD_KEYBOARD;
+                        assert(!input_seen(&app, &in) && app.pad_driven);
+                        SDL_zero(in);
+                        in.type = SDL_EVENT_MOUSE_MOTION;
+                        in.motion.xrel = 2.0f;
+                        assert(input_seen(&app, &in) && app.pad_driven);
+                        SDL_zero(in);
+                        in.type = SDL_EVENT_KEY_DOWN;
+                        in.key.which = 1;
+                        assert(!input_seen(&app, &in) && !app.pad_driven);
+                        assert(strstr(screen_said(&app, false, said, sizeof said), "F1: help.") &&
+                               !strstr(said, "Select: help."));
+                        foot_shot(&app, "launcher-foot-keyboard");
+                    }
                     assert(SDL_GetWindowSize(app.window, &w, &height));
                     assert(SDL_SetWindowSize(app.window, w, rows_height(GUI_LEAST_ROWS, app.scale)));
                     render(&app);
@@ -11729,6 +11974,7 @@ int main(int argc, char** argv) {
                 key(&app, SDLK_M);
                 assert(app.addons_shown && !app.mods_count && !app.cheats_count);
                 game_gpu_driver(&app);
+                game_own_settings(&app);
                 key(&app, SDLK_ESCAPE);
                 assert(!app.addons_shown && !app.menu.running && app.menu.view == GUI_LOAD_GAMES);
                 { /* and on its row of the recent games: the same box, named as the run named it */
@@ -11816,7 +12062,8 @@ int main(int argc, char** argv) {
             render(&app);
             {
                 char said[512];
-                assert(strstr(shown_keys(&app, said, sizeof said), "S: save states.")); /* Games' foot says S */
+                (void)said; /* Games' S, past its foot's three, in More's box */
+                assert(more_has(&app, "S", "S: save states"));
             }
             key(&app, SDLK_S);
             assert(app.states_shown && app.states_count == 3 && !app.menu.running);
@@ -11827,8 +12074,9 @@ int main(int argc, char** argv) {
                 char said[512];
                 key(&app, SDLK_ESCAPE);
                 assert(!app.states_shown);
-                app.pad_driven = true;
-                assert(strstr(shown_keys(&app, said, sizeof said), "X: save states."));
+                app.pad_driven = true; /* its foot's three before it; F1's box (its Select) says X */
+                assert(!strstr(shown_keys(&app, said, sizeof said), "X: save states.") &&
+                       strstr(screen_said(&app, true, said, sizeof said), "X: save states."));
                 { /* X as pad_menu.c gives it: Del from the pads' own keyboard */
                     SDL_Event e = {0};
                     e.type = SDL_EVENT_KEY_DOWN;
@@ -11976,16 +12224,17 @@ int main(int argc, char** argv) {
                 8);
             key(&app, SDLK_RETURN);
             /* rows: Update 1.2.0, Update 1.0.0, No update, DLC 1, A mod, B mod, 60 FPS, Infinite HP, Speed x2|x4, Add
-               Mod, Open Mods Folder, Add Cheats, Open Cheats Folder, Open Folder, Save States, Clean Cache, GPU Driver,
-               Freedreno Settings, Save, Play */
+               Mod, Open Mods Folder, Add Cheats, Open Cheats Folder, Open Folder, Export Saves, Import Saves, Save
+               States, Clean Cache, GPU Driver, Freedreno Settings, Settings, Save, Play */
             assert(app.addons_shown && !app.menu.running && app.addons.count == 3 && app.mods_count == 2 &&
-                   app.cheats_count == 3 && addons_rows(&app) == 20);
+                   app.cheats_count == 3 && addons_rows(&app) == 23);
             assert(addons_row(&app, 9) == ROW_ADD_MOD && addons_row(&app, 10) == ROW_MODS_FOLDER &&
                    addons_row(&app, 11) == ROW_ADD_CHEATS && addons_row(&app, 12) == ROW_CHEATS_FOLDER &&
-                   addons_row(&app, 13) == ROW_OPEN_FOLDER && addons_row(&app, 14) == ROW_STATES &&
-                   addons_row(&app, 15) == ROW_CLEAN_CACHE && addons_row(&app, 16) == ROW_GPU_DRIVER &&
-                   addons_row(&app, 17) == ROW_FREEDRENO && addons_row(&app, 18) == ROW_SAVE &&
-                   addons_row(&app, 19) == ROW_PLAY);
+                   addons_row(&app, 13) == ROW_OPEN_FOLDER && addons_row(&app, 14) == ROW_EXPORT_SAVES &&
+                   addons_row(&app, 15) == ROW_IMPORT_SAVES && addons_row(&app, 16) == ROW_STATES &&
+                   addons_row(&app, 17) == ROW_CLEAN_CACHE && addons_row(&app, 18) == ROW_GPU_DRIVER &&
+                   addons_row(&app, 19) == ROW_FREEDRENO && addons_row(&app, 20) == ROW_SETTINGS &&
+                   addons_row(&app, 21) == ROW_SAVE && addons_row(&app, 22) == ROW_PLAY);
             build_ids(&app, dirs);
             assert(!app.addons_checked[0] && !app.addons_checked[1] && app.addons_checked[2]);
             assert(app.mods_on[0] && !app.mods_on[1] && !strcmp(app.mods[0], "A mod"));
@@ -12074,9 +12323,10 @@ int main(int argc, char** argv) {
             assert(!app.cheats_on[0] && app.cheats_on[1] && app.addons_focus == 8 &&
                    !strcmp(app.message,
                            "\"Speed x2|x4\" always runs: a | in its name, which cheats_off= puts between two"));
-            /* past Open Folder, Save States, Clean Cache, GPU Driver and Freedreno Settings */
-            for (i = 0; i < 10; i++) key(&app, SDLK_DOWN);
-            assert(app.addons_focus == 18);
+            /* past Open Folder, Export Saves, Import Saves, Save States, Clean Cache, GPU Driver, Freedreno Settings
+               and Settings */
+            for (i = 0; i < 13; i++) key(&app, SDLK_DOWN);
+            assert(app.addons_focus == 21);
             key(&app, SDLK_RETURN);
             assert(!app.addons_shown && !app.menu.running && strstr(app.message, "kept"));
             checked = snx_ini_value(ini, "addons");
@@ -12230,8 +12480,8 @@ int main(int argc, char** argv) {
             key(&app, SDLK_DOWN);
             key(&app, SDLK_DOWN);
             key(&app, SDLK_RETURN);
-            for (i = 0; i < 17; i++) key(&app, SDLK_DOWN); /* Recompile, the last row */
-            assert(app.addons_focus == 19);
+            for (i = 0; i < 20; i++) key(&app, SDLK_DOWN); /* Recompile, the last row */
+            assert(app.addons_focus == 22);
             key(&app, SDLK_RETURN);
             assert(!app.addons_shown && !app.menu.running && !app.recompile && gui_queue_running(&app.queue) == 0);
             {
@@ -12581,8 +12831,9 @@ int main(int argc, char** argv) {
                 focus_game(&app, "0100ABCD12340000");
                 key(&app, SDLK_RETURN);
                 assert(app.addons_shown && addons_row(&app, 13) == ROW_OPEN_FOLDER);
-                assert(addons_icon(&app, 13) == GUI_ICON_FOLDER_OPEN && addons_icon(&app, 14) == GUI_ICON_SAVE &&
-                       addons_icon(&app, 15) == GUI_ICON_ERASER);
+                assert(addons_icon(&app, 13) == GUI_ICON_FOLDER_OPEN && addons_icon(&app, 14) == GUI_ICON_SHARE_2 &&
+                       addons_icon(&app, 15) == GUI_ICON_FOLDER_INPUT && addons_icon(&app, 16) == GUI_ICON_SAVE &&
+                       addons_icon(&app, 17) == GUI_ICON_ERASER);
                 app.addons_focus = 13;
                 key(&app, SDLK_RETURN);
                 assert(app.addons_folders_shown && addons_rows(&app) == GUI_GAME_FOLDERS && !app.addons_focus);
@@ -12700,9 +12951,9 @@ int main(int argc, char** argv) {
                 assert(caches[0] && caches[1] && !snx_path_exists(caches[0]) && !snx_path_exists(caches[1]));
                 assert(snx_path_within(caches[0], own) && snx_path_within(caches[1], own)); /* the test's own */
                 info = (UiRowInfo){0};
-                assert(ui_addons_rows_get_row_info(&app, 15, 0, &info) && addons_row(&app, 15) == ROW_CLEAN_CACHE &&
+                assert(ui_addons_rows_get_row_info(&app, 17, 0, &info) && addons_row(&app, 17) == ROW_CLEAN_CACHE &&
                        (info.attr & UI_ATTR_OFF) && !(info.attr & UI_ATTR_DANGER)); /* greyed: no colour */
-                app.addons_focus = 15;
+                app.addons_focus = 17;
                 key(&app, SDLK_RETURN);
                 snprintf(want, sizeof want, "%s has no cache to delete: no %s, no %s", app.addons_title, caches[0],
                          caches[1]);
@@ -12714,7 +12965,7 @@ int main(int argc, char** argv) {
                 keep = snx_path_join(saves, "user.1");
                 assert(!snx_mkdirs(saves) && !snx_write_file(keep, "save", 4));
                 info = (UiRowInfo){0};
-                assert(ui_addons_rows_get_row_info(&app, 15, 0, &info) && !(info.attr & UI_ATTR_OFF) &&
+                assert(ui_addons_rows_get_row_info(&app, 17, 0, &info) && !(info.attr & UI_ATTR_OFF) &&
                        (info.attr & UI_ATTR_DANGER)); /* the caches deleted, no way back */
                 key(&app, SDLK_RETURN);
                 gui_size_text(size, sizeof size, sizeof bytes);
@@ -14079,14 +14330,14 @@ int main(int argc, char** argv) {
         r = m.place.keys;
         assert(r.y > m.place.list.y + m.place.list.h && r.y + r.h == 800 - 8 * s);
         { /* the keys in the foot's letters, a size under the rest's, each sentence a button as a tab is (a box a cell
-             and 4 pixels of its letters high, the sentence a column inside, a column between two, the rows 2 pixels
-             apart): ESC alone against the left edge of the first row, F1's the last key, against the right edge of the
-             keys' last row */
+             and 4 pixels of its letters high, the sentence a column inside after its icon, a column between two, the
+             rows 2 pixels apart): ESC alone against the left edge of the first row, F1's the last key, against the
+             right edge of the keys' last row */
             int fs = foot_scale(&app), rows, pitch = 20 * fs;
             assert(fs == s - 1);
             rows = r.h / pitch;
             assert(rows >= 1 && r.h == rows * pitch); /* one row as tall as before the buttons: 16 and 4 pixels */
-            foot_px_is(&app, r.x + 8 * fs, r.y + 2 * fs, "ESC", yellow, black);
+            foot_px_is(&app, r.x + 4 * 8 * fs, r.y + 2 * fs, "ESC", yellow, black); /* after its icon and a column */
             assert(
                 same_colour(pixel(&app, (float)r.x, (float)(r.y + 10 * fs)), rgb(app.theme.dim))); /* its box's edge */
             assert(same_colour(pixel(&app, (float)(r.x + 4 * fs), (float)r.y), rgb(app.theme.dim)));
@@ -14262,7 +14513,8 @@ int main(int argc, char** argv) {
             b = form_row_box(&app, &f, false, 0);
             text_px_is(&app, b.x + cw / 2, item_text_y(&app, b), "- " ICON_APP_WINDOW " App", yellow, black);
             b = form_row_box(&app, &f, false, app.groups - 1); /* the last group, whole */
-            snprintf(last, sizeof last, "- %s %s", gui_icon_utf8(group_icon(app.group_keys[app.groups - 1].key), glyph),
+            snprintf(last, sizeof last, "- %s %s",
+                     gui_icon_utf8(gui_group_icon(app.group_keys[app.groups - 1].key), glyph),
                      app.group_keys[app.groups - 1].key);
             text_px_is(&app, b.x + cw / 2, item_text_y(&app, b), last, normal, black);
             text_px_is(&app, f.place.side.x + cw, f.place.side.y + 2 * s, "App", normal, black);
@@ -14615,8 +14867,8 @@ int main(int argc, char** argv) {
                 menu_boxes(&app, &mb);
                 room = foot_room(&app, mb.place.keys, app.theme.footer_box);
                 app.scale = foot_scale(&app);
-                /* each in its button, a column inside its edges */
-                assert(find_text(&app, "ESC", yellow, 1, &x, &y) && x == room.x + GUI_BUTTON_PAD * 8 * app.scale);
+                /* each in its button, a column inside its edges, after its icon and a column */
+                assert(find_text(&app, "ESC", yellow, 1, &x, &y) && x == room.x + (GUI_BUTTON_PAD + 3) * 8 * app.scale);
                 assert(find_text(&app, "F1", yellow, 1, &x, &y) &&
                        x + (int)(strlen("F1 help") + GUI_BUTTON_PAD) * 8 * app.scale == room.x + room.w);
                 app.scale = scale;
@@ -16112,7 +16364,7 @@ int main(int argc, char** argv) {
             free(path);
         }
         assert(!strstr(app.left, "other.txt"));
-        while (!__atomic_load_n(&app.left_space->done, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+        while (!atomic_load_explicit(&app.left_space->done, memory_order_acquire)) SDL_Delay(1);
         for (i = 0; i < 6; ++i) {
             path = snx_path_join(old, olds[i][0]);
             for (j = 0; j < app.left_space->count && strcmp(app.left_space->dirs[j], path); ++j) {}
@@ -16299,7 +16551,7 @@ int main(int argc, char** argv) {
                 left_behind(&app);
                 assert(app.lefts == 8);
                 /* a list that changed is counted again */
-                while (!__atomic_load_n(&app.left_space->done, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+                while (!atomic_load_explicit(&app.left_space->done, memory_order_acquire)) SDL_Delay(1);
                 assert(app.left_space->count == 8 && !strcmp(app.left_space->dirs[7], keys));
                 for (i = 0; i < 3; ++i) {
                     assert(strstr(app.left, said[i]));
@@ -16326,7 +16578,7 @@ int main(int argc, char** argv) {
                 const char* labels[GUI_SETUP_CHOICES];
                 SnxSetup setup_was = app.setup;
                 bool ok;
-                while (!__atomic_load_n(&app.left_space->done, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+                while (!atomic_load_explicit(&app.left_space->done, memory_order_acquire)) SDL_Delay(1);
                 assert(app.left_space->count == 5 && app.left_space->bytes[0] == 9 &&
                        app.left_space->bytes[1] == 3u << 20 && app.left_space->bytes[2] == 0 &&
                        app.left_space->bytes[3] == sizeof meta);
@@ -16346,11 +16598,11 @@ int main(int argc, char** argv) {
                 {
                     char* elsewhere[] = {"/elsewhere"}; /* a count for another list is not this one's */
                     space_count(&app.left_space, &app.left_counter, elsewhere, 1, true);
-                    while (!__atomic_load_n(&app.left_space->done, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+                    while (!atomic_load_explicit(&app.left_space->done, memory_order_acquire)) SDL_Delay(1);
                     render(&app);
                     shows(&app, "size        counting", ink);
                     left_behind(&app); /* this list counted again */
-                    while (!__atomic_load_n(&app.left_space->done, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+                    while (!atomic_load_explicit(&app.left_space->done, memory_order_acquire)) SDL_Delay(1);
                     assert(app.left_space->count == 5);
                 }
                 for (n = 0; n < 5; ++n) { /* each page: its head, its size, and Move All's and Delete All's words */
@@ -16425,7 +16677,7 @@ int main(int argc, char** argv) {
                 assert(!app.setup_on && app.menu.selected == selected && snx_is_file(loose) && snx_is_dir(work));
                 app.setup = setup_was;
                 /* Clean Old Settings cleans settings only: what an older version left stays where it is */
-                clean_old(&app);
+                clean_old(&app, true);
                 assert(snx_is_file(loose) && snx_is_dir(loose_data) && snx_is_file(npdm) && snx_is_dir(work));
                 left_behind(&app);
                 assert(app.lefts == 5);
@@ -16699,7 +16951,7 @@ int main(int argc, char** argv) {
         {
             char last[80], glyph[4];
             snprintf(last, sizeof last, "\xfe %s %s",
-                     gui_icon_utf8(group_icon(app.group_keys[app.groups - 1].key), glyph),
+                     gui_icon_utf8(gui_group_icon(app.group_keys[app.groups - 1].key), glyph),
                      app.group_keys[app.groups - 1].key);
             text_px_is(&app, b.x + cw / 2, item_text_y(&app, b), last, rgb(app.theme.page), rgb(app.theme.focus));
         }

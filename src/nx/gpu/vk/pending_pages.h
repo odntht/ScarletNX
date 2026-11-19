@@ -9,9 +9,10 @@
 #include "common/cpu/aarch64/cpu.h"
 
 /* Every guest page under 2^40 in a two-level table: leaves of 4096 pages made when a result first covers one, each
-   with a count per page, a bitmap of each group of 64 that have one, and its pages in all, so a lookup skips what no
-   result covers. Zeroed is empty. A change is made with vk_lock held, and takes pend_lock too; a lookup holds either
-   one (the renderer's threads vk_lock, a thread that must not wait for the renderer pend_lock).
+   with a count per page, a count for each group of 64 pages a result covers whole, a bitmap of each group's pages that
+   have one, and its pages in all, so a lookup skips what no result covers and a wide range changes one count a group.
+   Zeroed is empty. A change is made with vk_lock held, and takes pend_lock too; a lookup holds either one (the
+   renderer's threads vk_lock, a thread that must not wait for the renderer pend_lock).
    The same counts are kept again by GPU page, at every GPU page that shows a counted guest page: a page gains them when
    they are added, through the GMMU's index of mappings by guest address (gmmu_aliases), and when a mapping change
    points it at a counted guest page (pend_remap). Asking about a GPU range, hundreds of thousands of times a frame,
@@ -22,12 +23,13 @@ struct PendPages {
     PendLeaf* leaf[1u << 16];
     PendLeaf* gpu[1u << 16]; /* by GPU page: each one's count is that of the guest page the GMMU maps it to */
     u64 total;    /* every page's count added up */
-    u64 adds;     /* results added so far: unchanged, no result covers what was checked without a hit since */
+    _Atomic u64 adds; /* results added so far: unchanged, no result covers what was checked without a hit since */
     u64 overflow; /* pages past 2^40 results cover, read as covering every page */
     /* a table every page this one gains or loses is counted in as well, NULL for none: one table then answers whether
        anything at all is pending on a page (g_pend_any) */
     PendPages* also;
-    int listed; /* in pend_remap's tables: it has counted a guest page */
+    int listed;     /* in pend_remap's tables: it has counted a guest page */
+    int adds_alone; /* a result added counts in this table's adds only, not in those of the tables after it */
 };
 /* the lock of every table's changes (above): reentrant, taken after vk_lock and before mem.c's lock and the GMMU's.
    A mapping change holds it while it changes memory (gpu/vk/renderer.c), so nothing the renderer holds over guest
@@ -37,6 +39,9 @@ void pend_unlock(void);
 /* the guest pages pending compute results, graphics results and queued releases cover, all together: a read that meets
    none of them needs none of their checks (vk_mem_pending) */
 extern PendPages g_pend_any;
+/* the same but for writes in place (uma.c's out_pages): the producers count in it, and it in g_pend_any. Where newer
+   bytes of a page are elsewhere, which a read in place must not take (pend_set_any_watch) */
+extern PendPages g_pend_blk;
 /* the guest pages behind [gva, gva + size) (a GPU range, translated through the GMMU now) gain a result (delta 1) or
    lose one (-1). A result loses its pages with the mappings it gained them with: a mapping change lands every result
    over it first */
@@ -61,5 +66,10 @@ int pend_hit_va(const PendPages* t, u64 gva, u64 size);
 int pend_empty(const PendPages* t);
 /* nonzero when a result covers a guest page first to last (guest addresses >> 12), as pend_add_pages counts them */
 int pend_hit_pages(const PendPages* t, u64 first, u64 last);
+/* the guest pages 64 * g to 64 * g + 63 that a result covers, a bit each (bit 0 the first page) */
+u64 pend_guest_group(const PendPages* t, u64 g);
+/* fn(first, last) after the guest pages first to last (addresses >> 12) gained or lost a result in g_pend_blk, with
+   vk_lock and pend_lock held: uma.c's page tables keep which pages of a region some other place holds newer bytes of */
+void pend_set_any_watch(void (*fn)(u64 first, u64 last));
 
 #endif

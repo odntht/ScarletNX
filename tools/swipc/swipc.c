@@ -18,7 +18,7 @@
    - the raw data is little-endian, and a handler's raw arguments and outputs are host numbers: the unpacker converts
      scalars, and structs field by field, with a function the header defines for each struct (swipc_le_<type>). The
      contents of buffers are the guest's bytes, which their handler converts
-   It is strict C99 and depends on nothing, so a cross build can build it for the machine it runs on.
+   It is strict ISO C23 and depends on nothing, so a cross build can build it for the machine it runs on.
 
    Usage: swipc --root DIR --out DIR FILE.swipc...
    Each FILE is relative to --root, and its outputs are --out/FILE.h and --out/FILE.inc. The header has the types
@@ -43,13 +43,6 @@
 #define MAX_SVCS   16
 #define MAX_MSG    0x100 /* the IPC message buffer, a request's and the reply's (ipc.c's parse and respond) */
 
-#ifdef __GNUC__
-#define PRINTF_LIKE(f, a) __attribute__((format(printf, f, a)))
-#define NO_RETURN         __attribute__((noreturn))
-#else
-#define PRINTF_LIKE(f, a)
-#define NO_RETURN
-#endif
 
 enum {
     TK_INT,
@@ -139,9 +132,9 @@ static void ctr_check_cmd(Cmd* c);
 /* ============================================================ errors */
 static const char* cur_path = "";
 static int cur_line;
-static void vfail(int line, const char* fmt, va_list ap) NO_RETURN;
-static void fail(const char* fmt, ...) PRINTF_LIKE(1, 2) NO_RETURN;
-static void fail_at(int line, const char* fmt, ...) PRINTF_LIKE(2, 3) NO_RETURN;
+[[noreturn]] static void vfail(int line, const char* fmt, va_list ap);
+[[noreturn, gnu::format(printf, 1, 2)]] static void fail(const char* fmt, ...);
+[[noreturn, gnu::format(printf, 2, 3)]] static void fail_at(int line, const char* fmt, ...);
 static void vfail(int line, const char* fmt, va_list ap) {
     fprintf(stderr, "%s:%d: error: ", cur_path, line);
     vfprintf(stderr, fmt, ap);
@@ -172,7 +165,9 @@ static void check_c_name(const char* name, const char* what) {
         "inline",     "int",       "long",           "register",      "restrict", "return",   "short",    "signed",
         "sizeof",     "static",    "struct",         "switch",        "typedef",  "union",    "unsigned", "void",
         "volatile",   "while",     "_Alignas",       "_Alignof",      "_Atomic",  "_Bool",    "_Complex", "_Generic",
-        "_Imaginary", "_Noreturn", "_Static_assert", "_Thread_local", "bool",     "true",     "false",    "NULL"};
+        "_Imaginary", "_Noreturn", "_Static_assert", "_Thread_local", "bool",     "true",     "false",    "NULL",
+        "alignas",    "alignof",   "constexpr",      "nullptr",       "typeof",   "_BitInt",  "static_assert",
+        "thread_local", "typeof_unqual", "_Decimal32", "_Decimal64", "_Decimal128"};
     size_t i;
     if (strstr(name, "::")) fail("%s %s: a scoped name is not a C name", what, name);
     for (i = 0; i < sizeof reserved / sizeof reserved[0]; i++)
@@ -778,7 +773,7 @@ static void parse_file(void) {
 /* ============================================================ output */
 static char* obuf;
 static size_t olen, ocap;
-static void emit(const char* fmt, ...) PRINTF_LIKE(1, 2);
+[[gnu::format(printf, 1, 2)]] static void emit(const char* fmt, ...);
 static void emit(const char* fmt, ...) {
     char line[4096];
     va_list ap;

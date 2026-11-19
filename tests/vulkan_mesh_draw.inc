@@ -47,9 +47,9 @@ static int mesh_draw_depths(u64 target, float expected, const char* what) {
     CHECK(surface && depths);
     if (!surface || !depths) return 1;
     VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, .imageExtent = {8, 8, 1}};
-    vk_surf_use(vk_cmd(), surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+    vk_surf_use(vk_cmd(), surface, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                 VK_ACCESS_2_TRANSFER_READ_BIT);
-    rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
+    rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), buffer, 1, &copy);
     vk_finish();
     vk_readback_ready();
     int bad = 0;
@@ -65,7 +65,8 @@ static int mesh_draw_depths(u64 target, float expected, const char* what) {
 }
 static int check_mesh_draws(void) {
     if (!g_vk.has_mesh || !g_vk.has_task) {
-        puts("SKIP mesh draws: mesh_draws is off, or the device has no mesh and task shaders with subgroups of 32");
+        puts("SKIP mesh draws: VK_EXT_mesh_shader is off (a ban or vk_ext_mesh_shader=off), or the device has no mesh "
+             "and task shaders with subgroups of 32");
         return 0;
     }
     /* both mesh stages see the sets of both (vk_set_stages), and the other stages see only their own */

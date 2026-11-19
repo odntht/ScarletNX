@@ -42,14 +42,14 @@ enum { WAIT_SVC_SLEEP, WAIT_SVC_SYNC, WAIT_SVC_LOCK, WAIT_SVC_CV, WAIT_SVC_ADDR,
    kobj_destroy and kobj_signaled). The threads waiting on it name it in their waits (KThread.waits) */
 typedef struct KObj {
     int type;
-    int refs;      /* changed with __atomic operations; the object is destroyed as it reaches 0 */
+    _Atomic int refs; /* changed with __atomic operations; the object is destroyed as it reaches 0 */
     int nwait;     /* the waits that name it now, under g_klock: none, and a signal looks for no waiter */
     char name[24]; /* for the logs and the thread dump */
 } KObj;
 
 typedef struct KEvent {
     KObj o;
-    int signaled; /* stays set until cleared: Horizon's events don't clear themselves */
+    _Atomic int signaled; /* stays set until cleared: Horizon's events don't clear themselves */
 } KEvent;
 
 /* A guest thread. It holds a guest core while it runs game code and lets go of it only where a console thread would
@@ -63,18 +63,18 @@ struct KThread {
     int prio;       /* effective: base_prio raised by the waiters on the mutexes it owns */
     int base_prio;  /* as the game set it */
     int core;       /* the core it is scheduled on, 0 to NCORES - 1 */
-    int ideal_core; /* as set, -1 for none */
+    _Atomic int ideal_core; /* as set, -1 for none */
     u32 yields;     /* consecutive yields, of which only some reach the host */
-    int on_core;    /* the core it holds, -2 while waiting for one, -1 for none */
+    _Atomic int on_core; /* the core it holds, -2 while waiting for one, -1 for none */
     int pinned;     /* the core whose host CPUs its host thread runs on (core_pin), -1 before it first ran */
-    u32 core_next;  /* the core's wait list (kt_at) */
+    _Atomic u32 core_next; /* the core's wait list (kt_at) */
     u64 core_ticket;    /* arrival order there, which breaks priority ties */
     u64 core_queued;    /* when it lined up there (plat_ns), for the report */
     /* for the report at exit (kernel_core_report), under core_lk: the time it waited for a core, and how often, and
        the time it held one */
     u64 core_wait_ns, core_held_ns;
     u32 core_waits;
-    u64 affinity;
+    _Atomic u64 affinity;
     u64 tls;
     u32 own_handle; /* the handle the game got for it (kthread_set_own_handle), which its SDK tags the locks it holds with */
     u64 entry, arg, stack_top;
@@ -83,10 +83,11 @@ struct KThread {
     /* svcSetThreadActivity: suspended and in_svc (inside an SVC, running no game code) are read with __atomic loads
        without the lock. pause_at is where a paused thread waits: 0 blocked inside the SVC or not paused, 1 before
        the SVC, 2 after it */
-    int suspended, in_svc, pause_at;
+    _Atomic int suspended, in_svc;
+    int pause_at;
     /* what a game pause (kernel_hold) counts on, with __atomic stores: 1 blocked in a wait that runs nothing until it
        ends (sleep_nl, kthread_wait, a JIT compile), 2 stopped at a hold point, 0 neither */
-    int stopped;
+    _Atomic int stopped;
     /* where it stopped, which is how a thread a save state restarts goes on (thread_resume): PARK_RUN at its pc,
        PARK_ENTER the SVC before its pc again (it hadn't begun), PARK_WAIT the rest of its SVC's wait (wait_svc), and
        PARK_SERVICE the SVC again, as its request (a service's wait, kthread_wait) never got its answer */
@@ -118,7 +119,8 @@ typedef struct KShmem {
     u64 size;
     u8* host;
     u64 pool;         /* the alias pool's offset of its pages plus 1 (host maps them), 0 when host is a copy */
-    u64 gaddr, gsize; /* without the pool: where the game mapped it and how much; gaddr is 0 when unmapped and read
+    _Atomic u64 gaddr,
+        gsize; /* without the pool: where the game mapped it and how much; gaddr is 0 when unmapped and read
                          atomically */
     u32 perm;
 } KShmem;
@@ -190,14 +192,16 @@ void kthread_resume(KThread* t);
 /* pc_wait for a guest thread blocked in a service on the service's own lock m: it counts as stopped for a game pause,
    and a wake during one waits for the pause to end, m let go of meanwhile (returning 0, as a spurious wake). A save
    state taken then makes the request again on load, which is only right while the service has changed nothing for
-   it. Once it has (kthread_commit), the wait is a plain one: a pause waits for the request to finish instead. Another
-   thread just waits */
+   it. Once it has (kthread_commit), the wait is a plain one: a pause waits for the request to finish instead. So is a
+   wait outside an SVC (an NVN call's syncpoint wait), which no svc instruction makes again. Another thread just
+   waits */
 int kthread_wait(PCond* c, PMutex* m, i64 timeout_ns);
 /* the request the calling thread serves has changed what a service holds (vi's QueueBuffer queued its slot): it can't
    be made again, so it finishes before a game pause stops the thread. Until the thread's SVC leaves */
 void kthread_commit(void);
 /* around a guest thread's wait for the host off its core (a JIT compile): stopped as far as a game pause goes, and its
-   end a hold point */
+   end a hold point. A save state restarts the thread at the pc its CPU holds (PARK_RUN), which the caller sets first:
+   only a wait at a point the game's code goes on from can use it */
 void kthread_block(KThread* t);
 void kthread_unblock(KThread* t);
 void kernel_run_main(u64 entry, const u64* args, u64 stack_size, int prio, int core);
@@ -224,6 +228,7 @@ void kernel_load_symbols(void);
 u64 kernel_find_symbol_exact(const char* name); /* 0 when no loaded module exports this name */
 /* the i-th exported function, in address order: its address and its name (NULL when unreadable); 0 past the last */
 int kernel_symbol(u32 i, u64* addr, const char** name);
+u64 kernel_symbol_size(u32 i); /* its size in bytes as its symbol gives it, 0 when unknown or past the last */
 void kernel_dump_regs(CPU* c);
 /* For the crash report of a fault at guest address fault: the thread's last call, when it went to the game's memcpy,
    memmove or memset (the runtime's libc hooks run them) and the fault lies in the range it copies or fills, with that
@@ -234,6 +239,8 @@ void kernel_dump_threads(void);
 /* the guest thread of slot ix (kt_ix): its id, and its name into out as the dump gives it (the SDK's, else the
    kernel's, "" for none); 0 for a slot with no thread. Read without the locks, as the dump reads them */
 u64 kernel_thread_name(u32 ix, char* out, int n);
+/* The wait reason of a thread, as the dump gives it, for a Tracy fiber's name. Read without the locks */
+const char* kernel_thread_state(const KThread* t, char* out, size_t n);
 /* how long threads waited for their cores and how busy each core was, logged at exit */
 void kernel_core_report(void);
 /* host thread tid (plat_tid's) waits in a fault on memory the GPU holds: its guest thread lets go of its emulated

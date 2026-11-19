@@ -158,10 +158,10 @@ typedef struct GpuChannel {
     u32 dma_launch_index;
     /* what the stream waits for before its next method (gpu_park). The GPU thread runs other channels meanwhile, as
        the GPU's host interface (PFIFO) switches channels on an acquire that fails */
-    u32 park;      /* GPU_PARK_*, or 0 */
-    u32 park_val;  /* the value compared with, or the syncpoint's threshold */
-    int park_geq;  /* reach park_val (a wrapping compare) instead of equalling it */
-    u64 park_addr; /* the semaphore's GPU address, or the syncpoint id */
+    _Atomic u32 park;      /* GPU_PARK_*, or 0 */
+    _Atomic u32 park_val;  /* the value compared with, or the syncpoint's threshold */
+    _Atomic int park_geq;  /* reach park_val (a wrapping compare) instead of equalling it */
+    _Atomic u64 park_addr; /* the semaphore's GPU address, or the syncpoint id */
     u64 park_end;  /* the plat_ns() past which the stream goes on anyway */
 } GpuChannel;
 /* A verify channel (gpu/nvn/nvn_verify.c): the game's NVN driver's stream, decoded into its registers on the GPU
@@ -202,6 +202,22 @@ typedef struct {
     int reset;
     u32 flags;
 } GpuUpscale;
+
+/* An Ounce's shading rate image, for the draws after its bind (NVN's BindShadingRateImage): its texture header (tic,
+   a TIC entry's words as host numbers, which the renderer looks up as a draw's texture) and its GPU address (addr, 0
+   with none bound). Each texel covers texel by texel pixels, and holds an index into the palette of the viewport
+   that a primitive goes to. A palette has
+   16 entries, entry i in bits 4i to 4i+3: a rate as the hardware numbers it, the numbers of
+   VkShadingRatePaletteEntryNV (0 no invocations, 1 to 4 16 to 2 invocations for each pixel, 5 one for each pixel,
+   6 one for 2x1 pixels, 7 1x2, 8 2x2, 9 4x2, 10 2x4, 11 4x4). new_image: the texels may have changed since the last
+   call, which only changed a palette */
+typedef struct {
+    u32 tic[8];
+    u64 addr;
+    u32 texel;
+    int new_image;
+    u64 palette[16];
+} GpuShadingRate;
 
 /* the VIC composition (gpu/video/vic.c): a surface plane as VIC addresses it (pitch linear rows or block linear
    GOBs), a slot's resolved rectangles and color matrix, and a job's planes and slots. The renderer's vic_compose
@@ -255,8 +271,8 @@ typedef struct NvdecPic {
    oy rows down; rows from h on read as zero and take no writes). With remap, an element is ns components of cs bytes
    in and nd out, component k of it from sel[k] (0-3 a source component, 4 constant A, 5 constant B, 6 and 7 the
    destination's own bytes); fill: nothing is read. snap: the source's bytes as read at submission (pitch linear, its
-   span from its lowest byte, gpu_dma_low), or NULL; snap_id: nonzero when they are the renderer's
-   (Renderer.snap_alloc), which dma_copy takes over */
+   span from its lowest byte, gpu_dma_low, or its lines alone, line k at k * line_in, when gpu_dma_sparse), or NULL;
+   snap_id: nonzero when they are the renderer's (Renderer.snap_alloc), which dma_copy takes over */
 typedef struct {
     u64 addr;
     int bl;
@@ -273,6 +289,16 @@ static inline i64 gpu_dma_low(const GpuDmaSide* s, u32 lines) {
 static inline u64 gpu_dma_span(const GpuDmaSide* s, u32 lines, u32 line) {
     i64 p = gpu_dma_pitch(s);
     return lines ? (u64)(p < 0 ? -p : p) * (lines - 1) + line : 0;
+}
+/* whether a pitch linear source's lines are read one by one, packed (line k at k * line), and not as their span: when
+   the span is more than twice their bytes. A 256x256 region of an 8192 texel wide RGBA8 surface is 256 lines of
+   1 KiB, 32 KiB apart: 256 KiB read for its lines, 8 MiB for its span */
+static inline int gpu_dma_sparse(const GpuDmaSide* s, u32 lines, u32 line) {
+    return lines > 1 && gpu_dma_span(s, lines, line) / 2 > (u64)lines * line;
+}
+/* the bytes a pitch linear source's read holds: its lines packed when sparse, else its span */
+static inline u64 gpu_dma_read_bytes(const GpuDmaSide* s, u32 lines, u32 line) {
+    return gpu_dma_sparse(s, lines, line) ? (u64)lines * line : gpu_dma_span(s, lines, line);
 }
 typedef struct {
     int multi, remap, fill, shuffle, keep;
@@ -308,6 +334,8 @@ typedef struct {
    Unmapped pages read as zero and take no writes; the int calls return -1 when any page was unmapped */
 int gmem_read(u64 gva, void* dst, u64 size);
 int gmem_write(u64 gva, const void* src, u64 size);
+/* gmem_write, the write recorded as gpu_mem_written_by's of that writer */
+int gmem_write_by(u64 gva, const void* src, u64 size, int kind, u32 format, u64 surface);
 /* a constant buffer upload (LOAD_CONSTANT_BUFFER): gmem_write, stamped with gpu_mem_written_cb */
 int gmem_write_cb(u64 gva, const void* src, u64 size);
 /* gmem_read and gmem_write in halves, for a copy made of many small runs (a block linear row's 16 byte runs): the
@@ -400,6 +428,39 @@ void gpu_mem_written_cpu(u64 cpu, u64 size);
 /* fn(cpu, n) for each run of guest memory that a GPU-side write above changes (gpu/vk/uma.c's hazard count) */
 void gpu_set_write_watch(void (*fn)(u64 cpu, u64 n));
 u64 gpu_mem_generation(void);   /* the last generation fully published */
+/* [gva, gva + size) watched from now: a GPU-side write on a page of its 2 MiB granules moves
+   gpu_mem_granules_generation. 0 where it can't be (gpu_page_check=1, or past the GPU's addresses) */
+int gpu_mem_watch(u64 gva, u64 size);
+/* the newest generation that wrote a page of the watched granules of [gva, gva + size), published after
+   gpu_mem_generation reached it; ~0 where one of them is not watched */
+u64 gpu_mem_granules_generation(u64 gva, u64 size);
+/* what made a GPU-side write: gpu_mem_written_cb, gpu_mem_written, gpu_mem_written_shader, gpu_mem_remapped,
+   gpu_mem_written_cpu, gpu_mem_written_all; then each writer that gpu_mem_written_by names */
+enum {
+    GPU_WRITE_CB = 1,
+    GPU_WRITE_ENGINE,
+    GPU_WRITE_SHADER,
+    GPU_WRITE_REMAP,
+    GPU_WRITE_RESULT,
+    GPU_WRITE_ALL,
+    GPU_WRITE_RUNTIME, /* gmem_write: the runtime's own write */
+    GPU_WRITE_INLINE,  /* the inline engine's data */
+    GPU_WRITE_CLEAR,   /* the 3D engine's clear of memory before the renderer runs */
+    GPU_WRITE_2D,      /* a blit of the 2D engine */
+    GPU_WRITE_DMA,     /* a copy of the copy engine */
+    GPU_WRITE_COMPUTE, /* a dispatch's storage */
+    GPU_WRITE_TARGET,  /* a render target's write-back */
+    GPU_WRITE_IMAGE,   /* a storage image's publish */
+    GPU_WRITE_RELEASE, /* a semaphore or report release */
+    GPU_WRITE_KINDS
+};
+/* gpu_mem_written of a writer of kind GPU_WRITE_RUNTIME or after, for the log's counts; for a surface's write (a target's
+   write-back, a storage image's publish), its format (VkFormat) and address, else 0 and 0 */
+void gpu_mem_written_by(u64 gva, u64 size, int kind, u32 format, u64 surface);
+/* the kind of the newest GPU-side write on a page of [a, a + sz), 0 where none or too long ago to tell */
+int gpu_mem_newest_kind(u64 a, u64 sz);
+/* the same, with the format and address of the surface that wrote it (gpu_mem_written_by), 0 and 0 for another writer */
+int gpu_mem_newest_write(u64 a, u64 sz, u32* format, u64* surface);
 void gpu_mem_written_all(void); /* a save state's load: every page written, after anything asked before */
 int gpu_mem_dirty_since(u64 since, u64 a, u64 sz); /* a GPU-side write after since touched [a, a + sz) */
 /* fn(ctx, at, n) for each run of [a, a + sz) on the GPU pages a GPU-side write after since touched, in order: what
@@ -439,6 +500,22 @@ void gpu_park(GpuChannel* ch, u32 kind, u64 addr, u32 val, int geq);
 /* something a parked channel may wait for changed (a syncpoint increment, on the GPU thread or off it): look again.
    Any thread */
 void gpu_kick(void);
+/* gpu_kick, only while a poll of the GPU thread (gpu_call_poll) waits: a write to guest memory that such a wait may
+   look at, made off the GPU thread with no kick of its own (vk/release.c's releases). Any thread, after the write */
+void gpu_kick_polls(void);
+/* why a poll returns 0, said by the poll before it returns (the GPU thread): what gpu_poll_stats counts */
+enum { GPU_POLL_OTHER, GPU_POLL_EVENT, GPU_POLL_SYNC, GPU_POLL_SETTLE, GPU_POLL_PRESENT, GPU_POLL_N };
+void gpu_poll_why(u32 why);
+/* the GPU thread's sleeps after a pass that ran nothing, by what ended them (0 a kick, 1 a new item, 2 neither: the
+   timeout), their counts and ns, and the polls that returned 0 by why */
+typedef struct {
+    u64 sleeps[3], sleep_ns[3], misses[GPU_POLL_N];
+    u32 last; /* what ended the newest sleep */
+} GpuPollStats;
+void gpu_poll_stats(GpuPollStats* s);
+/* the GPU thread's wall time outside its wait for work so far, in ns: replay, setup and recording, the waits inside
+   them (locks, fences) included */
+u64 gpu_thread_busy_ns(void);
 /* the CPU signals what a GPU stream may wait for (an NVN event, a syncpoint increment through nvhost-ctrl): what it
    wrote before is for the work after the wait to see (renderer.h mem_may_have_changed). Before the signal, any thread */
 void gpu_cpu_signal(void);
@@ -451,6 +528,7 @@ extern volatile u64 g_gpu_submits;
 /* the blocking wait the GPU thread is in, for the stall report: what it waits for (a string that lives on) and a number
    that names it, before the wait, and NULL after. Ignored on other threads: 1 on the GPU thread */
 int gpu_wait_note(const char* what, u64 value);
+int gpu_on_thread(void); /* 1 on the GPU thread */
 /* the stall watchdog's report of what the GPU thread and each channel with queued jobs are doing. Any thread */
 void gpu_report_stall(void);
 /* guest memory [cpu_addr, cpu_addr + len) changed without a write the host's write tracking sees: decommitted pages,
@@ -460,7 +538,7 @@ extern void (*g_gpu_mem_changed)(u64 cpu_addr, u64 len); /* the renderer's side 
 /* the renderer lands pending shader results before the stream goes on past them: before a write of memory those
    results overlap (size > 0), and before anything the game can observe (gpu_signal_point, size 0) */
 extern void (*g_gpu_before_write)(u64 gva, u64 size);
-extern int g_gpu_releases; /* the renderer holds releases waiting to happen (renderer.h release_need) */
+extern _Atomic int g_gpu_releases; /* the renderer holds releases waiting to happen (renderer.h release_need) */
 /* what a change of backing changes (g_gpu_mapping_begin's kind) */
 enum {
     GPU_MAPPING_GMMU = 0,  /* the GPU address space: gva and size are its GPU range */

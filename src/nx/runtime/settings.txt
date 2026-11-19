@@ -303,6 +303,30 @@ setting Anisotropic filtering
     startup
     words Game's|#x
     help 0 = textures filtered as the game asks, 2 to 16 = sharper surfaces seen at an angle
+setting Upscaler
+    key upscaler
+    text 16
+    default off
+    words off=Off|bilinear=Bilinear|fsr1=AMD FSR 1|nis=NVIDIA NIS|sgsr=Qualcomm SGSR
+    help The filter that grows the game's frame to the window: Off as the console's window always drew it (smooth on
+    help the Switch and the Vita, sharp pixels on the 3DS), Bilinear smooth, AMD FSR 1, NVIDIA NIS and Qualcomm SGSR
+    help with sharper edges. NIS grows a frame twice at most: past that FSR 1 runs, and the log says so. A Switch game
+    help takes a change while it runs, the Upscaler shortcut's for the run; a 3DS or Vita game takes it at start
+setting Upscaler sharpness
+    key upscaler_sharpness
+    int 0 100
+    default 75
+    help How sharp AMD FSR 1, NVIDIA NIS and Qualcomm SGSR draw the frame's edges: 0 the softest, 100 the sharpest
+setting Anti-aliasing
+    key anti_aliasing
+    text 8
+    default off
+    words off=Off|auto=Auto|fxaa=FXAA|smaa=SMAA|ssaa2=SSAA 2x|ssaa4=SSAA 4x
+    help Smoothing of the shown frame's edges, after the upscaler: Auto = FXAA where the window shows the frame at 1.25
+    help times its size or more each way, else none; FXAA and SMAA filter the frame at the window's size (with the
+    help upscaler Off, scaled as the window scales it, the 3DS in sharp pixels); SSAA 2x and 4x draw it 2 or 4 times as
+    help large and shrink it. A Switch game takes a change while it runs, the Anti-aliasing shortcut's for the run; a
+    help 3DS or Vita game takes it at start
 setting Game HDR
     key hdr_game
     label Game HDR output
@@ -366,15 +390,6 @@ setting Vulkan driver
     help which driver runs and why. On every other system the game runs on the system's driver whatever the value (on
     help Android, gpu_driver's), and the log says so for moltenvk and kosmickrisp. Any other value stops the game,
     help saying so
-setting Mesh draws
-    key mesh_draws
-    label Mesh shader draws (experimental)
-    int 0 1
-    default 0
-    startup
-    words Off|On
-    help 1 = an Ounce game's mesh draws (DrawMeshTasks) draw with VK_EXT_mesh_shader, where the GPU has it.
-    help Experimental: on one NVIDIA GPU most runs with them ended in a GPU fault. 0 = they are skipped
 setting Vertex input dynamic state
     key vertex_input_dynamic_state
     text 16
@@ -468,9 +483,19 @@ setting BC7 queue
     default 0
     startup
     words Auto|#
-    help The thousands of blocks the BC7 encoder may have queued on the GPU before an upload waits for it to do them.
-    help 0 = by the GPU's own memory: 256 for every 2 GB of it, from 256 to 4096, and 256 on a GPU that shares the
-    help computer's memory (a GT 1030, 2 GB, lost the device with more queued). 1 to 16384 = that many thousand
+    help The thousands of blocks the BC7 encoder may have queued on the GPU. An upload submits at each half of them
+    help and waits for the half before. 0 = by the GPU's own memory: 256 for every 2 GB of it, from 256 to 4096, and
+    help 256 on a GPU that shares the computer's memory (a GT 1030, 2 GB, lost the device with more queued). 1 to
+    help 16384 = that many thousand
+setting ASTC compute queue
+    key astc_compute_queue
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help On = a new ASTC texture is decoded and encoded on the GPU's compute queue, where it has one of its own,
+    help beside the drawing, and a load waits only for those encodes. Off = on the graphics queue, after the drawing
+    help before it. The textures are the same either way
 setting ASTC quick Mtexels
     label Very large ASTC textures from (megatexels)
     key astc_quick_mtexels
@@ -568,6 +593,20 @@ setting Thread stack (MB)
     startup
     help The host stack of each of the game's threads, in MB: a game's deep calls take it. Less leaves address space
     help for more threads where a device has little, and a game that calls very deep may then stop
+setting GPU pstate
+    label GPU clocks held
+    key gpu_pstate
+    text 16
+    default auto
+    startup
+    words auto=Auto|on=On|off=Off
+    help Holds the GPU's clocks up while the game runs. A frame keeps the GPU half idle (it waits for the frame's
+    help commands, then the game waits for it), and a driver that sets the clocks by how busy the GPU is lowers them,
+    help which makes every frame slower. auto = held on a discrete GPU where its driver lets a program do it: AMD's on
+    help Linux (amdgpu's peak stable pstate, from the level auto), NVIDIA's (VK_NV_low_latency2's boost); and on a
+    help phone's Adreno (kgsl's top power level while frames are presented); not on a computer's integrated GPU, which
+    help shares its power with the CPU. on = held there too. off = the driver sets them. The log says which, and why
+    help where they are not held. Any other value stops the game, saying so
 setting Pipeline threads
     key pipeline_threads
     int 0 32
@@ -998,6 +1037,22 @@ setting TV mode shortcut
     set hotkey_set
     help The key, as hotkey_help's, that steps the TV mode round On, Off and Auto while the game runs, as the game's
     help menu's TV mode row does: for this run, docked keeps the .ini's choice
+setting Upscaler shortcut
+    key hotkey_upscaler
+    text 64
+    default Ctrl+U
+    label Upscaler
+    set hotkey_set
+    help The key, as hotkey_help's, that steps the upscaler round Off, Bilinear, AMD FSR 1, NVIDIA NIS and Qualcomm
+    help SGSR while the game runs: for this run, upscaler keeps the .ini's choice
+setting Anti-aliasing shortcut
+    key hotkey_anti_aliasing
+    text 64
+    default Ctrl+Shift+A
+    label Anti-aliasing
+    set hotkey_set
+    help The key, as hotkey_help's, that steps the anti-aliasing round Off, Auto, FXAA, SMAA, SSAA 2x and SSAA 4x while
+    help the game runs: for this run, anti_aliasing keeps the .ini's choice
 
 table g_network_ini
 setting Network
@@ -1101,8 +1156,9 @@ setting Vulkan pipeline cache
     default 1
     startup
     words Off|On
-    help 1 = the GPU driver's compiled pipelines are kept between runs (shader_cache/vk_pipelines.bin). 0 = they are
-    help neither read nor written: every pipeline is compiled again, as in a first run, to measure that
+    help 1 = the GPU driver's compiled pipelines are kept between runs (shader_cache/vk_pipelines.bin), and so are its
+    help shader objects' binaries (vk_shaders.bin). 0 = they are neither read nor written: every pipeline and shader
+    help object is compiled again, as in a first run, to measure that
 setting GPU mirror past limit
     key vk_mirror_past_limit
     int 0 1
@@ -1349,9 +1405,12 @@ setting Draw state check
     default 0
     startup
     words Off|On
-    help 1 = a draw that keeps the last draw's shaders and pipeline makes them again to compare, and the log names
-    help each difference (a register missing from a group, an input that is not compared). Slow: for checking what
-    help a draw keeps
+    help 1 = a draw that keeps an earlier draw's shaders and pipeline makes them again to compare, and the log names
+    help each difference (a register missing from a group, an input that is not compared, a kept key that is not the
+    help state's bytes). A kept constant buffer's bytes are hashed again (where the CPU wrote nothing since), a kept
+    help texture view or sampler is made again, and a descriptor kept from an earlier frame is encoded again, and
+    help compared too. A texture the quick check finds unchanged is checked the full way too, and the log counts where
+    help the full check found a change. Slow: for checking what a draw keeps
 setting Profiler
     key profile
     only windows
@@ -1413,6 +1472,25 @@ setting Shader corpus
     startup
     help A folder that keeps each translated shader for snx-shaderc (gpu/shader/corpus.c). With it every shader is
     help translated, and none is kept for the next run. Empty: none, or captures/shaders with Shader captures
+setting Pipeline stats
+    key pipeline_stats
+    text 1024
+    default ""
+    startup
+    help A CSV file that gets the driver's statistics of each whole and optimized graphics pipeline, and of each
+    help compute pipeline (VK_KHR_pipeline_executable_properties): for each shader stage, the instructions, registers,
+    help spills and the others that the driver reports, by the program hashes of the log's lines (a shader corpus file
+    help of the program starts with the same first 8 hex digits). Draws that bind shader objects get no rows. On some
+    help drivers, pipelines made with it are not the ones in the pipeline cache of runs without it. Empty: none
+setting GL call census
+    key gl_call_census
+    text 1024
+    default ""
+    startup
+    help A TSV file that gets, for a game that draws through its own OpenGL driver, each GL function it calls: the
+    help calls, the frames it is called in, the most in one frame, the first and last frame, and the driver's own calls
+    help of it apart. Written every 600 frames and as the game ends. Every GL call costs a count while it is set; the
+    help driver still runs each one. Empty: none
 setting ASTC dump
     key astc_dump
     text 1024
@@ -1481,13 +1559,14 @@ setting Guest memory in place
     int 0 2
     default 0
     startup
-    only android
+    only linux
     words Auto|Import|Move
     help Where vk_memory has the GPU read guest memory in place, how it reaches it, to compare the two ways on one
-    help device. 0 = imported where it is (VK_EXT_external_memory_host), and without that moved into AHardwareBuffers
-    help when vk_memory=2. 1 = imported only: without VK_EXT_external_memory_host guest memory is copied. 2 = moved
-    help into AHardwareBuffers only, on a driver that imports too and with vk_memory=0 as well; elsewhere than
-    help Android there are none, and guest memory is copied
+    help device. 0 = moved into memfds the GPU imports as dma-bufs (Linux's /dev/udmabuf) on a driver whose imports
+    help cost each submission (amdgpu), else imported where it is (VK_EXT_external_memory_host), and without that
+    help moved into AHardwareBuffers when vk_memory=2. 1 = imported only: without VK_EXT_external_memory_host guest
+    help memory is copied. 2 = moved only, into AHardwareBuffers on Android and dma-bufs on Linux, also on a driver
+    help that imports and with vk_memory=0; where there are neither, guest memory is copied
 setting Guest buffers copied
     key uma_copies
     int 0 2
@@ -1572,6 +1651,42 @@ setting Descriptor buffers
     help barriers are skipped, which the tracking of targets and buffers orders. 0 = descriptor sets for graphics
     help too, where a fragment barrier ends the render pass only after storage writes or reads that are still
     help pending, or after guest memory used in place
+setting Constant buffers by address
+    key vk_cb_address
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = with descriptor heaps, a constant buffer that a shader reads only at constant offsets is mapped by its
+    help address, and its draws write no descriptor for it. A read at an offset from a register keeps the
+    help descriptor, whose range bounds it. 0 = a descriptor for every constant buffer
+setting Constant buffer windows
+    key vk_cb_windows
+    int 0 2
+    default 2
+    startup
+    words Off|On|Automatic
+    help How the vertex and fragment programs' constant buffers are bound. 2, Automatic: as 64 KiB windows of the
+    help staging ring with their offsets in push constants, where the GPU takes 224 bytes of push constants and uniform
+    help ranges of 64 KiB and its descriptors are not in heaps, but not on lavapipe, whose linear rasterizer smashes its
+    help stack with them. 1 = windows on lavapipe too, which needs Mesa's LP_PERF=no_rast_linear (a test runs it so);
+    help a GPU that can't take them binds them one by one and says why. 0 = each constant buffer bound one by one
+setting Indirect copies
+    key vk_copy_indirect
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = where the device has VK_KHR_copy_memory_indirect and device addresses, the copies of GPU-owned results
+    help into one buffer are made by one command, from a list the GPU reads. 0 = one copy command each
+setting Texture loads in place
+    key vk_inplace_loads
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = where the device has device addresses, a block linear texture load reads the bytes that GPU results
+    help hold where they are, and the CPU's bytes from staging. 0 = the results' bytes are copied into staging first
 setting Vulkan recording thread
     key vk_record
     int 0 1
@@ -1668,6 +1783,15 @@ setting Tracy sampling
     words Off|On
     help 1 = starts the sampler at the first connection, for the trace's flame graphs. With JIT'd guest code and the
     help drivers' own threads, the sample stacks read as [unknown] over the instrumented zones
+setting Tracy context switches
+    key tracy_context_switches
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = puts the OS's context switches on the threads' timelines, so a thread's wait and preemption show against
+    help the game's zones. On Linux this needs permission to read perf events and tracefs; without it Tracy writes a
+    help debug line and leaves the feature off. Tracy starts its sampler with it, so the sample stacks come too
 setting Tracy frame images
     key tracy_frame_images
     int 0 60
@@ -1794,15 +1918,27 @@ setting State checks
 # ---- the 3DS driver's display ----
 
 table g_ctr_display_ini
-setting CTR separate screens
-    key ctr_separate_windows
-    label Separate screens
+setting CTR screen layout
+    key ctr_screen_layout
+    label Screen layout
+    int 0 4
+    default 0
+    startup
+    words Stacked|Single screen|Large screen|Side by side|Separate windows
+    help The window's arrangement: 0 = the top screen above the bottom one, 1 = one screen only (the top, or the
+    help bottom one with the swap), 2 = the large screen (the top, or the bottom one with the swap) on the left, with
+    help the other screen at its own size over 2.25, centred vertically at the large one's
+    help right, 3 = side by side, 4 = each screen gets a window of its own, filling it, where the host can make the
+    help second window, and the one window stacked where it cannot.
+setting CTR screen swap
+    key ctr_screen_swap
+    label Screen swap
     int 0 1
     default 0
     startup
     words Off|On
-    help 1 = the top and bottom screens each have a window of their own, each taking its whole window, instead of the
-    help top screen above the bottom one in one window
+    help 1 = the top and bottom screens trade places in the stacked, large-screen and side-by-side layouts. The bottom
+    help screen is the one shown in the single-screen layout.
 setting CTR top resolution
     key ctr_top_resolution
     label Top screen resolution
@@ -1988,7 +2124,10 @@ setting @VK_EXT_index_type_uint8
 setting @VK_EXT_load_store_op_none
 setting @VK_EXT_map_memory_placed
 setting @VK_EXT_memory_budget
+setting @VK_EXT_memory_priority
 setting @VK_EXT_mesh_shader
+setting @VK_EXT_pageable_device_local_memory
+setting @VK_EXT_physical_device_drm
 setting @VK_EXT_pipeline_creation_feedback
 setting @VK_EXT_pipeline_robustness
 setting @VK_EXT_post_depth_coverage
@@ -2008,6 +2147,7 @@ setting @VK_EXT_vertex_input_dynamic_state
 setting @VK_GOOGLE_display_timing
 setting @VK_KHR_calibrated_timestamps
 setting @VK_KHR_cooperative_matrix
+setting @VK_KHR_copy_memory_indirect
 setting @VK_KHR_dynamic_rendering
 setting @VK_KHR_dynamic_rendering_local_read
 setting @VK_KHR_extended_flags
@@ -2015,12 +2155,14 @@ setting @VK_KHR_external_memory_fd
 setting @VK_KHR_external_memory_win32
 setting @VK_KHR_format_feature_flags2
 setting @VK_KHR_fragment_shader_barycentric
+setting @VK_KHR_fragment_shading_rate
 setting @VK_KHR_index_type_uint8
 setting @VK_KHR_load_store_op_none
 setting @VK_KHR_maintenance4
 setting @VK_KHR_maintenance5
 setting @VK_KHR_maintenance8
 setting @VK_KHR_map_memory2
+setting @VK_KHR_pipeline_executable_properties
 setting @VK_KHR_pipeline_library
 setting @VK_KHR_portability_subset
 setting @VK_KHR_present_id
@@ -2031,6 +2173,7 @@ setting @VK_KHR_shader_clock
 setting @VK_KHR_shader_maximal_reconvergence
 setting @VK_KHR_swapchain
 setting @VK_KHR_synchronization2
+setting @VK_KHR_unified_image_layouts
 setting @VK_KHR_video_decode_av1
 setting @VK_KHR_video_decode_h264
 setting @VK_KHR_video_decode_queue
@@ -2038,6 +2181,8 @@ setting @VK_KHR_video_queue
 setting @VK_NV_device_diagnostic_checkpoints
 setting @VK_NV_fragment_coverage_to_color
 setting @VK_NV_framebuffer_mixed_samples
+setting @VK_NV_low_latency2
+setting @VK_NV_shading_rate_image
 setting @VK_VALVE_shader_mixed_float_dot_product
 
 section Game: g_game_ini

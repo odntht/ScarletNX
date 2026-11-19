@@ -134,9 +134,10 @@ Before any profiler, look at what the runtime already measures.
 
 - **The stats box** (`stats=1`, `F12`): frames a second, the last frame's time, the process's CPU and memory, the
   graphics queue's busy share and busy time a frame (from Vulkan timestamps), video memory against the driver's
-  budget (`VK_EXT_memory_budget`), and a graph of the last 120 frame times with 60 and 30 FPS guides. A graph that
-  is flat but high is steady work; one with spikes is a hitch to find (a JIT miss, a pipeline compile, a texture
-  upload: Tracy names it).
+  budget (`VK_EXT_memory_budget`), and a graph of the last 120 frame times with 60 and 30 FPS guides, under it a line
+  each for the pipelines made and the BC7 encoder's runs while the last second had some, that second's and the
+  run's (`Compiling: 3 / 1240`, `Encoding: 12 / 5300`). A graph that is flat but high is steady work; one with spikes
+  is a hitch to find (a JIT miss, a pipeline compile, a texture upload: Tracy names it).
 - **`--log=2`** adds, each second, a `resources:` line (footprint, free memory, the renderer's device memory), every
   5 s a `threads:` line with the three threads that took the most CPU, and every 600 presents an `ipc:` line with the
   slowest service commands. That alone often says which thread to profile. `--log=2` costs time itself: do not time a
@@ -187,6 +188,21 @@ Turn on the sampler (`--tracy-sampling=1`) for the time between the zones. It ne
 has them unless `kernel.perf_event_paranoid` forbids it), samples at 1 kHz (`TRACY_SAMPLING_HZ`), and names the
 runtime, the game's `_code.so` and shared libraries' exports; the JIT's code stays `[unknown]`. Without it, Tracy shows
 the instrumented zones alone, which costs much less.
+
+Turn on `tracy_context_switches` (`--tracy-context-switches=1`) for the OS's context switches on the threads'
+timelines. A guest thread's wait and preemption then show against the game's zones. On Linux this needs permission to
+read perf events and tracefs (`kernel.perf_event_paranoid`, and a high `ulimit -n`), and Tracy turns it off with a
+debug line when it cannot. Tracy couples it to its sampler, so the sample stacks come on with it.
+
+Each guest thread's wait also appears as a **fiber**, named for what the thread blocked on: an object, a mutex, a
+condition variable, an address, a pause, a service request or a game pause. The Fibers pane lists them with their
+durations, so a thread's idle time can be sorted by why it waited without reading the log.
+
+Tracy 0.15.0 has no call that writes a trace from the app. A fatal outside a signal marks the trace's message pane
+with the reason and closes the client, so a capture writes the events up to it. A fatal from the crash handler exits
+before the client can close. Its capture keeps the events already sent, which may not include the reason. Start with
+`--tracy-capture` to keep a trace of a crash, and read the game's log for the reason. The runtime's own crash handler
+stays in charge of the signal.
 
 Things to know (more in [Development](development.md#profiling)):
 

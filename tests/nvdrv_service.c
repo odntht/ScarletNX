@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 #include "nx/hle/services/nvdrv.c"
 #include "nx/hle/hle.c"
@@ -61,7 +62,7 @@ int pc_wait(PCond* c, PMutex* m, i64 timeout_ns) {
         test_fail("nothing here waits for a syncpoint", __LINE__);
         return 1;
     }
-    __atomic_add_fetch(&g_hle.nvdrv.syncpt[test_wake], 1, __ATOMIC_SEQ_CST);
+    atomic_fetch_add_explicit(&g_hle.nvdrv.syncpt[test_wake], 1, memory_order_seq_cst);
     test_wake = 0;
     return 1;
 }
@@ -134,6 +135,7 @@ void svc_register(const char* name, SvcCtor ctor) {
 /* kernel objects, counted; a handle takes a reference and names its object */
 void kobj_ref(KObj* o) { o->refs++; }
 void kobj_unref(KObj* o) {
+    if (!o) return;
     CHECK(o->refs > 0);
     if (--o->refs) return;
     free(o);
@@ -182,12 +184,31 @@ void gpu_submit(const void* entries, u32 n, u32 channel, u32 incs, u32 wait_id, 
     test_gpu.expect = expect;
     test_gpu.submits++;
 }
+/* with test_hold, the calls wait in test_held until the test runs them as the GPU thread (run_held) */
+static int test_hold;
+static void (*test_held_fn[8])(void*);
+static void* test_held[8];
+static u32 test_nheld;
+static int test_on_gpu; /* the test plays the GPU thread, which sees the page table and not the changes queued for it */
+int gpu_on_thread(void) { return test_on_gpu; }
 void gpu_call(void (*fn)(void*), void* arg, const u32* chans, u32 nchans) {
     CHECK(nchans <= 4);
     test_gpu.calls++;
-    memcpy(test_gpu.call_chans, chans, nchans * sizeof *chans);
+    if (nchans) memcpy(test_gpu.call_chans, chans, nchans * sizeof *chans);
     test_gpu.ncall_chans = nchans;
+    if (test_hold) {
+        CHECK(test_nheld < 8);
+        test_held_fn[test_nheld] = fn;
+        test_held[test_nheld++] = arg;
+        return;
+    }
     fn(arg); /* the GPU thread has nothing queued before it */
+}
+static void run_held(u32 k) {
+    CHECK(k < test_nheld);
+    test_on_gpu = 1;
+    test_held_fn[k](test_held[k]);
+    test_on_gpu = 0;
 }
 void gpu_channel_close(u32 channel) { test_gpu.closed_channel = channel; }
 void gpu_release_retire(u32 channel) { (void)channel; }
@@ -861,6 +882,54 @@ static void test_gmmu_freed(void) {
     CHECK(gmmu_run(g, ~0ull, &cpu) == 0x4000);
     gmmu_unmap(g, 0x4000, 0, 0);
 }
+/* changes queued for the GPU thread (gmmu_later): other threads see a queued map's pages, rounded up to whole pages,
+   where the table has no entry, the newest map first, and no queued unmap; the GPU thread sees the table alone. One
+   call makes every change up to its number, and a call whose changes went already finds nothing to do */
+static void test_gmmu_later(void) {
+    const u64 g = 0x7200000000ull, c = 0xB0000000ull;
+    u64 cpu = 0;
+    test_hold = 1;
+    test_nheld = 0;
+    u32 a = gmmu_later(GMMU_LATER_MAP, g, c, 0x1800, 0);
+    gmmu_later_post(a);
+    CHECK(test_nheld == 1 && g_host.nvdrv.nlater == 1);
+    CHECK(gmmu_translate(g + 0x1FFF) == c + 0x1FFF && !gmmu_translate(g + 0x2000));
+    CHECK(gmmu_run(g + 0x1000, ~0ull, &cpu) == 0x1000 && cpu == c + 0x1000);
+    CHECK(gmmu_run(g, 0x800, &cpu) == 0x800 && cpu == c);
+    test_on_gpu = 1;
+    CHECK(!gmmu_translate(g) && !gmmu_run(g, ~0ull, &cpu));
+    test_on_gpu = 0;
+    gmmu_later(GMMU_LATER_MAP, g, 0xC0000000ull, 0x1000, 0);
+    CHECK(gmmu_translate(g) == 0xC0000000ull && gmmu_translate(g + 0x1000) == c + 0x1000);
+    u32 u = gmmu_later(GMMU_LATER_UNMAP, g, 0, 0x2000, 0);
+    CHECK(gmmu_translate(g) == 0xC0000000ull);
+    run_held(0); /* the first change alone: the table's entries answer from then on */
+    CHECK(g_host.nvdrv.nlater == 2 && gmmu_translate(g) == c && gmmu_translate(g + 0x1FFF) == c + 0x1FFF);
+    gmmu_later_post(u);
+    run_held(1);
+    CHECK(g_host.nvdrv.nlater == 0 && !gmmu_translate(g) && !gmmu_translate(g + 0x1000));
+    gmmu_later_post(a);
+    run_held(2);
+    CHECK(g_host.nvdrv.nlater == 0 && !gmmu_translate(g));
+    /* the ring wraps, then grows with the oldest first */
+    test_nheld = 0;
+    u32 last = 0, head = g_host.nvdrv.later_head;
+    for (u32 i = 0; i < 40; i++) last = gmmu_later(GMMU_LATER_MAP, g, c, 0x1000, 0);
+    gmmu_later_post(last);
+    run_held(0);
+    CHECK(g_host.nvdrv.nlater == 0 && g_host.nvdrv.later_head == head + 40 && gmmu_translate(g) == c);
+    gmmu_later_post(gmmu_later(GMMU_LATER_UNMAP, g, 0, 0x1000, 0));
+    run_held(1);
+    for (u64 i = 0; i < 100; i++) last = gmmu_later(GMMU_LATER_MAP, g + i * 0x1000, c + i * 0x1000, 0x1000, 0);
+    CHECK(g_host.nvdrv.nlater == 100 && gmmu_translate(g + 99 * 0x1000) == c + 99 * 0x1000 && gmmu_translate(g) == c);
+    gmmu_later_post(last);
+    run_held(2);
+    CHECK(g_host.nvdrv.nlater == 0 && gmmu_translate(g + 99 * 0x1000) == c + 99 * 0x1000);
+    gmmu_later_post(gmmu_later(GMMU_LATER_UNMAP, g, 0, 100 * 0x1000, 0));
+    run_held(3);
+    CHECK(!gmmu_translate(g) && !gmmu_translate(g + 99 * 0x1000));
+    test_hold = 0;
+}
 /* gmmu_run against gmmu_translate page by page: runs longer than an entry's count, across a table's end, broken by a
    page mapped elsewhere, and what an own unmap keeps */
 static u64 run_by_pages(u64 gva, u64 max, u64* cpu) {
@@ -942,9 +1011,30 @@ static void alias_query(u64 cpu, u64 size) {
         CHECK(alias_seen.count[i] == 1 && alias_seen.lo[i] == a && alias_seen.hi[i] == b);
     }
 }
+/* the edges kept at each change: sorted, two for each run, its start's and its end's */
+static void alias_check_edges(void) {
+    const GAlias* x = &g_hle.nvdrv.alias;
+    const GRun* r = g_hle.nvdrv.gruns;
+    if (!x->edges_ok) return;
+    CHECK(x->nedge == 2 * g_hle.nvdrv.ngruns);
+    u8* had = calloc(g_hle.nvdrv.ngruns + 1, 1);
+    CHECK(had);
+    for (u32 i = 0; i < x->nedge; i++) {
+        const GEdge* e = &x->edge[i];
+        CHECK(!i || x->edge[i - 1].key <= e->key);
+        CHECK(e->run < g_hle.nvdrv.ngruns);
+        if (e->key & 1)
+            CHECK(e->key == (r[e->run].cpage << 1 | 1) && !(had[e->run] & 1));
+        else
+            CHECK(e->key == (r[e->run].cpage + r[e->run].pages) << 1 && !(had[e->run] & 2));
+        had[e->run] |= e->key & 1 ? 1 : 2;
+    }
+    free(had);
+}
 /* the runs are sorted, disjoint, and show what the table does over the test's range */
 static void alias_check_runs(void) {
     const GRun* r = g_hle.nvdrv.gruns;
+    alias_check_edges();
     for (u32 k = 0; k + 1 < g_hle.nvdrv.ngruns; k++) CHECK(r[k].pages && r[k].gpage + r[k].pages <= r[k + 1].gpage);
     for (u32 i = 0; i < ALIAS_PAGES; i++) {
         u64 g = (ALIAS_G >> 12) + i, c = gmmu_translate(g << 12);
@@ -984,6 +1074,20 @@ static void test_gmmu_aliases(void) {
             gmmu_unmap(ALIAS_G + g * 0x1000, n * 0x1000, 0, 0);
         }
         alias_check();
+    }
+    { /* guest pages far apart, up to the top of a guest's memory (AS_TOP), over the last GPU pages: their edges' keys
+         differ in their high bits as well, so the edges kept in order (grun_change, alias_build) are checked across
+         all of guest memory. The test's other mappings differ in their low bits only */
+        static const u64 apart[] = {0x7FFFF00000ull, ALIAS_C + 0x400000, 0x1234567000ull, 0x2000000000ull,
+                                    ALIAS_C + 0x800000, 0x40000000ull,   0x7F00000000ull, 0x3FFFFFF000ull};
+        const u32 nf = sizeof apart / sizeof *apart;
+        for (u32 k = 0; k < nf; k++) gmmu_map(ALIAS_G + (u64)(ALIAS_PAGES - 2 * nf + 2 * k) * 0x1000, apart[k], 0x2000);
+        alias_check_runs();
+        for (u32 k = 0; k < nf; k++) {
+            alias_query(apart[k], 0x2000);
+            u32 i = ALIAS_PAGES - 2 * nf + 2 * k;
+            CHECK(alias_seen.count[i] == 1 && alias_seen.count[i + 1] == 1);
+        }
     }
     gmmu_unmap(ALIAS_G, (u64)ALIAS_PAGES * 0x1000, 0, 0);
     alias_check();
@@ -1092,6 +1196,7 @@ int main(void) {
     }
     test_nvmap_as();
     test_gmmu_freed();
+    test_gmmu_later();
     test_gmmu_runs();
     test_gmmu_aliases();
     nvdrv = new_nvdrv();

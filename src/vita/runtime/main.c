@@ -46,6 +46,8 @@ static void usage(FILE* out) {
     snx_cli_help(out, vita_cli);
     fputs(
         "Vita options:\n"
+        "  --gpu-driver=NAME      The Vulkan driver package to run with (Android arm64), --freedreno-env=NAME=value;...\n"
+        "                         its Freedreno variables, as the Switch's.\n"
         "  --KEY=VALUE            A Vita debug setting: --vita-hle-trace=1 logs each import the runtime lacks (2\n"
         "                         every call), --vita-gxm-trace=1 each scene. And the Switch's --aot-threads=N:\n"
         "                         the game's code compiles on N threads (1 to 1024; the default 0: the computer's\n"
@@ -198,36 +200,40 @@ static int play(const char* folder, bool recompile, double seconds, const char* 
     }
     /* Load the game's bundled system modules before compiling. Their code shares the guest address space and
        their exports are dispatched as guest functions by NID, not replaced with fake success returns. */
-    static const char* const libraries[] = {"libc.suprx", "libfios2.suprx", "libsmart.suprx", "libult.suprx"};
+    static const struct {
+        const char* file;
+        bool deferred; /* started by the game's own sceKernelLoadStartModule, when it makes one */
+    } libraries[] = {{"libc.suprx", false},   {"libfios2.suprx", false}, {"libsmart.suprx", false},
+                     {"libult.suprx", false}, {"libfios3.suprx", false}, {"steroid.suprx", true}};
     for (unsigned i = 0; i < sizeof libraries / sizeof *libraries; ++i) {
         char path[SNX_PATH_SIZE];
-        int n = snprintf(path, sizeof path, "%s/patch/sce_module/%s", folder, libraries[i]);
+        int n = snprintf(path, sizeof path, "%s/patch/sce_module/%s", folder, libraries[i].file);
         if (n < 0 || (size_t)n >= sizeof path) continue;
         if (!snx_is_file(path)) {
-            n = snprintf(path, sizeof path, "%s/app/sce_module/%s", folder, libraries[i]);
+            n = snprintf(path, sizeof path, "%s/app/sce_module/%s", folder, libraries[i].file);
             if (n < 0 || (size_t)n >= sizeof path) continue;
         }
         if (!snx_is_file(path)) {
-            n = snprintf(path, sizeof path, "%s/sce_module/%s", folder, libraries[i]);
+            n = snprintf(path, sizeof path, "%s/sce_module/%s", folder, libraries[i].file);
             if (n < 0 || (size_t)n >= sizeof path || !snx_is_file(path)) continue;
         }
         VitaImage library;
         uint32_t variable_base = image.variable_count;
         uint32_t base = 0x71000000u + i * 0x01000000u;
         if (!vita_image_load_at(path, &library, base, variable_base, error, sizeof error)) {
-            fprintf(stderr, "scarletnx-vita: cannot load %s: %s\n", libraries[i], error);
+            fprintf(stderr, "scarletnx-vita: cannot load %s: %s\n", libraries[i].file, error);
             vita_image_free(&image);
             free(module);
             return 1;
         }
-        if (!vita_image_merge(&image, &library, error, sizeof error)) {
-            fprintf(stderr, "scarletnx-vita: cannot link %s: %s\n", libraries[i], error);
+        if (!vita_image_merge(&image, &library, libraries[i].deferred, error, sizeof error)) {
+            fprintf(stderr, "scarletnx-vita: cannot link %s: %s\n", libraries[i].file, error);
             vita_image_free(&library);
             vita_image_free(&image);
             free(module);
             return 1;
         }
-        printf("Loaded %s: %u exports, %u imports at 0x%08x\n", libraries[i], library.export_count,
+        printf("Loaded %s: %u exports, %u imports at 0x%08x\n", libraries[i].file, library.export_count,
                library.import_count, base);
         vita_image_free(&library);
     }
@@ -341,8 +347,9 @@ int snx_vita_main(int argc, char** argv) {
         if (common) continue;
         if (!strncmp(a, "--", 2) && strchr(a, '=')) {
             /* the Vita debug table's, --press-len= and --shot-every= being vita_press_len and vita_shot_every (a Switch
-               game's are g_unattended_ini's), vulkan_video (which the Vita's AVC decoder doesn't take yet), a Vulkan
-               extension's (vk_ext_*) and gamepad_map */
+               game's are g_unattended_ini's), vulkan_video (which the Vita's AVC decoder doesn't take yet), the
+               upscaler and the anti-aliasing (the presenter's, gpu/vk.c), a Vulkan extension's (vk_ext_*) and
+               gamepad_map */
             char key[64];
             const char* value = settings_arg(a, key, sizeof key);
             const IniOpt* o = NULL;
@@ -359,7 +366,11 @@ int snx_vita_main(int argc, char** argv) {
                                                : !strcmp(key, "shot_every") ? "vita_shot_every"
                                                                             : key);
                 if (!o) o = ini_find(g_debug_ini, key);
-                if (!o && !strcmp(key, "vulkan_video")) o = ini_find(g_graphics_ini, key);
+                if (!o && (!strcmp(key, "vulkan_video") || !strcmp(key, "upscaler") ||
+                           !strcmp(key, "upscaler_sharpness") || !strcmp(key, "anti_aliasing")))
+                    o = ini_find(g_graphics_ini, key);
+                /* the GPU driver package and Freedreno's variables, the Switch's settings (common/gpu/vk/gpu_driver_load.h) */
+                if (!o && (!strcmp(key, "gpu_driver") || !strcmp(key, "freedreno_env"))) o = ini_find(g_game_ini, key);
                 if (!o) o = ini_find(g_vk_extensions_ini, key); /* a Vulkan extension's, as the 3DS takes them */
             }
             if (o)

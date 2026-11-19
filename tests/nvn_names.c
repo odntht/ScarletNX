@@ -29,8 +29,8 @@ static u8 memory[4 << 20];
 u8* g_mem = memory; /* guest address a is memory + a */
 u64 g_code_lo, g_code_hi;
 const SnxNros* g_nros; /* main.c's: a game module without NROs of its own */
-int g_frames, g_opt_fps;
-int g_vi_refresh_hz = 60; /* present.c's: the display at VI_REFRESH_HZ */
+_Atomic int g_frames, g_opt_fps;
+_Atomic int g_vi_refresh_hz = 60; /* present.c's: the display at VI_REFRESH_HZ */
 
 /* the memory: a pool's storage at POOL_MEM, objects below it */
 #define POOL      0x1000u
@@ -184,6 +184,14 @@ void gmmu_space_free(u64 gva, u64 size) {
     (void)gva;
     (void)size;
 }
+/* the page table's changes the GPU thread makes later (hle/services/nvdrv.c), made at once: no page table here, and
+   a freed pool's nvmap handle goes */
+u32 gmmu_later(GmmuLaterKind kind, u64 gva, u64 cpu, u64 size, u32 nvmap) {
+    (void)gva, (void)cpu, (void)size;
+    if (kind == GMMU_LATER_FREE) nvmap_handle_drop(nvmap);
+    return 1;
+}
+void gmmu_later_post(u32 seq) { (void)seq; }
 u64 gmmu_run(u64 gva, u64 max, u64* cpu) {
     *cpu = gva;
     return max;

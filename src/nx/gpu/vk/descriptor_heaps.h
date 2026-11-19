@@ -56,46 +56,84 @@ static inline void vk_descriptor_heap_write_index_run(void* destination, uint32_
    (vk_descriptor_heap_memory_plan_fit) */
 #define VK_DESCRIPTOR_HEAP_RESOURCE_FRAME (8ull << 20)
 
+/* The slots of the lasting part of the resource heap, by kind (S5 of the draw reuse: descriptor_heaps.c's lasting):
+   the descriptors of views and of buffers that live longer than a frame, kept from one frame to the next */
+#define VK_DESCRIPTOR_HEAP_LASTING_UBO           8192u
+#define VK_DESCRIPTOR_HEAP_LASTING_SSBO          4096u
+#define VK_DESCRIPTOR_HEAP_LASTING_IMAGE         16384u
+#define VK_DESCRIPTOR_HEAP_LASTING_STORAGE_IMAGE 2048u
+#define VK_DESCRIPTOR_HEAP_LASTING_TEXEL         1024u
+#define VK_DESCRIPTOR_HEAP_LASTING_SLOTS                                                                               \
+    (VK_DESCRIPTOR_HEAP_LASTING_UBO + VK_DESCRIPTOR_HEAP_LASTING_SSBO + VK_DESCRIPTOR_HEAP_LASTING_IMAGE +             \
+     VK_DESCRIPTOR_HEAP_LASTING_STORAGE_IMAGE + VK_DESCRIPTOR_HEAP_LASTING_TEXEL)
+
 typedef struct {
     VkDeviceSize frame_size, reserved_offset, reserved_size, range_size, allocation_size, alignment;
+    VkDeviceSize lasting_offset, lasting_size; /* the lasting part, after the reserved range: 0 bytes for none */
 } VkDescriptorHeapMemoryPlan;
 /* A stable heap shares one reserved range across command buffers. Only its user range is split into frame slots.
+   The lasting part follows the reserved range, at descriptor alignment; no frame slot reaches it.
    The extra address-alignment bytes belong to the backing buffer, outside the bound heap range. */
-static inline int vk_descriptor_heap_memory_plan(VkDescriptorHeapMemoryPlan* plan, VkDeviceSize frame_size,
-                                                  uint32_t frames, VkDeviceSize reserved, VkDeviceSize heap_alignment,
-                                                  VkDeviceSize descriptor_alignment, VkDeviceSize heap_limit,
-                                                  VkDeviceSize allocation_limit) {
+static inline int vk_descriptor_heap_memory_plan_lasting(VkDescriptorHeapMemoryPlan* plan, VkDeviceSize frame_size,
+                                                  uint32_t frames, VkDeviceSize lasting, VkDeviceSize reserved,
+                                                  VkDeviceSize heap_alignment, VkDeviceSize descriptor_alignment,
+                                                  VkDeviceSize heap_limit, VkDeviceSize allocation_limit) {
     if (!plan || !frame_size || !frames || !heap_alignment || !descriptor_alignment ||
         frame_size > UINT64_MAX - descriptor_alignment + 1) return 0;
     frame_size = snx_align_up(frame_size, descriptor_alignment);
     if (frame_size > UINT32_MAX / frames) return 0; /* Indirect indices are byte offsets in32-bit words. */
     VkDeviceSize user = frame_size * frames;
-    if (reserved > UINT64_MAX - user) return 0;
-    VkDeviceSize range = user + reserved;
+    if (reserved > UINT64_MAX - user || user + reserved > UINT64_MAX - descriptor_alignment + 1) return 0;
+    VkDeviceSize range = user + reserved, lasting_offset = 0;
+    if (lasting) {
+        lasting_offset = snx_align_up(range, descriptor_alignment);
+        if (lasting > UINT32_MAX || lasting_offset > UINT32_MAX - lasting) return 0; /* indices again */
+        range = lasting_offset + lasting;
+    }
     if (range > heap_limit || range > UINT64_MAX - heap_alignment + 1 ||
         range + heap_alignment - 1 > allocation_limit) return 0;
-    *plan = (VkDescriptorHeapMemoryPlan){frame_size, user, reserved, range, range + heap_alignment - 1, heap_alignment};
+    *plan = (VkDescriptorHeapMemoryPlan){frame_size, user, reserved, range, range + heap_alignment - 1, heap_alignment,
+                                         lasting_offset, lasting};
     return 1;
 }
 
-/* Device maxima include the reserved range. Reduce the requested user range instead of rejecting a useful small
-   heap. Frame partitions retain descriptor alignment, including when the advertised heap limit is not aligned. */
-static inline int vk_descriptor_heap_memory_plan_fit(VkDescriptorHeapMemoryPlan* plan, VkDeviceSize frame_size,
-                                                      uint32_t frames, VkDeviceSize reserved, VkDeviceSize heap_alignment,
-                                                      VkDeviceSize descriptor_alignment, VkDeviceSize heap_limit,
-                                                      VkDeviceSize allocation_limit) {
+/* Device maxima include the reserved range and the lasting part. Reduce the requested user range instead of rejecting
+   a useful small heap. Frame partitions retain descriptor alignment, including when the advertised heap limit is not
+   aligned. */
+static inline int vk_descriptor_heap_memory_plan_lasting_fit(VkDescriptorHeapMemoryPlan* plan, VkDeviceSize frame_size,
+                                                      uint32_t frames, VkDeviceSize lasting, VkDeviceSize reserved,
+                                                      VkDeviceSize heap_alignment, VkDeviceSize descriptor_alignment,
+                                                      VkDeviceSize heap_limit, VkDeviceSize allocation_limit) {
     if (!frame_size || !frames || !heap_alignment || !descriptor_alignment || allocation_limit < heap_alignment - 1)
         return 0;
     VkDeviceSize range_limit = allocation_limit - (heap_alignment - 1);
     if (range_limit > heap_limit) range_limit = heap_limit;
-    if (range_limit <= reserved) return 0;
-    VkDeviceSize user_limit = range_limit - reserved;
+    VkDeviceSize fixed = reserved; /* and the lasting part with the most padding before it */
+    if (lasting && (lasting > UINT64_MAX - fixed || descriptor_alignment - 1 > UINT64_MAX - fixed - lasting)) return 0;
+    if (lasting) fixed += lasting + descriptor_alignment - 1;
+    if (range_limit <= fixed) return 0;
+    VkDeviceSize user_limit = range_limit - fixed;
     if (user_limit > UINT32_MAX) user_limit = UINT32_MAX;
     VkDeviceSize frame_limit = snx_align_down(user_limit / frames, descriptor_alignment);
     if (!frame_limit) return 0;
     if (frame_size > frame_limit) frame_size = frame_limit;
-    return vk_descriptor_heap_memory_plan(plan, frame_size, frames, reserved, heap_alignment, descriptor_alignment,
-                                           heap_limit, allocation_limit);
+    return vk_descriptor_heap_memory_plan_lasting(plan, frame_size, frames, lasting, reserved, heap_alignment,
+                                           descriptor_alignment, heap_limit, allocation_limit);
+}
+/* The same with no lasting part */
+static inline int vk_descriptor_heap_memory_plan(VkDescriptorHeapMemoryPlan* plan, VkDeviceSize frame_size,
+                                                  uint32_t frames, VkDeviceSize reserved, VkDeviceSize heap_alignment,
+                                                  VkDeviceSize descriptor_alignment, VkDeviceSize heap_limit,
+                                                  VkDeviceSize allocation_limit) {
+    return vk_descriptor_heap_memory_plan_lasting(plan, frame_size, frames, 0, reserved, heap_alignment,
+                                                  descriptor_alignment, heap_limit, allocation_limit);
+}
+static inline int vk_descriptor_heap_memory_plan_fit(VkDescriptorHeapMemoryPlan* plan, VkDeviceSize frame_size,
+                                                      uint32_t frames, VkDeviceSize reserved, VkDeviceSize heap_alignment,
+                                                      VkDeviceSize descriptor_alignment, VkDeviceSize heap_limit,
+                                                      VkDeviceSize allocation_limit) {
+    return vk_descriptor_heap_memory_plan_lasting_fit(plan, frame_size, frames, 0, reserved, heap_alignment,
+                                                      descriptor_alignment, heap_limit, allocation_limit);
 }
 /* A failed allocation changes neither the cursor nor earlier live offsets. The caller retires a frame only at an
    external draw boundary, after its fence; an allocation never submits or changes the command buffer. */
@@ -246,6 +284,22 @@ static inline int vk_descriptor_heap_table_append(uint32_t* words, uint32_t coun
     return 1;
 }
 
+/* Map a uniform buffer binding by address: the table's two words at word (8-byte aligned, as the table is) hold the
+   buffer's device address, which the shader reads through the address push data names (vk_cb_addr_mask). No
+   descriptor is written for it, and the read has no range: only reads the binding covers whole may go this way */
+static inline int vk_descriptor_heap_address_mapping(VkDescriptorSetAndBindingMappingEXT* mapping, uint32_t set,
+                                                     uint32_t binding, uint32_t word) {
+    if (!mapping || set >= 5 || (word & 1u) || word > UINT32_MAX / 4) return 0;
+    *mapping = (VkDescriptorSetAndBindingMappingEXT){
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT,
+        .descriptorSet = set, .firstBinding = binding, .bindingCount = 1,
+        .resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT,
+        .source = VK_DESCRIPTOR_MAPPING_SOURCE_INDIRECT_ADDRESS_EXT,
+        .sourceData.indirectAddress = {.pushOffset = VK_DESCRIPTOR_HEAP_PUSH_OFFSET + 8 * set,
+                                       .addressOffset = 4 * word}};
+    return 1;
+}
+
 /* Map one existing binding to separate byte-index arrays. Byte strides preserve exact per-type packing and avoid
    the20-bit image/12-bit sampler limit of combined packed indices. The actual index must respect its type alignment. */
 static inline int vk_descriptor_heap_binding_mapping(VkDescriptorSetAndBindingMappingEXT* mapping,
@@ -301,10 +355,11 @@ void vk_descriptor_heaps_destroy(void);
 void vk_descriptor_heaps_layout(VkDescriptorSetLayout layout, const VkDescriptorSetLayoutBinding* bindings,
                                  uint32_t count);
 /* The caller owns maps through pipeline creation. Attach mapping info to the corresponding shader stage. */
+/* cb_addr: the constant buffer slots mapped by address (vk_cb_addr_mask), which the writes must take the same way */
 uint32_t vk_descriptor_heaps_mapping(VkDescriptorSetLayout layout, uint32_t set,
-                                      VkDescriptorSetAndBindingMappingEXT* maps, uint32_t capacity);
+                                      VkDescriptorSetAndBindingMappingEXT* maps, uint32_t capacity, uint32_t cb_addr);
 VkDescriptorSet vk_descriptor_heaps_write(VkDescriptorSetLayout layout, uint32_t count,
-                                           const VkWriteDescriptorSet* writes);
+                                           const VkWriteDescriptorSet* writes, uint32_t cb_addr);
 void vk_descriptor_heaps_bind(VkCommandBuffer cb, uint32_t first, uint32_t count, const VkDescriptorSet* sets);
 /* Writes returnNULL on exhaustion. The renderer retries the whole draw with its legacy backend; no write submits.
    Reset only after the slot's GPU work completes and its command pool is reset. */
@@ -317,13 +372,37 @@ typedef struct {
     uint64_t image_requests, image_driver_calls, image_hits, image_evictions, image_lookups, image_replicas;
     uint64_t sampler_requests, sampler_driver_calls, sampler_hits, sampler_evictions, sampler_lookups, sampler_replicas;
     uint64_t address_queries, peak_used_bytes;
+    uint64_t cb_addresses; /* constant buffers written by their address, with no descriptor (vk_cb_addr_mask) */
     uint64_t arena_allocated_bytes, cache_allocated_bytes, reserved_bytes, resource_range_bytes, sampler_range_bytes;
     uint64_t buffer_native_calls; /* API invocations; buffer_driver_calls remains encoded-element count. */
+    /* The lasting part: descriptors found there, made there, forgotten with their object, given back once no
+       frame's table can name them, taken back from an object that still lives, not made for want of a slot, made again
+       and compared (draw_state_check=1) and found different. The walks over the slots waiting to be freed, those
+       skipped while no slot could be, and the slots the walks looked at */
+    uint64_t lasting_hits, lasting_made, lasting_forgotten, lasting_freed, lasting_evicted, lasting_full;
+    uint64_t lasting_checked, lasting_differs, lasting_bytes;
+    /* The words a table took from the stage's last table with no lookup, and those that
+       draw_state_check=1 found again and compared, and found different */
+    uint64_t memo_kept, memo_checked, memo_differs;
+    uint64_t lasting_reaps, lasting_reaps_skipped, lasting_reap_looked;
 } VkDescriptorHeapStats;
 /* Counters are monotonic. Requests/payload include every logical element. On successful runs, requests equal
    lookups+replicas; sampler hits may overlap driver calls when byte interning follows native encoding.
    Memory values describe physical allocations of device memory, reserved ranges and CPU cache storage. */
 void vk_descriptor_heaps_get_stats(VkDescriptorHeapStats* stats);
+
+/* The lasting part: the descriptors of views and of the buffers named here live from frame to frame,
+   found by their object's handle. vk_descriptor_heaps_lasting names a buffer that lives longer than a frame (a buffer
+   of the buffer cache's own, a page-cache region or slab, a guest memory import), never a ring's. Each destroy of a
+   view or of a named buffer calls vk_descriptor_heaps_forget_* before vkDestroy*: its entries leave the table at once,
+   so an object made later with the same handle finds none, and their bytes are used again once no frame's table can
+   name them. Any thread: without vk_lock the forget waits in a queue that every lookup empties first */
+void vk_descriptor_heaps_lasting(VkBuffer buffer);
+void vk_descriptor_heaps_forget_buffer(VkBuffer buffer);
+void vk_descriptor_heaps_forget_view(VkImageView view);
+/* the forgets so far, in any descriptor mode: a descriptor set kept by the handles its writes name holds while it
+   stays the same, as a destroy in the middle of a frame lets a new object of the same handle come */
+uint64_t vk_descriptor_heaps_forgets(void);
 
 /* Any legacy descriptor or push command invalidates heap state across both bind points. */
 void vk_descriptor_heaps_invalidate(void);

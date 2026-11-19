@@ -7,11 +7,13 @@
 
 /* Every page under 2^40 (all GPU and guest addresses) in a two-level table like the GMMU's: leaves of 4096 pages
    (16 MiB) made at the first write in them, each with its latest generation so a lookup skips the leaves nothing wrote
-   since. Zeroed is empty. Writers are serialized by the caller; readers take no lock (write_pages.c) */
+   since, and a stamp for each group of 64 pages written whole so a wide range stores one stamp a group. Zeroed is
+   empty. Writers are serialized by the caller; readers take no lock (write_pages.c) */
 typedef struct WritePageLeaf WritePageLeaf;
 typedef struct {
-    WritePageLeaf* leaf[1u << 16];
-    u64 overflow; /* the latest write the table couldn't hold (out of range, no memory), read as covering every page */
+    WritePageLeaf* _Atomic leaf[1u << 16];
+    _Atomic u64
+        overflow; /* the latest write the table couldn't hold (out of range, no memory), read as covering every page */
 } WritePages;
 void write_pages_stamp(WritePages* t, u64 a, u64 size, u64 gen);
 /* nonzero if a page of [a,a+size) was stamped with a generation after since */
@@ -19,5 +21,7 @@ int write_pages_since(const WritePages* t, u64 since, u64 a, u64 size);
 /* fn(ctx, at, n) for each run of [a,a+size) on pages stamped after since, in order, clipped to the range: pages that
    touch make one run. The whole range at once where the overflow stands for every page */
 void write_pages_runs(const WritePages* t, u64 since, u64 a, u64 size, void (*fn)(void* ctx, u64 at, u64 n), void* ctx);
+/* the newest generation stamped on a page of [a,a+size), the overflow's where it is newer; 0 for none */
+u64 write_pages_newest(const WritePages* t, u64 a, u64 size);
 
 #endif

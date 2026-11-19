@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 const IniOpt* ini_find(const IniOpt* table, const char* key) {
     for (; table->key; ++table)
@@ -116,10 +117,10 @@ void ini_read(const IniOpt* o, const char* v) {
     if (d > o->hi) d = o->hi;
     /* atomic: other threads read some of the settings while a reload writes them (the GPU thread's vsync) */
     if (o->type == INI_INT)
-        __atomic_store_n((int*)o->var, (int)d, __ATOMIC_RELAXED);
+        atomic_store_explicit((_Atomic int*)o->var, (int)d, memory_order_relaxed);
     else {
         float f = (float)d;
-        __atomic_store((float*)o->var, &f, __ATOMIC_RELAXED);
+        atomic_store_explicit((_Atomic float*)o->var, f, memory_order_relaxed);
     }
     /* clamped, an int's whole part, or a number with something after it */
     if (ini_check(o, v, why, sizeof why)) say(o, v);
@@ -168,10 +169,10 @@ int ini_changed(const IniOpt* table, int flags, char* out, size_t n) {
         } else {
             double def = strtod(table->def, NULL);
             if (table->type == INI_INT)
-                same = __atomic_load_n((const int*)table->var, __ATOMIC_RELAXED) == (int)def;
+                same = atomic_load_explicit((_Atomic const int*)table->var, memory_order_relaxed) == (int)def;
             else {
                 float f;
-                __atomic_load((const float*)table->var, &f, __ATOMIC_RELAXED);
+                f = atomic_load_explicit((_Atomic const float*)table->var, memory_order_relaxed);
                 same = f == (float)def;
             }
             ini_format(table, value, sizeof value);
@@ -392,6 +393,13 @@ static const struct {
                       {"astc_background_threads", "astc_background's CPU threads are gone: the GPU encodes alone"},
                       {"press", "now script, whose press_at:press is the same press"},
                       {"press_at", "now script, whose press_at:press is the same press"},
+                      {"vk_defrag", "the renderer always defragments a discrete GPU's memory, and never another's"},
+                      {"vk_heap_budget_mb", "went with no replacement: it was for tests of a GPU with less memory"},
+                      {"vk_nv_dedicated_allocation_image_aliasing",
+                       "the renderer no longer uses the extension: it lost the GPU on NVIDIA's driver"},
+                      {"ctr_separate_windows", "now ctr_screen_layout=4"},
+                      {"mesh_draws", "the mesh draws are on where the driver has VK_EXT_mesh_shader and no ban holds: "
+                                     "vk_ext_mesh_shader=off skips them"},
                       {NULL, NULL}};
 const char* ini_deprecated(const char* k) {
     int i;
@@ -411,7 +419,7 @@ const char* ini_renamed(const char* k) {
 void ini_deprecated_head(FILE* f) {
     fprintf(f,
             "\n[Deprecated]\n; keys an older version used, which do nothing now (docs/user/deprecations.md): delete them, "
-            "or use Settings > App >\n;   Clean Old Settings in the launcher\n");
+            "or use Clean Old Settings\n;   in the game's menu or the launcher's Settings > App\n");
 }
 void ini_deprecated_key(FILE* f, const char* key, const char* value) {
     fprintf(f, "; %s: %s\n%s=%s\n", key, ini_deprecated(key), key, value);
@@ -425,8 +433,8 @@ int ini_deprecated_note(char* out, size_t size, const char* path, const char* co
     for (i = 0; i < n && at < size; i++) at += (size_t)snprintf(out + at, size - at, "%s%s", i ? ", " : "", keys[i]);
     if (at < size)
         snprintf(out + at, size - at,
-                 "), under [Deprecated]: delete %s, or use Settings > App > Clean Old Settings in "
-                 "the launcher",
+                 "), under [Deprecated]: delete %s, or use Clean Old Settings in the game's menu or the "
+                 "launcher's Settings > App",
                  n > 1 ? "them" : "it");
     return 1;
 }

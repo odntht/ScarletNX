@@ -35,15 +35,9 @@ static inline int plat_cpu_count(void) {
 /* the host for the log's header, so a report needn't describe it: "<OS and version>, <CPU>, <n> threads, <n> GB RAM",
    the CPU left out where the host doesn't name it. Nothing that names the machine or its user */
 void plat_system_info(char* out, size_t cap);
-/* C11's _Noreturn, which C99 code (it includes this) has not */
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-#define SNX_NORETURN _Noreturn
-#else
-#define SNX_NORETURN
-#endif
 /* Ends the process with code at once: stdio is flushed, but atexit handlers don't run and other threads are left
    where they are */
-SNX_NORETURN void plat_exit_now(int code);
+[[noreturn]] void plat_exit_now(int code);
 
 /* ---- power */
 /* Whether the host runs from its charger: 1 plugged in, 0 on its battery, -1 when that cannot be read. Call it on the
@@ -90,7 +84,8 @@ int plat_vm_commit(u8* p, u64 size);       /* readable and writable; 0, or -1 */
 void plat_vm_decommit(u8* p, u64 size);    /* inaccessible again, and zero when committed next */
 /* committed [p, p + size) becomes the pages of fd (a buffer a GPU shares, that large), shared, readable and writable,
    holding what it held; and back to fresh private pages holding what it held. 0; -1 with p as it was (ENOSYS but on
-   Linux and Android); -2 when p couldn't be put back either. The caller keeps writers out meanwhile (plat_freeze) */
+   Linux and Android); -3 with p on fresh private pages holding what it held, not fd's; -2 when p couldn't be put back
+   either. The caller keeps writers out meanwhile (plat_freeze) */
 int plat_vm_share(u8* p, int fd, u64 size);
 int plat_vm_unshare(u8* p, u64 size);
 /* A buffer of size bytes a GPU takes in place, which guest memory moves into where the driver can't import host
@@ -99,6 +94,12 @@ int plat_vm_unshare(u8* p, u64 size);
    memory (the tests' way). 0, or -1 with errno (ENOSYS elsewhere, and on Android before 8) */
 int plat_gpu_buffer(u64 size, int* fd, void** handle);
 void plat_gpu_buffer_free(int fd, void* handle, u64 size);
+/* Linux: a dma-buf of all size bytes of plat_gpu_buffer's memfd fd, from /dev/udmabuf, which the driver imports with no
+   per-submission cost (a host-memory import of amdgpu's has its pages faulted in again at each). The dma-buf pins the
+   pages: nothing may punch the memfd while it lives. The descriptor, or -1 with errno (ENODEV without the device,
+   ENOSYS elsewhere). plat_dmabuf_limit: the bytes one may hold (udmabuf's size_limit_mb), 0 when there are none */
+int plat_gpu_buffer_dmabuf(int fd, u64 size);
+u64 plat_dmabuf_limit(void);
 /* What of the process lies in its address space's [lo, hi) and is not the guest's: a mapping with a name (a file, a
    device, a named anonymous mapping such as ART's or the allocator's, a memfd other than the alias pool's) that own
    does not claim (own(a, b): 1 when [a, b) is the caller's; NULL claims none), and a run that nothing maps, which any
@@ -117,8 +118,8 @@ int plat_ww_scan(u8* p, u64 size, void (*cb)(u8* p, u64 size));
 /* [p, p + size) of the reservation is about to be written by the kernel (a system call given guest memory to fill),
    which the protection plat_ww_scan uses on some hosts would fail with EFAULT: the pages open, written, and no scan
    protects them again until plat_ww_close with the same range, after the call. A range being moved (plat_freeze)
-   waits for the move first. Nothing to do where the kernel's writes are tracked as they come (Linux's userfaultfd,
-   Windows' write watch) */
+   waits for the move first, but on the thread that moves it, whose write is the move's. Nothing to do where the
+   kernel's writes are tracked as they come (Linux's userfaultfd, Windows' write watch) */
 void plat_ww_open(u8* p, u64 size);
 void plat_ww_close(u8* p, u64 size);
 /* Hot pages (write_tracking_hot=1, with page protection only): a page the scans found written in a row is left
@@ -155,7 +156,8 @@ void plat_vm_fd_close(int fd);
 int plat_vm_files(u8* base, u64 size, const char* dir);
 /* the file slot under p: 1 with its descriptor and p's offset in its file (either may be NULL), or 0 */
 int plat_vm_files_slot(const u8* p, int* fd, u64* off);
-/* copies between host memory and the pool: 0, or -1 */
+/* copies between host memory and the pool: 0, or -1 with errno (ENXIO for a read past the pool's end). A read into the
+   reservation is the kernel's write to guest memory, which it opens and closes itself (plat_ww_open) */
 int plat_alias_write(u64 off, const void* src, u64 size);
 int plat_alias_read(u64 off, void* dst, u64 size);
 void plat_alias_free(u64 off, u64 size); /* the range reads as zero again and uses no memory */

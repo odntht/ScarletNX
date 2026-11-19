@@ -12,6 +12,7 @@
 #include "common/utilities/common.h"
 #include "common/platform/time.h"
 #include "common/utilities/pad_sdl.h"
+#include "gui/icons.h"
 #include <SDL3/SDL.h>
 #if (defined(__FreeBSD__) || defined(__linux__)) && !defined(__ANDROID__)
 #include <dirent.h>
@@ -20,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 /* HD rumble (hd_play): each pad's last report and when it went. SDL's HIDAPI driver writes a raw effect at once. Over
    Bluetooth, a controller that gets a report less than 30 ms after the last one can turn off, and its actuators stop
@@ -48,7 +50,7 @@ static struct {
     char names[SNX_GAMEPADS][64]; /* theirs, for the game's menu, which the renderer draws on its thread */
     u32 names_version;            /* their changes, under ui_lock */
     int labels[SNX_GAMEPADS][4], symmetric[SNX_GAMEPADS]; /* and how its button map screen draws them */
-    unsigned held[SNX_GAMEPADS];                          /* the controls each holds, a bit each, as last polled */
+    _Atomic unsigned held[SNX_GAMEPADS];                  /* the controls each holds, a bit each, as last polled */
     int left_type[SNX_GAMEPADS]; /* gamepad_assign=1: the type of the pad a player is kept for (connect.h) */
     int console_paused;          /* gamepad_assign=1: the game paused for a controller that left */
     int console_was;             /* gamepad_assign at gamepad_console's last poll */
@@ -95,9 +97,8 @@ void gamepad_map_set(const IniOpt* o, const char* v) {
 }
 /* which player a key gamepad_p<N>_... is */
 static int player_of(const IniOpt* o) { return o->key[sizeof "gamepad_p" - 1] - '1'; }
-typedef char players_counted[sizeof g_settings.player_connected / sizeof *g_settings.player_connected == SNX_GAMEPADS
-                                 ? 1
-                                 : -1];
+static_assert(sizeof g_settings.player_connected / sizeof *g_settings.player_connected == SNX_GAMEPADS,
+              "a player_connected setting for each gamepad");
 /* a player's map, as gamepad_map's: none ("") is gamepad_map's; one that cannot be read is said, and changes nothing */
 void gamepad_player_map_set(const IniOpt* o, const char* v) {
     SnxPlayerConfig* p = &g_gamepad.players[player_of(o)];
@@ -168,9 +169,9 @@ unsigned gamepad_held(int i) {
     int k;
     for (k = 0; k < SNX_GAMEPADS; k++)
         if (i < 0)
-            held |= __atomic_load_n(&g_gamepad.held[k], __ATOMIC_RELAXED);
+            held |= atomic_load_explicit(&g_gamepad.held[k], memory_order_relaxed);
         else if (g_gamepad.names[k][0] && !i--)
-            return __atomic_load_n(&g_gamepad.held[k], __ATOMIC_RELAXED);
+            return atomic_load_explicit(&g_gamepad.held[k], memory_order_relaxed);
     return held;
 }
 u32 gamepad_names_version(void) { return g_gamepad.names_version; }
@@ -323,6 +324,8 @@ static unsigned busy(void) {
     for (i = 0; i < SNX_GAMEPADS; i++) b |= (unsigned)(g_gamepad.pads[i] != NULL) << i;
     return b;
 }
+/* a controller's notification, after the icon of the launcher's Controllers. Under ui_lock */
+static void pad_toast(const char* text, u64 now_ns) { overlay_toast(gui_group_icon("Controllers"), text, now_ns); }
 void gamepad_open(u32 id) {
     int i;
     char guid[33];
@@ -380,7 +383,7 @@ void gamepad_open(u32 id) {
     if (g_settings.controller_assignment) { /* as Eden's hints: which controller joined, and as which player */
         char said[96];
         snprintf(said, sizeof said, "P%d: %s joined", i + 1, g_gamepad.names[i]);
-        overlay_toast(said, plat_ns());
+        pad_toast(said, plat_ns());
     }
     ui_unlock();
 }
@@ -397,7 +400,7 @@ void gamepad_close(u32 id) {
                 char said[96];
                 connect_leave(i, plat_ns());
                 snprintf(said, sizeof said, "P%d: %s left", i + 1, g_gamepad.names[i]);
-                overlay_toast(said, plat_ns());
+                pad_toast(said, plat_ns());
             }
             g_gamepad.names[i][0] = 0;
             ++g_gamepad.names_version;
@@ -449,7 +452,7 @@ void gamepad_console(int plus, u64 now_ns) {
     }
     if (notice[0]) { /* the pause's, kept while it lasts */
         ui_lock();
-        overlay_toast(notice, now);
+        pad_toast(notice, now);
         ui_unlock();
     }
     if (freed) gamepad_open_waiting(); /* a player no longer kept: a waiting ninth takes it */
@@ -503,6 +506,26 @@ u64 gamepad_button(u32 id, int button) {
     for (slot = 0; slot < SNX_GAMEPADS && g_gamepad.pads[slot] != g; slot++) {}
     map_of(slot < SNX_GAMEPADS ? slot : -1, &map);
     return map.bit[control] < 0 ? 0 : 1ull << map.bit[control];
+}
+int gamepad_sends_name(u32 id, int bit, char* out, size_t size) {
+    SDL_Gamepad* g = SDL_GetGamepadFromID(id);
+    int labels[4], control, slot, type;
+    SnxPadMap map;
+    if (!size) return 0;
+    out[0] = 0;
+    if (!g) return 0;
+    type = SDL_GetGamepadType(g);
+    if (type == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT || type == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT) {
+        snprintf(out, size, "%s", snx_pad_button_name(bit));
+        return 1;
+    }
+    for (slot = 0; slot < SNX_GAMEPADS && g_gamepad.pads[slot] != g; slot++) {}
+    map_of(slot < SNX_GAMEPADS ? slot : -1, &map);
+    control = snx_pad_map_find(&map, bit);
+    if (control < 0) return 0;
+    snx_pad_labels(g, labels);
+    snprintf(out, size, "%s", snx_pad_control_name(control, labels));
+    return 1;
 }
 int gamepad_slot_type(int slot) {
     if (slot < 0 || slot >= SNX_GAMEPADS || !g_gamepad.pads[slot]) return SDL_GAMEPAD_TYPE_UNKNOWN;
@@ -582,7 +605,7 @@ void gamepad_state(u64* buttons, i32 sticks[4]) {
         if (g)
             for (c = 0; c < SNX_PAD_CONTROLS; c++)
                 if (snx_pad_held(g, c)) held |= 1u << c;
-        __atomic_store_n(&g_gamepad.held[i], held, __ATOMIC_RELAXED); /* the renderer's thread draws them */
+        atomic_store_explicit(&g_gamepad.held[i], held, memory_order_relaxed); /* the renderer's thread draws them */
         if (!g) continue;
         gamepad_state_slot(i, &one, axes);
         b |= one;

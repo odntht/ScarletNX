@@ -69,6 +69,7 @@ ARTIFACTS = {
     'ScarletNX-linux-riscv64-{short}.AppImage': 'ScarletNX-linux-riscv64.AppImage',
     'ScarletNX-linux-loongarch64-{short}.AppImage': 'ScarletNX-linux-loongarch64.AppImage',
     'ScarletNX-windows-x86_64-{short}': 'ScarletNX-windows-x86_64.zip',
+    'ScarletNX-windows-aarch64-{short}': 'ScarletNX-windows-aarch64.zip',
     'ScarletNX-android-universal-{short}.apk': 'ScarletNX-android-universal.apk',
     'ScarletNX-macos-arm64-{short}.zip': 'ScarletNX-macos-arm64.zip',
     'ScarletNX-ios-arm64-{short}.ipa': 'ScarletNX-ios-arm64.ipa',
@@ -80,13 +81,16 @@ OPTIONAL = {
     'ScarletNX-linux-ppc64.AppImage',
     'ScarletNX-linux-riscv64.AppImage',
     'ScarletNX-linux-loongarch64.AppImage',
+    'ScarletNX-windows-aarch64.zip',
     'ScarletNX-macos-arm64.zip',
     'ScarletNX-ios-arm64.ipa',
 }
-# The packages only a run a nightly can come of builds (build.yml's appimage-cross): a pull request's notes leave them
-# out, where a nightly's say they were not built. tests/publish_builds_test.py holds them to build.yml
+# The packages only a run a nightly can come of makes (build.yml's appimage-cross, which bundles none on a pull
+# request): a pull request's notes leave them out, where a nightly's say they were not built.
+# tests/publish_builds_test.py holds them to build.yml
 NIGHTLY_ONLY = {
     'ScarletNX-linux-ppc64le.AppImage',
+    'ScarletNX-linux-ppc64.AppImage',
     'ScarletNX-linux-riscv64.AppImage',
     'ScarletNX-linux-loongarch64.AppImage',
 }

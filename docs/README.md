@@ -41,7 +41,7 @@ keeps audits and measurements as they were taken.
 - [Profiling](dev/profiling.md): a walkthrough of the CPU and GPU profilers for a recompiled game, and how to read them
 - [Architecture](dev/architecture.md): AArch64 to a native module, the runtimes' boundaries and what each owns
 - [The recompiler as a library](dev/library.md): building, using and the limits of `libscarletnx-recompiler`
-- [edenprobe](dev/edenprobe.md): the hardware probes CI runs against a baseline
+- [Amberlith](dev/edenprobe.md) (edenprobe): the hardware probes CI runs against a baseline
 - [Coverage](dev/coverage.md): which of the runtime's code edenprobe, the tests and a game run, and the paths none of them reach
 - [Status and roadmap](dev/roadmap.md): what is next
 - [The CPU cost of a draw](dev/draw-cost.md): the plan to cut the GPU thread's work for each draw
@@ -91,6 +91,8 @@ keeps audits and measurements as they were taken.
     and the optimized pipeline made after them
   - [Driver quirks](layers/gpu/driver-quirks.md): what each GPU driver gets wrong, where that is known from, and how
     the renderer works around it
+  - [GPU clocks](layers/gpu/gpu-clocks.md): the GPU's clocks held up while a game runs (`gpu_pstate`), the way on
+    each system and why some have none
   - [ASTC compute uploads](layers/gpu/astc.md)
   - [Block linear surfaces and texture conversions on the GPU](layers/gpu/blocklinear.md)
   - [BCn without BCn: ETC2 and EAC on phone GPUs](layers/gpu/bcn.md)

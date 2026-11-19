@@ -6,6 +6,7 @@
    green one, so a quad drawn from the wrong vertices shows red, and a strip that takes its restart index (2, the red
    quad's top right corner) for a vertex draws a second triangle with red in it */
 #include <math.h>
+#include "nx/gpu/vk/quad_indices.h"
 
 /* a program at address of count instructions (a scheduling word before every three), a fragment program's header
    taking a screen-linear RGBA input when fragment is set, or one with perspective when it is 2 */
@@ -35,10 +36,10 @@ static int index_pixels(u64 target, IndexPixels* px) {
     VkBuffer buffer;
     u8* data = vk_readback_buffer(64, &buffer);
     CHECK(surface && data);
-    vk_surf_use(vk_cmd(), surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+    vk_surf_use(vk_cmd(), surface, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                 VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {4, 4, 1}};
-    rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
+    rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), buffer, 1, &copy);
     vk_finish();
     vk_readback_ready();
     *px = (IndexPixels){0};
@@ -82,10 +83,10 @@ static int index_first_pixel(u64 target, u8 out[4]) {
         vk_unlock();
         return -1;
     }
-    vk_surf_use(vk_cmd(), surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+    vk_surf_use(vk_cmd(), surface, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                 VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {4, 4, 1}};
-    rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
+    rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), buffer, 1, &copy);
     vk_finish();
     vk_readback_ready();
     memcpy(out, data, 4);
@@ -180,6 +181,58 @@ static int index_list_restart_cases(GpuChannel* channel, u64 target, u64 indices
     return 0;
 }
 
+/* Quads and quad strips from indices of each size made into triangles on the GPU (texconv's TC_INDEX_QUADS, for
+   indices the CPU can't read) against quad_indices.h's, which the CPU makes: the same six indices a quad, for the first
+   and the last vertex provoking */
+static int index_quads_gpu_cases(void) {
+    static const u32 idx[10] = {7, 300, 2, 9, 70000, 5, 0xFE, 1, 65535, 3};
+    vk_lock();
+    for (u32 isz = 1; isz <= 4; isz *= 2)
+        for (u32 flags = 0; flags < 4; flags++) {
+            u8 in[40] = {0}, want[4 * 24];
+            for (u32 j = 0; j < 10; j++)
+                for (u32 b = 0; b < isz; b++) in[isz * j + b] = (u8)(idx[j] >> (8 * b));
+            int strip = (flags & 2) != 0, last = flags & 1;
+            u32 nq = snx_quads_of(10, strip);
+            CHECK(snx_quad_indices(in, isz, 10, strip, last, 0, 0, want) == nq);
+            VkBuffer src, out, rb;
+            u64 at, oat;
+            u8* staged = vk_stage(40, vk_stage_align(), &src, &at);
+            CHECK(staged && vk_stage_output((u64)nq * 24, vk_stage_align(), &out, &oat, NULL));
+            memcpy(staged, in, sizeof in);
+            vk_render_end();
+            CHECK(vk_tc_index(vk_cmd(), TC_INDEX_QUADS, isz, flags, nq, src, at, 10 * isz, out, oat, (u64)nq * 24));
+            VkMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                  .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                  .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                                  .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                                  .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+            VkDependencyInfo d = {
+                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &b};
+            rec_CmdPipelineBarrier2(vk_cmd(), &d);
+            u8* data = vk_readback_buffer((u64)nq * 24, &rb);
+            CHECK(data);
+            VkBufferCopy c = {oat, 0, (u64)nq * 24};
+            rec_CmdCopyBuffer(vk_cmd(), out, rb, 1, &c);
+            vk_finish();
+            vk_readback_ready();
+            if (memcmp(data, want, (size_t)nq * 24)) {
+                for (u32 k = 0; k < nq * 6; k++)
+                    if (snx_ld_le32(data + 4 * k) != snx_ld_le32(want + 4 * k)) {
+                        fprintf(stderr,
+                                "GPU %s of %u-byte indices, %s vertex provoking: index %u is %u, the CPU's %u\n",
+                                strip ? "quad strip" : "quads", isz, last ? "last" : "first", k,
+                                snx_ld_le32(data + 4 * k), snx_ld_le32(want + 4 * k));
+                        break;
+                    }
+                vk_unlock();
+                return 1;
+            }
+        }
+    vk_unlock();
+    return 0;
+}
+
 static int index_cases(GpuChannel* channel, u64 target, u64 indices) {
     IndexPixels px;
     const u32 quad[5] = {9, 4, 5, 6, 7}, quad0[4] = {0, 1, 2, 3}, strip[5] = {4, 5, 7, 2, 4};
@@ -199,6 +252,16 @@ static int index_cases(GpuChannel* channel, u64 target, u64 indices) {
         CHECK(!index_draw(channel, target, &call, &px));
         CHECK(index_all_green(&px));
     }
+    /* indexed quads whose restart index (9) cuts the first short after two red corners: the green quad alone, where
+       taking 9 for a vertex drew one quad of the red corners, 9 and green 4. The cut comes first: a red quad after the
+       green one is not drawn over it */
+    const u32 quad_cut[7] = {0, 1, 9, 4, 5, 6, 7};
+    CHECK(!index_buffer(channel, indices, quad_cut, 7, 2, 9));
+    call = (DrawCall){.topology = 7, .indexed = 1, .count = 7, .instances = 1};
+    CHECK(!index_draw(channel, target, &call, &px));
+    if (!index_all_green(&px)) fprintf(stderr, "quads restarting at 9: %u green, %u red\n", px.green, px.red);
+    CHECK(index_all_green(&px));
+    channel->r3d[0x591] = 0;
     /* inline indices: quads, and a strip with its restart index */
     call = (DrawCall){.topology = 7, .indexed = 3, .first = 1, .count = 4, .instances = 1, .inline_indices = quad};
     CHECK(!index_draw(channel, target, &call, &px));
@@ -699,7 +762,7 @@ static int minmax_fragment_case(GpuChannel* channel, u64 target, u64 address) {
             if (!ok)
                 fprintf(stderr, "min/max %s: the %s of a texel of 0 and one of 1 reads red %u, not %u\n",
                         device ? "by the device's sampler" : "in a fragment program",
-                        reduction == 1 ? "least" : "greatest", first[0], reduction == 1 ? 0 : 255);
+                        reduction == 1 ? "least" : "greatest", first[0], reduction == 1 ? 0u : 255u);
         }
     }
     g_vk.feat12.samplerFilterMinmax = had;
@@ -1118,10 +1181,10 @@ static int shadow_map_depth(u64 map, float* depth) {
     VkBuffer buffer;
     u8* data = vk_readback_buffer(4, &buffer);
     CHECK(surface && data);
-    vk_surf_use(vk_cmd(), surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+    vk_surf_use(vk_cmd(), surface, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                 VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, .imageExtent = {1, 1, 1}};
-    rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
+    rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), buffer, 1, &copy);
     vk_finish();
     vk_readback_ready();
     memcpy(depth, data, 4);
@@ -1486,12 +1549,12 @@ static int own_target_case(GpuChannel* channel, u64 target, u64 address, int cli
         ok = staged != NULL;
         if (ok) {
             memcpy(staged, initial, sizeof initial);
-            vk_surf_use(vk_cmd(), surface, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+            vk_surf_use(vk_cmd(), surface, VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                         VK_ACCESS_2_TRANSFER_WRITE_BIT);
             VkBufferImageCopy region = {.bufferOffset = offset,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                         .imageExtent = {4, 4, 1}};
-            rec_CmdCopyBufferToImage(vk_cmd(), upload, surface->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            rec_CmdCopyBufferToImage(vk_cmd(), upload, surface->img, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &region);
             vk_surf_wrote(surface);
             vk_rt_drawn(surface);
             vk_surf_touch(surface);
@@ -1503,11 +1566,11 @@ static int own_target_case(GpuChannel* channel, u64 target, u64 address, int cli
             data = vk_readback_buffer(64, &readback);
         }
         if (ok && data) {
-            vk_surf_use(vk_cmd(), surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+            vk_surf_use(vk_cmd(), surface, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                         VK_ACCESS_2_TRANSFER_READ_BIT);
             VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                       .imageExtent = {4, 4, 1}};
-            rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
+            rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), readback, 1, &copy);
             vk_finish();
             vk_readback_ready();
             memcpy(out, data, sizeof out);
@@ -1560,11 +1623,11 @@ static int feedback_upload(u64 target, const u8* pixels) {
     u8* staged = surface ? vk_stage(64, 4, &upload, &offset) : NULL;
     if (!staged) return 0;
     memcpy(staged, pixels, 64);
-    vk_surf_use(vk_cmd(), surface, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+    vk_surf_use(vk_cmd(), surface, VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                 VK_ACCESS_2_TRANSFER_WRITE_BIT);
     VkBufferImageCopy region = {
         .bufferOffset = offset, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {4, 4, 1}};
-    rec_CmdCopyBufferToImage(vk_cmd(), upload, surface->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    rec_CmdCopyBufferToImage(vk_cmd(), upload, surface->img, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &region);
     vk_surf_wrote(surface);
     vk_rt_drawn(surface);
     vk_surf_touch(surface);
@@ -1719,11 +1782,11 @@ static int feedback_interval_case(GpuChannel* channel, u64 target, u64 address) 
         }
         Surf* surface = vk_rt_find(read);
         if (ok && data && surface) {
-            vk_surf_use(vk_cmd(), surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+            vk_surf_use(vk_cmd(), surface, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                         VK_ACCESS_2_TRANSFER_READ_BIT);
             VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                       .imageExtent = {4, 4, 1}};
-            rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
+            rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), readback, 1, &copy);
             vk_finish();
             vk_readback_ready();
             memcpy(out, data, sizeof out);
@@ -1842,6 +1905,7 @@ static int check_index_draws(void) {
         r[0x7c0 + stream * 2] = (u32)((source + 8 * 16 - 1) >> 32);
         r[0x7c1 + stream * 2] = (u32)(source + 8 * 16 - 1);
     }
+    CHECK(!index_quads_gpu_cases());
     int had8 = g_vk.has_index8;
     CHECK(!index_cases(channel, target, indices));
     g_vk.has_index8 = 0; /* the widening on the GPU, which a device without 8-bit indices takes */

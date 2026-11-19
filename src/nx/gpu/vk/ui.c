@@ -2,7 +2,8 @@
    Copyright 2026 the ScarletNX contributors */
 /* The on-screen controls, the game's menu (runtime/platform/ui.h) and the shader loading screen before the game
    (runtime/platform/prepare_screen.h) over a presented frame: the quads they give, drawn opaque in the window's one
-   pass (vk_ui_present), after the frame's own quad and before the present. Nothing is recorded while none shows.
+   pass (vk_ui_present), after the frame's own quad and before the present, but for a notification's line fading in or
+   out (ui_fade_set), blended at its alpha in the same pass. Nothing is recorded while none shows.
 
    Each quad is an instance, its SnxUiQuad (20 bytes) as it is, whose corners the vertex shader makes: the CPU writes no
    vertices. The instances stay in a buffer on the device from frame to frame, and a frame copies into it only the
@@ -43,7 +44,7 @@ static DevMem g_glyphs_mem;
 #define UI_RING_BYTES SNX_UI_RING_MAX
 /* ui.vert's push constants: its Picture (UiPicture), then the frame's region's first word in Ring, pushed apart as it
    changes every frame (ui_record) */
-#define UI_PUSH_BYTES 28
+#define UI_PUSH_BYTES 32
 static VkBuffer g_frames;
 static DevMem g_frames_mem;
 static u8* g_frames_at;
@@ -56,26 +57,32 @@ typedef struct {
 static UiSlot g_slot[VK_FRAMES];
 static int g_slot_now; /* this frame's region */
 static int g_frames_coherent; /* its memory host-coherent: what the CPU writes needs no flush */
-/* the frame's runs of quads, each drawn with one call (ui_record), kept while no quad changes */
+/* the frame's runs of quads, each drawn with one call (ui_record), kept while no quad changes: fade, the faded span its
+   quads are of (g_fades), -1 for none */
 typedef struct {
-    int first, count, set, pipe;
+    int first, count, set, pipe, fade;
     u32 vertices;
 } UiRun;
 static UiRun g_runs[MAX_QUADS];
 static int g_nruns, g_runs_n = -1; /* the quads they were made for, -1 for none */
 static VkDescriptorSetLayout g_dsl;
 static VkPipelineLayout g_layout;
-/* ui.frag's two pipelines (its MODE): plain, for a quad that covers every pixel of its own (a fill, a bar, a backed
+/* ui.frag's pipelines (its MODE): plain, for a quad that covers every pixel of its own (a fill, a bar, a backed
    letter or icon), and sparse, for one that leaves its clear pixels alone (a shape, a letter, an icon, the atlas's
-   texels): discarded, or on a GPU that renders in tiles written clear and blended away */
-enum { UI_PLAIN, UI_SPARSE };
-static VkPipeline g_pipes[2];
+   texels): discarded, or on a GPU that renders in tiles written clear and blended away. And faded, plain's quads of
+   the spans ui_fade_set gives (a notification's lines coming or going), blended over the picture at each one's alpha
+   (FADE) */
+enum { UI_PLAIN, UI_SPARSE, UI_FADED, UI_PIPES };
+static VkPipeline g_pipes[UI_PIPES];
+static SnxUiFade g_fades[SNX_UI_FADES]; /* those spans as the last list made gave them, the rest zeroed */
+static int g_nfades;
 static VkFormat g_pipe_format;
 static u32 g_pipe_space; /* what the pipelines' picture takes (g_vk.sc_space): half floats are both HDR spaces' */
 static int g_pipe_tiler; /* the sparse pipeline blends: made for a GPU that renders in tiles */
 typedef struct {
     u32 mode, srgb, space;
     f32 white;
+    u32 fade;
 } UiSpec;
 /* a GPU that renders in tiles, by its vendor: ARM's Mali, Qualcomm's Adreno, Apple's, Imagination's PowerVR and
    Broadcom's VideoCore, where a discard costs its tile's early tests */
@@ -204,15 +211,16 @@ static int pipeline_make(VkFormat format) {
                                         .pColorBlendState = &cb,
                                         .pDynamicState = &ds,
                                         .layout = g_layout};
-    /* ui.frag's MODE (0 plain, 1 sparse that discards, 2 sparse that blends) and SRGB, and for the swapchain of a
-       game's HDR frames its SPACE (gpu/hdr_output.h's) and WHITE, the light the layer's white is drawn at there */
+    /* ui.frag's MODE (0 plain, 1 sparse that discards, 2 sparse that blends) and SRGB, for the swapchain of a game's
+       HDR frames its SPACE (gpu/hdr_output.h's) and WHITE, the light the layer's white is drawn at there, and FADE */
     UiSpec spec;
-    VkSpecializationMapEntry entries[4] = {{0, offsetof(UiSpec, mode), 4},
+    VkSpecializationMapEntry entries[5] = {{0, offsetof(UiSpec, mode), 4},
                                            {1, offsetof(UiSpec, srgb), 4},
                                            {2, offsetof(UiSpec, space), 4},
-                                           {3, offsetof(UiSpec, white), 4}};
-    VkSpecializationInfo si = {4, entries, sizeof spec, &spec};
-    /* premultiplied: a pixel written clear leaves the picture as it was */
+                                           {3, offsetof(UiSpec, white), 4},
+                                           {4, offsetof(UiSpec, fade), 4}};
+    VkSpecializationInfo si = {5, entries, sizeof spec, &spec};
+    /* premultiplied: a pixel written clear leaves the picture as it was, and one at alpha a takes 1 - a of it */
     const VkPipelineColorBlendAttachmentState blended = {.blendEnable = VK_TRUE,
                                                          .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
                                                          .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
@@ -222,10 +230,10 @@ static int pipeline_make(VkFormat format) {
                                                          .alphaBlendOp = VK_BLEND_OP_ADD,
                                                          .colorWriteMask = 0xF};
     int ok, i, blend = tiler();
-    if (g_pipes[UI_PLAIN] && g_pipes[UI_SPARSE] && g_pipe_format == format && g_pipe_space == g_vk.sc_space &&
-        g_pipe_tiler == blend)
+    if (g_pipes[UI_PLAIN] && g_pipes[UI_SPARSE] && g_pipes[UI_FADED] && g_pipe_format == format &&
+        g_pipe_space == g_vk.sc_space && g_pipe_tiler == blend)
         return 1;
-    for (i = 0; i < 2; ++i) { /* vk_finish ran when the swapchain changed format */
+    for (i = 0; i < UI_PIPES; ++i) { /* vk_finish ran when the swapchain changed format */
         if (g_pipes[i]) vkDestroyPipeline(g_vk.dev, g_pipes[i], NULL);
         g_pipes[i] = VK_NULL_HANDLE;
     }
@@ -235,12 +243,14 @@ static int pipeline_make(VkFormat format) {
     st[1].module = fs;
     st[1].pSpecializationInfo = &si;
     ok = vs && fs;
-    for (i = 0; ok && i < 2; ++i) {
-        spec.mode = i == UI_PLAIN ? 0 : blend ? 2 : 1;
+    for (i = 0; ok && i < UI_PIPES; ++i) {
+        spec.mode = i == UI_SPARSE ? blend ? 2 : 1 : 0;
         spec.srgb = (u32)g_vk.sc_srgb;
         spec.space = g_vk.sc_space;
         spec.white = (f32)snx_hdr_paper_white(g_settings.hdr_paper_white);
-        ba = i == UI_SPARSE && blend ? blended : (VkPipelineColorBlendAttachmentState){.colorWriteMask = 0xF};
+        spec.fade = i == UI_FADED;
+        ba = (i == UI_SPARSE && blend) || i == UI_FADED ? blended
+                                                        : (VkPipelineColorBlendAttachmentState){.colorWriteMask = 0xF};
         int entered = snx_vk_compile_enter();
         ok = VK_OK(vkCreateGraphicsPipelines(g_vk.dev, vk_pipeline_cache(), 1, &gci, NULL, &g_pipes[i]));
         snx_vk_compile_leave(entered);
@@ -250,7 +260,7 @@ static int pipeline_make(VkFormat format) {
     g_pipe_format = format;
     g_pipe_space = g_vk.sc_space;
     g_pipe_tiler = blend;
-    for (i = 0; i < 2 && !ok; ++i) {
+    for (i = 0; i < UI_PIPES && !ok; ++i) {
         if (g_pipes[i]) vkDestroyPipeline(g_vk.dev, g_pipes[i], NULL);
         g_pipes[i] = VK_NULL_HANDLE;
     }
@@ -308,13 +318,13 @@ static void atlas_upload(VkCommandBuffer cb) {
         return;
     }
     vk_barrier(cb, g_atlas, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
-               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    rec_CmdCopyBufferToImage(cb, buf, g_atlas, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
+    rec_CmdCopyBufferToImage(cb, buf, g_atlas, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &copy);
     vk_barrier(cb, g_atlas, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-               VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+               VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+               VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_LAYOUT(SHADER_READ_ONLY_OPTIMAL));
     for (i = 0; i < 2; ++i) {
-        VkDescriptorImageInfo di = {g_samplers[i], g_atlas_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo di = {g_samplers[i], g_atlas_view, VK_LAYOUT(SHADER_READ_ONLY_OPTIMAL)};
         VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                    .dstSet = g_sets[i],
                                    .descriptorCount = 1,
@@ -354,7 +364,7 @@ static void image_upload(VkCommandBuffer cb) {
     u8* to;
     if (!px || version == g_image_version) return;
     if (!g_image) {
-        VkDescriptorImageInfo di = {g_samplers[0], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo di = {g_samplers[0], VK_NULL_HANDLE, VK_LAYOUT(SHADER_READ_ONLY_OPTIMAL)};
         VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                    .dstSet = g_sets[UI_IMAGE],
                                    .descriptorCount = 1,
@@ -382,18 +392,20 @@ static void image_upload(VkCommandBuffer cb) {
     /* the last frame's draws sampled it: they finish before the copy writes over it */
     vk_barrier(cb, g_image, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
                VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    rec_CmdCopyBufferToImage(cb, buf, g_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+               VK_LAYOUT(TRANSFER_DST_OPTIMAL));
+    rec_CmdCopyBufferToImage(cb, buf, g_image, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &copy);
     vk_barrier(cb, g_image, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-               VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+               VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+               VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_LAYOUT(SHADER_READ_ONLY_OPTIMAL));
     g_image_version = version;
 }
 /* ui.vert's Picture: the picture's size, the ring's head and its slots from bit 16, the bars' slow colour and its
-   height, and the backed letters' ground, which g_shown compares from frame to frame */
+   height, the backed letters' ground, which g_shown compares from frame to frame, and a faded span's alpha, pushed
+   before each faded run (ui_record), 1 till then */
 typedef struct {
     float w, h;
     u32 ring, slow, slow_from, ground;
+    float fade;
 } UiPicture;
 _Static_assert(UI_PUSH_BYTES == sizeof(UiPicture) + sizeof(u32), "ui.vert's Picture, then the ring's word");
 static UiPicture g_pc;
@@ -403,6 +415,7 @@ static UiPicture g_pc;
 static struct {
     int safe[4], n;
     UiPicture pc;
+    SnxUiFade fades[SNX_UI_FADES]; /* and the faded spans: a fade moves their alphas alone */
     int changed;
 } g_shown = {.n = -1, .changed = 1};
 
@@ -576,13 +589,21 @@ static unsigned quad_sample(int i) { return ui_q_bits(&g_quads[i], UI_Q_SAMPLE, 
 /* an outline shape (an unfilled circle, round box or cross with its edge), which ui.vert draws as UI_OUTLINE_PARTS
    quads over its edge and its label, so that its inside takes no fragment: the vertices an instance of it takes */
 #define UI_OUTLINE_PARTS 16 /* ui.vert's OUTLINE_PARTS */
-/* the pipeline a quad is drawn with: plain for a fill, a bar, a backed letter or icon, sparse for the rest */
+/* the faded span quad i is of, -1 for none */
+static int quad_fade(int i) {
+    int k;
+    for (k = 0; k < g_nfades; ++k)
+        if (i >= g_fades[k].first && i < g_fades[k].end) return k;
+    return -1;
+}
+/* the pipeline a quad is drawn with: plain for a fill, a bar, a backed letter or icon, faded for those in a faded
+   span, sparse for the rest */
 static int quad_pipe(int i) {
     unsigned ink = ui_q_bits(&g_quads[i], UI_Q_INK, 3);
-    return ink == UI_SOLID || ink == UI_RING ||
-                   ((ink == UI_GLYPH || ink == UI_ICON) && ui_q_bits(&g_quads[i], UI_Q_BACKED, 1))
-               ? UI_PLAIN
-               : UI_SPARSE;
+    if (ink == UI_SOLID || ink == UI_RING ||
+        ((ink == UI_GLYPH || ink == UI_ICON) && ui_q_bits(&g_quads[i], UI_Q_BACKED, 1)))
+        return quad_fade(i) >= 0 ? UI_FADED : UI_PLAIN;
+    return UI_SPARSE;
 }
 static u32 quad_vertices(int i) {
     const SnxUiQuad* q = &g_quads[i];
@@ -617,11 +638,21 @@ static int ui_list(const int safe[4]) {
     }
     overlay_draw(&list, sw, sh, now);
     ui_dirty_end(&first, &end);
-    g_pc = (UiPicture){(float)sw,  (float)sh,       (u32)ring->head | (u32)ring->n << 16,
-                       ring->slow, ring->slow_from, ui_ground()};
+    {
+        SnxUiFade fades[SNX_UI_FADES];
+        int k, nf = ui_fades(fades), moved = nf != g_nfades;
+        for (k = 0; k < nf && !moved; ++k) moved = fades[k].first != g_fades[k].first || fades[k].end != g_fades[k].end;
+        if (moved) g_runs_n = -1; /* the runs take the faded spans' quads apart */
+        memcpy(g_fades, fades, sizeof g_fades);
+        g_nfades = nf;
+        g_pc = (UiPicture){(float)sw,   (float)sh, (u32)ring->head | (u32)ring->n << 16, ring->slow, ring->slow_from,
+                           ui_ground(), 1.0f};
+    }
     frames_owe(first, end);
     if (first < end || list.n != g_runs_n) g_runs_n = -1; /* a quad changed: the runs are made again */
-    if (first < end || list.n != g_shown.n || memcmp(&g_pc, &g_shown.pc, sizeof g_pc)) g_shown.changed = 1;
+    if (first < end || list.n != g_shown.n || memcmp(&g_pc, &g_shown.pc, sizeof g_pc) ||
+        memcmp(g_fades, g_shown.fades, sizeof g_fades))
+        g_shown.changed = 1;
     return list.n;
 }
 /* the frame's layer, before a rendering pass: its quads made (the producers, under ui_lock), what changed written into
@@ -637,6 +668,7 @@ static int ui_prepare(VkCommandBuffer cb, const int safe[4]) {
     memcpy(g_shown.safe, safe, sizeof g_shown.safe);
     g_shown.n = n;
     g_shown.pc = g_pc;
+    memcpy(g_shown.fades, g_fades, sizeof g_fades);
     g_shown.changed = 0;
     if (!n || !g_atlas || !pipeline_make(g_vk.sc_format) || !glyphs_upload(cb) || !frames_make()) return 0;
     g_slot_now = frames_send(n, ui_ring());
@@ -654,14 +686,15 @@ int vk_ui_changed(void) {
     ui_unlock();
     return g_shown.changed;
 }
-/* the runs of the n quads: of one pipeline, sampling the same way and taking as many vertices, in their order (six
-   corners for a quad, or an outline shape's parts) */
+/* the runs of the n quads: of one pipeline, sampling the same way, taking as many vertices (six corners for a quad, or
+   an outline shape's parts) and faded at one alpha, in their order */
 static void runs_make(int n) {
     int i, run;
     for (i = 0, g_nruns = 0; i < n; i = run) {
         UiRun r = {.first = i, .set = (int)quad_sample(i), .pipe = quad_pipe(i), .vertices = quad_vertices(i)};
+        r.fade = r.pipe == UI_FADED ? quad_fade(i) : -1;
         for (run = i + 1; run < n && (int)quad_sample(run) == r.set && quad_vertices(run) == r.vertices &&
-                          quad_pipe(run) == r.pipe;
+                          quad_pipe(run) == r.pipe && (r.fade < 0 || quad_fade(run) == r.fade);
              ++run)
             continue;
         r.count = run - i;
@@ -670,13 +703,13 @@ static void runs_make(int n) {
     g_runs_n = n;
 }
 /* the n quads ui_prepare made, into the rendering pass open on cb, over the whole picture: from this frame's region,
-   each run with one call, the pipeline and the set bound where they change */
+   each run with one call, the pipeline and the set bound where they change, and before a faded run its span's alpha */
 static void ui_record(VkCommandBuffer cb, int n) {
     VkViewport vp = {0, 0, g_pc.w, g_pc.h, 0, 1};
     VkRect2D sci = {{0, 0}, g_vk.sc_extent};
     VkDeviceSize vo = g_region * (u64)g_slot_now + UI_RING_BYTES;
     u32 ring_at = (u32)(g_region * (u64)g_slot_now / 4); /* ui.vert's Picture.ring_at, in the ring's words */
-    int i, set = -1, pipe = -1;
+    int i, set = -1, pipe = -1, fade = -1;
     if (g_runs_n != n) runs_make(n);
     vk_render_forget_state(); /* another pipeline and layout: a draw after it sets everything again */
     rec_CmdSetViewport(cb, 0, 1, &vp);
@@ -693,6 +726,11 @@ static void ui_record(VkCommandBuffer cb, int n) {
         if (set != r->set)
             rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout, 0, 1, &g_sets[set = r->set], 0,
                                       NULL);
+        if (r->fade >= 0 && r->fade != fade) {
+            const float alpha = (float)g_fades[fade = r->fade].alpha / 255.0f;
+            rec_CmdPushConstants(cb, g_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                 offsetof(UiPicture, fade), sizeof alpha, &alpha);
+        }
         rec_CmdDraw(cb, r->vertices, (u32)r->count, 0, (u32)r->first);
     }
 }
@@ -700,7 +738,7 @@ static void ui_record(VkCommandBuffer cb, int n) {
 static void ui_pass_begin(VkCommandBuffer cb, VkImageView view, int clear) {
     VkRenderingAttachmentInfo at = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
                                     .imageView = view,
-                                    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    .imageLayout = VK_LAYOUT(COLOR_ATTACHMENT_OPTIMAL),
                                     .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
                                     .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
                                     .clearValue = {.color = {{0, 0, 0, 1}}}};
@@ -716,25 +754,26 @@ void vk_ui_draw(VkCommandBuffer cb, VkImage sc, const int safe[4]) {
     VkImageView view;
     if (!n || !(view = sc_view(sc))) return;
     vk_barrier(cb, sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+               VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+               VK_LAYOUT(COLOR_ATTACHMENT_OPTIMAL));
     ui_pass_begin(cb, view, 0);
     ui_record(cb, n);
     rec_CmdEndRendering(cb);
     vk_barrier(cb, sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_LAYOUT(COLOR_ATTACHMENT_OPTIMAL),
+               VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
 }
 void vk_ui_present(VkCommandBuffer cb, VkImage sc, Surf* src, VkRect2D crop, VkRect2D to, u32 transform,
                    const int safe[4]) {
     SnxPresentSource from;
     int n = ui_prepare(cb, safe), framed = src && vk_present_quad_source(cb, src, 1, !g_vk.sc_srgb, &from);
+    if (framed) vk_present_quad_effects(cb, &from, &crop, to, transform); /* the upscaler and the anti-aliasing */
     VkImageView view = sc_view(sc);
     /* the acquire's wait is at the colour output (renderer.c's submit): the image's first use */
     vk_barrier(cb, sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_LAYOUT(COLOR_ATTACHMENT_OPTIMAL));
     if (view) {
         ui_pass_begin(cb, view, 1);
         if (framed) vk_present_quad_draw(cb, &from, g_vk.sc_format, crop, to, transform);
@@ -743,6 +782,6 @@ void vk_ui_present(VkCommandBuffer cb, VkImage sc, Surf* src, VkRect2D crop, VkR
         vk_render_forget_state();
     }
     vk_barrier(cb, sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_LAYOUT(COLOR_ATTACHMENT_OPTIMAL),
                VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 }

@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright 2026 the ScarletNX contributors
-# Links a pull request's builds from one comment, which .github/workflows/pr-checks.yml rewrites each time a run of
+# Links a pull request's builds from one comment, which .github/workflows/publish.yml rewrites each time a run of
 # .github/workflows/build.yml on it ends, so they can be had from the pull request itself. A run of a commit that is no
 # longer the branch's head leaves the comment alone.
 #
 #   scripts/pr-builds.sh REPO PR RUN SHA [--print]
 #
 # PR may be empty: then it is the open pull request whose head is SHA, and with none there is nothing to link. A job of
-# the run that did not succeed gets a line, by its id in build.yml, but edenprobe, which builds nothing: its line is its
-# results, the notices its job leaves (the NRO's and the APK's), linked to the run's summary (docs/dev/edenprobe.md).
-# The checks of a package as installed, the sanitizers' build, the A64 differential's QEMU reference, the job that says
-# whether a pull request needs it and the scheduled run's Nightly due make no package, so they get none. NEEDS, when
-# set, stands for the run's jobs, in the shape of toJSON(needs). --print writes the comment to stdout and posts nothing.
+# the run that did not succeed gets a line, by its id in build.yml, but Amberlith's runs (edenprobe), which build
+# nothing: their line is their results, the notices they leave (the NRO's and the APK's), linked to the run's summary
+# (docs/dev/edenprobe.md). They are the step "Run Amberlith" of the job that builds Linux x86-64, which fails with them
+# alone and still built its package, so it gets no line then; a run of an older build.yml had them in a job of their
+# own. The A64 differential's QEMU reference, the job that says whether a pull request needs it and the scheduled run's
+# Nightly due make no package, so they get none, and neither do an older build.yml's sanitizers' build, its checks of a
+# package as installed and its linux job, the last two skipped on a pull request. NEEDS, when set, stands for the run's
+# jobs, in the shape of toJSON(needs). --print writes the comment to stdout and posts nothing.
 # gh needs a token that may read the run's artifacts, jobs and checks, and write on pull requests.
 set -euo pipefail
 
@@ -35,18 +38,21 @@ if [ -z "$print" ] && [ "$(gh api "repos/$repo/pulls/$pr" --jq .head.sha)" != "$
     echo "$sha is no longer the head of #$pr: its comment stays"
     exit 0
 fi
-# every artifact but the APK's halves (-stage), which only the job that packs the APK takes, edenprobe's reports,
-# which its line below links through the run, and a failed job's mark (scripts/fail-fast.py)
-artifacts=$(gh api "repos/$repo/actions/runs/$run/artifacts?per_page=100")
+# every artifact but the APK's halves (-stage), which only the job that packs the APK takes, an older build.yml's
+# install trees (-install), which only the run's own jobs took, the A64 differential's QEMU reference, which only the
+# cross builds take, edenprobe's reports, which its line below links through the run, and a failed job's mark
+# (scripts/fail-fast.py): the packages a person downloads, kept until the first of them expires
+artifacts=$(gh api "repos/$repo/actions/runs/$run/artifacts?per_page=100" | jq '.artifacts |= map(select((.expired | not)
+    and (.name | endswith("-stage") or endswith("-install") or startswith("ScarletNX-llvm-qemu-reference-")
+        or startswith("edenprobe-") or startswith("fail-fast-") | not)))')
 links=$(jq -r --arg url "https://github.com/$repo/actions/runs/$run/artifacts" '
-    .artifacts | map(select((.expired | not) and (.name | endswith("-stage") or startswith("edenprobe-") or startswith("fail-fast-") | not))) |
-    sort_by(.name)[] |
+    .artifacts | sort_by(.name)[] |
     "- [\(.name)](\($url)/\(.id)), \(.size_in_bytes / 1048576 | floor) MiB"' <<<"$artifacts")
 until=$(jq -r '[.artifacts[].expires_at] | min // empty | .[:10]' <<<"$artifacts")
 
-# The run's jobs as toJSON(needs) would have them: a job's legs under its id, with the worst of their conclusions.
-# A matrix job skipped whole has one job, under its name before the matrix filled it in. A job this does not know
-# keeps its own name, so its failure still shows
+# The run's jobs as toJSON(needs) would have them: a job's legs under its id, with the worst of their conclusions, and
+# Amberlith's runs under edenprobe, its step's conclusion. A matrix job skipped whole has one job, under its name before
+# the matrix filled it in. A job this does not know keeps its own name, so its failure still shows
 if [ -z "${NEEDS:-}" ]; then
     jobs=$(gh api "repos/$repo/actions/runs/$run/jobs?per_page=100")
     needs=$(jq '
@@ -54,18 +60,28 @@ if [ -z "${NEEDS:-}" ]; then
             if . == "macOS and iOS (arm64)" then "apple"
             elif . == "Android APK" then "android"
             elif startswith("Windows (") then "windows"
-            elif startswith("edenprobe") then "edenprobe"
+            elif startswith("Amberlith") or startswith("edenprobe") then "edenprobe"
             elif endswith(", as installed") then empty
             elif . == "Recompiler changes" or startswith("A64 differential") or . == "Nightly due" then empty
+            elif . == "Linux (${{ matrix.arch }})" then empty
             elif test("^Linux AppImage \\((x86_64|aarch64)\\)$") then "appimage"
             elif startswith("Linux AppImage (") then "appimage-cross"
             elif test("^Linux \\([^,]*\\)$") then "linux"
             elif startswith("Linux (") then empty
             else . end;
+        # the leg that runs them: the other lists the step too, skipped
+        def amberlith:
+            if .name == "Linux AppImage (x86_64)" then [(.steps // [])[] | select(.name == "Run Amberlith")][0]
+            else null end;
         # the order of the needs build.yml gave the comment, then any other
         ["linux", "appimage", "appimage-cross", "windows", "android", "apple", "edenprobe"] as $needs |
         ["failure", "timed_out", "cancelled", "action_required", "skipped"] as $worst |
-        [.jobs[] | {key: (.name | build_id), job: .id, conclusion: (.conclusion // .status)}] | group_by(.key) |
+        [.jobs[] | amberlith as $probe | [(.steps // [])[] | select(.conclusion == "failure") | .name] as $failed |
+            {key: (.name | build_id), job: .id,
+                conclusion: (if $probe != null and $failed == ["Run Amberlith"] then "success"
+                    else .conclusion // .status end)},
+            (if $probe != null then {key: "edenprobe", job: .id, conclusion: ($probe.conclusion // $probe.status)}
+                else empty end)] | group_by(.key) |
         map((map(.conclusion) | unique) as $c | {key: .[0].key, value: {
             job: .[0].job,
             result: (if $c == ["success"] then "success"
@@ -73,7 +89,8 @@ if [ -z "${NEEDS:-}" ]; then
             outputs: {}}}) |
         sort_by(.key as $k | $needs | index($k) // length) |
         from_entries' <<<"$jobs")
-    probe_job=$(jq -r '.edenprobe | select(.result == "success" or .result == "failure") | .job // empty' <<<"$needs")
+    # a step skipped too: a pull request whose files call for no run says so in a notice before the runs
+    probe_job=$(jq -r '.edenprobe.job // empty' <<<"$needs")
     if [ -n "$probe_job" ]; then
         # a notice for each of its runs, the NRO's first: the API does not list them in the order the job left them
         notice=$(gh api "repos/$repo/check-runs/$probe_job/annotations" |
@@ -85,10 +102,15 @@ else
 fi
 failed=$(jq -r 'to_entries[] | select(.key != "edenprobe" and .value.result != "success") |
     "\(.key) (\(.value.result))"' <<<"$needs" | paste -sd, - | sed 's/,/, /g')
+# a pull request that changes nothing either run loads ends the job at once, passed, its notice saying so
 probe=$(jq -r --arg url "https://github.com/$repo/actions/runs/$run" '.edenprobe // empty |
-    "[\(.outputs.result // "edenprobe")](\($url)): " +
-    if .result == "success" then "every case of the baseline passes"
-    elif .result == "failure" then "failed, see its summary" else .result end' <<<"$needs")
+    if (.outputs.result // "") | startswith("Amberlith: not run, ") then
+        "[Amberlith](\($url)): " + (.outputs.result | ltrimstr("Amberlith: "))
+    else
+        "[\(.outputs.result // "Amberlith")](\($url)): " +
+        if .result == "success" then "every case of the baseline passes"
+        elif .result == "failure" then "failed, see its summary" else .result end
+    end' <<<"$needs")
 
 body="$mark
 Builds of ${sha::7}${until:+, kept until $until}:

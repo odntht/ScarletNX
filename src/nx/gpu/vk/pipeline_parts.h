@@ -55,6 +55,10 @@ int vk_gpl_choose(const VkGplDevice* d, u32* dyn_pr, char* line, size_t n);
 /* the log line of who makes a depth range of -1 to 1 on d, the device (dyn_pr has VK_DYN_PR_DEPTH_RANGE) or the last
    stage before rasterization, and then what the device lacks for it, into line */
 void vk_depth_range_line(const VkGplDevice* d, u32 dyn_pr, char* line, size_t n);
+/* the pixels conservative rasterization overestimates a draw by: the dilation its key asks for (conservative: 1 plus
+   quarter pixels, 0 to 3), cut to most, the device's maxExtraPrimitiveOverestimationSize. A dilation that is cut is
+   said in line, with the value asked for and the one drawn; line is "" when it is drawn whole */
+float vk_conservative_dilation(u32 conservative, float most, char* line, size_t n);
 
 /* the parts of a pipeline made of libraries, a bit each (docs/layers/gpu/pipeline-libraries.md, "The four parts") */
 #define VK_PART_VI  1u  /* vertex input interface */
@@ -62,7 +66,7 @@ void vk_depth_range_line(const VkGplDevice* d, u32 dyn_pr, char* line, size_t n)
 #define VK_PART_FS  4u  /* fragment shader */
 #define VK_PART_FO  8u  /* fragment output interface */
 #define VK_PART_ALL 15u /* a whole pipeline */
-#define VK_PIPE_DYN_MAX 33  /* the most dynamic states a draw pipeline has */
+#define VK_PIPE_DYN_MAX 34  /* the most dynamic states a draw pipeline has */
 /* what decides a draw pipeline's dynamic states: dyn_pr (VK_DYN_PR_*), the feedback loop's dynamic state, a binding
    stride (a vertex layout with bindings and has_dynamic_stride), dynamic vertex input and tessellation. A mesh
    pipeline has no input assembly or vertex input: its topology, primitive restart, strides and layout aren't states */
@@ -70,6 +74,7 @@ typedef struct {
     u32 dyn_pr;
     int feedback_dynamic, stride, vertex_input, tess, mesh;
     int clamp_range; /* the depth clamp's range as dynamic state (has_depth_clamp_range) */
+    int rate_palette; /* the viewports' shading rate palettes (g_vk.vrs VK_VRS_NV, shading_rate.c) */
 } PipeDynIn;
 /* the dynamic states of the parts in parts (VK_PART_*) into out, in the order a whole pipeline lists them: how many */
 u32 vk_pipe_dynamic(u32 parts, const PipeDynIn* in, VkDynamicState* out);
@@ -82,12 +87,18 @@ u32 vk_pipe_dynamic(u32 parts, const PipeDynIn* in, VkDynamicState* out);
 typedef struct {
     u32 topo_class;
     VertexLayout vi;
+    u32 fetch; /* PipeKey.fetch: no vertex input state, none of it dynamic */
+    u32 heaps; /* PipeKey.heaps: a library of heaps links only with others of heaps (in each part's key) */
 } PipeViKey;
 typedef struct {
     VkShaderModule vs, tcs, tes, gs;
     u32 arrays; /* PipeKey.arrays' bits of the vertex, tessellation and geometry sets */
     /* 0 where dyn_pr makes them dynamic */
     u32 patch, polygon, depth_clamp, depth_clip, provoking_last, conservative;
+    /* PipeKey.cb_addr of the vertex, tessellation and geometry sets, the fragment set's 0: the part maps those
+       constant buffers by address, as the draws write them. The sixth is 0, so that heaps ends the key with no padding */
+    u32 cb_addr[6];
+    u32 heaps;
 } PipePrKey;
 typedef struct {
     VkShaderModule fs; /* the fragment program, or the empty one */
@@ -97,6 +108,8 @@ typedef struct {
     u32 sample_shading, samples, sample_off, alpha_to_coverage, alpha_to_one;
     VkCoverage coverage;
     u32 spec; /* PipeKey.fs_spec: the module's specialization constants */
+    u32 cb_addr[6]; /* PipeKey.cb_addr of the fragment set, the others 0 (six: no padding before heaps) */
+    u32 heaps;
 } PipeFsKey;
 typedef struct {
     u32 ncolor, color[8], depth, stencil;
@@ -106,7 +119,13 @@ typedef struct {
     u32 logic_op, samples, sample_off, alpha_to_coverage, alpha_to_one, sample_shading, feedback;
     VkCoverage coverage;
     VkAdvancedBlend advanced; /* a native advanced equation is in the output part's blend state */
+    u32 heaps;
 } PipeFoKey;
+/* no padding in a key, whose bytes memcmp compares */
+_Static_assert(sizeof(PipeViKey) == offsetof(PipeViKey, heaps) + sizeof(u32), "PipeViKey has padding");
+_Static_assert(sizeof(PipePrKey) == offsetof(PipePrKey, heaps) + sizeof(u32), "PipePrKey has padding");
+_Static_assert(sizeof(PipeFsKey) == offsetof(PipeFsKey, heaps) + sizeof(u32), "PipeFsKey has padding");
+_Static_assert(sizeof(PipeFoKey) == offsetof(PipeFoKey, heaps) + sizeof(u32), "PipeFoKey has padding");
 /* the device state the split reads, g_vk.dyn_pr and has_feedback_dynamic, as arguments so a test gives its own */
 typedef struct {
     u32 dyn_pr;

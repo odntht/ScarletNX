@@ -14,6 +14,7 @@
    Dispatches that read textures run on the graphics queue, after everything recorded before them. */
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include "nx/gpu/gpu.h"
 #include "nx/gpu/maxwell/kepler_compute_regs.h"
 #include "nx/gpu/shader/shader.h"
@@ -29,6 +30,7 @@
 #include "nx/gpu/renderer.h"
 #include "nx/gpu/vk/backing.h"
 #include "nx/gpu/vk/pending_pages.h"
+#include "nx/gpu/vk/pipeline_stats.h"
 #include "nx/memory/own.h"
 
 typedef struct CsPipe {
@@ -60,7 +62,7 @@ static CsOut g_out[256];
 static int g_nout;
 /* the guest pages every pending result covers, the current batch's and those put aside: a read or write of memory no
    result covers (most of them) is answered without checking each result, through the GMMU page by page */
-static PendPages g_pages = {.also = &g_pend_any};
+static PendPages g_pages = {.also = &g_pend_blk};
 static void outs_pages(const CsOut* out, int n, int delta) {
     for (int i = 0; i < n; i++) pend_add(&g_pages, out[i].addr, out[i].size, delta);
 }
@@ -115,10 +117,11 @@ static void logs_unref(VkWriteLog** logs, u32* n) {
    graphics submit waits for g_vk_cs_wait_value, and the arena they read stays alive until that frame is done */
 VkSemaphore g_vk_csem;
 u64 g_vk_cs_wait_value;
-static u64 g_cval;
+static _Atomic u64 g_cval;
 static int g_ar_gfx;
 static u64 g_org_cap;
-u64 g_vk_dispatches, g_vk_cs_batches, g_vk_cs_wait_ns;
+u64 g_vk_dispatches, g_vk_cs_batches;
+_Atomic u64 g_vk_cs_wait_ns;
 u64 g_vk_cs_open, g_vk_cs_left; /* vk.h */
 /* A program's window: 80 zero bytes in place of a header, then the bytes of its code that cs_read_code reads, and zeros
    after them. It takes as much code as a graphics program's window (pipeline.c's SH_CODE): an Ounce game has a
@@ -190,6 +193,15 @@ static int cs_cb_read(u32 idx, u32 off, u32* out) {
         return 1;
     }
     return 0;
+}
+/* The range constant buffer i binds: only the bytes the shader reads (cbuf_max), zeros after the guest's: reads past
+   the range are zero with robustBufferAccess2, and stay in bounds, of undefined value, with robust buffer access alone.
+   A whole checked step, within the limit (vk_cb_range), so it can pass the guest's bytes by more than the alignment the
+   arena's space check adds to each binding: that check counts this range */
+static u32 cs_cb_range(const CsPipe* p, u32 i) {
+    u32 range = g_cbn[i];
+    if (p->si.cbuf_max[i] && range > p->si.cbuf_max[i]) range = p->si.cbuf_max[i];
+    return vk_cb_range(range);
 }
 /* a constant buffer word for the handles a program loads from memory (vk_memory_handles) */
 static u32 cs_memh_cbuf(void* user, u32 bank, u32 off) {
@@ -327,9 +339,17 @@ static int arena_fit(u64 need) {
 }
 static u64 arena_alloc(u64 size) {
     u64 al = vk_stage_align(), at = (g_ar_used + al - 1) & ~(al - 1);
+    /* the dispatch's space check made room for every binding (vk_dispatch's need): one past the arena would be
+       written over other memory */
+    if (at + size > g_ar_cap)
+        fatal("vulkan: a compute dispatch's binding of %llu bytes at %llu passes the arena's %llu bytes",
+              (unsigned long long)size, (unsigned long long)at, (unsigned long long)g_ar_cap);
     g_ar_used = at + size;
     return at;
 }
+/* dispatches whose bindings took more of the arena than their space check counted (vk_cs_arena_short) */
+static u64 g_cs_arena_short;
+u64 vk_cs_arena_short(void) { return g_cs_arena_short; }
 
 /* The storage buffers that hold the shared memory of programs that ask for more than the device gives
    (ShaderInfo.shared_spill), a dispatch's blocks' parts one after another: one for the dispatches recorded on the
@@ -400,7 +420,14 @@ static int cs_spill(const CsPipe* p, int indirect, u32 gx, u32 gy, u32 gz, int g
 
 static GpOp g_op[VK_GP_OPS];
 static GpOps g_ops = {.op = g_op, .cap = VK_GP_OPS, .queries = VK_GP_QUERIES};
-/* submits the batch without waiting; it signals g_vk_csem with the next value */
+/* a graphics timeline value the next batch waits for (vk_compute_after_gfx), 0 none */
+static u64 g_after_gfx;
+u64 vk_compute_submitted(void) { return g_vk_csem ? atomic_load_explicit(&g_cval, memory_order_relaxed) : 0; }
+void vk_compute_after_gfx(u64 value) {
+    if (value > g_after_gfx) g_after_gfx = value;
+}
+/* submits the batch without waiting; it signals g_vk_csem with the next value. A batch after a defrag's move of what
+   its dispatches may read in place (vk_compute_after_gfx) waits for the graphics submission that copied it back */
 static void cs_submit(void) {
     if (!g_recording) return;
     vk_devmem_flush(g_ar_mem, 0, VK_WHOLE_SIZE); /* the arena may not be host coherent */
@@ -409,13 +436,20 @@ static void cs_submit(void) {
     VkCommandBufferSubmitInfo c = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = g_ccb};
     VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                                  .semaphore = g_vk_csem,
-                                 .value = ++g_cval,
+                                 .value = atomic_fetch_add_explicit(&g_cval, 1, memory_order_relaxed) + 1,
                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    const VkSemaphoreSubmitInfo after = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                                         .semaphore = vk_gfx_timeline(),
+                                         .value = g_after_gfx,
+                                         .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                        .waitSemaphoreInfoCount = g_after_gfx ? 1 : 0,
+                        .pWaitSemaphoreInfos = &after,
                         .commandBufferInfoCount = 1,
                         .pCommandBufferInfos = &c,
                         .signalSemaphoreInfoCount = 1,
                         .pSignalSemaphoreInfos = &sig};
+    g_after_gfx = 0;
     vk_rec_queue(g_vk.compute); /* after the graphics submissions before it, when the queue is theirs too */
     vk_wait_foreground();
     vk_queue_lock(g_vk.compute);
@@ -428,8 +462,9 @@ static void cs_submit(void) {
     g_recording = 0;
     g_inflight = 1;
     if (!VK_OK(r)) { /* never signaled by the GPU: the host signals it, so waits for it end */
-        VkSemaphoreSignalInfo ss = {
-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g_vk_csem, .value = g_cval};
+        VkSemaphoreSignalInfo ss = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+                                    .semaphore = g_vk_csem,
+                                    .value = atomic_load_explicit(&g_cval, memory_order_relaxed)};
         VK_OK(vkSignalSemaphore(g_vk.dev, &ss));
     }
 }
@@ -442,7 +477,7 @@ static void cs_wait(u64 value, const char* file, int line) {
     vk_wait_semaphore(g_vk_csem, value);
     gpu_wait_note(NULL, 0);
     u64 ns = plat_ns() - t0;
-    __atomic_add_fetch(&g_vk_cs_wait_ns, ns, __ATOMIC_RELAXED);
+    atomic_fetch_add_explicit(&g_vk_cs_wait_ns, ns, memory_order_relaxed);
     if (mine) vk_wait_site(file, line, ns);
 }
 /* the arena's results into guest memory, after its batch is done: of a logged one the bytes its dispatch wrote, each
@@ -481,7 +516,7 @@ static void cs_arena_done(VkBuffer b, DevMem m, u8* p, u64 cap, int gfx) {
 static void cs_any_update(void) {
     int any = g_nout > 0;
     for (u32 i = g_ptail; i != g_phead && !any; i++) any = g_pend[i % CS_PENDING].nout > 0;
-    g_cs_any = any;
+    atomic_store_explicit(&g_cs_any, any, memory_order_relaxed);
     if (!any && !pend_empty(&g_pages)) /* a result lost pages through other mappings than it gained them through */
         WARN_LIMIT(1, "vulkan: compute results landed, but their guest pages are still counted\n");
 }
@@ -542,7 +577,7 @@ static void cs_put_aside(void) {
     b->ar_cap = g_ar_cap;
     b->org = g_org;
     b->org_cap = g_org_cap;
-    b->cval = g_cval;
+    b->cval = atomic_load_explicit(&g_cval, memory_order_relaxed);
     b->gfx = g_ar_gfx;
     /* its pool outlives the reset the next batch records */
     b->ops.pool = g_ops.pool;
@@ -585,7 +620,7 @@ static void cs_land(void) {
     if (!g_recording && !g_inflight) return;
     g_landing = 1;
     cs_submit();
-    cs_wait(g_cval, __FILE__, __LINE__);
+    cs_wait(atomic_load_explicit(&g_cval, memory_order_relaxed), __FILE__, __LINE__);
     g_inflight = 0;
     vk_gpuprof_compute_land(&g_ops);
     cs_write_back(g_ar_mem, g_ar_ptr, g_org, g_out, g_nout);
@@ -735,7 +770,7 @@ static void cs_abandon_binding(u8* originals[8]) {
    batch. Any other overlap lands the results now, so the caller's caches see them in memory */
 int vk_compute_gpu_src(u64 gva, u64 len, VkBuffer* buf, u64* off) {
     u32 k;
-    if (!g_cs_any || g_landing || !pend_hit(&g_pages, gva, len)) return 0;
+    if (!atomic_load_explicit(&g_cs_any, memory_order_relaxed) || g_landing || !pend_hit(&g_pages, gva, len)) return 0;
     for (int i = 0; i < g_nout; i++) {
         CsOut* o = &g_out[i];
         if (gva >= o->addr + o->size || o->addr >= gva + len) {
@@ -753,7 +788,7 @@ int vk_compute_gpu_src(u64 gva, u64 len, VkBuffer* buf, u64* off) {
         g_ar_gfx = 1;
         cs_put_aside();
         o = &g_pend[(g_phead - 1) % CS_PENDING].out[i];
-        g_vk_cs_wait_value = g_cval;
+        g_vk_cs_wait_value = atomic_load_explicit(&g_cval, memory_order_relaxed);
         *buf = g_pend[(g_phead - 1) % CS_PENDING].ar;
         *off = o->off + (gva - o->addr);
         return 1;
@@ -799,9 +834,9 @@ u64 vk_compute_put_aside(void) {
 void vk_compute_wait_at(u64 value, const char* file, int line) {
     if (value) cs_wait(value, file, line);
 }
-u64 vk_compute_number(void) { return g_cval + (g_recording ? 1 : 0); }
+u64 vk_compute_number(void) { return atomic_load_explicit(&g_cval, memory_order_relaxed) + (g_recording ? 1 : 0); }
 void vk_compute_progress(u64* submitted, u64* done) {
-    *submitted = __atomic_load_n(&g_cval, __ATOMIC_RELAXED);
+    *submitted = atomic_load_explicit(&g_cval, memory_order_relaxed);
     *done = 0;
     if (g_vk_csem) VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_vk_csem, done));
 }
@@ -814,7 +849,7 @@ void vk_compute_land_through(u64 value) {
 void vk_compute_before_write(u64 gva, u64 size) {
     if (!size)
         vk_compute_land();
-    else if (g_cs_any)
+    else if (atomic_load_explicit(&g_cs_any, memory_order_relaxed))
         vk_compute_mem_need(gva, size);
 }
 /* a read of guest memory: results for it have to be there first. Called from any thread that reads guest memory while
@@ -846,7 +881,7 @@ void vk_compute_mem_need(u64 a, u64 n) {
     if (pend_hit(&g_pages, a, n)) cs_mem_need(a, n);
     vk_unlock();
 }
-u64 vk_compute_adds(void) { return g_pages.adds; }
+u64 vk_compute_adds(void) { return atomic_load_explicit(&g_pages.adds, memory_order_relaxed); }
 int vk_compute_pending(u64 a, u64 n) {
     int hit;
     vk_lock();
@@ -940,7 +975,13 @@ static CsPipe* cs_pipe(const u8* code, u32 flow_base, u32 lx, u32 ly, u32 lz, u3
     CsPipe* p = g_csp[key & 255];
     while (p && (p->key != key || !vk_cb_reads_hold(&p->cbr, cs_cb_read))) p = p->next;
     if (p) return p;
+    /* Made with vk_lock let go: the translation and the driver's compile need nothing it guards (the pipeline file's
+       thread makes these with no hold, vk_cs_pipe_load). One took 235 ms in a racing game, and every thread that
+       landed GPU results waited for it. The table, g_cb and the code window are the dispatching thread's alone. Not
+       while a constant buffer is still to be read (g_cb_later): a read of it can land results */
+    int paused = !g_cb_later && vk_lock_pause();
     p = cs_make(code, blen, key, flow_base, lx, ly, lz, shm, k, cs_cb_read);
+    vk_lock_resume(paused);
     if (!p) return &g_cs_alloc_failed;
     p->next = g_csp[key & 255];
     g_csp[key & 255] = p;
@@ -1033,15 +1074,20 @@ static CsPipe* cs_make(const u8* code, u32 blen, u64 key, u32 flow_base, u32 lx,
     plat_thread_note("making the compute pipeline %016llx (%zu KB of SPIR-V, a block of %ux%ux%u, %u bytes of shared "
                      "memory)",
                      (unsigned long long)key, nw / 256, lx, ly, lz, (unsigned)p->si.shared_size);
-    if (!VK_OK(snx_vk_compute_pipeline_subgroups(g_vk.dev, vk_pipeline_cache(), g_vk.cs_playout, spv, (size_t)nw * 4,
-                                                 warp ? 32 : 0, warp && lx % 32 == 0, &p->p)))
+    if (!VK_OK(snx_vk_compute_pipeline_flags(g_vk.dev, vk_pipeline_cache(), g_vk.cs_playout, spv, (size_t)nw * 4,
+                                             warp ? 32 : 0, warp && lx % 32 == 0, vk_pipeline_stats_flags(), &p->p)))
         p->failed = 1;
+    else
+        vk_pipeline_stats_write_compute(p->p, key);
     plat_thread_note_clear();
     free(spv);
     /* as a draw's program says it (pipeline.c): the textures a compute program samples as none */
     if (!p->failed && p->si.memh_none)
         LOG_LIMIT(64, "vulkan: compute %016llx samples %u texture%s as none, whose handles no dispatch gives (%s)\n",
                   (unsigned long long)key, p->si.memh_none, p->si.memh_none == 1 ? "" : "s", p->si.memh_why);
+    if (!p->failed && p->si.flow_why[0])
+        LOG_LIMIT(64, "vulkan: compute %016llx runs its control flow in a dispatch loop: %s\n", (unsigned long long)key,
+                  p->si.flow_why);
     if (!p->failed)
         LOG_LIMIT(12, "vulkan: compute %016llx ready: block %ux%ux%u, %d global buffers, %d textures, %d images\n",
                   (unsigned long long)key, lx, ly, lz, p->si.ngbuf, p->si.ntex, p->si.nimg);
@@ -1059,17 +1105,17 @@ static int cs_reads_same(const VkCbReads* a, const VkCbReads* b);
 static struct {
     PMutex lock;             /* list's */
     CsPipe* list;            /* made, for the next dispatch to put in the table (cs_take_loaded) */
-    int any;                 /* list holds one: read by every dispatch without the lock, written rarely */
+    _Atomic int any;         /* list holds one: read by every dispatch without the lock, written rarely */
     const VkCbReads* replay; /* the reads of the one being made, which translating it again answers from */
 } g_cs_load = {.lock = PMUTEX_INIT};
 /* vk_lock held: the loaded pipelines in the table, but those a dispatch made meanwhile (a game started without waiting
    for the shaders) */
 static void cs_take_loaded(void) {
-    if (!__atomic_load_n(&g_cs_load.any, __ATOMIC_ACQUIRE)) return;
+    if (!atomic_load_explicit(&g_cs_load.any, memory_order_acquire)) return;
     pm_lock(&g_cs_load.lock);
     CsPipe* list = g_cs_load.list;
     g_cs_load.list = NULL;
-    __atomic_store_n(&g_cs_load.any, 0, __ATOMIC_RELAXED);
+    atomic_store_explicit(&g_cs_load.any, 0, memory_order_relaxed);
     pm_unlock(&g_cs_load.lock);
     while (list) {
         CsPipe *p = list, *q;
@@ -1126,7 +1172,7 @@ int vk_cs_pipe_load(const u32 launch[5], const u32* cbr, u32 ncbr, const u8* vke
         pm_lock(&g_cs_load.lock);
         p->next = g_cs_load.list;
         g_cs_load.list = p;
-        __atomic_store_n(&g_cs_load.any, 1, __ATOMIC_RELEASE);
+        atomic_store_explicit(&g_cs_load.any, 1, memory_order_release);
         pm_unlock(&g_cs_load.lock);
         p = NULL;
     }
@@ -1186,18 +1232,36 @@ int vk_buffer_image(const u32* tic, int kind, VkBufImg* out) {
     return 1;
 }
 
+void vk_null_buffer_image(int kind, VkBufImg* out) {
+    /* storage texel buffers of these formats, and atomics on R32_UINT, every Vulkan device has */
+    out->gva = 0;
+    out->bytes = 16;
+    out->fmt = kind == 1   ? VK_FORMAT_R32_UINT
+               : kind == 2 ? VK_FORMAT_R32G32B32A32_UINT
+               : kind == 3 ? VK_FORMAT_R32G32B32A32_SINT
+                           : VK_FORMAT_R32G32B32A32_SFLOAT;
+}
+
 /* whether [pa, pa + len) of code is as it was when the write-tracking clock read wseen and the GPU's writes were at
    generation gw, page by page: a window's pages need not follow each other in host memory. 0 when it can't tell */
-static int cs_code_unchanged(u64 pa, u32 len, u64 gw, u32 wseen) {
+static int cs_code_unchanged(u64 pa, u32 len, u64 gw, u32 wseen, u64 own_hash) {
+    static u8 bytes[CS_CODE];
+    int compare = 0;
     gmem_need(pa, len); /* pending results over the code land first, as the write tracking then sees them */
     if (gpu_mem_dirty_since(gw, pa, len)) return 0;
     for (u64 a = pa, end = pa + len; a < end;) {
         u64 n = 0x1000 - (a & 0xFFF);
         if (n > end - a) n = end - a;
-        if (vk_written_since(gmem_host(a, n), n, wseen) != 0) return 0;
+        int w = vk_written_since(gmem_host(a, n), n, wseen);
+        if (w > 0) return 0;
+        compare |= w < 0;
         a += n;
     }
-    return 1;
+    if (!compare) return 1;
+    /* a page write tracking can't tell of (one an import holds with unified memory, uma.c, or none tracked): the
+       program's own bytes against their hash when it was read. Taken as changed, one battle's dispatches read, hashed
+       and walked a program's window again at one in six, nearly all of them the same code */
+    return gmem_read_code_cpu(pa, bytes, len) == len && vk_hash(bytes, len) == own_hash;
 }
 /* Both the initial translation and format specialization use the same bounded program, in the window dst (CS_WINDOW
    bytes). bytes: the program's code bytes as its front end knows them (DispatchState.code_bytes), 0 when it doesn't.
@@ -1345,7 +1409,7 @@ static int mirror_plan(const CsPipe* p, int ng, const u64* sa, const u32* ss, u6
 /* the results other than the mirror's pending over [gva, gva + len) land, as a read of guest memory has them: the
    mirror's own are where it reads them */
 static void mirror_need_others(u64 gva, u64 len) {
-    if (g_cs_any) vk_compute_mem_need(gva, len);
+    if (atomic_load_explicit(&g_cs_any, memory_order_relaxed)) vk_compute_mem_need(gva, len);
     vk_buf_mem_need(gva, len);
     vk_gfx_image_mem_need(gva, len);
     vk_release_need(gva, len);
@@ -1358,6 +1422,8 @@ void vk_dispatch(const DispatchState* d) {
     u32 tcb_key;
     u64 tic_key_base;
     VkBufImg bimg[8] = {0};
+    u64 bimg_at[8] = {0}; /* the buffer images' headers: where, their handles and words 0, for the log */
+    u32 bimg_h[8] = {0}, bimg_w0[8] = {0};
     int i;
     SNX_ZONE(z_dispatch, "dispatch");
     vk_frame_check();
@@ -1408,6 +1474,7 @@ void vk_dispatch(const DispatchState* d) {
         u64 gw;        /* gpu_mem_generation() when the window was read */
         u32 epoch, lx, ly, lz, shm;
         u32 wseen, code_len; /* vk_ww_now() then, and the bytes of the window */
+        u64 own_hash;        /* of the code_len bytes at addr, for a check write tracking can't make */
         CsPipe* p;
     };
     /* by the program's address (lookup_ways.h). An Ounce game dispatches a few hundred programs a frame: in 64 entries
@@ -1430,7 +1497,7 @@ void vk_dispatch(const DispatchState* d) {
     int same = p && fe->addr == pa && fe->lx == lx && fe->ly == ly && fe->lz == lz && fe->shm == shm &&
                vk_cb_reads_hold(&p->cbr, cs_cb_read);
     if (same && (fe->shader_generation != g_vk.shader_generation || fe->epoch != epoch)) {
-        if (cs_code_unchanged(pa, fe->code_len, fe->gw, fe->wseen)) {
+        if (cs_code_unchanged(pa, fe->code_len, fe->gw, fe->wseen, fe->own_hash)) {
             fe->shader_generation = g_vk.shader_generation;
             fe->epoch = epoch;
             fe->wseen = vk_ww_now();
@@ -1460,6 +1527,7 @@ void vk_dispatch(const DispatchState* d) {
         fe->wseen = wseen;
         fe->gw = gw;
         fe->code_len = code_len;
+        fe->own_hash = vk_hash(code_buf + 80, code_len);
         fe->lx = lx;
         fe->ly = ly;
         fe->lz = lz;
@@ -1567,6 +1635,8 @@ void vk_dispatch(const DispatchState* d) {
     u64 sa[16];
     u32 ss[16];
     int ng = p->si.ngbuf > 16 ? 16 : p->si.ngbuf;
+    /* the arena's space check: each binding's bytes as the arena takes them below, its range rounded to the device's
+       checked steps, and the alignment before it (arena_alloc) */
     u64 need = 0;
     int tables = 0;
     u32 table_bank = ~0u; /* the bank whose windows tw_base and tw_len hold */
@@ -1585,7 +1655,7 @@ void vk_dispatch(const DispatchState* d) {
             }
             sa[i] = tw_base[w];
             ss[i] = tw_len[w];
-            need += ss[i] + vk_stage_align();
+            need += vk_sb_round(ss[i]) + vk_stage_align();
             tables = 1;
             continue;
         }
@@ -1593,11 +1663,11 @@ void vk_dispatch(const DispatchState* d) {
         /* the address's words: an indirect buffer's are its parent's, which vk_gbuf_desc follows to the pointer */
         for (u32 w = 0; w < (bank ? 2u : 3u); w++) cs_cb_read(bank, off + 4 * w, &v[w]);
         ss[i] = vk_gbuf_desc(ST_CS, p->si.gbuf_cbuf_off[i], v, &sa[i]);
-        need += ss[i] + vk_stage_align();
+        need += vk_sb_round(ss[i]) + vk_stage_align();
     }
-    for (int i = 0; i < 8; i++)
-        if (p->si.cbuf_mask & (1u << i)) need += g_cbn[i] + vk_stage_align();
-    if (p->si.root_max) need += SH_ROOT_BYTES + vk_stage_align();
+    for (u32 i = 0; i < 8; i++)
+        if (p->si.cbuf_mask & (1u << i)) need += cs_cb_range(p, i) + vk_stage_align();
+    if (p->si.root_max) need += vk_cb_range(p->si.root_max) + vk_stage_align();
     /* buffer images: their headers from the compute engine's texture pool, handles from its texture bank */
     for (i = 0; i < p->si.nimg && i < 8; i++) {
         u64 tic_base;
@@ -1610,8 +1680,14 @@ void vk_dispatch(const DispatchState* d) {
             g_cs_skips[CS_SKIP_BUFFER_IMAGE]++;
             return;
         }
-        vk_gmem_words(tic_base + (h & 0xFFFFF) * 32ull, tic, 8);
-        if (!vk_buffer_image(tic, p->si.img[i].kind, &bimg[i])) {
+        bimg_at[i] = tic_base + (h & 0xFFFFF) * 32ull;
+        bimg_h[i] = h;
+        vk_gmem_words(bimg_at[i], tic, 8);
+        bimg_w0[i] = tic[0];
+        /* a header that names no texture: a texel of zeros of its own (gva 0), as a draw's */
+        if (vk_tic_names_none(tic))
+            vk_null_buffer_image(p->si.img[i].kind, &bimg[i]);
+        else if (!vk_buffer_image(tic, p->si.img[i].kind, &bimg[i])) {
             LOG_LIMIT(4, "vulkan: unsupported compute buffer image (header word 0 %08x, skipped)\n", tic[0]);
             g_cs_skips[CS_SKIP_BUFFER_IMAGE]++;
             return;
@@ -1705,6 +1781,7 @@ void vk_dispatch(const DispatchState* d) {
             return;
         }
     }
+    const u64 ar_from = g_ar_used; /* where the bindings start in the arena */
 
     VkDescriptorSet set;
     u64 setup_sub;
@@ -1741,12 +1818,7 @@ rebind:
     u32 nw = 0;
     for (int i = 0; i < 8; i++)
         if (p->si.cbuf_mask & (1u << i)) {
-            /* only the bytes the shader reads, zeros after the guest's: reads past the range are zero with
-               robustBufferAccess2, and stay in bounds, of undefined value, with robust buffer access alone */
-            u32 range = g_cbn[i];
-            if (p->si.cbuf_max[i] && range > p->si.cbuf_max[i]) range = p->si.cbuf_max[i];
-            range = vk_cb_range(range); /* a whole checked step, within the limit; the tail is zeroed below */
-            u32 n = g_cbn[i] < range ? g_cbn[i] : range;
+            u32 range = cs_cb_range(p, (u32)i), n = g_cbn[i] < range ? g_cbn[i] : range; /* the tail zeroed below */
             VkBuffer cbuf = g_ar;
             u64 o;
             u8* dst;
@@ -1992,18 +2064,23 @@ rebind:
                     h |= h2;
             }
             u32 tic[8] = {0}, tsc[8] = {0};
+            const u64 tic_at = tic_base + (u64)texture_handle_tic_id(h) * TEXTURE_POOL_ENTRY_BYTES;
             /* a handle from memory the program alone makes (SH_PROBE_NONE) names no header: no texture */
-            if (!(st->flags & SNX_TEX_MEMORY) || st->cbuf_off != SH_PROBE_NONE) {
-                vk_gmem_words(tic_base + (u64)texture_handle_tic_id(h) * TEXTURE_POOL_ENTRY_BYTES, tic, 8);
+            const int headed = !(st->flags & SNX_TEX_MEMORY) || st->cbuf_off != SH_PROBE_NONE;
+            if (headed) {
+                vk_gmem_words(tic_at, tic, 8);
                 vk_gmem_words(tsc_base + (u64)texture_handle_tsc_id(h) * TEXTURE_POOL_ENTRY_BYTES, tsc, 8);
             }
             VkImageViewType want = vk_tex_view_type(st);
             Surf* t = vk_tex_from_tic_guest(tic, st->flags & 1);
+            /* a header that names no texture by itself reads the null texture, a raw load's too, and the dispatch goes
+               on, as a draw's does */
+            const int none = !t && headed && vk_tic_names_none(tic);
             /* a program fetching samples (flags bit 1) reads a multisampled image, others a single-sampled one: an
                image of other samples reads zeros, as a missing texture does */
             int ms = (st->flags & 2) != 0;
             if (t && ms != (t->msaa != 0)) t = NULL;
-            if ((st->flags & 1) && !t) {
+            if ((st->flags & 1) && !t && !none) {
                 LOG_LIMIT(4,
                           "vulkan: a raw surface load's header %08x %08x %08x names no texture of 4-, 8- or 16-byte "
                           "color texels stored as they are: the dispatch is skipped\n",
@@ -2023,13 +2100,13 @@ rebind:
                           "%ux%u surface of VkFormat %d, which has no depth: the compare's result is the driver's\n",
                           (unsigned long long)p->key, i, tic[0] & 0x7F, t->w, t->h, (int)t->f.vk);
             VkImageLayout sampled_layout =
-                p->si.nimg ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                p->si.nimg ? VK_IMAGE_LAYOUT_GENERAL : VK_LAYOUT(SHADER_READ_ONLY_OPTIMAL);
             const Surf* sampled = v ? t : NULL; /* the texture whose own view is bound, for the sampler */
             if (v)
                 vk_surf_use(vk_cmd(), t, sampled_layout, VK_SAMPLED_STAGES, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
             else {
                 v = vk_null_view(want, st->shadow ? 3 : num, ms); /* a compare's: the farthest depth, as a draw's */
-                sampled_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                sampled_layout = VK_LAYOUT(SHADER_READ_ONLY_OPTIMAL);
             }
             VkSampler smp =
                 vk_tex_bind_sampler(tsc, tic, st, num, sampled, want, (int)(p->si.tex_minmax_mask >> i & 1));
@@ -2038,6 +2115,12 @@ rebind:
                 cs_abandon_binding(originals);
                 return;
             }
+            if (none && !sampled && vk_null_header_first(tic_at))
+                LOG("vulkan: compute %016llx texture %d (handle %08x) names %s at %llx (word 0 %08x): it reads the "
+                    "null texture, %s, and the dispatch goes on\n",
+                    (unsigned long long)p->key, i, h,
+                    vk_tic_empty(tic) ? "an empty header" : "a header of no Vulkan format", (unsigned long long)tic_at,
+                    tic[0], st->shadow ? "a depth of 1.0 to compare" : "zeros");
             ii[i] = (VkDescriptorImageInfo){smp, v, sampled_layout};
             w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                              .dstSet = set,
@@ -2137,6 +2220,23 @@ rebind:
                 bufimg_off[i] = bufimg_off[alias];
                 bufimg_buf[i] = bufimg_buf[alias];
                 if (bimg[i].bytes > bimg[alias].bytes) bimg[i].bytes = bimg[alias].bytes;
+            } else if (!bimg[i].gva) { /* zeros of its own, which land nowhere */
+                u8* zeros;
+                if (deferred)
+                    zeros = vk_stage(bimg[i].bytes, vk_stage_align(), &bufimg_buf[i], &bufimg_off[i]);
+                else {
+                    bufimg_off[i] = arena_alloc(bimg[i].bytes);
+                    bufimg_buf[i] = g_ar;
+                    zeros = g_ar_ptr + bufimg_off[i];
+                }
+                if (!zeros) {
+                    for (k = 0; k < i; k++)
+                        if (bufimg_view[k]) vk_defer_buffer_view(bufimg_view[k]);
+                    g_cs_skips[CS_SKIP_BUFFER_IMAGE]++;
+                    cs_abandon_binding(originals);
+                    return;
+                }
+                memset(zeros, 0, bimg[i].bytes);
             } else if (deferred) { /* a pending result, like a written storage buffer */
                 if (!vk_buf_copy_writable(bimg[i].gva, (u32)bimg[i].bytes, &bufimg_buf[i], &bufimg_off[i], 1)) {
                     for (k = 0; k < i; k++)
@@ -2171,6 +2271,12 @@ rebind:
             w[nw].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
             w[nw].pTexelBufferView = &bufimg_view[i];
             nw++;
+            if (!bimg[i].gva && vk_null_header_first(bimg_at[i]))
+                LOG("vulkan: compute %016llx buffer image %d (handle %08x) names %s at %llx (word 0 %08x): it reads "
+                    "zeros and its stores land nowhere, and the dispatch goes on\n",
+                    (unsigned long long)p->key, i, bimg_h[i],
+                    bimg_w0[i] ? "a header of no Vulkan format" : "an empty header", (unsigned long long)bimg_at[i],
+                    bimg_w0[i]);
         }
         if (fmt_used) {
             VkBuffer fbuf = g_ar;
@@ -2203,7 +2309,7 @@ rebind:
     }
     /* an indirect dispatch's grid, as the GPU holds it (a compute program's results that haven't landed where they
        are) */
-    if (d->indirect && ((d->indirect & 3) || !vk_buf_get(d->indirect, 12, &grid_buf, &grid_off))) {
+    if (d->indirect && ((d->indirect & 3) || !vk_buf_get_at(d->indirect, 12, 4, &grid_buf, &grid_off))) {
         LOG_LIMIT(4, "vulkan: an indirect dispatch's grid at %llx can't be read\n", (unsigned long long)d->indirect);
         vk_buf_writable_abort();
         res_unref_all(made, ng);
@@ -2223,6 +2329,15 @@ rebind:
         g_cs_skips[CS_SKIP_INPUTS_MOVED]++;
         return;
     }
+    /* the bindings within what the space check counted: more is a binding it missed, which at the arena's end
+       would pass it (arena_alloc) */
+    if (!deferred && g_ar_used > ar_from + need) {
+        g_cs_arena_short++;
+        LOG_LIMIT(4,
+                  "vulkan: a compute dispatch's bindings took %llu bytes of the arena, where its space check counted "
+                  "%llu\n",
+                  (unsigned long long)(g_ar_used - ar_from), (unsigned long long)need);
+    }
     /* the outputs, once every input is read (an input can alias another storage buffer's output) */
     for (int i = 0; i < ng && !deferred; i++)
         if (((p->si.gbuf_wmask >> i) & 1) && sa[i]) {
@@ -2240,7 +2355,7 @@ rebind:
         int alias = 0;
         int k;
         for (k = 0; k < i; k++) alias |= bufimg_view[k] && bufimg_off[k] == bufimg_off[i];
-        if (bufimg_view[i] && !alias && g_nout < 256) {
+        if (bufimg_view[i] && bimg[i].gva && !alias && g_nout < 256) {
             memcpy(g_org + bufimg_off[i], g_ar_ptr + bufimg_off[i], bimg[i].bytes);
             g_out[g_nout].addr = bimg[i].gva;
             g_out[g_nout].off = bufimg_off[i];
@@ -2328,8 +2443,8 @@ rebind:
         u32 nf = 0;
         for (int i = 0; i < ng; i++)
             if (p->si.gbuf_mark[i] && sa[i]) f[nf++] = (VkMirFold){mcpu[i], ss[i], p->si.gbuf_mark[i] - 1u};
-        vk_mirror_fold(cb, vk_wlog_buffer(log), vk_wlog_size(log), f, nf);
-        vk_wlog_clear(cb, log); /* in the GPU's memory (cs_log): the folds were its only readers */
+        u32 cleared = vk_mirror_fold(cb, vk_wlog_buffer(log), vk_wlog_size(log), f, nf);
+        vk_wlog_clear(cb, log, cleared); /* in the GPU's memory (cs_log): the folds were its only readers */
         vk_wlog_ready(log);     /* clear again from here on in this queue's commands: the next dispatch's too */
     }
     if (log) { /* recorded: the dispatch's reference goes with the work that writes the log */
@@ -2355,7 +2470,8 @@ rebind:
                 res_publish(sa[i], ss[i], made[i]);
             else
                 res_wrote(sa[i], ss[i]);
-            gpu_mem_written(sa[i], ss[i]); /* what is built from these bytes (buffers, textures) takes the new ones */
+            /* what is built from these bytes (buffers, textures) takes the new ones */
+            gpu_mem_written_by(sa[i], ss[i], GPU_WRITE_COMPUTE, 0, 0);
         }
         res_unref_all(made, ng);
         g_vk_dispatches++;
@@ -2364,11 +2480,13 @@ rebind:
     if (deferred) {
         /* pending from here: the submit copies them where the host reads them (vk_buf_host_barrier). Submitted at
            once, the GPU runs it while the stream goes on, and a reader of its results waits for that submit alone,
-           not for the draws recorded after it: Pokemon Legends Z-A writes command lists with a dispatch and fetches
+           not for the draws recorded after it: one game writes command lists with a dispatch and fetches
            them a little later (a GPFIFO entry with SYNC), once a frame */
+        const u64 staged_before = vk_buf_commits_staged();
         vk_uma_writer(p->key);
         vk_buf_writable_commit();
         vk_uma_writer(0);
+        const int staged = vk_buf_commits_staged() != staged_before;
         for (i = 0; i < p->si.nimg && i < 8; i++)
             if (bufimg_view[i]) vk_defer_buffer_view(bufimg_view[i]);
         /* the storage images' texels over their guest bytes, after the dispatch on the GPU */
@@ -2377,7 +2495,10 @@ rebind:
             for (int k = 0; k < i && !seen; k++) seen = images[k] == images[i];
             if (!images[i] || seen) continue;
             vk_surf_wrote(images[i]);
-            if (!vk_surf_publish(images[i])) vk_surf_flush(images[i], NULL);
+            if (!vk_surf_publish(images[i]))
+                vk_surf_flush(images[i], NULL);
+            else
+                vk_surf_stored(images[i]); /* a texture over its memory takes its texels on the GPU */
         }
         g_vk_dispatches++;
         /* Not one in the GPU mirror: its results land only where the CPU first touches them, and that read submits
@@ -2388,8 +2509,14 @@ rebind:
            the end of the game's GPU submission (vk_release_submit) or whatever submits first, as the console's GPU
            runs what a flush handed it. Submitted each, one game's battle map made 350 to 390 submissions a present
            by the GPU profiler, and 22 to 24 so. A program a CPU reader waited for while its writes were still
-           unsubmitted (vk_uma_read_soon) is submitted at once, as above */
-        if (vk_uma() && !vk_buf_pending_unsubmitted() && !vk_uma_read_soon(p->key)) {
+           unsubmitted (vk_uma_read_soon) is submitted at once, as above. A draw's result pending in that submission
+           is no reason to submit: what reads one on the GPU copies it there (owned.c's pending_gpu_read). Submitted
+           for them, another game's battle made about 70 submissions a present, with the GPU idle between them.
+           Where guest memory is copied, a dispatch that staged no result for the host waits the same way: its storage
+           images are published over their guest bytes, GPU-owned, and a CPU access to them submits what is open
+           first (owned.c's own_wait). Submitted each, a scene that fills its compute textures a level a dispatch made
+           129 submissions a present on a discrete GPU, the graphics queue idle 2.4 ms a present between them */
+        if ((vk_uma() || !staged) && !vk_uma_read_soon(p->key)) {
             g_vk_cs_open = vk_submit_number();
             g_vk_cs_left++;
             return;

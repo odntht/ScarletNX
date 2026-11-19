@@ -68,6 +68,7 @@ typedef struct {
     NvnDraw d;
     i64 stride[2]; /* the copies' row and image strides (gpu/nvn/nvn_copy.c) */
     u32 syncpt;
+    int waited; /* its last submission had a wait: the next one's walk takes its snapshot too (nvn_replay_submit) */
 } NvnReplayQueue;
 /* a submission's effect on what the CPU sees (nvn_replay.c's FX_*), at gva */
 typedef struct {
@@ -106,7 +107,7 @@ typedef struct {
     u64 unknown[2]; /* the ops logged as not replayed, a bit each (GPU thread) */
     u32 shown;   /* the presents' syncpoint: up by one as each reaches the display, 0 before the first queue */
     u32 present_submitted, present_walked; /* the shared shown syncpoint requires global present order */
-    u64 submitted, walked;                 /* nvn_replay_submitted and nvn_replay_walked */
+    _Atomic u64 submitted, walked;         /* nvn_replay_submitted and nvn_replay_walked */
     u32 settled; /* nvn_replay_finish_all's syncpoint: up by one as each of its waits ends, 0 before the first */
 } NvnReplayState;
 

@@ -12,6 +12,7 @@
 #include "common/utilities/common.h"
 #include "common/utilities/pad_sdl.h" /* snx_pad_slot */
 #include "support/sdl_real_pads.h"
+#include "gui/icons.h"
 #include <SDL3/SDL.h>
 #include <string.h>
 #include <stdio.h>
@@ -38,9 +39,11 @@ static char stored[64];
 void ini_set(const char* k, const char* v) { snprintf(stored, sizeof stored, "%s=%s", k, v); }
 /* gamepad_assign=1's notices and pauses */
 static char toasted[128];
-void overlay_toast(const char* text, u64 now_ns) {
+static unsigned toasted_icon;
+void overlay_toast(unsigned icon, const char* text, u64 now_ns) {
     (void)now_ns;
     snprintf(toasted, sizeof toasted, "%s", text);
+    toasted_icon = icon;
 }
 static int paused;
 int game_pause(void) {
@@ -303,12 +306,23 @@ int main(void) {
     CHECK(gamepad_button(SDL_GetJoystickID(pro), SDL_GAMEPAD_BUTTON_EAST) == A);
     CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_DPAD_UP) == UP);
     CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_GUIDE) == 0);
+    /* and its hints name the buttons sending A and B as each pad's face does: an Xbox pad's B sends A */
+    char name[16];
+    CHECK(gamepad_sends_name(SDL_GetJoystickID(xbox), 0, name, sizeof name) && !strcmp(name, "B"));
+    CHECK(gamepad_sends_name(SDL_GetJoystickID(xbox), 1, name, sizeof name) && !strcmp(name, "A"));
+    CHECK(gamepad_sends_name(SDL_GetJoystickID(pro), 0, name, sizeof name) && !strcmp(name, "A"));
+    CHECK(gamepad_sends_name(SDL_GetJoystickID(pro), 1, name, sizeof name) && !strcmp(name, "B"));
+    CHECK(gamepad_sends_name(SDL_GetJoystickID(sony), 0, name, sizeof name) && !strcmp(name, "Circle"));
+    CHECK(gamepad_sends_name(SDL_GetJoystickID(sony), 1, name, sizeof name) && !strcmp(name, "Cross"));
+    CHECK(!gamepad_sends_name(0, 0, name, sizeof name) && !name[0]); /* no pad */
 
     /* gamepad_swap_ab=1: A and B swapped, X and Y where the console's are; a key that is none of these is no gamepad
        key, and gamepad_buttons is one no longer (docs/user/deprecations.md) */
     CHECK(gamepad_ini("gamepad_swap_ab", "1"));
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == A);
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_EAST) == B);
+    CHECK(gamepad_sends_name(SDL_GetJoystickID(xbox), 0, name, sizeof name) && !strcmp(name, "A"));
+    CHECK(gamepad_sends_name(SDL_GetJoystickID(sony), 0, name, sizeof name) && !strcmp(name, "Cross"));
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_NORTH) == X);
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_WEST) == Y);
     CHECK(with(cube, SDL_GAMEPAD_BUTTON_EAST) == B);
@@ -622,6 +636,7 @@ int main(void) {
         gamepad_console(0, plat_ns()); /* the mode's start: none held */
         one = attach(XBOX);
         CHECK(gamepad_slot_id(0) == SDL_GetJoystickID(one) && strstr(toasted, "P1: ") && strstr(toasted, " joined"));
+        CHECK(toasted_icon == gui_group_icon("Controllers") && toasted_icon == GUI_ICON_GAMEPAD_2); /* the launcher's */
         two = attach(SONY);
         CHECK(gamepad_slot_id(1) == SDL_GetJoystickID(two));
         SDL_DetachVirtualJoystick(SDL_GetJoystickID(two));
@@ -650,6 +665,7 @@ int main(void) {
         CHECK(paused == 1);
         gamepad_console(0, t + 3400000000ull);
         CHECK(!paused && !strcmp(toasted, "Going on without P2") && !gamepad_slot_kept(1));
+        CHECK(toasted_icon == GUI_ICON_GAMEPAD_2);
         /* manual again: what was kept goes, the pads stay where they are */
         CHECK(gamepad_ini("gamepad_assign", "0"));
         gamepad_console(0, t + 3500000000ull);

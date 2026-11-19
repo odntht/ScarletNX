@@ -89,6 +89,7 @@ snx_component(gpu gpu/gpu.c gpu/guest_pools.c gpu/guest_textures.c gpu/maxwell/e
               gpu/nvn/nvn_loader.c gpu/nvn/nvn_object.c gpu/nvn/nvn_cmd.c gpu/nvn/nvn_queue.c gpu/nvn/nvn_dlss.c
               gpu/nvn/nvn_tex.c gpu/nvn/nvn_driver.c gpu/nvn/nvn_tic.c gpu/nvn/nvn_replay.c gpu/nvn/nvn_draw.c gpu/nvn/nvn_copy.c gpu/nvn/nvn_state.c
               gpu/nvn/nvn_save.c
+              gpu/gl/gl_census.c
               gpu/shipped_pass.c)
 # the NVN functions nvn implements: their adapters and table, generated from gpu/nvn/nvn.hook
 target_link_libraries(snx_gpu PRIVATE snx_zstd) # an Ounce game's .zs shader files (gpu/shipped_pass.c)
@@ -106,7 +107,7 @@ set(platform runtime/platform/log.c runtime/platform/plat_sdl.c runtime/platform
              runtime/platform/audio_denoise.c
              runtime/platform/ui.c runtime/platform/vpad.c
              runtime/platform/fatal_screen.c
-             runtime/platform/prepare_screen.c runtime/platform/gpu_driver_load.c runtime/platform/resources.c)
+             runtime/platform/prepare_screen.c runtime/platform/resources.c)
 if(WIN32)
     list(APPEND platform runtime/platform/plat_win32.c runtime/platform/profiler_win32.c)
 else()
@@ -119,11 +120,6 @@ if(APPLE)
     # under ARC, as gui/apple.m is: the global that holds the activity's token keeps it
     set_source_files_properties(runtime/platform/plat_apple.m PROPERTIES COMPILE_OPTIONS -fobjc-arc)
 endif()
-if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
-    # a GPU driver package loaded in place of the system's driver (runtime/platform/gpu_driver_load.c), on the
-    # packages' one ABI
-    list(APPEND platform runtime/platform/gpu_driver_android.c)
-endif()
 if(SNX_TRACY)
     # the C++ client's connection id, which the C layer's GPU track keys its epochs on
     list(APPEND platform runtime/platform/tracy_conn.cpp)
@@ -131,6 +127,8 @@ endif()
 snx_component(platform ${platform})
 # the microphone's neural noise reduction (runtime/platform/audio_denoise.c), from cmake/dependencies.cmake
 target_link_libraries(snx_platform PRIVATE snx_rnnoise)
+# the GPU driver a run asks for (src/common/gpu/vk/gpu_driver_load.h), which the other renderers share
+target_link_libraries(snx_platform PRIVATE snx_vk_common)
 # the tracy-capture a capture needs (tracy.c), the client's release (cmake/dependencies.cmake)
 target_compile_definitions(snx_platform PRIVATE SNX_TRACY_VERSION="${SNX_TRACY_VERSION}")
 
@@ -138,7 +136,7 @@ snx_component(shader gpu/shader/shader.c gpu/shader/decode.c gpu/shader/corpus.c
                      gpu/shader/spirv_translate.c gpu/shader/spirv_compute.c gpu/shader/structure.c
                      gpu/shader/shared_reach.c gpu/shader/registers.c gpu/shader/forms.c gpu/shader/dataflow.c
                      gpu/shader/emit_int.c gpu/shader/emit_float.c gpu/shader/emit_memory.c gpu/shader/emit_texture.c
-                     gpu/shader/emit_io.c gpu/shader/emit_flow.c gpu/shader/emit_thread.c
+                     gpu/shader/emit_io.c gpu/shader/emit_flow.c gpu/shader/emit_thread.c gpu/shader/fuse.c
                      gpu/shader/sm86_decode.c gpu/shader/sm86_translate.c gpu/shader/sm86_eval.c gpu/shader/advanced_blend_spirv.c
                      gpu/shader/coverage_spirv.c gpu/shader/capture_tiles_spirv.c gpu/shader/depth_stencil_spirv.c gpu/shader/write_log.c
                      gpu/shader/minmax_spirv.c)
@@ -150,9 +148,9 @@ snx_decodetree(snx_shader OUTPUT decode-sm53.inc DECODE "${CMAKE_CURRENT_SOURCE_
 snx_decodetree(snx_shader OUTPUT decode-sm86.inc DECODE "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shader/sm86.decode"
                OPTIONS -w 16 --static-decode=decode_sm86)
 snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/descriptors.c gpu/vk/descriptor_heaps.c gpu/vk/descriptor_objects.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
-                 gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/writelog.c gpu/vk/mirror.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/xfb.c gpu/vk/display.c gpu/vk/compute.c
-                 gpu/vk/pending_pages.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/upscale.c gpu/vk/memory.c gpu/vk/ledger.c gpu/vk/pagespace.c gpu/vk/range_shape.c gpu/vk/tex_census.c gpu/vk/tex_report.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/bc7_cache.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/vk/hdr_swapchain.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/devmem.c gpu/vk/space.c gpu/vk/gpuprof.c gpu/vk/uma.c
-                 gpu/vk/ftz_probe.c gpu/vk/vertex_input.c gpu/vk/pipeline_parts.c gpu/vk/cb_fold.c
+                 gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/writelog.c gpu/vk/mirror.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/table.c gpu/vk/xfb.c gpu/vk/display.c gpu/vk/compute.c
+                 gpu/vk/pending_pages.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/shading_rate.c gpu/vk/shading_rate_table.c gpu/vk/upscale.c gpu/vk/memory.c gpu/vk/ledger.c gpu/vk/pagespace.c gpu/vk/range_shape.c gpu/vk/tex_census.c gpu/vk/tex_report.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/bc7_cache.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/vk/hdr_swapchain.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/devmem.c gpu/vk/space.c gpu/vk/gpuprof.c gpu/vk/uma.c
+                 gpu/vk/ftz_probe.c gpu/vk/vertex_input.c gpu/vk/pipeline_parts.c gpu/vk/pipeline_stats.c gpu/vk/shader_objects.c gpu/vk/cb_fold.c
                  gpu/vk/draw_texture.c gpu/vk/draw_texture_shader.c gpu/vk/tess_passthrough.c gpu/vk/varying_geometry.c gpu/vk/present_quad.c gpu/vk/capture.c gpu/vk/depth_shadow.c gpu/vk/predraw.c
                  "${volk_SOURCE_DIR}/volk.c")
 # the ASTC decoder's, the block linear deswizzle and swizzle's, the texture conversions', the VIC composition's and
@@ -227,11 +225,21 @@ snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc_bcn.comp NAME astc_bc4_spv HEADER 
                DEFINES SNX_BCN_KIND=4)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc_bcn.comp NAME astc_bc5_spv HEADER nx/gpu/texture/astc_bcn_spv.h
                DEFINES SNX_BCN_KIND=5)
+# what those textures' blocks hold, read on the GPU from the blocks a texture keeps as it loads (gpu/texture/astc_kind.h,
+# gpu/vk/astc.c's vk_astc_kind_read)
+snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc_kind.comp NAME astc_kind_spv HEADER nx/gpu/texture/astc_kind_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/blocklinear.comp NAME blocklinear_spv HEADER nx/gpu/texture/blocklinear_spv.h)
+snx_glsl_spirv(snx_vk SOURCE gpu/texture/blocklinear.comp NAME blocklinear_runs_spv
+               HEADER nx/gpu/texture/blocklinear_runs_spv.h DEFINES BL_RUNS=1)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_spv HEADER nx/gpu/texture/texconv_spv.h)
 # its ETC2 build: BCn encoded again as ETC2 and EAC, for a GPU that samples those and not BCn (gpu/vk/texconv.c)
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_etc2_spv HEADER nx/gpu/texture/texconv_spv.h
                DEFINES SNX_TC_ETC2)
+# and again with SPIR-V's packed dot product (gpu/texture/etc2_encode.glsl's et_dot, Vulkan 1.3's
+# shaderIntegerDotProduct) for the GPUs that say they have an instruction for it: the encoder compares each texel
+# with four colours by their dot products
+snx_glsl_spirv(snx_vk SOURCE gpu/texture/texconv.comp NAME texconv_etc2_dot_spv HEADER nx/gpu/texture/texconv_spv.h
+               TARGET vulkan1.3 DEFINES SNX_TC_ETC2 SNX_BC7_DOT=1)
 # its ASTC build: BC2, BC3 and BC7 encoded again as ASTC 4x4, for a GPU that samples ASTC and not BCn
 # (gpu/texture/astc_encode.glsl over bc7_encode.glsl's fitter)
 # in three passes (gpu/texture/texconv.glsl's SNX_ASTC_PASS): the blocks that are an ASTC layout as they stand, moved
@@ -285,6 +293,7 @@ snx_glsl_spirv(snx_vk SOURCE gpu/vk/query_predicate.comp NAME query_predicate_sp
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/query_count.comp NAME query_count_spv HEADER nx/gpu/vk/query_count_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/xfb_indirect.comp NAME xfb_indirect_spv HEADER nx/gpu/vk/xfb_indirect_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/depth_pack.comp NAME depth_pack_spv HEADER nx/gpu/vk/depth_pack_spv.h)
+snx_glsl_spirv(snx_vk SOURCE gpu/vk/shading_rate.comp NAME shading_rate_spv HEADER nx/gpu/vk/shading_rate_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/mirror_harvest.comp NAME mirror_harvest_spv HEADER nx/gpu/vk/mirror_harvest_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/mirror_fold.comp NAME mirror_fold_spv HEADER nx/gpu/vk/mirror_fold_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/wlog_merge.comp NAME wlog_merge_spv HEADER nx/gpu/vk/wlog_merge_spv.h)
@@ -331,18 +340,7 @@ if(ANDROID)
         target_link_options(scarletnx-run PRIVATE ${snx_jemalloc_exports})
     endif()
     install(TARGETS scarletnx-run RUNTIME DESTINATION lib/${ANDROID_ABI})
-    if(ANDROID_ABI STREQUAL "arm64-v8a")
-        # the two calls Android's Vulkan loader opens its driver with, for the copy of it a run with a GPU driver
-        # package loads (runtime/platform/gpu_driver_hook.h): -z global is what puts them before the system's
-        add_library(snx_gpu_driver_hook SHARED runtime/platform/gpu_driver_hook.c)
-        target_include_directories(snx_gpu_driver_hook PRIVATE "${PROJECT_SOURCE_DIR}/src")
-        target_compile_options(snx_gpu_driver_hook PRIVATE -Wall -Wextra -Werror=missing-prototypes)
-        target_link_options(snx_gpu_driver_hook PRIVATE LINKER:-z,global)
-        set_target_properties(snx_gpu_driver_hook PROPERTIES OUTPUT_NAME scarletnx-gpu-hook)
-        install(TARGETS snx_gpu_driver_hook LIBRARY DESTINATION lib/${ANDROID_ABI})
-        include(GNUInstallDirs)
-        install(FILES runtime/platform/ADRENOTOOLS-NOTICE.txt DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/scarletnx)
-    endif()
+    # the GPU driver loader's hook library (scarletnx-gpu-hook) is src/common's, shared with the other renderers
 endif()
 list(TRANSFORM components PREPEND snx_)
 add_library(scarletnx-nx STATIC)

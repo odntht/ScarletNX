@@ -641,10 +641,14 @@ board FCRAM past the application pool.
 
 Presentation is **Vulkan only** (volk, with no linked Vulkan library):
 the device converts the guest framebuffers to RGBA8 and shows the landscape-
-rotated screens live in an SDL3 Vulkan window through a real swapchain, the top
-screen above the bottom one as on the console, the bottom one centred under it.
-The pair keeps its shape in a window of any size. The 3DS display's Separate
-screens setting gives each screen a window of its own instead, which fills with
+rotated screens live in an SDL3 Vulkan window through a real swapchain, in the
+arrangement the 3DS display's Screen layout setting picks: the top screen above
+the bottom one as on the console, one screen alone, the large screen at the left
+with the other at its own size over 2.25 (Azahar's Android default), centred
+vertically at the large one's right, or side by side, each screen keeping its
+shape in a window large enough for it. Screen swap trades the screens' places,
+and picks the bottom screen in the one-screen layout. Screen layout 4 gives each
+screen a window of its own instead, which fills with
 that screen. Top screen resolution and Bottom screen resolution scale the 3D
 rendering of that screen, 1 to 16 times the console's 400x240 and 320x240, and
 each screen keeps the console's proportions in the window whatever its scale. A
@@ -655,7 +659,7 @@ its pixels is shown from memory. The Switch's `vsync` picks how the
 window shows its images, as for a Switch game: `1` each at the display's refresh
 (FIFO), `0` the newest at the next refresh (mailbox) or at once (immediate), and the
 run says at start which it got. Its `fullscreen=1` starts the window fullscreen (the
-top screen's, with Separate screens), but for a `--seconds`, `--frames` or `--max-blocks` run,
+top screen's, with screen layout 4), but for a `--seconds`, `--frames` or `--max-blocks` run,
 and F11 or Alt+Enter switches the window it is pressed in, as on the Switch;
 Alt+Enter does not press Start. Esc twice within 3 seconds closes the game, a first
 press warning on the terminal and in a line over the game in the window it was pressed in,
@@ -674,11 +678,23 @@ host seconds, which are the console's seconds at the default pace, and `--shot P
 writes the last frame of both screens as one PPM to exactly PATH, the top above the
 bottom as the window shows them.
 
+How a target's render scale is chosen and kept:
+- A texture without mipmaps, other than a cube or shadow map, that covers a scaled colour target's whole image,
+  in the target's format, is filled from the scaled image.
+- A texture without mipmaps, other than a cube or shadow map, that covers a scaled depth buffer is filled from
+  the scaled depth when the buffer is D24S8 and the texture RGBA8, D24 and RGB8, or D16 and RGB565, RGB5A1 or RGBA4.
+- A target that opens over a depth buffer last drawn by another target of the same size, format, scale and flip
+  copies that target's scaled depth.
+
 The separate windows and the two render resolutions are checked by `3ds_windows`: each
 screen takes its own setting's scale and no other's, both screens present, and the PPM
-dumps stay the framebuffer's own size whatever the scale. With Separate screens on, that
+dumps stay the framebuffer's own size whatever the scale. With screen layout 4 on, that
 test skips unless the device presents to both windows, and it skips where the host makes no
 window (CI).
+The one window's layouts are checked as a pure function by `3ds_layouts`: the stacked and one-screen layouts at
+480x400, the large and side layouts at several windows (some swapped), a narrow window and a wide one where both
+screens still get a rectangle of their console's shape inside the window and over no part of the other, a screen
+with no frame yet, screen layout 4 with no second window, and a value past the five shown as stacked.
 A window minimized and restored gets its swapchain back, checked by `3ds_windows_minimized`
 (it skips where the host keeps the swapchain or does not minimize). On Windows a minimized
 window's surface is 0x0 and no swapchain can be made at that size, so the first frame after
@@ -690,6 +706,13 @@ the frame is not shown, the game runs on, and the run's report counts those fram
 that frames show again once an image is free. `3ds_windows_headless` starts the presenter
 with no window even where the host has a display, and checks that both screens still
 decode, their dumps are written, and `--shot`'s two-screen PPM is made.
+Each shown frame's submission signals its swapchain image's own semaphore, which the
+present waits for. A present's wait has no fence, so an image's semaphore is used again
+only once that image is acquired again. The ring moves to its next slot at every
+submission, so a slot's semaphore cannot stand for the image's. `3ds_windows_submissions`
+presents frames with other submissions between them, and
+`3ds_windows_submissions_validation` runs it under the validation layer with SDL's
+offscreen window, which needs no display.
 The RAM is one shared mapping (a memfd on Linux), so that every guest view of a page is the
 same memory, and some drivers will not import it (`VK_EXT_external_memory_host`): RADV
 imports a host pointer as an amdgpu user pointer of private anonymous memory only, and its

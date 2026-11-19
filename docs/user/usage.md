@@ -322,8 +322,9 @@ settings, its logs and its caches, each where the table below puts it. One not k
 named its dump) or not there yet is greyed, and pressed it says why and makes nothing; Back goes back to the box's rows.
 **Clean Cache** deletes the game's shader cache (`shader_cache/` of its cache
 folder: the pipeline cache, the translated shaders and those prepared ahead of time) and its code cache
-(`<id>.jitcache`), asked first with each one's size and folder; the game makes them again as it runs, and its saves,
-settings and dump stay. It is greyed while the game has neither.
+(`<id>.jitcache`), asked first with each one's size and folder; the game makes them again as it runs (its next run
+says `Compiling shaders` over the game as it starts), and its saves, settings and dump stay. It is greyed while the
+game has neither.
 
 A mod's `exefs/` changes the game's code, which ScarletNX compiles ahead of time. The game's stamp (`<id>.abi`) records
 the mods' ExeFS files it was recompiled with, and playing it through the driver or the launcher recompiles it when the
@@ -857,8 +858,13 @@ fullscreen; F12 stats on and off; Ctrl+Shift+F12 a RenderDoc capture of the next
 (`renderdoc`, or a game RenderDoc's program started), as the game's menu's **Capture frame** is, which shows only then;
 Pause pauses the whole game and resumes it (the window's title says "(paused)"); Escape twice within 3 seconds quit, the
 first press a warning over the game; Ctrl+D the TV mode On, Off or Auto for the run, as the game's menu's **TV mode**
-is. F4, F6, F12 and Pause say over the game what the press set and what it was (`FPS limit: off (was the game's
-pace)`, `Stats: on (was off)`), the log the same line. Each of these keys is a setting
+is. F4, F6, F12, Ctrl+D and Pause say over the game what the press set (`FPS limit: off`, `Stats: on`), the log
+what it was too (`FPS limit: off (was the game's pace)`). What shows over the game is a line each, the oldest at the
+top, four at most, each going after 3 seconds; the next press of the same key, or the next word on a save state,
+takes its line where it is. A line starts with an icon the launcher shows for the same thing: a setting's group in its
+Settings (Performance's gauge for the FPS limit, Display's screen for stats), a key's row on F1's page (a
+screenshot's picture), the save icon for save states, and Controllers' gamepad for a controller joining or leaving.
+Each of these keys is a setting
 ([Shortcuts](settings.md#shortcuts)), set in the game's menu's **Shortcuts** page too, and F1 lists them as they are
 set. A window shows at most one image per refresh and drops the rest unless images
 tear, and the game keeps the pace `fps_limit` sets.
@@ -881,22 +887,34 @@ can't load is shown in the failure colour, and Enter on it says why. `--state-lo
 state FILE the same way.
 
 In the game's menu the arrows, Enter and Escape move, select and go back; a gamepad's D-pad or left stick, A and B
-do the same, the on-screen controls' too, and a direction held goes on after a moment. **TV mode** steps On, Off and
+do the same, and a direction held goes on after a moment. The on-screen controls hide while the menu is open, so the
+two never lie over each other: a finger taps its rows, and the controls come back as it closes. **TV mode** steps On, Off and
 Auto, Left and Right either way, once a press: each step docks or undocks the console under the game. **Volume** is the
 game's sound on a slider ([`volume`](settings.md#audio)), 100% at first: Left and Right step it 5% either way, held
 too, and Enter or A up, stopping at Mute and at 100%; a tap or a click on the slider takes the step under it, one left
-of it steps down and one on its value up, and a press moves the knob as it drags. Each step is heard at once and kept
-in the game's `.ini`, but while the launcher's Settings > Audio > Volume passes the run its own (`--volume=N`), which
-the run then keeps to: the step lasts until the game ends.
+of it steps down and one on its value up, and a press moves the knob as it drags. Each step is heard at once.
+What the menu changes is kept for this game alone, in its own picks over the launcher's Settings, which every game
+gets ([Settings](settings.md)): its value shows `*` after it, and Delete or a controller's Y gives back the
+launcher's (else the game's `.ini`'s) at once; with fingers, a tap on that line does it for the row in focus.
+**Settings**, after Volume, opens the game's other settings, a page for each section the menu has no page of its own
+for (Display, Graphics with Vulkan Extensions, Audio, Performance, Network, then Debug), each row named and worded as
+the launcher's Settings say it, kept in the game's own picks as Volume is. A row read when the game starts says
+*(next start)* and shows the value it starts with next; a number with no words steps a quarter (a twentieth within a
+range of 2), a word round its words, and a text with no words (a folder, a name) is only shown here: the launcher's
+Settings type it. **Clean Old Settings** shows while the game's `.ini` keeps keys
+under `[Deprecated]` or its own picks keys no setting takes ([Deprecations](deprecations.md)): asked first, with how
+many, Cancel in focus, it takes them out of both files at once, the log naming each with its value.
 
 A game that asks for text (a name, a password, a search) shows a box over the game, in the menu's look and the same
 on every platform: the game's own words for it, the line with the text the game started it with, and how many
 characters it holds against the game's least and most. What you type goes in, from the keyboard or an input method,
 and on Android and iOS the system's keyboard comes up with the box (a tap on the line brings it back). Backspace takes
 the last character away, Enter or A gives the line, and Esc or B cancels; a tap on the box's OK or Cancel does the
-same. Short of the game's least, Enter says how many more it needs. The menu (Home, F2) opens over the box, and
-`swkbd_text` answers in its place. With no window to show it in (`-H`), the game's text is the answer, or the
-nickname of the user playing when the game gives none, and the log says which.
+same. Its hint names what you pressed last, the keyboard's keys or the controller's buttons as its face labels them
+(an Xbox pad's B gives the line, a PlayStation one's Circle), and the Shortcuts page's wait for a key names so the
+key that cancels it. Short of the game's least, Enter says how many more it needs. The menu (Home, F2) opens over the
+box, and `swkbd_text` answers in its place. With no window to show it in (`-H`), the game's text is the answer, or
+the nickname of the user playing when the game gives none, and the log says which.
 
 A game that stops on an error shows a panel with **Share Log**, **Copy path** and **Close**. Share Log saves
 `scarletnx.log` (the build, the error and the game's log) beside the game's log, as the menu's does, and on Android
@@ -917,10 +935,10 @@ tap one and size it with the bar on top; *Done* or Back ends it), snap to a grid
 shown, a stick's middle where the finger lands, a D-pad a finger slides on, a buzz on each press (Android), the touch
 screen, and *Reset layout*, in the warning colour and asked first. Each control is a white shape drawn hard over the game, its edge and its label; a pressed
 one is filled, its label cut out. The
-game's `.ini` keeps them: `controls`, `controls_scale`,
-`controls_snap`, `controls_rel_center`, `controls_dpad_slide`, `controls_haptics`, a control's place once it
-was moved (`controls_a=0.930 0.470 100`: its middle across the screen and its size in percent), and whether it is
-shown once that changed (`controls_a_shown=0`). The launcher's Settings have the same, but the layout.
+game's own picks keep them: `controls`, `controls_scale`,
+`controls_snap`, `controls_rel_center`, `controls_dpad_slide`, `controls_haptics`, and whether a control is shown once
+that changed (`controls_a_shown=0`); its `.ini` keeps a control's place once it was moved (`controls_a=0.930 0.470 100`:
+its middle across the screen and its size in percent). The launcher's Settings have the same, but the layout.
 Beside the executable: `Game.log`, `threads.txt` (15 s refresh), `captures/` (screenshots); an installed copy on Linux
 keeps the first two in its state folder ([Folders](#folders)). `Game.log` is this run's: the 4 runs before keep theirs
 in `logs/` beside it, named by when each was last written (`2026-10-28_14-05-33.log`). Past `log_max` (MiB, 1 to

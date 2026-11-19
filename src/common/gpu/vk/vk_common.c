@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
-#define _POSIX_C_SOURCE 200809L /* getpid in strict C99 */
+#define _POSIX_C_SOURCE 200809L /* getpid in strict ISO C */
 #endif
 #include "common/gpu/vk/vk_common.h"
 #include "common/platform/file.h"
@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h> /* GetCurrentProcessId */
@@ -356,10 +357,10 @@ VkResult snx_vk_shader_module(VkDevice dev, const uint32_t* words, size_t size, 
     return vkCreateShaderModule(dev, &info, NULL, out);
 }
 static PMutex g_compile = PMUTEX_INIT;
-static int g_compile_serial;
-void snx_vk_compile_serial(int on) { __atomic_store_n(&g_compile_serial, on != 0, __ATOMIC_RELEASE); }
+static _Atomic int g_compile_serial;
+void snx_vk_compile_serial(int on) { atomic_store_explicit(&g_compile_serial, on != 0, memory_order_release); }
 int snx_vk_compile_enter(void) {
-    if (!__atomic_load_n(&g_compile_serial, __ATOMIC_ACQUIRE)) return 0;
+    if (!atomic_load_explicit(&g_compile_serial, memory_order_acquire)) return 0;
     pm_lock(&g_compile);
     return 1;
 }
@@ -367,12 +368,14 @@ void snx_vk_compile_leave(int entered) {
     if (entered) pm_unlock(&g_compile);
 }
 static VkResult module_pipeline(VkDevice dev, VkPipelineCache cache, VkPipelineLayout layout, VkShaderModule module,
-                                const VkSpecializationInfo* spec, uint32_t subgroup, bool full, VkPipeline* out) {
+                                const VkSpecializationInfo* spec, uint32_t subgroup, bool full,
+                                VkPipelineCreateFlags flags, VkPipeline* out) {
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo size = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
         .requiredSubgroupSize = subgroup};
     VkComputePipelineCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .flags = flags,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                   .pNext = subgroup ? &size : NULL,
                   .flags = full ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT : 0,
@@ -388,17 +391,22 @@ static VkResult module_pipeline(VkDevice dev, VkPipelineCache cache, VkPipelineL
 }
 VkResult snx_vk_module_pipeline(VkDevice dev, VkPipelineCache cache, VkPipelineLayout layout, VkShaderModule module,
                                 const VkSpecializationInfo* spec, VkPipeline* out) {
-    return module_pipeline(dev, cache, layout, module, spec, 0, false, out);
+    return module_pipeline(dev, cache, layout, module, spec, 0, false, 0, out);
+}
+VkResult snx_vk_compute_pipeline_flags(VkDevice dev, VkPipelineCache cache, VkPipelineLayout layout,
+                                       const uint32_t* words, size_t size, uint32_t subgroup, bool full,
+                                       VkPipelineCreateFlags flags, VkPipeline* out) {
+    VkShaderModule module;
+    VkResult r = snx_vk_shader_module(dev, words, size, &module);
+    if (r != VK_SUCCESS) return r;
+    r = module_pipeline(dev, cache, layout, module, NULL, subgroup, full, flags, out);
+    vkDestroyShaderModule(dev, module, NULL);
+    return r;
 }
 VkResult snx_vk_compute_pipeline_subgroups(VkDevice dev, VkPipelineCache cache, VkPipelineLayout layout,
                                            const uint32_t* words, size_t size, uint32_t subgroup, bool full,
                                            VkPipeline* out) {
-    VkShaderModule module;
-    VkResult r = snx_vk_shader_module(dev, words, size, &module);
-    if (r != VK_SUCCESS) return r;
-    r = module_pipeline(dev, cache, layout, module, NULL, subgroup, full, out);
-    vkDestroyShaderModule(dev, module, NULL);
-    return r;
+    return snx_vk_compute_pipeline_flags(dev, cache, layout, words, size, subgroup, full, 0, out);
 }
 VkResult snx_vk_compute_pipeline(VkDevice dev, VkPipelineCache cache, VkPipelineLayout layout, const uint32_t* words,
                                  size_t size, VkPipeline* out) {

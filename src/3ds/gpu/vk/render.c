@@ -9,10 +9,13 @@
    height - 1, unless the framebuffer is flipped) are the compute shaders' business. The triangles the CPU makes for a
    draw with a geometry shader turn their quaternions as video_core/rasterizer_accelerated.cpp's AddTriangle does. */
 #include "3ds/gpu/vk/vk_render.h"
+#include "3ds/gpu/texture.h"
 #include "3ds/gpu/transfer.h"
 #include "3ds/gpu/vk/fsgen.h"
 #include "3ds/gpu/vk/shaders/color_spv.h"
 #include "3ds/gpu/vk/shaders/depth_spv.h"
+#include "3ds/gpu/vk/shaders/scaled_depth_texture_spv.h"
+#include "3ds/gpu/vk/shaders/scaled_texture_spv.h"
 #include "3ds/gpu/vk/shaders/standin_spv.h"
 #include "3ds/gpu/vk/shaders/texture_spv.h"
 #include "3ds/gpu/vk/vk.h"
@@ -31,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #define RING_SIZE (32u << 20) /* the uploads, a part for each submission slot: uniforms, LUTs, default and immediate
                                  vertices */
@@ -80,6 +84,8 @@ static const uint32_t tex_config[3] = {0x081, 0x091, 0x099}, tex_format[3] = {0x
 enum { FMT_BYTE, FMT_UBYTE, FMT_SHORT, FMT_FLOAT };
 enum { DEFAULTS = 12, ZERO_SLOT = 16 }; /* the binding of the default attributes, and its slot of zeros */
 enum { NO_DEPTH = 0xff };
+/* FB_DEPTH_FORMAT's numbers of the depth formats (depth_word.glsl names them alike) */
+enum { DEPTH_D16 = 0, DEPTH_D24 = 2, DEPTH_D24S8 = 3 };
 /* the open rendering pass: a target's attachments, or a shadow pass with none (its draws write the target's colour
    image as storage) */
 enum { RENDERING_TARGET = 1, RENDERING_SHADOW = 2 };
@@ -121,6 +127,7 @@ typedef struct {
 typedef struct {
     uint32_t pa[6], format, width, height, levels, bytes;
     bool cube, valid;
+    bool flip; /* a texture made from a scaled target takes the target's flip */
     Image image;
     uint64_t used;
 } Texture;
@@ -259,7 +266,7 @@ typedef struct {
 
 static struct {
     bool made, failed;
-    SnxCtrVkCompute color, depth, texture;
+    SnxCtrVkCompute color, depth, texture, scaled_texture, scaled_depth_texture;
     VkDescriptorSetLayout set0, set1, set2;
     VkDescriptorSetLayout set_layouts[3]; /* the three, for the shader objects that take them */
     /* the stand-ins' push constants (the fragment one's, and the vertex one's where the device has room for them),
@@ -344,14 +351,14 @@ static struct {
     bool program_uploaded;
     uint64_t program_uploaded_hash;
     VkDeviceSize program_at;
-    int low_refused;  /* a worker's low priority was refused, which the first one refused says (atomic) */
+    _Atomic int low_refused; /* a worker's low priority was refused, which the first one refused says (atomic) */
     /* the driver's pipelines kept between runs (snx_ctr_vk_pipeline_cache_open): the cache every pipeline is made
        with, its file, whether a pipeline went into it since it was written and when the last one did (atomic: the
        workers make pipelines too) */
     VkPipelineCache cache;
     char cache_path[1200];
-    int cache_dirty;
-    uint64_t cache_used_ms;
+    _Atomic int cache_dirty;
+    _Atomic uint64_t cache_used_ms;
     /* with shader objects: the driver's binaries of the shaders kept between runs, and their file (binaries_open once
        read); and in the open recording, the shaders bound, the state set (object_state, once object_set) */
     SnxVkShaderBinaries binaries;
@@ -502,7 +509,11 @@ static bool made(void) {
     g.failed = true;
     if (!snx_ctr_vk_compute(snx_ctr_color_spv, snx_ctr_color_spv_size / 4, 1, 1, 28, &g.color) ||
         !snx_ctr_vk_compute(snx_ctr_depth_spv, snx_ctr_depth_spv_size / 4, 3, 0, 32, &g.depth) ||
-        !snx_ctr_vk_compute(snx_ctr_texture_spv, snx_ctr_texture_spv_size / 4, 1, 1, 20, &g.texture))
+        !snx_ctr_vk_compute(snx_ctr_texture_spv, snx_ctr_texture_spv_size / 4, 1, 1, 20, &g.texture) ||
+        !snx_ctr_vk_compute(snx_ctr_scaled_texture_spv, snx_ctr_scaled_texture_spv_size / 4, 0, 2, 20,
+                            &g.scaled_texture) ||
+        !snx_ctr_vk_compute(snx_ctr_scaled_depth_texture_spv, snx_ctr_scaled_depth_texture_spv_size / 4, 2, 1, 28,
+                            &g.scaled_depth_texture))
         return false;
     if (depth_usable(VK_FORMAT_D24_UNORM_S8_UINT))
         g.depth_format = VK_FORMAT_D24_UNORM_S8_UINT;
@@ -648,6 +659,7 @@ static bool dispatch(const SnxCtrVkCompute* c, const SnxCtrVkWindow* windows, un
 
 static unsigned color_bytes(unsigned format) { return format == 0 ? 4 : format == 1 ? 3 : 2; }
 static unsigned depth_bytes(unsigned format) { return format == 0 ? 2 : format == 2 ? 3 : 4; }
+static const uint8_t color_formats[8] = {0, 1, 3, 2, 4, 0xff, 0xff, 0xff}; /* PICA's to transfer.h's */
 static bool overlaps(uint32_t a, uint64_t a_size, uint32_t b, uint64_t b_size) {
     return a < (uint64_t)b + b_size && b < (uint64_t)a + a_size;
 }
@@ -855,13 +867,24 @@ static void end_rendering(void) {
     vkCmdEndRendering(snx_ctr_vk_commands());
     g.rendering = 0;
 }
+/* the copies between a depth target's image and its scratch buffer at its scale (the depth words, then the stencil
+   bytes from stencil_at), and the scratch windows they fill, as depth.comp and scaled_depth_texture.comp read them */
+static void depth_scratch(const Target* t, VkBufferImageCopy copies[2], SnxCtrVkWindow windows[2]) {
+    uint32_t width = t->key.width * t->key.scale, height = t->key.height * t->key.scale;
+    VkDeviceSize pixels = (VkDeviceSize)width * height;
+    copies[0] = (VkBufferImageCopy){0, width, height, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0},
+                                    {width, height, 1}};
+    copies[1] = (VkBufferImageCopy){t->stencil_at, width, height, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1},
+                                    {0, 0, 0}, {width, height, 1}};
+    windows[0] = (SnxCtrVkWindow){t->scratch, 0, pixels * 4};
+    windows[1] = (SnxCtrVkWindow){t->scratch, t->stencil_at, (pixels + 3) / 4 * 4};
+}
 /* the target's colour, and its depth and stencil, moved between the guest's memory and its images (store: to memory,
    which is then the GPU's until the recording is done) */
 static bool target_move(Target* t, bool store, bool color, bool depth) {
     const TargetKey* k = &t->key;
     VkCommandBuffer cb = snx_ctr_vk_commands();
     uint32_t width = k->width * k->scale, height = k->height * k->scale;
-    VkDeviceSize pixels = (VkDeviceSize)width * height;
     SnxCtrVkWindow w[3];
     uint32_t inside;
     if (store) end_rendering(); /* its barrier and dispatch cannot be recorded inside a target's pass */
@@ -874,11 +897,8 @@ static bool target_move(Target* t, bool store, bool color, bool depth) {
         gpu_uses(k->color_pa, color_span(k), store);
     }
     if (depth && k->depth_format != NO_DEPTH && snx_ctr_vk_window(k->depth_pa, depth_span(k), &w[0], &inside)) {
-        VkBufferImageCopy copies[2] = {
-            {0, width, height, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {width, height, 1}},
-            {t->stencil_at, width, height, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, 0, 0}, {width, height, 1}}};
-        w[1] = (SnxCtrVkWindow){t->scratch, 0, pixels * 4};
-        w[2] = (SnxCtrVkWindow){t->scratch, t->stencil_at, (pixels + 3) / 4 * 4};
+        VkBufferImageCopy copies[2];
+        depth_scratch(t, copies, w + 1);
         uint32_t push[8] = {inside, k->width, k->height, k->depth_format, k->flip, store, g.depth_float, k->scale};
         if (store) {
             vkCmdCopyImageToBuffer(cb, t->depth.image, VK_IMAGE_LAYOUT_GENERAL, t->scratch, 2, copies);
@@ -1010,6 +1030,10 @@ static Target* target_find(const TargetKey* k) {
     if (t == &g.targets[g.target_count]) ++g.target_count;
     return t;
 }
+static bool depth_shared(const TargetKey* a, const TargetKey* b) {
+    return a->depth_pa == b->depth_pa && a->width == b->width && a->height == b->height &&
+           a->depth_format == b->depth_format && a->scale == b->scale && a->flip == b->flip;
+}
 /* the draw's target open: the one kept for key, loaded from memory unless its images hold what memory does. Other
    targets over the same memory are stored first, and are stale from now on */
 static SnxCtrPicaResult target_open(const TargetKey* k) {
@@ -1018,6 +1042,8 @@ static SnxCtrPicaResult target_open(const TargetKey* k) {
     g.open = 0;
     Target* t = target_find(k);
     if (!t) return SNX_CTR_PICA_UNSUPPORTED;
+    /* the target over the same depth buffer, at the same scale, that drew last and holds its depth */
+    Target* shared = NULL;
     for (unsigned i = 0; i < g.target_count; ++i) {
         Target* u = &g.targets[i];
         if (u == t) continue;
@@ -1027,8 +1053,26 @@ static SnxCtrPicaResult target_open(const TargetKey* k) {
                      overlaps(u->key.depth_pa, depth_span(&u->key), k->depth_pa, depth_span(k));
         if (!color && !depth) continue;
         if (!target_store(u)) return AGAIN;
+        if (u->depth_valid && k->scale > 1 && k->depth_format != NO_DEPTH && depth_shared(&u->key, k) &&
+            (!shared || u->used > shared->used))
+            shared = u;
         if (color) set_color(u, false, u->color_dirty);
         if (depth) set_depth(u, false, u->depth_dirty);
+    }
+    /* the 1x reload would lose the scaled depth of the shared target, so its depth image is copied instead */
+    if (shared && !t->depth_valid) {
+        VkCommandBuffer cb = snx_ctr_vk_commands();
+        uint32_t width = k->width * k->scale, height = k->height * k->scale;
+        VkImageCopy copy = {{VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1},
+                            {0, 0, 0},
+                            {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1},
+                            {0, 0, 0},
+                            {width, height, 1}};
+        snx_ctr_vk_barrier(cb);
+        vkCmdCopyImage(cb, shared->depth.image, VK_IMAGE_LAYOUT_GENERAL, t->depth.image, VK_IMAGE_LAYOUT_GENERAL, 1,
+                       &copy);
+        snx_ctr_vk_barrier(cb);
+        set_depth(t, true, t->depth_dirty);
     }
     bool color = !t->color_valid, depth = !t->depth_valid && k->depth_format != NO_DEPTH;
     if ((color || depth) && !target_move(t, false, color, depth)) return AGAIN;
@@ -1300,6 +1344,90 @@ static Texture* texture_slot(uint32_t width, uint32_t height, uint32_t levels, u
     set_texture(least, false);
     return least;
 }
+/* the scaled target whose colour image is the whole of a texture of memory at pa, in the same size and colour format
+   (color_formats takes the texture's format to the target's): one level, neither a cube nor a shadow map, and the
+   target's colour valid */
+static const Target* scaled_source(uint32_t pa, uint32_t width, uint32_t height, uint32_t format, uint32_t levels,
+                                   bool cube, bool shadow) {
+    if (levels != 1 || cube || shadow || format >= sizeof color_formats) return NULL;
+    for (unsigned i = 0; i < g.target_count; ++i) {
+        const Target* t = &g.targets[i];
+        if (t->key.scale > 1 && t->color_valid && t->color.image && t->key.color_pa == pa && t->key.width == width &&
+            t->key.height == height && t->key.color_format == color_formats[format])
+            return t;
+    }
+    return NULL;
+}
+/* the texture's image filled from the target's colour image by one dispatch of scaled_texture.comp: both are storage
+   images, the source at binding 0 and the destination at 1, with the target's format and flip as push constants */
+static bool scaled_fill(const Target* source, VkImageView destination, uint32_t width, uint32_t height,
+                        uint32_t scale) {
+    VkDescriptorSet set = snx_ctr_vk_set(g.scaled_texture.set);
+    if (!set) return false;
+    VkDescriptorImageInfo from = {VK_NULL_HANDLE, source->color.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo to = {VK_NULL_HANDLE, destination, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet writes[2] = {{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                       .dstSet = set,
+                                       .dstBinding = 0,
+                                       .descriptorCount = 1,
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                       .pImageInfo = &from},
+                                      {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                       .dstSet = set,
+                                       .dstBinding = 1,
+                                       .descriptorCount = 1,
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                       .pImageInfo = &to}};
+    vkUpdateDescriptorSets(device(), 2, writes, 0, NULL);
+    uint32_t push[5] = {width, height, source->key.color_format, source->key.flip, scale};
+    VkCommandBuffer cb = snx_ctr_vk_commands();
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.scaled_texture.pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.scaled_texture.layout, 0, 1, &set, 0, NULL);
+    vkCmdPushConstants(cb, g.scaled_texture.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
+    vkCmdDispatch(cb, (width * scale + 7) / 8, (height * scale + 7) / 8, 1);
+    return true;
+}
+/* the texture formats that read a depth buffer's words as texels: a D24S8 word as RGBA8, a D24 one as RGB8, a D16
+   one as RGB5A1, RGB565 or RGBA4 (the 16-bit formats that pixel.glsl decodes)
+   (depth formats: depth.comp; FB_DEPTH_FORMAT, 3dbrew GPU/Internal Registers 0x116) */
+static bool depth_texel(uint8_t depth_format, uint32_t format) {
+    switch (depth_format) {
+    case DEPTH_D16: return format == SNX_CTR_TEX_RGB5A1 || format == SNX_CTR_TEX_RGB565 || format == SNX_CTR_TEX_RGBA4;
+    case DEPTH_D24: return format == SNX_CTR_TEX_RGB8;
+    case DEPTH_D24S8: return format == SNX_CTR_TEX_RGBA8;
+    default: return false;
+    }
+}
+/* the scaled depth target whose depth buffer is the whole of a texture of memory at pa: the same size, one level,
+   neither a cube nor a shadow map, its depth valid, and a texel depth_texel takes. Of several sharing that buffer, the
+   one that drew into it last (the largest used serial) */
+static const Target* scaled_depth_source(uint32_t pa, uint32_t width, uint32_t height, uint32_t format, uint32_t levels,
+                                         bool cube, bool shadow) {
+    if (levels != 1 || cube || shadow) return NULL;
+    const Target* source = NULL;
+    for (unsigned i = 0; i < g.target_count; ++i) {
+        const Target* t = &g.targets[i];
+        if (t->key.scale > 1 && t->depth_valid && t->depth.image && t->key.depth_pa == pa && t->key.width == width &&
+            t->key.height == height && depth_texel(t->key.depth_format, format) && (!source || t->used > source->used))
+            source = t;
+    }
+    return source;
+}
+/* the texture's image filled from a scaled depth target's depth buffer by scaled_depth_texture.comp: the buffer and its
+   stencil copied into the target's scratch first, as the store copies them, then one dispatch over the scaled image */
+static bool scaled_depth_fill(const Target* source, VkImageView destination, uint32_t format) {
+    const TargetKey* k = &source->key;
+    uint32_t width = k->width * k->scale, height = k->height * k->scale;
+    VkBufferImageCopy copies[2];
+    SnxCtrVkWindow w[2];
+    depth_scratch(source, copies, w);
+    uint32_t push[7] = {k->width, k->height, format, k->depth_format, k->flip, k->scale, g.depth_float};
+    VkCommandBuffer cb = snx_ctr_vk_commands();
+    snx_ctr_vk_barrier(cb);
+    vkCmdCopyImageToBuffer(cb, source->depth.image, VK_IMAGE_LAYOUT_GENERAL, source->scratch, 2, copies);
+    snx_ctr_vk_barrier(cb);
+    return dispatch(&g.scaled_depth_texture, w, 2, destination, push, sizeof push, width, height);
+}
 /* the image and sampler of texture unit: the texture kept, or decoded from guest memory on the GPU and kept */
 static SnxCtrPicaResult texture(const SnxCtrPica* p, unsigned unit, unsigned type, const Image** image,
                                 VkSampler* sampled) {
@@ -1328,11 +1456,22 @@ static SnxCtrPicaResult texture(const SnxCtrPica* p, unsigned unit, unsigned typ
        a texture); the textures made from that memory before went stale when the target was drawn into */
     for (unsigned f = 0; f < (cube ? 6u : 1u); ++f)
         if (g.made && !store_over(pa[f], bytes)) return AGAIN;
+    /* a scaled target that is the texture's whole image: the texture is then made from its image, not from memory. A
+       colour target's colour comes first, then a depth target's depth buffer */
+    const Target* source = scaled_source(pa[0], width, height, format, levels, cube, shadow);
+    bool from_depth = false;
+    if (!source) {
+        source = scaled_depth_source(pa[0], width, height, format, levels, cube, shadow);
+        from_depth = source != NULL;
+    }
+    uint32_t scale = source ? source->key.scale : 1;
+    bool flip = source && source->key.flip;
     uint64_t serial = snx_ctr_vk_serial();
     for (unsigned i = 0; i < g.texture_count; ++i) {
         Texture* t = &g.textures[i];
         if (t->valid && t->cube == cube && t->format == format && t->width == width && t->height == height &&
-            t->levels == levels && !memcmp(t->pa, pa, sizeof pa)) {
+            t->levels == levels && t->image.width == width * scale && t->flip == flip &&
+            !memcmp(t->pa, pa, sizeof pa)) {
             t->used = serial;
             *image = &t->image;
             return SNX_CTR_PICA_OK;
@@ -1342,20 +1481,39 @@ static SnxCtrPicaResult texture(const SnxCtrPica* p, unsigned unit, unsigned typ
     uint32_t inside[6];
     for (unsigned f = 0; f < (cube ? 6u : 1u); ++f)
         if (!snx_ctr_vk_window(pa[f], bytes, &windows[f], &inside[f])) return SNX_CTR_PICA_OK; /* outside RAM */
-    Texture* t = texture_slot(width, height, levels, cube ? 6 : 1);
+    Texture* t = texture_slot(width * scale, height * scale, levels, cube ? 6 : 1);
     /* the image's layout transition and the decode below cannot be recorded inside a target's pass */
     end_rendering();
-    if (!texture_image(t, width, height, levels, cube ? 6 : 1)) return SNX_CTR_PICA_UNSUPPORTED;
+    if (!texture_image(t, width * scale, height * scale, levels, cube ? 6 : 1)) {
+        if (!source) return SNX_CTR_PICA_UNSUPPORTED;
+        /* the device had no room for the scaled image: the texture is decoded from memory at scale 1 instead */
+        source = NULL;
+        flip = false;
+        if (!texture_image(t, width, height, levels, cube ? 6 : 1)) return SNX_CTR_PICA_UNSUPPORTED;
+    }
     memcpy(t->pa, pa, sizeof pa);
     t->format = format;
     t->width = width;
     t->height = height;
     t->levels = levels;
     t->bytes = bytes;
+    t->flip = flip;
     t->cube = cube;
     t->used = serial;
     VkCommandBuffer cb = snx_ctr_vk_commands();
     snx_ctr_vk_barrier(cb);
+    if (source) {
+        if (from_depth) {
+            if (!scaled_depth_fill(source, t->image.levels[0], format)) return AGAIN;
+        } else {
+            if (!scaled_fill(source, t->image.levels[0], width, height, scale)) return AGAIN;
+        }
+        snx_ctr_vk_barrier(cb);
+        for (unsigned f = 0; f < (cube ? 6u : 1u); ++f) gpu_uses(pa[f], bytes, false);
+        set_texture(t, true); /* watched from now on */
+        *image = &t->image;
+        return SNX_CTR_PICA_OK;
+    }
     for (unsigned f = 0; f < (cube ? 6u : 1u); ++f) {
         uint32_t at = inside[f];
         for (uint32_t i = 0; i < levels; ++i) {
@@ -1409,7 +1567,7 @@ static VkShaderCreateInfoEXT object_info(VkShaderStageFlagBits stage, const uint
 }
 /* a shader object made: when the cache was last used, for its write (snx_ctr_vk_pipeline_cache_save) */
 static void compiled_now(void) {
-    __atomic_store_n(&g.cache_used_ms, (uint64_t)(snx_seconds() * 1000), __ATOMIC_RELAXED);
+    atomic_store_explicit(&g.cache_used_ms, (uint64_t)(snx_seconds() * 1000), memory_order_relaxed);
 }
 /* o's words handed to a free job of the workers, which then owns them: whether one was free */
 static bool object_queue(ShaderObject* o) {
@@ -1688,8 +1846,8 @@ static VkPipeline make_pipeline(const PipeKey* k, VkShaderModule vs, VkShaderMod
     VkPipeline pipeline = VK_NULL_HANDLE;
     if (vkCreateGraphicsPipelines(v->device, g.cache, 1, &pi, NULL, &pipeline) != VK_SUCCESS) return VK_NULL_HANDLE;
     if (g.cache) {
-        __atomic_store_n(&g.cache_used_ms, (uint64_t)(snx_seconds() * 1000), __ATOMIC_RELAXED);
-        __atomic_store_n(&g.cache_dirty, 1, __ATOMIC_RELAXED);
+        atomic_store_explicit(&g.cache_used_ms, (uint64_t)(snx_seconds() * 1000), memory_order_relaxed);
+        atomic_store_explicit(&g.cache_dirty, 1, memory_order_relaxed);
     }
     return pipeline;
 }
@@ -1697,7 +1855,8 @@ static VkPipeline make_pipeline(const PipeKey* k, VkShaderModule vs, VkShaderMod
    system's low priority (low, snx_vk_pipeline_low_workers) */
 static int SDLCALL pipe_worker(void* low) {
     char why[256];
-    if (low && snx_thread_priority_low(why, sizeof why) && !__atomic_exchange_n(&g.low_refused, 1, __ATOMIC_RELAXED))
+    if (low && snx_thread_priority_low(why, sizeof why) &&
+        !atomic_exchange_explicit(&g.low_refused, 1, memory_order_relaxed))
         fprintf(
             stderr,
             "3ds gpu: a pipeline worker asked for %s, the system's low priority: %s (said for the first one refused)\n",
@@ -2303,7 +2462,6 @@ static SnxCtrPicaResult record(SnxCtrPica* p, Source source, bool indexed) {
                      /* Azahar's IsFlipped: the rows go from y = 0 up when bit 24 is clear (games set it) */
                      .flip = (uint8_t)!(r[FB_SIZE] >> 24 & 1),
                      .depth_format = (uint8_t)(r[FB_DEPTH_FORMAT] & 3)};
-    static const uint8_t color_formats[8] = {0, 1, 3, 2, 4, 0xff, 0xff, 0xff}; /* PICA's to transfer.h's */
     key.color_format = color_formats[r[FB_COLOR_FORMAT] >> 16 & 7];
     uint64_t pixels = (uint64_t)key.width * key.height;
     SnxCtrVkWindow probe;
@@ -2732,12 +2890,12 @@ void snx_ctr_vk_pipeline_cache_open(const char* directory) {
    once waited 3.2 s so) */
 #define CACHE_QUIET_MS 20000u
 void snx_ctr_vk_pipeline_cache_save(bool at_exit) {
-    bool pipelines = g.cache && __atomic_load_n(&g.cache_dirty, __ATOMIC_RELAXED);
+    bool pipelines = g.cache && atomic_load_explicit(&g.cache_dirty, memory_order_relaxed);
     bool shaders = g.binaries_open && g.binaries.dirty;
     if (!pipelines && !shaders) return;
     if (!at_exit) {
         uint64_t now = (uint64_t)(snx_seconds() * 1000);
-        if (now - __atomic_load_n(&g.cache_used_ms, __ATOMIC_RELAXED) < CACHE_QUIET_MS) return;
+        if (now - atomic_load_explicit(&g.cache_used_ms, memory_order_relaxed) < CACHE_QUIET_MS) return;
         bool busy = false;
         if (g.job_lock) {
             SDL_LockMutex(g.job_lock);
@@ -2756,12 +2914,12 @@ void snx_ctr_vk_pipeline_cache_save(bool at_exit) {
             fprintf(stderr, "3ds gpu: the binaries of %zu shaders written (%zu KB)\n", g.binaries.count, saved >> 10);
     }
     if (!pipelines) return;
-    __atomic_store_n(&g.cache_dirty, 0, __ATOMIC_RELAXED);
+    atomic_store_explicit(&g.cache_dirty, 0, memory_order_relaxed);
     if (snx_vk_pipeline_cache_save(device(), g.cache, g.cache_path, &saved, why, sizeof why)) {
         fprintf(stderr, "3ds gpu: the pipeline cache could not be written to %s: %s\n", g.cache_path, why);
         /* written again after another quiet time, or at the end */
-        __atomic_store_n(&g.cache_used_ms, (uint64_t)(snx_seconds() * 1000), __ATOMIC_RELAXED);
-        __atomic_store_n(&g.cache_dirty, 1, __ATOMIC_RELAXED);
+        atomic_store_explicit(&g.cache_used_ms, (uint64_t)(snx_seconds() * 1000), memory_order_relaxed);
+        atomic_store_explicit(&g.cache_dirty, 1, memory_order_relaxed);
     } else if (at_exit)
         fprintf(stderr, "3ds gpu: the pipeline cache written (%zu KB)\n", saved >> 10);
 }
@@ -2847,6 +3005,8 @@ void snx_ctr_vk_render_free(void) {
     snx_ctr_vk_compute_free(&g.color);
     snx_ctr_vk_compute_free(&g.depth);
     snx_ctr_vk_compute_free(&g.texture);
+    snx_ctr_vk_compute_free(&g.scaled_texture);
+    snx_ctr_vk_compute_free(&g.scaled_depth_texture);
     free(g.vs);
     free(g.fs);
     free(g.pipes);

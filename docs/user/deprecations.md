@@ -12,7 +12,9 @@ What an older version used that this one replaced, how a run tells you, and how 
   never dropped in silence; a deprecated option still works.
 - **Each run says so** where you read it: stderr for the drivers, the game's `.log` and stderr for the runtime, the
   launcher's setup for files an older version left (its Old Files pages). The line names what replaced it.
-- **You remove it**: a setting by hand or with the launcher's **Settings > App > Clean Old Settings** (or Clean Now
+- **You remove it**: a setting by hand, with the game's menu's **Clean Old Settings** (shown while its `.ini` or
+  its own picks keep such keys, asked first) for that game, or with the launcher's **Settings > App > Clean Old
+  Settings** (or Clean Now
   on the setup's last notice), which takes the `[Deprecated]` section out of every game's `.ini` the launcher reaches
   (the games' config folder, `games/` and the libraries of Settings > App > Folders); a file an older version left, by
   moving it where the line says, or with Move All or Delete All on the setup's Old Files pages (Delete All never
@@ -23,8 +25,8 @@ A game's `.ini` keeps its deprecated keys last, under what became of each:
 
 ```ini
 [Deprecated]
-; keys an older version used, which do nothing now (docs/user/deprecations.md): delete them, or use Settings > App >
-;   Clean Old Settings in the launcher
+; keys an older version used, which do nothing now (docs/user/deprecations.md): delete them, or use Clean Old Settings
+;   in the game's menu or the launcher's Settings > App
 ; renderer: Vulkan is the only renderer
 renderer=opengl
 ```
@@ -51,6 +53,10 @@ renderer=opengl
 | `.ini` key `nvn_direct` (`0` the game's NVN driver, `1` the runtime, `2` the runtime where it knew the game's NVN API version) | [gpu] Make NVN the only GPU path and rename nvn_direct to the loader | nothing: the runtime always runs the game's NVN calls | the same |
 | `.ini` key `astc_background_threads` (the CPU threads that made the better ASTC textures) | [vk] Encode the background's ASTC levels on the GPU alone | nothing: the GPU makes them alone | the same |
 | `.ini` keys `press`, `press_at` (an unattended run's one press: its buttons in hex, at a time in ms) | #373 | `script`: `press_at:press` is the same press, held `press_len` ms | the same |
+| `.ini` keys `vk_defrag` (`1` the free space inside the GPU's blocks of device memory gathered into whole blocks, the default; `0` blocks keep what they hold) and `vk_heap_budget_mb` (the GPU's heap used up to that many MiB, for tests of a GPU with less memory) | [vk] Drop the defrag and memory extension settings: the renderer falls back on its own | nothing: a discrete GPU's memory is always defragmented and an integrated or mobile GPU's never, and the heap takes the driver's budget | under `[Deprecated]`, named once a run |
+| `.ini` key `vk_nv_dedicated_allocation_image_aliasing` (`VK_NV_dedicated_allocation_image_aliasing`: memory made for an image alone kept for another image) | [vk] Keep the memory of its own the driver only preferred, for the next request it fits | nothing: the renderer no longer uses the extension, which lost the GPU on NVIDIA's driver, and keeps such memory with no resource named | under `[Deprecated]`, named once a run |
+| `.ini` key `ctr_separate_windows` | [3ds] make separate windows screen layout 4 | `ctr_screen_layout` 4 | the same |
+| `.ini` key `mesh_draws` (an Ounce game's mesh draws: `0` skipped, the default; `1` drawn with `VK_EXT_mesh_shader`) | [vk] Draw an Ounce game's mesh draws by default, but on NVIDIA's driver | `vk_ext_mesh_shader`: `auto`, the default, draws them where the driver has `VK_EXT_mesh_shader` and no ban holds (one does on NVIDIA's); `off` skips them; `on` goes over the ban | the same |
 | `--keep-c` | Replace Python pipeline with a C90 driver | `--keep-ir` | still taken, said on stderr once a run |
 | `--recomp` | [cli] the options' names | `--recompile` | still taken, said on stderr once a run |
 | `--repo DIR` | [cli] the options' names | `--data DIR` | still taken, said on stderr once a run |

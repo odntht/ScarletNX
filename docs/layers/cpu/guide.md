@@ -135,9 +135,11 @@ and at the plan.
 | Area | Files |
 | --- | --- |
 | Finding functions | `src/common/cpu/recompiler/codegen.c`, `src/nx/loader/loader.c`, `src/nx/loader/codegen_view.c` |
-| The instruction emitters, ported from QEMU's `translate-a64.c` | `ir_int.c`, `ir_ldst.c`, `ir_fpu.c`, `ir_vec.c`, `ir_vec_fp.c`, `ir_vec_crypto.c` in `src/common/cpu/recompiler/llvm/` |
+| The instruction emitters, ported from QEMU's `translate-a64.c` | `ir_int.c`, `ir_ldst.c`, `ir_vec.c`, `ir_vec_fp.c`, `ir_vec_crypto.c` in `src/common/cpu/recompiler/llvm/` |
+| The integer data-processing, hint, barrier, general-purpose load and store, scalar floating-point and SIMD integer (one element per lane) emitters and the branch operands, generated from the Arm architecture's Sail | `ir_sail.c` (`tools/sailgen`'s output; `ir_fpu.c` sends it the scalar floating point, `ir_vec.c` the SIMD ops whose element loop is one vector operation), the Sail and the NX's fixups in `src/common/cpu/aarch64/sail/`; the floating-point arithmetic's lowering, fast paths and helper calls, in `tools/sailgen/llvm.h` |
 | A guest function's IR: calls, returns, polls, stale checks | `ir_codegen.c` |
-| Guest state, flags and memory accesses | `ir_state.c` |
+| Guest registers' and flags' per-block cache, for every emitter | `tools/sailgen/llvm.h` (the back end), whose functions are `ir.h`'s accessors in `ir_sail.c` |
+| The flags' helpers, the vectors' cache and memory accesses | `ir_state.c` |
 | Guest registers as locals, and the call sites | `ir_promote.c` |
 | Helpers, `snx_lookup`, calls into the runtime | `ir_helpers.c`, `ir_emit.c` |
 | The pass pipeline and the target CPU | `ir.c` |
@@ -171,7 +173,7 @@ title ID.
 the commit what you ran. For a crash fix, run enough times to show the crash is gone, since one good run proves nothing
 about an intermittent crash.
 
-**C.** Clang only, strict ISO C99 (`.claude/skills/snx-code-quality/SKILL.md`).
+**C.** Clang only, strict ISO C23 (`.claude/skills/snx-code-quality/SKILL.md`).
 
 * No `-fno-strict-aliasing`. Access an object through its own type, a character type, `memcpy` or
   `common/utilities/endian.h`, a union member, or a local copied in and out.

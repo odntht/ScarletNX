@@ -22,6 +22,7 @@ static inline void nvn_record_relocate(u64 dst, u64 src, u32 op, u32 size) {
         {OP_COPY_T2T, offsetof(NvnPCopyT2T, src), 1},       {OP_COPY_T2T, offsetof(NvnPCopyT2T, dst), 1},
         {OP_CLEAR_TEX, offsetof(NvnPClearTex, texture), 1},
         {OP_DLSS, offsetof(NvnPDlss, tex), NVN_DLSS_TEXTURES},
+        {OP_RATE_IMAGE, offsetof(NvnPRateImage, tex), 1},
     };
     size_t i;
     u32 k;
@@ -68,13 +69,14 @@ typedef struct {
    once read from the game's driver (driver: 1; read_api: its API version among them); the transform feedback layouts
    of the programs that capture, by serial, under their lock: programs that capture are few, and their entries stay */
 typedef struct {
-    u64 serial;
+    _Atomic u64 serial;
     i32 info[NVN_DEVICE_INFO_ITEMS];
-    int driver, read_api;
-    u32 formats[8];   /* bit f: a texture of NVN format f was initialized (logged once) */
-    u64 device;       /* the device the game made last (atomic): the runtime has one */
-    u32 debug_domain; /* the debug domains generated (atomic) */
-    u32 device_flags; /* the flags of that device (atomic) */
+    _Atomic int driver;
+    int read_api;
+    _Atomic u32 formats[8];   /* bit f: a texture of NVN format f was initialized (logged once) */
+    _Atomic u64 device;       /* the device the game made last (atomic): the runtime has one */
+    _Atomic u32 debug_domain; /* the debug domains generated (atomic) */
+    _Atomic u32 device_flags; /* the flags of that device (atomic) */
     PMutex xfb_lock;
     NvnXfbEntry* xfb; /* immutable layouts, sorted by serial and copied out under xfb_lock */
     u32 nxfb, xfb_capacity;
@@ -103,10 +105,13 @@ u32 nvn_device_flags(void);
 u64 nvn_device(void);
 u64 nvn_pool_gpu(u64 pool);
 
-/* Around a wait for the host inside an NVN call: the game's thread off its guest core and stopped as far as a game
-   pause goes, as rt_miss waits for a compile. An NVN call comes straight from the game's code, with no SVC to give the
-   core up, and on the console a thread waiting for the GPU leaves its core to the others: one game's main thread held
-   its core through the frame's wait for its fence, and a lower-priority loading thread on that core never finished */
+/* Around a wait for the host inside an NVN call: the game's thread off its guest core. An NVN call comes straight from
+   the game's code, with no SVC to give the core up, and on the console a thread waiting for the GPU leaves its core to
+   the others: one game's main thread held its core through the frame's wait for its fence, and a lower-priority loading
+   thread on that core never finished. The thread is not stopped for a game pause: in the middle of a function the
+   runtime runs natively, nothing in g_hle says where it goes on, and a save state taken then restarted it at a stale pc
+   (one game's thread that waits for its fences lost its wait in nvnSyncWait, and its renderer waited for good). A pause
+   waits for the wait to end, as the GPU runs until the guest threads have stopped (pause.c) */
 void nvn_wait_begin(void);
 void nvn_wait_end(void);
 

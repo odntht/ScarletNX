@@ -14,31 +14,41 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #if defined(SNX_TRACY)
 #include <SDL3/SDL_process.h>
 /* g_tracy_state is the client's, and the emissions' gate is it being SNX_TRACY_ON; g_tracy_pending counts them in
    flight. t_tracy is this thread's: the zones it has open, its zone tick, whether it mirrors a connection, and the
    name it goes by. */
-#define SNX_TRACY_ZONE_MAX 64
-#define SNX_TRACY_POLL     4096
-#define SNX_TRACY_OFF      0 /* not started */
-#define SNX_TRACY_ON       1
-#define SNX_TRACY_STOPPED  2 /* shut down, for good */
-static int g_tracy_state;
-static int g_tracy_pending;
+#define SNX_TRACY_ZONE_MAX  64
+#define SNX_TRACY_FIBER_MAX  4 /* room for a wait nested inside another, though none of the call sites does it now */
+#define SNX_TRACY_POLL      4096
+#define SNX_TRACY_OFF     0 /* not started */
+#define SNX_TRACY_ON      1
+#define SNX_TRACY_STOPPED 2 /* shut down, for good */
+static _Atomic int g_tracy_state;
+static _Atomic int g_tracy_pending;
 /* zones wanted deeper than SNX_TRACY_ZONE_MAX: dropped rather than leaked, and counted so a hole in a trace
    where the innermost work should be says it was this */
-static uint32_t g_tracy_dropped;
+static _Atomic uint32_t g_tracy_dropped;
 typedef struct {
     TracyCZoneCtx zones[SNX_TRACY_ZONE_MAX];
     int zone_depth;
     int attached;
+    int fiber_depth;
+    uint8_t fiber_slot[SNX_TRACY_FIBER_MAX];
+    uint8_t fiber_kind[SNX_TRACY_FIBER_MAX];
     unsigned zone_tick;
     uint64_t conn; /* the connection attached mirrors: a new one is re-announced to its server */
     char name[64];
 } TracyThread;
 static _Thread_local TracyThread t_tracy;
+
+/* The server keys a fiber by its name's address and reads the string when a GUI asks, so the name must stay at one
+   address for the capture's life. One slot of each kind gives every guest thread's wait its own lane. */
+#define SNX_TRACY_FIBER_NAME_MAX 96
+static char g_fiber_names[SNX_FIBER_SLOTS][SNX_FIBER_KINDS][SNX_TRACY_FIBER_NAME_MAX];
 
 /* The launcher's tracy-capture process; it writes the trace when the client disconnects. */
 static SDL_Process* g_tracy_capture;
@@ -70,14 +80,17 @@ static void tracy_plots_send(void);
    gray sample zones, which with JIT'd guest code and the drivers' own threads (the NVIDIA helpers', MangoHud's) reads
    as a wall of [unknown]; the instrumented zones alone don't, so the sampler is off unless the trace wants the flame
    graphs. */
-static int g_tracy_sampling;
+static _Atomic int g_tracy_sampling;
 static void tracy_sampling_start(void) {
-    if (!g_settings.tracy_sampling) return;
-    if (__atomic_exchange_n(&g_tracy_sampling, 1, __ATOMIC_ACQ_REL)) return;
-    if (TracyCBeginSamplingProfiling()) LOG("tracy: sampling the run's stacks\n");
+    /* Tracy 0.15.0 starts its system trace (the OS's context switches, and the sampled stacks with it) from
+       BeginSamplingProfiling, which this build makes manual. Both settings ask for that one call; without it the
+       context-switch lanes stay empty even though the library can capture them. */
+    if (!g_settings.tracy_sampling && !g_settings.tracy_context_switches) return;
+    if (atomic_exchange_explicit(&g_tracy_sampling, 1, memory_order_acq_rel)) return;
+    if (TracyCBeginSamplingProfiling()) LOG("tracy: the stack sampler and the OS's context switches are on\n");
 }
 static void tracy_sampling_stop(void) {
-    if (!__atomic_exchange_n(&g_tracy_sampling, 0, __ATOMIC_ACQ_REL)) return;
+    if (!atomic_exchange_explicit(&g_tracy_sampling, 0, memory_order_acq_rel)) return;
     TracyCEndSamplingProfiling();
 }
 
@@ -229,15 +242,15 @@ static const PmTracy g_pm_tracy_snx = {pm_tracy_make, pm_tracy_free,   pm_tracy_
 static void tracy_start_client(void) {
     char info[512];
     int n;
-    if (__atomic_load_n(&g_tracy_state, __ATOMIC_ACQUIRE) != SNX_TRACY_OFF) return;
+    if (atomic_load_explicit(&g_tracy_state, memory_order_acquire) != SNX_TRACY_OFF) return;
     ___tracy_startup_profiler();
-    __atomic_store_n(&g_tracy_state, SNX_TRACY_ON, __ATOMIC_RELEASE);
+    atomic_store_explicit(&g_tracy_state, SNX_TRACY_ON, memory_order_release);
     pm_tracy_register(&g_pm_tracy_snx); /* safe again: each lock keeps its single context */
     n = snprintf(info, sizeof info, "%s\n%s", snx_build_info(), g_tracy_title);
-    __atomic_add_fetch(&g_tracy_pending, 1, __ATOMIC_ACQ_REL);
+    atomic_fetch_add_explicit(&g_tracy_pending, 1, memory_order_acq_rel);
     TracyCSetThreadName("main");
     if (n > 0) TracyCAppInfo(info, (size_t)(n < (int)sizeof info ? n : (int)sizeof info - 1));
-    __atomic_sub_fetch(&g_tracy_pending, 1, __ATOMIC_ACQ_REL);
+    atomic_fetch_sub_explicit(&g_tracy_pending, 1, memory_order_acq_rel);
     if (g_opt_tracy_capture)
         LOG("tracy: profiling this run to its capture\n");
     else
@@ -285,7 +298,7 @@ static void tracy_capture_connected(void) {
 void snx_tracy_capture_now(void) {
     int status = 0, state;
     tracy_capture_lock();
-    state = __atomic_load_n(&g_tracy_state, __ATOMIC_ACQUIRE);
+    state = atomic_load_explicit(&g_tracy_state, memory_order_acquire);
     if (state == SNX_TRACY_STOPPED) goto out;
     if (state == SNX_TRACY_OFF) {
         tracy_port_setup(1); /* before the client reads it, which is when it starts */
@@ -313,14 +326,14 @@ out:
 
 /* 1 while the client's emissions are allowed: closed before it starts and, again, before it shuts down. tracy_conn
    reads it so TracyCIsConnected is never reached while the client has no data to read (an assert). */
-int snx_tracy_gate_open(void) { return __atomic_load_n(&g_tracy_state, __ATOMIC_ACQUIRE) == SNX_TRACY_ON; }
+int snx_tracy_gate_open(void) { return atomic_load_explicit(&g_tracy_state, memory_order_acquire) == SNX_TRACY_ON; }
 
 int snx_tracy_enter(void) {
     /* The count comes before the second gate read, and both are sequenced with the exchange shutdown closes it with,
        so a thread that is about to emit is either counted before shutdown looks or sees the gate closed. */
-    if (__atomic_load_n(&g_tracy_state, __ATOMIC_ACQUIRE) != SNX_TRACY_ON) return 0;
-    __atomic_add_fetch(&g_tracy_pending, 1, __ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&g_tracy_state, __ATOMIC_SEQ_CST) != SNX_TRACY_ON) {
+    if (atomic_load_explicit(&g_tracy_state, memory_order_acquire) != SNX_TRACY_ON) return 0;
+    atomic_fetch_add_explicit(&g_tracy_pending, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&g_tracy_state, memory_order_seq_cst) != SNX_TRACY_ON) {
         snx_tracy_leave();
         return 0;
     }
@@ -330,7 +343,7 @@ int snx_tracy_enter(void) {
 void snx_tracy_leave(void) {
     /* Whenever the count reaches zero, wake whoever waits on it, whether or not shutdown has marked itself: a
        thread may read that mark before shutdown's store is visible and so not wake a waiter already blocking. */
-    if (__atomic_sub_fetch(&g_tracy_pending, 1, __ATOMIC_ACQ_REL) == 0) {
+    if ((atomic_fetch_sub_explicit(&g_tracy_pending, 1, memory_order_acq_rel) - 1) == 0) {
         pm_lock(&g_tracy_wait_lock);
         pc_broadcast(&g_tracy_wait_cond);
         pm_unlock(&g_tracy_wait_lock);
@@ -348,10 +361,10 @@ static void tracy_announce(void) {
 TracyCZoneCtx snx_tracy_zone_begin(const struct ___tracy_source_location_data* srcloc) {
     TracyCZoneCtx ctx = {0};
     uint64_t conn;
-    if (__atomic_load_n(&g_tracy_state, __ATOMIC_ACQUIRE) != SNX_TRACY_ON) return ctx;
+    if (atomic_load_explicit(&g_tracy_state, memory_order_acquire) != SNX_TRACY_ON) return ctx;
     /* No room to track a deeper zone: drop it rather than leak a begin. */
     if (t_tracy.zone_depth >= SNX_TRACY_ZONE_MAX) {
-        __atomic_add_fetch(&g_tracy_dropped, 1, __ATOMIC_RELAXED);
+        atomic_fetch_add_explicit(&g_tracy_dropped, 1, memory_order_relaxed);
         return ctx;
     }
     /* A thread not mirroring a connection asks at every zone, so one that makes few — the frontend's one a frame,
@@ -369,7 +382,7 @@ TracyCZoneCtx snx_tracy_zone_begin(const struct ___tracy_source_location_data* s
             tracy_announce();
         }
         if (TracyCIsConnected) /* the poll already pays for the count */
-            TracyCPlot("tracy dropped zones", (double)__atomic_load_n(&g_tracy_dropped, __ATOMIC_RELAXED));
+            TracyCPlot("tracy dropped zones", (double)atomic_load_explicit(&g_tracy_dropped, memory_order_relaxed));
         snx_tracy_leave();
         if (!t_tracy.attached) return ctx;
     }
@@ -409,6 +422,44 @@ void snx_tracy_thread_name(const char* name) {
     snx_tracy_leave();
 }
 
+void snx_tracy_fiber_enter(uint32_t slot, uint32_t kind, const char* name) {
+    if (!name || !*name || t_tracy.fiber_depth >= SNX_TRACY_FIBER_MAX) return;
+    if (slot >= SNX_FIBER_SLOTS || kind >= SNX_FIBER_KINDS) return;
+    if (!snx_tracy_enter()) return;
+    if (TracyCIsConnected) {
+        /* No leave without an enter: a connection that came and went while this thread was not looking would
+           otherwise leave a fiber the server never saw. The pair is pushed only when both events went out. */
+        char* dst = g_fiber_names[slot][kind];
+        snprintf(dst, SNX_TRACY_FIBER_NAME_MAX, "%s", name);
+        TracyCFiberEnter(dst);
+        t_tracy.fiber_slot[t_tracy.fiber_depth] = (uint8_t)slot;
+        t_tracy.fiber_kind[t_tracy.fiber_depth] = (uint8_t)kind;
+        t_tracy.fiber_depth++;
+    }
+    snx_tracy_leave();
+}
+
+void snx_tracy_fiber_leave(void) {
+    /* Pop the pair whatever the connection does: a disconnect here must not leave a depth that leave_all cannot
+       clear. Only the events depend on a server being there. */
+    if (t_tracy.fiber_depth <= 0) return;
+    if (!snx_tracy_enter()) {
+        t_tracy.fiber_depth--;
+        return;
+    }
+    t_tracy.fiber_depth--;
+    if (TracyCIsConnected) {
+        TracyCFiberLeave;
+        if (t_tracy.fiber_depth > 0) {
+            /* The name of an inner fiber is that of its slot: the pair on top tells which one ends. The fiber that
+               switched away is running again after this one leaves. */
+            char* dst = g_fiber_names[t_tracy.fiber_slot[t_tracy.fiber_depth]][t_tracy.fiber_kind[t_tracy.fiber_depth]];
+            if (*dst) TracyCFiberEnter(dst);
+        }
+    }
+    snx_tracy_leave();
+}
+
 /* The plots' formats: the byte counts as sizes, the shares as percent, the idle mark as steps. */
 static void tracy_plots_send(void) {
     static const struct {
@@ -432,6 +483,10 @@ static void tracy_plots_send(void) {
         {"syncpt timeouts/s", 0, 0, 1},
         {"hid updates/s", 0, 0, 1},
         {"audio mix ms", 0, 0, 1},
+        {"audio frame ms", 0, 0, 1},
+        {"audio queued ms", 0, 0, 1},
+        {"audio underruns", 0, 1, 0},
+        {"tracy dropped zones", 0, 0, 1},
         {"guest memory", 1, 0, 1},
         {"compute cpu reads", 0, 0, 1},
         {"gpu thread idle", 0, 1, 0},
@@ -461,6 +516,7 @@ static void tracy_plots_send(void) {
         {"gpu idle: queued", 0, 0, 1},
         {"gpu busy", 2, 0, 1},
         {"gpu submissions/frame", 0, 0, 1},
+        {"copy MB", 1, 0, 1},
         {"jit compile ms", 0, 0, 1},
         {"jit batch size", 0, 0, 1},
         {"jit batch functions", 0, 0, 1},
@@ -474,6 +530,44 @@ static void tracy_plots_send(void) {
         {"submits pending", 0, 0, 1},    {"compute pending", 0, 0, 1},    {"pipelines", 0, 0, 1},
         {"pipeline make ms", 0, 0, 1},   {"pipeline wait ms", 0, 0, 1},   {"pipeline cache hits", 0, 0, 1},
         {"io read MB/s", 0, 0, 1},       {"io write MB/s", 0, 0, 1},
+        /* the renderer's per-frame counters and the resource categories, which the slow-frame log used to keep */
+        {"shader translate ms", 0, 0, 1},  {"texture upload count", 0, 0, 1},
+        {"render targets made", 0, 0, 1},  {"vk finish ms", 0, 0, 1},
+        {"texture pipeline count", 0, 0, 1}, {"texture pipeline ms", 0, 0, 1},
+        {"gpu wait: finish ms", 0, 0, 1},  {"gpu wait: recycle ms", 0, 0, 1},
+        {"gpu wait: submit ms", 0, 0, 1},
+        {"vk resource: image requirements ms", 0, 0, 1}, {"vk resource: image allocation ms", 0, 0, 1},
+        {"vk resource: image destruction ms", 0, 0, 1},  {"vk resource: target setup ms", 0, 0, 1},
+        {"vk resource: target reload ms", 0, 0, 1},      {"vk resource: surface reclaim ms", 0, 0, 1},
+        {"vk resource: buffer maintenance ms", 0, 0, 1}, {"vk resource: buffer cache build ms", 0, 0, 1},
+        /* the GPU queue's waits, holds and reasons for a submission */
+        {"gpu round: finish ms", 0, 0, 1},  {"gpu round: recycle ms", 0, 0, 1},
+        {"gpu round: submit ms", 0, 0, 1},  {"gpu hold: passes ms", 0, 0, 1},
+        {"gpu hold: dispatches ms", 0, 0, 1}, {"gpu hold: copies ms", 0, 0, 1},
+        {"gpu hold: nothing ms", 0, 0, 1},  {"gpu submit: other", 0, 0, 1},
+        {"gpu submit: present", 0, 0, 1},   {"gpu submit: finish", 0, 0, 1},
+        {"gpu submit: 1 ms", 0, 0, 1},      {"gpu submit: readback", 0, 0, 1},
+        {"gpu submit: frame end", 0, 0, 1}, {"gpu submit: split", 0, 0, 1},
+        {"gpu submit: background", 0, 0, 1},
+        /* the IPC window's totals and its most costly commands, by rank */
+        {"ipc req/s", 0, 0, 1},         {"ipc handler ms", 0, 0, 1},
+        {"ipc commands", 0, 0, 1},      {"ipc other req/s", 0, 0, 1},
+        {"ipc top 0 ms", 0, 0, 1},      {"ipc top 1 ms", 0, 0, 1},
+        {"ipc top 2 ms", 0, 0, 1},      {"ipc top 3 ms", 0, 0, 1},
+        {"ipc top 4 ms", 0, 0, 1},      {"ipc top 5 ms", 0, 0, 1},
+        {"ipc top 6 ms", 0, 0, 1},      {"ipc top 7 ms", 0, 0, 1},
+        /* the guest's busiest SVCs and hook families, and the NCE's own counters */
+        {"top svc 0/s", 0, 0, 1},       {"top svc 1/s", 0, 0, 1},
+        {"top svc 2/s", 0, 0, 1},       {"top svc 3/s", 0, 0, 1},
+        {"top svc 4/s", 0, 0, 1},       {"top svc 5/s", 0, 0, 1},
+        {"top hook 0/s", 0, 0, 1},      {"top hook 1/s", 0, 0, 1},
+        {"top hook 2/s", 0, 0, 1},      {"top hook 3/s", 0, 0, 1},
+        {"top hook 4/s", 0, 0, 1},      {"nce svc/s", 0, 0, 1},
+        {"nce trap/s", 0, 0, 1},        {"nce ticks/s", 0, 0, 1},
+        {"nce run/s", 0, 0, 1},
+        /* the JIT's compiled code and its AOT lookups */
+        {"jit code KiB", 0, 0, 1},      {"jit instructions", 0, 0, 1},
+        {"jit variant hits", 0, 0, 1},  {"jit variant misses", 0, 0, 1},
     };
     if (!snx_tracy_enter()) return;
     if (TracyCIsConnected)
@@ -712,12 +806,29 @@ void snx_tracy_log(int lvl, const char* text) {
     snx_tracy_leave();
 }
 
+void snx_tracy_fiber_leave_all(void) {
+    while (t_tracy.fiber_depth > 0) snx_tracy_fiber_leave();
+}
+
+void snx_tracy_fatal(const char* text) {
+    /* No pending count here: the crash path can reach this with a lock held, and leave() would take the wait lock
+       when the count reached zero. A run ending here cannot have work left in flight to wait for. */
+    if (!text || !snx_tracy_gate_open()) return;
+    if (TracyCIsConnected) {
+        size_t n = strlen(text);
+        while (n && (text[n - 1] == '\n' || text[n - 1] == '\r')) n--;
+        if (n) ___tracy_emit_logString(TracyMessageSeverityFatal, 0, 0, n, text);
+    }
+}
+
 void snx_tracy_shutdown(void) {
     u64 until;
     int on = SNX_TRACY_ON;
+    snx_tracy_fiber_leave_all(); /* this thread's fibers, while the client can still hear their end */
     /* Close the gate, once and only on a running client; the exchange is sequenced with the counts, so a thread that
        passed it is already counted. */
-    if (!__atomic_compare_exchange_n(&g_tracy_state, &on, SNX_TRACY_STOPPED, 0, __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE))
+    if (!atomic_compare_exchange_strong_explicit(&g_tracy_state, &on, SNX_TRACY_STOPPED, memory_order_seq_cst,
+                                                 memory_order_acquire))
         return;
     tracy_sampling_stop();
     /* End this thread's nested zones, each releasing its own count. */
@@ -727,7 +838,7 @@ void snx_tracy_shutdown(void) {
     until = plat_ns() + 2000000000ull;
     for (;;) {
         i64 left;
-        if (!__atomic_load_n(&g_tracy_pending, __ATOMIC_ACQUIRE)) {
+        if (!atomic_load_explicit(&g_tracy_pending, memory_order_acquire)) {
             ___tracy_shutdown_profiler();
             tracy_capture_finish(1);
             return;
@@ -736,7 +847,7 @@ void snx_tracy_shutdown(void) {
         /* the bound is computed under the lock, right before the wait: a wait cannot be given a stale one and
            run past the deadline */
         left = (i64)(until - plat_ns());
-        if (left > 0 && __atomic_load_n(&g_tracy_pending, __ATOMIC_ACQUIRE))
+        if (left > 0 && atomic_load_explicit(&g_tracy_pending, memory_order_acquire))
             pc_wait(&g_tracy_wait_cond, &g_tracy_wait_lock, left);
         pm_unlock(&g_tracy_wait_lock);
         if (left <= 0) break;

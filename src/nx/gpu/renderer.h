@@ -92,6 +92,10 @@ typedef struct Renderer {
     /* A temporal upscale (a Switch 2 game's DLSS evaluation, GpuUpscale): 1 when the renderer wrote the output, 0
        for the front end's stand-in (a filtered copy). NULL in a renderer without one */
     int (*upscale)(const GpuUpscale* u);
+    /* An Ounce's shading rate image (GpuShadingRate) for the draws after it: the id they give in DrawCall.shading_rate,
+       0 when they shade each pixel (a renderer or device without it, an image it can't take). A later call can give
+       the image other texels, and the draws of an earlier id then shade each pixel. NULL in a renderer without it */
+    u32 (*shading_rate)(const GpuShadingRate* r);
     /* NVN copies choose their filter explicitly; source steps can be negative to mirror an axis. */
     int (*blit_filter)(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, int dh, double sx, double sy,
                        double sdx, double sdy, int linear);
@@ -234,6 +238,9 @@ typedef struct Renderer {
     /* RendererPrepare's progress, any thread. What isn't done when the game starts goes on in the background. NULL when
        the renderer makes nothing before */
     void (*prepare)(RendererPrepare* p);
+    /* the upscaler's (which 0) or the anti-aliasing's (1) next step for this run, the shortcuts' (hotkey_upscaler,
+       hotkey_anti_aliasing): its label, NULL when the renderer has none. Any thread */
+    const char* (*step_effect)(int which);
 } Renderer;
 
 extern const Renderer vk_renderer;
@@ -248,6 +255,6 @@ extern _Atomic int g_gfx_any;     /* graphics storage-buffer results are pending
 extern _Atomic int g_gfx_img_any; /* graphics storage-image results are pending somewhere */
 extern _Atomic int g_uma_any;     /* writes into guest memory in place are pending somewhere (gpu/vk/uma.c) */
 extern _Atomic int g_mir_any;     /* writes of the GPU mirror's programs are pending somewhere (gpu/vk/mirror.c) */
-extern u64 g_tex_cache_hits, g_tex_cache_misses, g_tex_upload_bytes, g_tex_frees; /* added to atomically */
+extern _Atomic u64 g_tex_cache_hits, g_tex_cache_misses, g_tex_upload_bytes, g_tex_frees; /* added to atomically */
 
 #endif

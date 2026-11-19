@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
 
 typedef char state_pointers_are_8_bytes[sizeof(void*) == 8 ? 1 : -1]; /* pointer fields hold the numbers below */
 
@@ -273,7 +274,8 @@ static int save_memory(StateWriter* w, char* why, size_t whysize) {
     MemBlock* blk = (MemBlock*)malloc(sizeof *blk * (nblk + 1));
     MemSpan* span = (MemSpan*)malloc(sizeof *span * (nspan + 1));
     u8* buf = (u8*)malloc(GROUP * PAGE);
-    u64 hdr[2] = {__atomic_load_n(&g_heap_size, __ATOMIC_ACQUIRE), __atomic_load_n(&g_phys_mapped, __ATOMIC_ACQUIRE)};
+    u64 hdr[2] = {atomic_load_explicit(&g_heap_size, memory_order_acquire),
+                  atomic_load_explicit(&g_phys_mapped, memory_order_acquire)};
     int r = -1;
     if (!blk || !span || !buf) goto out;
     nblk = mem_blocks(blk, nblk);
@@ -643,8 +645,10 @@ enum {
     HEAP_GRUNS,
     HEAP_VAFREE,
     HEAP_FS,
-    HEAP_VIEW
+    HEAP_VIEW,
+    HEAP_EVENTFD /* a bsd eventfd, slot its session * BSD_MAX_FD + its fd: its count, semaphore and non-blocking */
 };
+#define EVENTFD_BYTES 16
 static int heap_put(StateIo* io, u32 kind, u32 slot, const void* p, u64 n) {
     return io_put32(io, kind) | io_put32(io, slot) | io_put64(io, n) | io_put(io, p, n);
 }
@@ -656,6 +660,13 @@ static int savable(char* why, size_t whysize) {
     for (i = 0; i < BSD_MAX; i++)
         for (k = 0; k < BSD_MAX_FD; k++)
             if (g_hle.bsd.bsds[i].fd[k].s) {
+                /* an eventfd is a counter the runtime keeps, which a load makes again (HEAP_EVENTFD): one game's
+                   socket thread polls one with no connection open, and no state of it could be saved */
+                u64 count;
+                int semaphore;
+                if (!g_hle.bsd.bsds[i].fd[k].bcast &&
+                    !snx_socket_event_get(g_hle.bsd.bsds[i].fd[k].s, &count, &semaphore))
+                    continue;
                 snprintf(why, whysize, "the game has a network connection open");
                 return -1;
             }
@@ -747,7 +758,13 @@ static void nil_host(Hle* c) {
         NIL(x->client_chain);
         NIL(x->lk);
     }
-    for (i = 0; i < BSD_MAX; i++) NIL(c->bsd.bsds[i].lk);
+    for (i = 0; i < BSD_MAX; i++) {
+        NIL(c->bsd.bsds[i].lk);
+        for (u32 k = 0; k < BSD_MAX_FD; k++) {
+            NIL(c->bsd.bsds[i].fd[k].s); /* an eventfd's in HEAP_EVENTFD, made again at a load */
+            NIL(c->bsd.bsds[i].fd[k].bcast);
+        }
+    }
     for (i = 0; i < LDN_MAX; i++) NIL(c->ldn.ldn[i].lk);
 }
 /* HLE (g_hle, its pointers numbers) and HEAP (what its members own) into the buffers, the names its numbers stand for
@@ -769,7 +786,9 @@ static int save_hle(Buf* hle, Buf* heap, Names* names) {
     }
     for (i = 0; i < SESSION_MAX; i++) {
         SWZ(c->ipc.sessions[i].obj);
-        SWZ(c->ipc.sessions[i].domain);
+        /* _Atomic: read with its order named, as every access to it is */
+        SWZ_AS(c->ipc.sessions[i].domain,
+               swz(names, (const void*)atomic_load_explicit(&c->ipc.sessions[i].domain, memory_order_relaxed)));
     }
     for (i = 0; i < DOMAIN_MAX; i++)
         for (k = 0; k < DOMAIN_OBJECTS; k++) SWZ(c->ipc.domains[i].obj[k]);
@@ -812,7 +831,8 @@ static int save_hle(Buf* hle, Buf* heap, Names* names) {
     }
     /* nvdrv: the GPU's page table, its mappings and runs, and the VA allocator's free ranges */
     for (i = 0; i < NV_GMMU_L1; i++)
-        if (c->nvdrv.gmmu[i]) r |= heap_put(&io, HEAP_GMMU, i, c->nvdrv.gmmu[i], 4096 * 8);
+        if (atomic_load_explicit(&c->nvdrv.gmmu[i], memory_order_relaxed))
+            r |= heap_put(&io, HEAP_GMMU, i, atomic_load_explicit(&c->nvdrv.gmmu[i], memory_order_relaxed), 4096 * 8);
     if (c->nvdrv.gmaps) r |= heap_put(&io, HEAP_GMAPS, 0, c->nvdrv.gmaps, (u64)c->nvdrv.ngmaps * sizeof(GMap));
     if (c->nvdrv.gruns) r |= heap_put(&io, HEAP_GRUNS, 0, c->nvdrv.gruns, (u64)c->nvdrv.ngruns * sizeof(GRun));
     if (c->nvdrv.vafree) r |= heap_put(&io, HEAP_VAFREE, 0, c->nvdrv.vafree, (u64)c->nvdrv.nvafree * sizeof(VaRange));
@@ -834,6 +854,19 @@ static int save_hle(Buf* hle, Buf* heap, Names* names) {
     c->fs.file_next = g_hle.fs.file_next;
     c->fs.dir_next = g_hle.fs.dir_next;
     SWZ(c->bsd.client);
+    /* bsd's eventfds (savable lets no other socket through) */
+    for (i = 0; i < BSD_MAX; i++)
+        for (k = 0; k < BSD_MAX_FD; k++) {
+            SnxSocket* s = c->bsd.bsds[i].fd[k].s;
+            u64 count;
+            int semaphore;
+            u8 rec[EVENTFD_BYTES];
+            if (!s || snx_socket_event_get(s, &count, &semaphore)) continue;
+            snx_st_le64(rec, count);
+            snx_st_le32(rec + 8, (u32)semaphore);
+            snx_st_le32(rec + 12, (u32)snx_socket_nonblocking(s));
+            r |= heap_put(&io, HEAP_EVENTFD, i * BSD_MAX_FD + k, rec, sizeof rec);
+        }
     /* the rest of the host's side: the running process keeps its own, or the load makes it again */
     nil_host(c);
     r |= io_put32(&io, HEAP_END);
@@ -854,7 +887,7 @@ static void drop_host(void) {
     for (i = 0; i < KCODEVIEW_MAX; i++) free(g_hle.svcmem.views[i].snap);
     for (i = 0; i < RO_STATES; i++)
         for (k = 0; k < RO_LIMIT; k++) free(g_hle.ldr.states[i].nrr[k].hashes);
-    for (i = 0; i < NV_GMMU_L1; i++) free(g_hle.nvdrv.gmmu[i]);
+    for (i = 0; i < NV_GMMU_L1; i++) free(atomic_load_explicit(&g_hle.nvdrv.gmmu[i], memory_order_relaxed));
     free(g_hle.nvdrv.gmaps);
     free(g_hle.nvdrv.gruns);
     free(g_hle.nvdrv.vafree);
@@ -908,10 +941,17 @@ static int hle_check(const Hle* h) {
         const KThread* t = &h->thread.threads[i];
         if (t->o.type != KO_THREAD) continue;
         if (t->nwaits < 0 || t->nwaits > (int)(sizeof t->waits / sizeof *t->waits) || t->core < 0 ||
-            t->core >= NCORES || t->ideal_core < -1 || t->ideal_core >= NCORES || t->core_next > KTHREAD_MAX ||
-            t->next_waiter > KTHREAD_MAX || t->lock_owner > KTHREAD_MAX || !id_ok(h, t->req_session, KO_SESSION) ||
-            t->req_nvfd > NV_FDS || t->park < PARK_RUN || t->park > PARK_SERVICE || t->wait_svc < WAIT_SVC_SLEEP ||
+            t->core >= NCORES || atomic_load_explicit(&t->ideal_core, memory_order_relaxed) < -1 ||
+            atomic_load_explicit(&t->ideal_core, memory_order_relaxed) >= NCORES ||
+            atomic_load_explicit(&t->core_next, memory_order_relaxed) > KTHREAD_MAX || t->next_waiter > KTHREAD_MAX ||
+            t->lock_owner > KTHREAD_MAX || !id_ok(h, t->req_session, KO_SESSION) || t->req_nvfd > NV_FDS ||
+            t->park < PARK_RUN || t->park > PARK_SERVICE || t->wait_svc < WAIT_SVC_SLEEP ||
             t->wait_svc > WAIT_SVC_SETTLE || t->state < 0 || t->state > 2)
+            return -1;
+        /* a request made again from the svc instruction before the pc: a thread outside an SVC has none there. Builds
+           before kthread_wait knew it parked an NVN call's syncpoint wait so, and its load ran the game on from a
+           stale pc */
+        if (t->state == 1 && t->park == PARK_SERVICE && !atomic_load_explicit(&t->in_svc, memory_order_relaxed))
             return -1;
         for (k = 0; k < (u32)t->nwaits; k++)
             if (!t->waits[k] || !id_ok(h, t->waits[k], 0)) return -1;
@@ -930,7 +970,7 @@ static int hle_check(const Hle* h) {
     /* the pointers, as unswz made them */
     for (i = 0; i < SVCOBJ_MAX; i++) {
         const SvcObj* o = &h->ipc.svcobjs[i];
-        if (o->refs > 0 && !o->dispatch) return -1;
+        if (atomic_load_explicit(&o->refs, memory_order_relaxed) > 0 && !o->dispatch) return -1;
         if (o->data) { /* a slot of its service's pool, whose first u32 names it (svcobj_new_data) */
             uintptr_t off = (uintptr_t)o->data - HLE_LO;
             u32 id;
@@ -941,7 +981,7 @@ static int hle_check(const Hle* h) {
     }
     for (i = 0; i < SESSION_MAX; i++)
         if (!ELEM_OK(h->ipc.sessions[i].obj, g_hle.ipc.svcobjs) ||
-            !ELEM_OK(h->ipc.sessions[i].domain, g_hle.ipc.domains))
+            !ELEM_OK(atomic_load_explicit(&h->ipc.sessions[i].domain, memory_order_relaxed), g_hle.ipc.domains))
             return -1;
     for (i = 0; i < DOMAIN_MAX; i++)
         for (k = 0; k < DOMAIN_OBJECTS; k++)
@@ -966,10 +1006,11 @@ static void staged_free(Hle* ld) {
     for (i = 0; i < KCODEVIEW_MAX; i++) free(ld->svcmem.views[i].snap);
     for (i = 0; i < RO_STATES * RO_LIMIT; i++) free(ld->ldr.states[i / RO_LIMIT].nrr[i % RO_LIMIT].hashes);
     for (i = 0; i < SNX_AUDREN_MAX; i++) free(ld->audren.rens[i].s);
-    for (i = 0; i < NV_GMMU_L1; i++) free(ld->nvdrv.gmmu[i]);
+    for (i = 0; i < NV_GMMU_L1; i++) free(atomic_load_explicit(&ld->nvdrv.gmmu[i], memory_order_relaxed));
     free(ld->nvdrv.gmaps);
     free(ld->nvdrv.gruns);
     free(ld->nvdrv.vafree);
+    for (i = 0; i < BSD_MAX * BSD_MAX_FD; i++) snx_socket_unref(ld->bsd.bsds[i / BSD_MAX_FD].fd[i % BSD_MAX_FD].s);
     nil_host(ld);
 }
 /* The state's copy of g_hle made whole while the game still runs: its host fields cleared, its pointers back, its heap
@@ -1029,12 +1070,16 @@ static int stage_hle(Hle* ld, Buf* heap, const Names* names, Buf* fs_paths) {
                     !(ld->audren.rens[slot].s = audren_state_unpack(p, n)))
                     goto bad;
                 break;
-            case HEAP_GMMU:
-                if (slot >= NV_GMMU_L1 || n != 4096 * 8 || ld->nvdrv.gmmu[slot] ||
-                    !(ld->nvdrv.gmmu[slot] = (u64*)malloc((size_t)n)))
+            case HEAP_GMMU: {
+                if (slot >= NV_GMMU_L1 || n != 4096 * 8 ||
+                    atomic_load_explicit(&ld->nvdrv.gmmu[slot], memory_order_relaxed))
                     goto bad;
-                memcpy(ld->nvdrv.gmmu[slot], p, (size_t)n);
+                _Atomic u64* table = malloc((size_t)n);
+                if (!table) goto bad;
+                memcpy(table, p, (size_t)n);
+                atomic_store_explicit(&ld->nvdrv.gmmu[slot], table, memory_order_relaxed);
                 break;
+            }
             case HEAP_GMAPS:
                 if (ld->nvdrv.gmaps || n != (u64)ld->nvdrv.ngmaps * sizeof(GMap) ||
                     !(ld->nvdrv.gmaps = (GMap*)malloc((size_t)(n ? n : 1))))
@@ -1064,6 +1109,16 @@ static int stage_hle(Hle* ld, Buf* heap, const Names* names, Buf* fs_paths) {
                 memcpy(v->snap, p, (size_t)n);
                 break;
             }
+            case HEAP_EVENTFD: {
+                BsdFd* f;
+                SnxSocket* sock;
+                if (slot >= BSD_MAX * BSD_MAX_FD || n != EVENTFD_BYTES) goto bad;
+                f = &ld->bsd.bsds[slot / BSD_MAX_FD].fd[slot % BSD_MAX_FD];
+                if (f->s || snx_socket_eventfd(&sock, snx_ld_le64(p), snx_ld_le32(p + 8) != 0)) goto bad;
+                snx_socket_set_nonblocking(sock, snx_ld_le32(p + 12) != 0);
+                f->s = sock;
+                break;
+            }
             case HEAP_FS:
                 fs_paths->p = p;
                 fs_paths->n = n;
@@ -1087,14 +1142,15 @@ static void install_hle(Hle* ld, const ShmPlan* plan) {
     memcpy(ld->thread.host_cpu, g_hle.thread.host_cpu, sizeof ld->thread.host_cpu);
     ld->thread.host_ncpu = g_hle.thread.host_ncpu;
     memcpy(ld->thread.pin_said, g_hle.thread.pin_said, sizeof ld->thread.pin_said);
-    ld->thread.hold = 1; /* the game is held until the load lets it go */
+    atomic_store_explicit(&ld->thread.hold, 1, memory_order_relaxed); /* the game is held until the load lets it go */
     memset(ld->thread.core_owner, 0, sizeof ld->thread.core_owner);
     memset(ld->thread.core_wait, 0, sizeof ld->thread.core_wait);
     for (i = 0; i < NCORES; i++) ld->thread.core_best[i] = 64;
     memcpy(ld->ipc.reg, g_hle.ipc.reg, sizeof ld->ipc.reg);
     ld->ipc.reg_next = g_hle.ipc.reg_next;
     memcpy(ld->ipc.ring, g_hle.ipc.ring, sizeof ld->ipc.ring);
-    ld->ipc.ring_n = g_hle.ipc.ring_n;
+    atomic_store_explicit(&ld->ipc.ring_n, atomic_load_explicit(&g_hle.ipc.ring_n, memory_order_relaxed),
+                          memory_order_relaxed);
     ld->debug.syms = g_hle.debug.syms;
     ld->debug.nsyms = g_hle.debug.nsyms;
     ld->am.nacp = g_hle.am.nacp;
@@ -1107,6 +1163,7 @@ static void install_hle(Hle* ld, const ShmPlan* plan) {
     ld->ssl.bio = g_hle.ssl.bio;
     ld->nvdrv.alias = g_hle.nvdrv.alias;
     ld->nvdrv.alias.stale = 1;     /* built again from the state's runs */
+    ld->nvdrv.alias.edges_ok = 0;  /* and their edges sorted again */
     ld->hid.pad1 = g_hle.hid.pad1; /* the players' input as the host reads it now */
     memcpy(ld->hid.pad_extra, g_hle.hid.pad_extra, sizeof ld->hid.pad_extra);
     ld->hid.touch = g_hle.hid.touch;
@@ -1126,6 +1183,12 @@ static void install_hle(Hle* ld, const ShmPlan* plan) {
             ld->svcmem.shmems[i].host = plan->host[i];
             ld->svcmem.shmems[i].pool = plan->off[i] + 1;
         }
+    /* the running game's sockets go with it: the state's eventfds are made already, and it holds no other */
+    for (i = 0; i < BSD_MAX * BSD_MAX_FD; i++) {
+        BsdFd* f = &g_hle.bsd.bsds[i / BSD_MAX_FD].fd[i % BSD_MAX_FD];
+        snx_socket_unref(f->s);
+        snx_socket_unref(f->bcast);
+    }
     memcpy(&g_hle, ld, sizeof g_hle);
 }
 
@@ -1247,7 +1310,7 @@ resume:
     else
         LOG("state: saved %s at guest time %.3f s (frame %d) in %.0f ms (GPU written back %.0f, gathered %.0f, "
             "sections %.0f, guest memory %.0f)\n",
-            path, (double)h.guest_ns / 1e9, __atomic_load_n(&g_frames, __ATOMIC_RELAXED),
+            path, (double)h.guest_ns / 1e9, atomic_load_explicit(&g_frames, memory_order_relaxed),
             (double)(plat_ns() - t0) / 1e6, (double)(t_land - t0) / 1e6, (double)(t_gather - t_land) / 1e6,
             (double)(t_memory - t_gather) / 1e6, (double)(plat_ns() - t_memory) / 1e6);
     return r;
@@ -1387,7 +1450,8 @@ int state_load(const char* path, char* why, size_t whysize) {
     free(temp.p);
     free(nvn.p);
     LOG("state: loaded %s (guest time %.3f s) at frame %d in %.0f ms (checked %.0f)\n", path, (double)h.guest_ns / 1e9,
-        __atomic_load_n(&g_frames, __ATOMIC_RELAXED), (double)(plat_ns() - t0) / 1e6, (double)(t_checked - t0) / 1e6);
+        atomic_load_explicit(&g_frames, memory_order_relaxed), (double)(plat_ns() - t0) / 1e6,
+        (double)(t_checked - t0) / 1e6);
     return 0;
 refuse:
     sr_close(r);
@@ -1520,7 +1584,7 @@ static void toast(const char* fmt, ...) {
     vsnprintf(text, sizeof text, fmt, ap);
     va_end(ap);
     ui_lock();
-    overlay_toast(text, plat_ns());
+    overlay_state_toast(text, plat_ns());
     ui_unlock();
 }
 /* a state's date and the play time then, as the menu lists them */

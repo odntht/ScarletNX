@@ -51,12 +51,24 @@ u64 gmmu_space_alloc(u64 size, u64 align);
 void gmmu_space_map(u64 gva, u64 cpu, u64 size);
 void gmmu_space_unmap(u64 gva, u64 size);
 void gmmu_space_free(u64 gva, u64 size);
+/* Changes of the page table that the GPU thread makes later, in order with the work queued after them, so that the
+   caller's thread doesn't wait for the renderer's lock that each change takes. gmmu_later adds one and returns its
+   sequence number: GMMU_LATER_MAP is gmmu_space_map(gva, cpu, size), GMMU_LATER_UNMAP gmmu_space_unmap(gva, size),
+   GMMU_LATER_FREE gmmu_space_free(gva, size) and then nvmap_handle_drop(nvmap). gmmu_later_post queues the GPU
+   thread's call that makes the changes up to seq: one after a few gmmu_later calls makes them all. Until a map is
+   made, gmmu_translate and gmmu_run on any other thread answer for its pages where the table has no entry, as the
+   reads of the caller's thread that come after it expect. The GPU thread's own answers follow the table */
+typedef enum { GMMU_LATER_MAP, GMMU_LATER_UNMAP, GMMU_LATER_FREE } GmmuLaterKind;
+u32 gmmu_later(GmmuLaterKind kind, u64 gva, u64 cpu, u64 size, u32 nvmap);
+void gmmu_later_post(u32 seq);
 /* Each GPU range that shows guest bytes of [cpu, cpu + size), clipped to them: fn(ctx, gva, n) for the n bytes at
    gva, each mapped page once. The same guest memory is mapped at several GPU addresses, so what is known of it by one
    address holds at the others, and this finds them all from the guest side. From any thread. fn runs under the
    index's lock: it takes no lock and doesn't call back into nvdrv. The index compares addresses only, as the page
    table holds them: guest memory freed under a mapping still counts here, where gmmu_translate reads it as unmapped */
 void gmmu_aliases(u64 cpu, u64 size, void (*fn)(void* ctx, u64 gva, u64 n), void* ctx);
+/* the log line of the index's builds since the last call, whose counts start over (the renderer's 600 presents) */
+void gmmu_alias_log(void);
 /* The other way: each run of the page table over [gva, gva + size), a range below 2^40, in GPU order and clipped to it:
    fn(ctx, gva, cpu, n) for n bytes at gva showing guest memory from cpu on, whole pages. Addresses only, and under the
    same lock, as gmmu_aliases */
@@ -153,6 +165,12 @@ typedef struct {
    cover[first[i]] to cover[first[i + 1]] are the runs over all of it, so a query walks the intervals its range
    meets. seen[r] is the query that last reported run r, so a run over several intervals is reported once. One block
    from bound, cap bytes */
+/* where run `run` starts (bit 0 of key set) or ends in guest memory, by guest page (key >> 1): ends sort first at a
+   page */
+typedef struct {
+    u64 key;
+    u32 run;
+} GEdge;
 typedef struct {
     u64* bound;
     u32* first; /* nbound + 1 entries */
@@ -161,7 +179,21 @@ typedef struct {
     size_t cap;
     u32 nbound, query;
     int stale; /* the runs changed since the index was built */
+    /* the runs' 2 * ngruns edges, sorted by key, kept so at every change of the runs (nvdrv.c
+       edge_insert, edge_remove), so the build is one pass. edges_ok: they match the runs (0 after a state's load,
+       which sorts them again once) */
+    GEdge* edge;
+    u32 nedge, capedge;
+    int edges_ok;
+    u32 builds;   /* the index's builds since the last log (gmmu_alias_log) */
+    u64 build_ns; /* and their time */
 } GAlias;
+/* a change of the page table queued for the GPU thread (gmmu_later), with its sequence number */
+typedef struct {
+    u64 gva, cpu, size;
+    u32 seq, nvmap;
+    int kind; /* a GmmuLaterKind */
+} GLater;
 /* an nvhost-ctrl event slot. ev is made on first use and nvdrv keeps a reference. An armed slot (its bit in
    HleNvdrv's armed_mask) is signaled once syncpoint id reaches thresh */
 typedef struct {
@@ -203,7 +235,7 @@ typedef struct {
        free buffers for every clip, and a handle past the table would be written outside it */
     u32 nvh_free[NVMAP_HANDLES];
     u32 nvh_nfree;
-    u64* gmmu[NV_GMMU_L1]; /* gmmu[i] -> GMMU_L2_ENTRIES page entries (nvdrv.c's GMMU_PTE_*) */
+    _Atomic u64* _Atomic gmmu[NV_GMMU_L1]; /* gmmu[i] -> GMMU_L2_ENTRIES page entries (nvdrv.c's GMMU_PTE_*) */
     GMap* gmaps;
     u32 ngmaps, capgmaps;
     /* the GPU page table again as runs, sorted by GPU page and disjoint, changed with it (gmmu_map, gmmu_unmap: every
@@ -217,7 +249,7 @@ typedef struct {
     VaRange* vafree;
     u32 nvafree, capvafree;
     int va_ready; /* the free ranges hold the whole region at first (va_init) */
-    u32 syncpt[SYNCPT_IDS];
+    _Atomic u32 syncpt[SYNCPT_IDS];
     u32 syncpt_max[SYNCPT_IDS];
     u8 syncpt_used[SYNCPT_N];
     u8 syncpt_gpu[SYNCPT_N]; /* a GPU channel's: submissions promise its increments (syncpt_max), the GPU thread makes
@@ -232,9 +264,9 @@ typedef struct {
     u32 ctrl_evt_next;
     /* the event slots armed now, a bit each under nvev_lk, and the tables that have one: syncpt_add skips the scan of
        every slot while none is, which is the common case for a game that waits on none of them */
-    u64 armed_mask[NV_CTRL_TABLES];
+    _Atomic u64 armed_mask[NV_CTRL_TABLES];
     /* RFC #142 rule 1's exception, a summary read without the lock: 1 ns a syncpt_add, the 64 words of armed_mask 8 */
-    u64 armed_tables;
+    _Atomic u64 armed_tables;
     /* a game thread arms a slot while GPU and video threads run nv_events_check after their increments: syncpt_add's
        at once, syncpt_add_quiet's at the outermost vk_unlock, after vk_lock goes (syncpt_events). Arming clears the
        event first and does both in one hold: an increment between a separate arm and clear would signal and then
@@ -248,6 +280,15 @@ typedef struct {
     PMutex lock;
     PMutex aslock; /* held across ioctl_as: the mappings below and the VA allocator */
     PMutex alias_lock;
+    PMutex later_lock; /* the queued changes below, taken last */
+    /* the changes queued for the GPU thread (gmmu_later): a ring of caplater (a power of two) from later_head, nlater
+       of them, the oldest first, under later_lock, and the last sequence number given. nlater is also read without
+       it, as a summary. Host state, as the GPU thread's queue is: a save state holds the GPU thread, so none is
+       queued then */
+    GLater* later;
+    u32 later_head;
+    _Atomic u32 nlater;
+    u32 caplater, later_seq;
     PCond sync_cv;
     PMutex sync_lk;
     PMutex submit_lk; /* a submission's promise and its place in the GPU queue, in the same order */
@@ -255,9 +296,9 @@ typedef struct {
     /* nv_first_use's (device, ioctl) pairs, under seen_lock */
     PMutex seen_lock;
     /* the waits that blocked (syncpt_wait), and those whose time ran out first, both atomic: the profiler's rates */
-    u64 syncpt_waits;
+    _Atomic u64 syncpt_waits;
     char syncpt_pad[64];
-    u64 syncpt_timeouts;
+    _Atomic u64 syncpt_timeouts;
 } HostNvdrv;
 /* nvdrv's thread state, t_hle.nvdrv (hle.h's) */
 typedef struct {

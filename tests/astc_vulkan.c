@@ -39,10 +39,12 @@
 
 VkState g_vk;
 VkSemaphore g_vk_csem;
+u64 vk_compute_submitted(void) { return 0; } /* no compute queue here: a move's binds wait for none */
 u64 g_vk_cs_wait_value;
 static unsigned errors;
 /* uma.c isn't here: no guest memory read in place for cmd.c's draws to settle */
 void vk_uma_settle(u64 ended) { (void)ended; }
+void vk_table_forget_view(VkImageView view) { (void)view; } /* no texture table here (table.c) */
 int vk_own_make_room(void) { return 0; } /* no kept results here: the device ring finds no room in their pool */
 /* Synthetic upload sources have no guest GPU mappings, ownership or pending in-place writes. */
 OwnState g_own;
@@ -91,6 +93,24 @@ void vk_surf_use(VkCommandBuffer cb, Surf* s, VkImageLayout layout, VkPipelineSt
     s->stage = stage;
     s->access = access;
 }
+/* surface.c's table: the textures a case lists (live_cases), by address. Other cases list none, so a failed cache read
+   finds no texture to load again (astc.c's cache_failed) and no level is copied from another texture (live_level) */
+#define LISTED 8 /* at least LIVE */
+static Surf* g_listed[LISTED];
+static Surf* listed_from(u32 i, u64 gva) {
+    for (; i < LISTED; i++)
+        if (g_listed[i] && g_listed[i]->gva == gva) return g_listed[i];
+    return NULL;
+}
+Surf* vk_surf_first(u64 gva) { return listed_from(0, gva); }
+Surf* vk_surf_next(const Surf* s) {
+    for (u32 i = 0; i < LISTED; i++)
+        if (g_listed[i] == s) return listed_from(i + 1, s->gva);
+    return NULL;
+}
+#if defined(_WIN32)
+void plat_prof_add_thread(HANDLE h) { (void)h; } /* profiler_win32.c's: no profiler here */
+#endif
 /* The standalone upload test has no guest buffer cache to flush or retire. */
 void vk_buf_frame_done(u64 frame) { (void)frame; }
 void vk_gfx_image_frame_done(u64 sub) { (void)sub; }
@@ -99,6 +119,20 @@ void vk_buf_host_barrier(VkCommandBuffer cb, u64 frame) {
     (void)frame;
 }
 VkPipelineCache vk_pipeline_cache(void) { return VK_NULL_HANDLE; }
+/* --stream: every upload on the ASTC stream, the compute queue's (astc.c), its images and staging shared by both queues,
+   and the barrier out of UNDEFINED that each upload starts with recorded there, as texture.c records it */
+static int g_test_stream;
+/* the image made last goes to the stream: not one in pieces (no mem), whose binds the graphics queue's submissions wait
+   for, as vk_astc_stream_fits leaves it out */
+static int g_stream_img;
+static int g_keep_off_stream; /* the next images stay off the stream, as vk_astc_stream_fits would keep them */
+static VkCommandBuffer upload_cmd(void) { return g_stream_img ? vk_astc_stream_cmd() : vk_cmd(); }
+static int test_image_create(VkImageCreateInfo* ii, VkImage* img, DevMem* mem) {
+    if (g_test_stream) vk_both_queues(&ii->sharingMode, &ii->queueFamilyIndexCount, &ii->pQueueFamilyIndices);
+    const int ok = vk_image_create(ii, img, mem);
+    g_stream_img = g_test_stream && ok && *mem && !g_keep_off_stream;
+    return ok;
+}
 static struct { u64 count, ns; } g_texture_pipelines;
 void vk_texture_pipeline_made(u64 ns) {
     g_texture_pipelines.count++;
@@ -121,12 +155,19 @@ int gmem_read(u64 gva, void* dst, u64 size) {
 void vk_lock(void) {}
 void vk_unlock(void) {}
 int vk_lock_held(void) { return 1; } /* cmd.c's wait for the next frame slot then waits under the lock, as before */
+/* the lock is no lock here, so a wait has nothing to let go of (device.c) */
+int vk_lock_pause(void) { return 0; }
+void vk_lock_resume(int paused) { (void)paused; }
+/* no draw's setup runs here, so an upload never lets the lock go to restart one (render.c) */
+int vk_render_setup_restarts(void) { return 0; }
 /* record.c resolves stand-ins for pipelines still being made (pipeline.c, not here): the test binds real ones */
 VkPipeline vk_pipeline_resolve(VkPipeline h) { return h; }
 VkPipeline vk_pipeline_now(VkPipeline h, int* pending) {
     *pending = 0;
     return h;
 }
+/* and binds them, pipelines alone here: no draw of this test has shader objects */
+void vk_pipeline_bind(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline h) { vkCmdBindPipeline(cb, bp, h); }
 /* cmd.c reads the frame's GPU timestamps for gpuprof.c, which isn't here */
 void vk_gpuprof_frame_done(u32 slot) { (void)slot; }
 void vk_gpuprof_cb_begin(VkCommandBuffer cb) { (void)cb; }
@@ -139,8 +180,9 @@ void vk_gpuprof_waited(u64 value, int kind) {
     (void)value;
     (void)kind;
 }
-/* and record.c's dispatches and copies, which it would time */
+/* and record.c's dispatches and transfers, which it would time, and the block linear moves' callers */
 void vk_gpuprof_tag(u64 key) { (void)key; }
+void vk_gpuprof_tag_at(u64 key, const void* site) { (void)key, (void)site; }
 int vk_gpuprof_dispatch_begin(VkCommandBuffer cb) { return (void)cb, 0; }
 void vk_gpuprof_dispatch_end(VkCommandBuffer cb) { (void)cb; }
 int vk_gpuprof_profiled(VkCommandBuffer cb) { return (void)cb, 0; }
@@ -240,6 +282,23 @@ static void init(void) {
     if (family == n) fatal("no compute queue\n");
     int sparse_queue = (families[family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;
     g_vk.gfx_timestamp_bits = families[family].timestampValidBits; /* the encoder's timing, as device.c sets it */
+    /* --stream: a queue of a compute-only family, as device.c takes one, else a second one of this family */
+    u32 cfam = ~0u, cindex = 0;
+    if (g_test_stream) {
+        for (u32 i = 0; i < n; i++)
+            if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+                cfam == ~0u)
+                cfam = i;
+        if (cfam == ~0u && families[family].queueCount >= 2) {
+            cfam = family;
+            cindex = 1;
+        }
+        if (cfam == ~0u) {
+            printf("SKIP: --stream: the device has no second queue for compute\n");
+            exit(77);
+        }
+        g_vk.compute_timestamp_bits = families[cfam].timestampValidBits; /* the encoder's timing there */
+    }
     free(families);
     VkPhysicalDeviceFeatures have;
     vkGetPhysicalDeviceFeatures(g_vk.phys, &have);
@@ -247,11 +306,15 @@ static void init(void) {
     g_vk.feat.textureCompressionBC = have.textureCompressionBC; /* bc_native_case compares the device's decoding */
     g_vk.feat.textureCompressionETC2 = have.textureCompressionETC2; /* etc2_case too, of the BCn it encodes again */
     g_vk.gfx_family = family;
-    float priority = 1;
-    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-                                  .queueFamilyIndex = family,
-                                  .queueCount = 1,
-                                  .pQueuePriorities = &priority};
+    const float priority[2] = {1, 1};
+    VkDeviceQueueCreateInfo qi[2] = {{.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                                      .queueFamilyIndex = family,
+                                      .queueCount = cindex ? 2 : 1,
+                                      .pQueuePriorities = priority},
+                                     {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                                      .queueFamilyIndex = cfam,
+                                      .queueCount = 1,
+                                      .pQueuePriorities = priority}};
     /* the encoder's builds with packed dot products where the device says it has an instruction for them, as
        device.c picks them (SNX_TEST_BC7_DOT=0 or 1 says otherwise, where the device has the feature) */
     VkPhysicalDeviceVulkan13Features have13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -277,12 +340,18 @@ static void init(void) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13, .timelineSemaphore = VK_TRUE};
     VkDeviceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                              .pNext = &f12,
-                             .queueCreateInfoCount = 1,
-                             .pQueueCreateInfos = &qi,
+                             .queueCreateInfoCount = cfam != ~0u && !cindex ? 2 : 1,
+                             .pQueueCreateInfos = qi,
                              .pEnabledFeatures = &g_vk.feat};
     VK_OK(vkCreateDevice(g_vk.phys, &ci, NULL, &g_vk.dev));
     volkLoadDevice(g_vk.dev);
     vkGetDeviceQueue(g_vk.dev, family, 0, &g_vk.gfx);
+    if (cfam != ~0u) {
+        vkGetDeviceQueue(g_vk.dev, cfam, cindex, &g_vk.compute);
+        g_vk.compute_family = cfam;
+        g_settings.astc_compute_queue = 1;
+        printf("ASTC stream: compute queue family %u, queue %u\n", cfam, cindex);
+    }
     vk_mem_init(sparse_queue);
     vk_devmem_init(0);
     vk_cmd_init();
@@ -339,7 +408,7 @@ static int level_rows(void* ctx, VkCommandBuffer* pcb, u32 z, u32 nz, u32 y, u32
         VkBuffer staged;
         vk_bl_range(&m, &lo, &hi);
         u8* p = vk_stage_upload(hi - lo, vk_stage_align(), &staged, &at);
-        *buf = vk_bl_scratch((u64)l->nx * 16 * n * nz, &cap);
+        *buf = (g_stream_img ? vk_astc_stream_bl : vk_bl_scratch)((u64)l->nx * 16 * n * nz, &cap);
         *off = 0;
         if (!p || !*buf) return 0;
         memcpy(p, l->bl + lo, hi - lo);
@@ -365,7 +434,7 @@ static void upload_layers(Surf* t, u8** blocks, u32 w, u32 h, u32 layers, u32 le
         u8* all = malloc(one * layers);
         for (u32 layer = 0; layer < layers; layer++) memcpy(all + one * layer, blocks[layer * levels + l], one);
         Level lv = {all, nx, ny, NULL, 2, 0};
-        if (!vk_astc_upload_layers(vk_cmd(), t, lw, lh, l, 0, layers, level_rows, &lv, NULL))
+        if (!vk_astc_upload_layers(upload_cmd(), t, lw, lh, l, 0, layers, level_rows, &lv, NULL))
             fatal("layers upload failed\n");
         free(all);
     }
@@ -375,7 +444,9 @@ static int g_bl_source; /* run's blocks come block linear */
 
 static void barrier(VkImage img, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src, VkImageLayout from,
                     VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst, VkImageLayout to) {
-    vk_barrier(vk_cmd(), img, VK_IMAGE_ASPECT_COLOR_BIT, src_stage, src, from, dst_stage, dst, to);
+    /* out of UNDEFINED before an upload: on the stream with --stream, as texture.c's tex_upload_ makes it */
+    vk_barrier(from == VK_IMAGE_LAYOUT_UNDEFINED ? upload_cmd() : vk_cmd(), img, VK_IMAGE_ASPECT_COLOR_BIT, src_stage,
+               src, from, dst_stage, dst, to);
 }
 
 /* reads a level of one layer back in bands of block rows of a slice that the readback buffer takes, comparing each
@@ -396,7 +467,7 @@ static void compare(VkImage img, u32 bw, u32 bh, int srgb, u32 w, u32 h, u32 dep
             VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
                                       .imageOffset = {0, (i32)(y * bh), (i32)z},
                                       .imageExtent = {w, rows, 1}};
-            rec_CmdCopyImageToBuffer(vk_cmd(), img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
+            rec_CmdCopyImageToBuffer(vk_cmd(), img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), readback, 1, &copy);
             vk_finish();
             vk_readback_ready();
             astc_decode_image(blocks + ((size_t)z * ny + y) * nx * 16, w, rows, bw, bh, expected, srgb);
@@ -429,10 +500,10 @@ static void run(u32 bw, u32 bh, int srgb, u32 w, u32 h, u32 depth, u32 layers, u
                             .samples = VK_SAMPLE_COUNT_1_BIT,
                             .tiling = VK_IMAGE_TILING_OPTIMAL,
                             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
-    if (!vk_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%ux%u image\n", w, h, depth);
+    if (!test_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%ux%u image\n", w, h, depth);
     int pieces = !t.mem;
     barrier(t.img, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COPY_BIT,
-            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
     u8** blocks = calloc((size_t)layers * levels, sizeof *blocks);
     size_t bytes = 0;
     for (u32 layer = 0; layer < layers; layer++)
@@ -453,7 +524,7 @@ static void run(u32 bw, u32 bh, int srgb, u32 w, u32 h, u32 depth, u32 layers, u
                                    b + (((size_t)z * lv.ny + y) * lv.nx + x) * 16, 16);
             }
             if (!(g_batch_layers && layers > 1 && depth == 1) &&
-                !vk_astc_upload(vk_cmd(), &t, 0, 0, lw, lh, ld, l, layer, level_rows, &lv, NULL))
+                !vk_astc_upload(upload_cmd(), &t, 0, 0, lw, lh, ld, l, layer, level_rows, &lv, NULL))
                 fatal("upload failed\n");
             free(bl); /* copied into staging already */
             bytes += (size_t)lw * lh * ld * 4;
@@ -465,8 +536,8 @@ static void run(u32 bw, u32 bh, int srgb, u32 w, u32 h, u32 depth, u32 layers, u
         if (!vk_stage(40ull << 20 < g_vk.alloc_cap ? 40ull << 20 : g_vk.alloc_cap, 16, &ignored, &off))
             fatal("stage growth failed\n");
     }
-    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL),
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_LAYOUT(TRANSFER_SRC_OPTIMAL));
     if (keep) {
         *kept = (size_t)w * h * depth * 4;
         *keep = malloc(*kept);
@@ -542,9 +613,9 @@ static void run_blocks(u32 kind, u32 bw, u32 bh, int srgb, u32 w, u32 h, u32 dep
                             .samples = VK_SAMPLE_COUNT_1_BIT,
                             .tiling = VK_IMAGE_TILING_OPTIMAL,
                             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
-    if (!vk_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%ux%u %s image\n", w, h, depth, name);
+    if (!test_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%ux%u %s image\n", w, h, depth, name);
     barrier(t.img, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COPY_BIT,
-            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
     u8** blocks = calloc((size_t)layers * levels, sizeof *blocks);
     for (u32 layer = 0; layer < layers; layer++)
         for (u32 l = 0; l < levels; l++) {
@@ -552,12 +623,12 @@ static void run_blocks(u32 kind, u32 bw, u32 bh, int srgb, u32 w, u32 h, u32 dep
             u8* b = blocks[layer * levels + l] = blocks_new(lw, lh, ld, bw, bh);
             Level lv = {b, (lw + bw - 1) / bw, (lh + bh - 1) / bh, NULL, 2, ld > 1};
             if (!(g_batch_layers && layers > 1 && depth == 1) &&
-                !vk_astc_upload(vk_cmd(), &t, 0, 0, lw, lh, ld, l, layer, level_rows, &lv, NULL))
+                !vk_astc_upload(upload_cmd(), &t, 0, 0, lw, lh, ld, l, layer, level_rows, &lv, NULL))
                 fatal("%s upload failed\n", name);
         }
     if (g_batch_layers && layers > 1 && depth == 1) upload_layers(&t, blocks, w, h, layers, levels, bw, bh);
-    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL),
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_LAYOUT(TRANSFER_SRC_OPTIMAL));
     for (u32 layer = 0; layer < layers; layer++)
         for (u32 l = 0; l < levels; l++) {
             u32 lw = w >> l ? w >> l : 1, lh = h >> l ? h >> l : 1, ld = depth >> l ? depth >> l : 1;
@@ -568,7 +639,7 @@ static void run_blocks(u32 kind, u32 bw, u32 bh, int srgb, u32 w, u32 h, u32 dep
             if (!actual) fatal("no readback buffer of %llu bytes\n", (unsigned long long)size);
             VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, layer, 1},
                                       .imageExtent = {lw, lh, ld}};
-            rec_CmdCopyImageToBuffer(vk_cmd(), t.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
+            rec_CmdCopyImageToBuffer(vk_cmd(), t.img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), readback, 1, &copy);
             vk_finish();
             vk_readback_ready();
             u8* texels = NULL;
@@ -617,12 +688,14 @@ static int upload_wait_rows(void* ctx, VkCommandBuffer* pcb, u32 z, u32 nz, u32 
     source->calls++;
     return level_rows(&source->level, pcb, z, nz, y, n, buf, off);
 }
-/* 262656 BC7 blocks: one strip reaches a 256Ki-block threshold (bc7_queue=256) with the default 16MiB scratch, then
-   another strip must record into a new command buffer. Constant blocks keep the GPU encoder's first fit exact;
-   the final block row has a different color, so a missing continuation cannot pass the output comparison. */
+/* 262656 BC7 blocks in two strips with the default 16MiB scratch, of 262144 and 512 blocks. With a limit of 1024
+   blocks (bc7_queue=1) each strip reaches half of it: the first submits, and the second submits and waits for the
+   first's submission (vk_submit_upload_wait's wait for the half before). Each strip after a submission records into
+   a new command buffer. Constant blocks keep the GPU encoder's first fit exact; the final block row has a different
+   color, so a missing continuation cannot pass the output comparison. The retire case keeps a 256Ki-block limit */
 static int upload_wait_case(int retire) {
     const u32 w = retire ? 1024 : 2048, h = retire ? 1024 : 2052, nx = w / 4, ny = h / 4;
-    g_settings.bc7_queue = 256; /* the threshold this case crosses, whatever Auto gives this GPU */
+    g_settings.bc7_queue = retire ? 256 : 1; /* the limit this case crosses, whatever Auto gives this GPU */
     VkImageFormatProperties props;
     if (!g_vk.feat.textureCompressionBC ||
         vkGetPhysicalDeviceImageFormatProperties(g_vk.phys, VK_FORMAT_BC7_UNORM_BLOCK, VK_IMAGE_TYPE_2D,
@@ -637,7 +710,7 @@ static int upload_wait_case(int retire) {
         .imageType = VK_IMAGE_TYPE_2D, .format = t.f.vk, .extent = {w, h, 1}, .mipLevels = 1,
         .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
-    if (!vk_image_create(&image, &t.img, &t.mem)) fatal("BC7 upload wait: cannot create the target image\n");
+    if (!test_image_create(&image, &t.img, &t.mem)) fatal("BC7 upload wait: cannot create the target image\n");
     u8* blocks = malloc((size_t)nx * ny * 16);
     if (!blocks) fatal("BC7 upload wait: no source memory\n");
     const u8 header[8] = {0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -658,17 +731,17 @@ static int upload_wait_case(int retire) {
     }
     UploadWaitSource source = {.level = {blocks, nx, ny, NULL, 0, 0}};
     barrier(t.img, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COPY_BIT,
-        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
     for (u32 upload = 0; upload < (retire ? 5u : 1u); upload++) {
         if (upload)
             barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
-                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
         u64 before = vk_last_submit();
-        if (!vk_astc_upload(vk_cmd(), &t, 0, 0, w, h, 1, 0, 0, upload_wait_rows, &source, NULL))
+        if (!vk_astc_upload(upload_cmd(), &t, 0, 0, w, h, 1, 0, 0, upload_wait_rows, &source, NULL))
             fatal("BC7 upload wait: upload failed\n");
         /* Each upload is below the limit, but five exceed it together. Every preceding upload is complete:
-           a stale queued-block count would force an extra submission on the fourth one. */
+           a stale queued-block count would force an extra submission on the second one. */
         if (retire) {
             if (vk_last_submit() != before) fatal("BC7 completed uploads caused an unnecessary submit at %u\n", upload);
             vk_finish();
@@ -676,11 +749,12 @@ static int upload_wait_case(int retire) {
     }
     if (g_texture_pipelines.count != 2 || !g_texture_pipelines.ns) /* astc_bc7.comp's two passes, each made once */
         fatal("BC7 upload wait: internal pipeline counters missed creation or counted a reused pipeline\n");
-    if (!retire && (source.calls < 2 || !source.changes || vk_submit_number() <= source.first_submit))
+    /* two paces: the first half's submission, and the second's with its wait */
+    if (!retire && (source.calls < 2 || !source.changes || vk_submit_number() < source.first_submit + 2))
         fatal("BC7 upload wait: no continuation across a submission (%u calls, %u changes)\n",
             source.calls, source.changes);
-    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL),
+        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_LAYOUT(TRANSFER_SRC_OPTIMAL));
     u64 row_bytes = (u64)nx * 16;
     u32 rows = (u32)((g_vk.alloc_cap < (16ull << 20) ? g_vk.alloc_cap : 16ull << 20) / row_bytes);
     if (!rows) fatal("BC7 upload wait: the readback cap holds no block row\n");
@@ -691,7 +765,7 @@ static int upload_wait_case(int retire) {
         if (!bytes) fatal("BC7 upload wait: no readback memory\n");
         VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
             .imageOffset = {0, (i32)(y * 4), 0}, .imageExtent = {w, count * 4, 1}};
-        rec_CmdCopyImageToBuffer(vk_cmd(), t.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
+        rec_CmdCopyImageToBuffer(vk_cmd(), t.img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), readback, 1, &copy);
         vk_finish();
         vk_readback_ready();
         for (u32 row = 0; row < count; row++)
@@ -728,34 +802,34 @@ static void run_region(u32 bw, u32 bh, int bc7, u32 w, u32 h, u32 rx, u32 ry, u3
                             .samples = VK_SAMPLE_COUNT_1_BIT,
                             .tiling = VK_IMAGE_TILING_OPTIMAL,
                             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
-    if (!vk_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%u image\n", w, h);
+    if (!test_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%u image\n", w, h);
     barrier(t.img, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COPY_BIT,
-            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
     const u32 nx = (w + bw - 1) / bw, ny = (h + bh - 1) / bh, x0 = rx * bw, y0 = ry * bh;
     const u32 rw = rnx * bw < w - x0 ? rnx * bw : w - x0, rh = rny * bh < h - y0 ? rny * bh : h - y0;
     u8* b = blocks_new(w, h, 1, bw, bh);
     Level lv = {b, nx, ny, NULL, 2, 0};
-    if (!vk_astc_upload(vk_cmd(), &t, 0, 0, w, h, 1, 0, 0, level_rows, &lv, NULL)) fatal("upload failed\n");
+    if (!vk_astc_upload(upload_cmd(), &t, 0, 0, w, h, 1, 0, 0, level_rows, &lv, NULL)) fatal("upload failed\n");
     u8* fresh = blocks_new(rnx * bw, rny * bh, 1, bw, bh);
     Level rv = {fresh, rnx, rny, NULL, 2, 0};
-    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL),
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
     int aligned = !bc7 || (x0 % 4 == 0 && y0 % 4 == 0);
-    if (vk_astc_upload(vk_cmd(), &t, x0, y0, rw, rh, 1, 0, 0, level_rows, &rv, NULL) != aligned)
+    if (vk_astc_upload(upload_cmd(), &t, x0, y0, rw, rh, 1, 0, 0, level_rows, &rv, NULL) != aligned)
         fatal("ASTC region %ux%u at block (%u, %u): the upload %s\n", bw, bh, rx, ry,
               aligned ? "was refused" : "of a region off 4x4 blocks went through");
     if (aligned)
         for (u32 y = 0; y < rny && ry + y < ny; y++)
             memcpy(b + ((size_t)(ry + y) * nx + rx) * 16, fresh + (size_t)y * rnx * 16,
                    (size_t)(rnx < nx - rx ? rnx : nx - rx) * 16);
-    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL),
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_LAYOUT(TRANSFER_SRC_OPTIMAL));
     u64 size = bc7 ? (u64)((w + 3) / 4) * ((h + 3) / 4) * 16 : (u64)w * h * 4;
     VkBuffer readback;
     u8* actual = vk_readback_buffer(size, &readback);
     if (!actual) fatal("no readback buffer of %llu bytes\n", (unsigned long long)size);
     VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
-    rec_CmdCopyImageToBuffer(vk_cmd(), t.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
+    rec_CmdCopyImageToBuffer(vk_cmd(), t.img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), readback, 1, &copy);
     vk_finish();
     vk_readback_ready();
     u8* texels = malloc((size_t)w * h * 4);
@@ -838,7 +912,7 @@ static void bench(u32 w, u32 h, int runs, BenchSource src) {
                                 .samples = VK_SAMPLE_COUNT_1_BIT,
                                 .tiling = VK_IMAGE_TILING_OPTIMAL,
                                 .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
-        if (!vk_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%u bench image\n", w, h);
+        if (!test_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%u bench image\n", w, h);
         if (t.mem) {
             DevMemInfo allocation;
             vk_devmem_info(t.mem, &allocation);
@@ -850,13 +924,13 @@ static void bench(u32 w, u32 h, int runs, BenchSource src) {
                    (unsigned long long)requirements.size);
         }
         barrier(t.img, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COPY_BIT,
-                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
         vk_finish();
         for (int r = 0; r < runs; r++) {
             Level lv = {b, (w + src.bw - 1) / src.bw, (h + src.bh - 1) / src.bh, NULL, 2, 0};
             u64 count = g_texture_pipelines.count, pipeline_ns = g_texture_pipelines.ns;
             u64 t0 = plat_ns();
-            if (!vk_astc_upload(vk_cmd(), &t, 0, 0, w, h, 1, 0, 0, level_rows, &lv, NULL))
+            if (!vk_astc_upload(upload_cmd(), &t, 0, 0, w, h, 1, 0, 0, level_rows, &lv, NULL))
                 fatal("bench upload failed\n");
             vk_finish();
             double s = (plat_ns() - t0) / 1e9;
@@ -870,6 +944,86 @@ static void bench(u32 w, u32 h, int runs, BenchSource src) {
         }
         vk_image_destroy(t.img, t.mem);
     }
+    free(b);
+}
+
+/* --bench-kind: what the GPU's read of a level's blocks' kind costs (astc.c's vk_astc_kind_read), beside the upload
+   straight to BC7 that keeps the blocks it reads and the BC1 image made from them (vk_astc_bcn_kept): each the GPU's
+   time between two timestamps around it, the least of runs. On random blocks, most of which are the error colour,
+   and on blocks of RGBA direct mode (12, eight colour values of 8 bits, as tests/vulkan_astc_kind.inc's normal maps),
+   which the read goes all the way through */
+static u64 bench_ts(VkQueryPool pool) {
+    u64 ts[2];
+    vk_finish();
+    if (vkGetQueryPoolResults(g_vk.dev, pool, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT))
+        fatal("no timestamps\n");
+    const u64 mask = g_vk.gfx_timestamp_bits >= 64 ? ~0ull : (1ull << g_vk.gfx_timestamp_bits) - 1;
+    return (u64)((double)((ts[1] - ts[0]) & mask) * g_vk.props.limits.timestampPeriod);
+}
+static void bench_kind(u32 w, u32 h, u32 bw, u32 bh, int runs, int direct) {
+    const u32 nx = (w + bw - 1) / bw, ny = (h + bh - 1) / bh;
+    u8* b = blocks_new(w, h, 1, bw, bh);
+    for (u32 i = 0; direct && i < nx * ny; i++) { /* mode 12, a 4x4 grid of 2 bit weights, values and weights random */
+        u8* k = b + (size_t)i * 16;
+        const u32 head = (((u32)k[0] | (u32)k[1] << 8 | (u32)k[2] << 16) & ~0x1FFFFu) | 0x42u | 12u << 13;
+        k[0] = (u8)head, k[1] = (u8)(head >> 8), k[2] = (u8)(head >> 16);
+    }
+    Surf t = {.w = w,
+              .h = h,
+              .layers = 1,
+              .levels = 1,
+              .depth3d = 1,
+              .f = {.vk = VK_FORMAT_BC7_UNORM_BLOCK, .bw = bw, .bh = bh}};
+    VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                            .imageType = VK_IMAGE_TYPE_2D,
+                            .format = VK_FORMAT_BC7_UNORM_BLOCK,
+                            .extent = {w, h, 1},
+                            .mipLevels = 1,
+                            .arrayLayers = 1,
+                            .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+    VkImage bc1;
+    DevMem bc1_mem;
+    if (!test_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%u bench image\n", w, h);
+    ii.format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    if (!test_image_create(&ii, &bc1, &bc1_mem)) fatal("cannot create a %ux%u bench image\n", w, h);
+    if (!vk_astc_keep(&t)) fatal("no memory to keep a %ux%u level's blocks\n", w, h);
+    VkQueryPoolCreateInfo qi = {
+        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2};
+    VkQueryPool pool;
+    if (!VK_OK(vkCreateQueryPool(g_vk.dev, &qi, NULL, &pool))) fatal("no query pool\n");
+    barrier(t.img, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    barrier(bc1, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vk_finish();
+    u64 best[3] = {~0ull, ~0ull, ~0ull};
+    for (int r = 0; r < runs; r++)
+        for (int k = 0; k < 3; k++) {
+            Level lv = {b, nx, ny, NULL, 2, 0};
+            VkCommandBuffer cb = vk_cmd();
+            rec_CmdResetQueryPool(cb, pool, 0, 2);
+            rec_CmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pool, 0);
+            u32 slot = 0;
+            if (k == 0 && !vk_astc_upload(cb, &t, 0, 0, w, h, 1, 0, 0, level_rows, &lv, NULL)) fatal("upload failed\n");
+            if (k == 1 && !(slot = vk_astc_kind_read(cb, &t))) fatal("no kind read\n");
+            if (k == 2 && !vk_astc_bcn_kept(cb, &t, bc1, 1)) fatal("no BC1 from the kept blocks\n");
+            rec_CmdWriteTimestamp2(vk_cmd(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pool, 1);
+            const u64 ns = bench_ts(pool);
+            vk_astc_kind_release(slot);
+            if (ns < best[k]) best[k] = ns;
+        }
+    printf("BENCH kind %ux%u of %ux%u %s blocks: BC7 upload %.3f ms, the kind read %.3f ms (%.1f%% of it), BC1 from "
+           "the kept blocks %.3f ms\n",
+           w, h, bw, bh, direct ? "RGBA direct" : "random", (double)best[0] / 1e6, (double)best[1] / 1e6,
+           100.0 * (double)best[1] / (double)best[0], (double)best[2] / 1e6);
+    fflush(stdout);
+    vkDestroyQueryPool(g_vk.dev, pool, NULL);
+    vk_astc_unkeep(&t);
+    vk_finish();
+    vk_image_destroy(bc1, bc1_mem);
+    vk_image_destroy(t.img, t.mem);
     free(b);
 }
 
@@ -908,28 +1062,29 @@ static void bc1_quality(int n, char** names) {
                                 .samples = VK_SAMPLE_COUNT_1_BIT,
                                 .tiling = VK_IMAGE_TILING_OPTIMAL,
                                 .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
-        if (!vk_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%u BC1 image\n", w, h);
+        if (!test_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%u BC1 image\n", w, h);
         barrier(t.img, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COPY_BIT,
-                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
         vk_finish();
         double ms = 1e30;
         for (int r = 0; r < 3; r++) { /* the fastest of three: the first makes the pipeline */
             Level lv = {b, (w + src.bw - 1) / src.bw, (h + src.bh - 1) / src.bh, NULL, 2, 0};
             const u64 t0 = plat_ns();
-            if (!vk_astc_upload(vk_cmd(), &t, 0, 0, w, h, 1, 0, 0, level_rows, &lv, NULL)) fatal("BC1 upload failed\n");
+            if (!vk_astc_upload(upload_cmd(), &t, 0, 0, w, h, 1, 0, 0, level_rows, &lv, NULL))
+                fatal("BC1 upload failed\n");
             vk_finish();
             const double m = (plat_ns() - t0) / 1e6;
             if (m < ms) ms = m;
         }
         barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                VK_LAYOUT(TRANSFER_SRC_OPTIMAL));
         const u64 size = (u64)((w + 3) / 4) * ((h + 3) / 4) * 8;
         VkBuffer readback;
         u8* actual = vk_readback_buffer(size, &readback);
         if (!actual) fatal("no readback buffer of %llu bytes\n", (unsigned long long)size);
         VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
-        rec_CmdCopyImageToBuffer(vk_cmd(), t.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
+        rec_CmdCopyImageToBuffer(vk_cmd(), t.img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), readback, 1, &copy);
         vk_finish();
         vk_readback_ready();
         u8* got = malloc((size_t)w * h * 4);
@@ -1001,9 +1156,9 @@ static u8* cache_upload(const CacheCase* c, const u8* blocks, u64* took, int dra
                             .samples = VK_SAMPLE_COUNT_1_BIT,
                             .tiling = VK_IMAGE_TILING_OPTIMAL,
                             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
-    if (!vk_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%ux%u BC7 image\n", c->w, c->h, c->depth);
+    if (!test_image_create(&ii, &t.img, &t.mem)) fatal("cannot create a %ux%ux%u BC7 image\n", c->w, c->h, c->depth);
     barrier(t.img, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COPY_BIT,
-            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
     /* the key as texture.c makes it: its layout's words, then its bytes */
     const u32 layout[8] = {0, nx * 16, nx * 16, ny, 0, 0, 0, c->layers};
     u64 content[2] = {0, 0};
@@ -1022,28 +1177,32 @@ static u8* cache_upload(const CacheCase* c, const u8* blocks, u64* took, int dra
     VkBufferImageCopy fill = {.bufferOffset = noise_at,
                               .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, c->layers},
                               .imageExtent = {c->w, c->h, c->depth}};
-    rec_CmdCopyBufferToImage(vk_cmd(), noise_buf, t.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fill);
-    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    /* on the queue the upload records on (--stream: the stream's), before it, as nothing of the other queue's may
+       write an image the stream loads */
+    rec_CmdCopyBufferToImage(upload_cmd(), noise_buf, t.img, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &fill);
+    vk_barrier(upload_cmd(), t.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+               VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
+               VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
     Level lv = {blocks, nx, ny, NULL, 2, 0};
-    t.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; /* as the barriers above left it, for vk_surf_use */
+    t.layout = VK_LAYOUT(TRANSFER_DST_OPTIMAL); /* as the barriers above left it, for vk_surf_use */
     t.stage = VK_PIPELINE_STAGE_2_COPY_BIT;
     t.access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     u64 t0 = plat_ns();
-    int ok = c->layers > 1 ? vk_astc_upload_layers(vk_cmd(), &t, c->w, c->h, 0, 0, c->layers, level_rows, &lv, content)
-                           : vk_astc_upload(vk_cmd(), &t, 0, 0, c->w, c->h, c->depth, 0, 0, level_rows, &lv, content);
+    int ok = c->layers > 1
+                 ? vk_astc_upload_layers(upload_cmd(), &t, c->w, c->h, 0, 0, c->layers, level_rows, &lv, content)
+                 : vk_astc_upload(upload_cmd(), &t, 0, 0, c->w, c->h, c->depth, 0, 0, level_rows, &lv, content);
     if (!ok) fatal("cached upload failed\n");
     *took = plat_ns() - t0;
     if (drain) vk_astc_background_drain();
     vk_astc_forget(&t, ~0u); /* the image goes */
-    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier(t.img, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL),
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, VK_LAYOUT(TRANSFER_SRC_OPTIMAL));
     VkBuffer readback;
     u8* actual = vk_readback_buffer(size, &readback);
     if (!actual) fatal("no readback buffer of %llu bytes\n", (unsigned long long)size);
     VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, c->layers},
                               .imageExtent = {c->w, c->h, c->depth}};
-    rec_CmdCopyImageToBuffer(vk_cmd(), t.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
+    rec_CmdCopyImageToBuffer(vk_cmd(), t.img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), readback, 1, &copy);
     vk_finish();
     vk_readback_ready();
     u8* got = malloc((size_t)size);
@@ -1129,16 +1288,16 @@ static void cache_burst(void) {
                                 .samples = VK_SAMPLE_COUNT_1_BIT,
                                 .tiling = VK_IMAGE_TILING_OPTIMAL,
                                 .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
-        if (!vk_image_create(&ii, &t[i].img, &t[i].mem)) fatal("cannot create a %ux%u BC7 image\n", W, H);
+        if (!test_image_create(&ii, &t[i].img, &t[i].mem)) fatal("cannot create a %ux%u BC7 image\n", W, H);
         barrier(t[i].img, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_COPY_BIT,
-                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
         u8* blocks = blocks_new(W, H, 1, 4, 4);
         const u32 layout[8] = {0, W / 4 * 16, W / 4 * 16, H / 4, 0, 0, 0, 1};
         u64 content[2] = {0, 0};
         vk_bc7_content(content, layout, sizeof layout);
         vk_bc7_content(content, blocks, (u64)(W / 4) * (H / 4) * 16);
         Level lv = {blocks, W / 4, H / 4, NULL, 2, 0};
-        if (!vk_astc_upload(vk_cmd(), &t[i], 0, 0, W, H, 1, 0, 0, level_rows, &lv, content))
+        if (!vk_astc_upload(upload_cmd(), &t[i], 0, 0, W, H, 1, 0, 0, level_rows, &lv, content))
             fatal("burst upload %u failed\n", i);
         free(blocks);
     }
@@ -1151,6 +1310,140 @@ static void cache_burst(void) {
     printf("PASS the BC7 cache: a burst of %d encodes in one submission, every one stored\n", N);
     fflush(stdout);
 }
+/* Live levels (astc.c's live_level): one level's blocks in textures at several addresses, each its own image, listed in
+   the table. The first decodes them. The second, at another address, copies them from the first's image on the GPU:
+   no cache read, no encode, the same bytes. The first written since (its wgen) and the second gone from the table, a
+   third reads the cache. A fourth right after it does not copy from the third, whose read is not done yet, and reads
+   too. After a finish, a fifth copies from the fourth. Then other blocks: a sixth decodes them and a seventh, in the
+   same command buffer with no finish between, copies them from the sixth's image, which the encoder has just written */
+static void live_surf(Surf* t, const CacheCase* c, u64 gva) {
+    const VkFormat format = c->srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+    *t = (Surf){.w = c->w,
+                .h = c->h,
+                .layers = 1,
+                .levels = 1,
+                .depth3d = 1,
+                .gva = gva,
+                .wgen = (u32)gva >> 20,
+                .upload_valid = 1,
+                .type = VK_IMAGE_VIEW_TYPE_2D,
+                .f = {.vk = format, .bw = c->bw, .bh = c->bh}};
+    VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                            .imageType = VK_IMAGE_TYPE_2D,
+                            .format = format,
+                            .extent = {c->w, c->h, 1},
+                            .mipLevels = 1,
+                            .arrayLayers = 1,
+                            .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+    if (!test_image_create(&ii, &t->img, &t->mem)) fatal("cannot create a %ux%u BC7 image\n", c->w, c->h);
+    vk_surf_use(upload_cmd(), t, VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT);
+}
+/* the level into t, with the key texture.c makes of its blocks */
+static void live_upload(Surf* t, const CacheCase* c, const u8* blocks) {
+    const u32 nx = (c->w + c->bw - 1) / c->bw, ny = (c->h + c->bh - 1) / c->bh;
+    const u32 layout[8] = {0, nx * 16, nx * 16, ny, 0, 0, 0, 1};
+    u64 content[2] = {0, 0};
+    vk_bc7_content(content, layout, sizeof layout);
+    vk_bc7_content(content, blocks, (u64)nx * ny * 16);
+    Level lv = {blocks, nx, ny, NULL, 2, 0};
+    vk_surf_use(vk_cmd(), t, VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    if (!vk_astc_upload(upload_cmd(), t, 0, 0, c->w, c->h, 1, 0, 0, level_rows, &lv, content))
+        fatal("live upload failed\n");
+}
+/* t's blocks, read back (the caller frees them) */
+static u8* live_read(Surf* t, u64 size) {
+    vk_surf_use(vk_cmd(), t, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
+                VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBuffer readback;
+    u8* actual = vk_readback_buffer(size, &readback);
+    if (!actual) fatal("no readback buffer of %llu bytes\n", (unsigned long long)size);
+    VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {t->w, t->h, 1}};
+    rec_CmdCopyImageToBuffer(vk_cmd(), t->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), readback, 1, &copy);
+    vk_finish();
+    vk_readback_ready();
+    u8* got = malloc((size_t)size);
+    if (!got) fatal("no memory for %llu bytes\n", (unsigned long long)size);
+    memcpy(got, actual, (size_t)size);
+    return got;
+}
+#define LIVE 7 /* uploads */
+static void live_cases(void) {
+    static const CacheCase c = {6, 6, 0, 97, 61, 1, 1};
+    if (!g_vk.feat.textureCompressionBC || !vk_astc_cached(c.w, c.h, 1)) {
+        printf("SKIP live levels: the device has no BC7 image, or the cache does not take the level\n");
+        return;
+    }
+    const u64 size = (u64)((c.w + 3) / 4) * ((c.h + 3) / 4) * 16;
+    u8* blocks = blocks_new(c.w, c.h, 1, c.bw, c.bh);
+    u8* other = blocks_new(c.w, c.h, 1, c.bw, c.bh);
+    if (!memcmp(blocks, other, (size_t)((c.w + c.bw - 1) / c.bw) * ((c.h + c.bh - 1) / c.bh) * 16))
+        fatal("live levels: the second blocks are the first's\n");
+    Surf t[LIVE];
+    u64 levels, hits, copies, encodes;
+    /* step: what the upload of t[i] did (copies and hits since the step before, encoder dispatches) */
+    const char* what[LIVE] = {"decoded",
+                              "copied from the first",
+                              "read after the first was written",
+                              "read while the third's read is on its way",
+                              "copied from the fourth",
+                              "other blocks decoded",
+                              "copied from the sixth in the same command buffer"};
+    /* without the recording thread the third's read is done at once, and the fourth copies from it */
+    const int later = vk_rec_threaded();
+    const u64 want_copies[LIVE] = {0, 1, 0, later ? 0 : 1, 1, 0, 1};
+    const u64 want_hits[LIVE] = {0, 0, 1, later ? 1 : 0, 0, 0, 0};
+    const int want_encode[LIVE] = {1, 0, 0, 0, 0, 1, 0};
+    for (u32 i = 0; i < LIVE; i++) {
+        live_surf(&t[i], &c, 0x1000000ull * (i + 1));
+        g_listed[i] = &t[i];
+        if (i == 2) {
+            t[0].wgen++;        /* written since its upload */
+            g_listed[1] = NULL; /* gone */
+        }
+        if (i == 4) vk_finish(); /* the fourth's read is done */
+        bc7_counts(&levels, &hits);
+        copies = vk_astc_bc7_copies();
+        encodes = vk_astc_dispatches();
+        live_upload(&t[i], &c, i < 5 ? blocks : other);
+        u64 hits2, copies2 = vk_astc_bc7_copies();
+        bc7_counts(&levels, &hits2);
+        const int encoded = vk_astc_dispatches() != encodes;
+        if (copies2 - copies != want_copies[i] || hits2 - hits != want_hits[i] || encoded != want_encode[i])
+            fatal("live levels: upload %u (%s) made %llu copies, %llu cache hits, %s\n", i + 1, what[i],
+                  (unsigned long long)(copies2 - copies), (unsigned long long)(hits2 - hits),
+                  encoded ? "an encode" : "no encode");
+        if (!i) vk_finish(); /* its blocks into the cache, for the third */
+    }
+    /* each image's blocks, read back after every upload: a readback waits for the GPU, which would land the third's
+       read before the fourth's upload */
+    u8* first = live_read(&t[0], size);
+    u8* sixth = live_read(&t[5], size);
+    if (!memcmp(first, sixth, (size_t)size)) fatal("live levels: the other blocks encode as the first's\n");
+    for (u32 i = 1; i < LIVE; i++) {
+        if (i == 5) continue;
+        const u8* want = i < 5 ? first : sixth;
+        u8* got = live_read(&t[i], size);
+        for (u64 b = 0; b < size; b++)
+            if (got[b] != want[b])
+                fatal("live levels: upload %u (%s), byte %llu is %u, the %s's %u\n", i + 1, what[i],
+                      (unsigned long long)b, got[b], i < 5 ? "first" : "sixth", want[b]);
+        free(got);
+    }
+    for (u32 i = 0; i < LIVE; i++) {
+        g_listed[i] = NULL;
+        vk_image_destroy(t[i].img, t[i].mem);
+    }
+    free(first);
+    free(sixth);
+    free(blocks);
+    free(other);
+    printf("PASS live levels: a level another texture holds is copied from its image, not read, while it holds it\n");
+    fflush(stdout);
+}
 static void cache_cases(void) {
     remove(CACHE_PATH);
     vk_astc_cache_open(CACHE_PATH);
@@ -1161,6 +1454,7 @@ static void cache_cases(void) {
         {10, 5, 0, 2051, 1101, 1, 1}, {10, 5, 1, 4100, 1030, 1, 1}, {8, 8, 1, 2048, 2048, 1, 1}};
     for (u32 i = 0; i < sizeof cases / sizeof cases[0]; i++) cache_case(&cases[i]);
     cache_burst();
+    live_cases();
     vk_bc7_cache_close();
     remove(CACHE_PATH);
 }
@@ -1344,7 +1638,9 @@ static void quick_timed_case(void) {
     blocks[7] ^= 0x10;
     vk_astc_background_stats(&b0);
     vk_astc_quick_texels(&ns0, &texels0);
+    g_keep_off_stream = 1; /* a level past the size measured takes the quick build: the stream takes none */
     free(cache_upload(&c, blocks, &took, 1));
+    g_keep_off_stream = 0;
     vk_astc_background_stats(&b);
     vk_astc_quick_texels(&ns, &texels);
     if (b.quick != b0.quick + 1 || b.made != b0.made + 1)
@@ -1660,35 +1956,35 @@ static void bc_native_case(void) {
                                 .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
         VkImage src, dst;
         DevMem src_mem, dst_mem;
-        if (!vk_image_create(&ii, &src, &src_mem)) fatal("cannot create a native BCn image\n");
+        if (!test_image_create(&ii, &src, &src_mem)) fatal("cannot create a native BCn image\n");
         ii.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        if (!vk_image_create(&ii, &dst, &dst_mem)) fatal("cannot create an RGBA32F image\n");
+        if (!test_image_create(&ii, &dst, &dst_mem)) fatal("cannot create an RGBA32F image\n");
         u64 at;
         VkBuffer staged, rb;
         memcpy(vk_stage((u64)nb * bb, vk_stage_align(), &staged, &at), blocks, (size_t)nb * bb);
         barrier(src, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
         barrier(dst, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
         VkBufferImageCopy up = {.bufferOffset = at,
                                 .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                 .imageExtent = {w, h, 1}};
-        rec_CmdCopyBufferToImage(vk_cmd(), staged, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &up);
+        rec_CmdCopyBufferToImage(vk_cmd(), staged, src, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &up);
         barrier(src, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                VK_ACCESS_2_TRANSFER_READ_BIT, VK_LAYOUT(TRANSFER_SRC_OPTIMAL));
         VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                             .srcOffsets = {{0, 0, 0}, {(i32)w, (i32)h, 1}},
                             .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                             .dstOffsets = {{0, 0, 0}, {(i32)w, (i32)h, 1}}};
-        rec_CmdBlitImage(vk_cmd(), src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        rec_CmdBlitImage(vk_cmd(), src, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), dst, VK_LAYOUT(TRANSFER_DST_OPTIMAL),
                          1, &blit, VK_FILTER_NEAREST);
         barrier(dst, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                VK_ACCESS_2_TRANSFER_READ_BIT, VK_LAYOUT(TRANSFER_SRC_OPTIMAL));
         float* got = (float*)vk_readback_buffer((u64)w * h * 16, &rb);
         VkBufferImageCopy down = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
-        rec_CmdCopyImageToBuffer(vk_cmd(), dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &down);
+        rec_CmdCopyImageToBuffer(vk_cmd(), dst, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), rb, 1, &down);
         vk_finish();
         vk_readback_ready();
         u8* want = malloc((size_t)w * h * pb);
@@ -1820,34 +2116,34 @@ static void etc2_native(int kind, const u8* etc, u32 w, u32 h) {
                             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
     VkImage src, dst;
     DevMem src_mem, dst_mem;
-    if (!vk_image_create(&ii, &src, &src_mem)) fatal("cannot create an ETC2 image\n");
+    if (!test_image_create(&ii, &src, &src_mem)) fatal("cannot create an ETC2 image\n");
     ii.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-    if (!vk_image_create(&ii, &dst, &dst_mem)) fatal("cannot create an RGBA32F image\n");
+    if (!test_image_create(&ii, &dst, &dst_mem)) fatal("cannot create an RGBA32F image\n");
     u64 at;
     VkBuffer staged, rb;
     memcpy(vk_stage((u64)n * bb, vk_stage_align(), &staged, &at), etc, (size_t)n * bb);
     barrier(src, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
     barrier(dst, VK_PIPELINE_STAGE_2_NONE, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_LAYOUT(TRANSFER_DST_OPTIMAL));
     VkBufferImageCopy up = {
         .bufferOffset = at, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
-    rec_CmdCopyBufferToImage(vk_cmd(), staged, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &up);
+    rec_CmdCopyBufferToImage(vk_cmd(), staged, src, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &up);
     barrier(src, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+            VK_LAYOUT(TRANSFER_SRC_OPTIMAL));
     VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                         .srcOffsets = {{0, 0, 0}, {(i32)w, (i32)h, 1}},
                         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                         .dstOffsets = {{0, 0, 0}, {(i32)w, (i32)h, 1}}};
-    rec_CmdBlitImage(vk_cmd(), src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+    rec_CmdBlitImage(vk_cmd(), src, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), dst, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1,
                      &blit, VK_FILTER_NEAREST);
     barrier(dst, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+            VK_LAYOUT(TRANSFER_SRC_OPTIMAL));
     float* got = (float*)vk_readback_buffer((u64)w * h * 16, &rb);
     VkBufferImageCopy down = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
-    rec_CmdCopyImageToBuffer(vk_cmd(), dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &down);
+    rec_CmdCopyImageToBuffer(vk_cmd(), dst, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), rb, 1, &down);
     vk_finish();
     vk_readback_ready();
     int ek = etc_kind_of(kind), sn = ek == EAC_R_SNORM || ek == EAC_RG_SNORM,
@@ -2098,14 +2394,33 @@ static void bench_etc2(int runs, const char* file) {
        slice decoded, repeated over the level and made BC7 by the CPU's encoder (its fast build) */
     u8* pic = NULL;
     if (file) {
-        BenchSource src = {file, 0, 0};
-        u8* astc = bench_blocks(&src, w, h);
         u8* texels = malloc((size_t)w * h * 4);
         pic = malloc((size_t)bw * bh * 16);
-        astc_decode_image(astc, w, h, src.bw, src.bh, texels, 0);
+        const size_t len = strlen(file);
+        if (len > 5 && !strcmp(file + len - 5, ".rgba")) {
+            /* FILE.rgba: a square picture of RGBA8 texels, its side from its size, repeated over the level */
+            FILE* f = fopen(file, "rb");
+            if (!f) fatal("cannot open %s\n", file);
+            fseek(f, 0, SEEK_END);
+            const long size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            u32 side = 1;
+            while ((u64)(side + 1) * (side + 1) * 4 <= (u64)size) side++;
+            u8* raw = malloc((size_t)side * side * 4);
+            if (!raw || fread(raw, 4, (size_t)side * side, f) != (size_t)side * side) fatal("cannot read %s\n", file);
+            fclose(f);
+            for (u32 y = 0; y < h; y++)
+                for (u32 x = 0; x < w; x++)
+                    memcpy(texels + ((size_t)y * w + x) * 4, raw + ((size_t)(y % side) * side + x % side) * 4, 4);
+            free(raw);
+        } else {
+            BenchSource src = {file, 0, 0};
+            u8* astc = bench_blocks(&src, w, h);
+            astc_decode_image(astc, w, h, src.bw, src.bh, texels, 0);
+            free(astc);
+        }
         bc7_encode_cpu_fast(texels, w, h, 1, pic);
         free(texels);
-        free(astc);
     }
     for (int ki = file ? 4 : 0; ki < 5; ki++) {
         int kind = kinds[ki];
@@ -2142,6 +2457,8 @@ int main(int argc, char** argv) {
     /* --vk_max_allocation_mb=N as the runtime takes it (ctest's astc_vulkan_pieces: 4), and --large */
     for (int i = 1; i < argc; i++)
         if (!strncmp(argv[i], "--vk_max_allocation_mb=", 23)) g_settings.vulkan_allocation_cap = atoi(argv[i] + 23);
+        else if (!strcmp(argv[i], "--stream"))
+            g_test_stream = 1;
         else if (!strcmp(argv[i], "--large")) large = 1;
         else if (!strcmp(argv[i], "--bench")) {
             large = 2;
@@ -2161,7 +2478,9 @@ int main(int argc, char** argv) {
         } else if (!strcmp(argv[i], "--bench-etc2")) {
             large = 3;
             if (i + 1 < argc && argv[i + 1][0] != '-') bench_src.name = argv[++i];
-        } else if (!strcmp(argv[i], "--astc-encode"))
+        } else if (!strcmp(argv[i], "--bench-kind"))
+            large = 5;
+        else if (!strcmp(argv[i], "--astc-encode"))
             large = 4; /* the BCn to ASTC transcoder alone (ctest's astc_vulkan_encode_dot) */
     init();
     /* every level as before (the fast build, the cache's whole levels): background_cases turns the quick encode on */
@@ -2170,6 +2489,12 @@ int main(int argc, char** argv) {
     if (upload_wait) return upload_wait_case(upload_wait == 2);
     if (large == 3) {
         bench_etc2(3, bench_src.name);
+        return 0;
+    }
+    if (large == 5) {
+        static const u32 fp[3] = {4, 6, 8};
+        for (int direct = 0; direct < 2; direct++)
+            for (u32 f = 0; f < 3; f++) bench_kind(2048, 2048, fp[f], fp[f], 5, direct);
         return 0;
     }
     if (large == 4) {
@@ -2279,7 +2604,11 @@ int main(int argc, char** argv) {
         run_blocks(kind, 8, 8, kind == 1, 2051, 1101, 1, 1, 1);
     }
     cache_cases();
-    background_cases();
+    /* a very large level's quick build and its background are the graphics queue's (vk_astc_stream_fits) */
+    if (g_test_stream)
+        puts("SKIP very large levels: --stream takes none (vk_astc_stream_fits)");
+    else
+        background_cases();
     quick_timed_case();
     /* a region uploaded again: inside the level, at its right and bottom edges, as BC7 and as RGBA8, footprints that
        step 1, 2 and 4 blocks to a 4x4 BC7 block, and a BC7 region off those blocks */

@@ -9,6 +9,7 @@
 #include "nx/gpu/vk/descriptor_objects.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include "nx/runtime/platform/log.h"
 #include "nx/gpu/gpu.h"
 #include "nx/hle/services/nvdrv.h"
@@ -75,6 +76,7 @@ typedef struct {
     Dead* dead;
     int ndead, capdead;
     u64 dead_bytes; /* device memory evicted cache entries among them release (vk_defer_bytes) */
+    u64 dead_moved; /* of those, what moves out of a block being emptied release (vk_defer_moved) */
     /* descriptor pools, reset when the frame is reused and kept */
     VkDescriptorPool pool_d[64];
     int npool, ipool; /* pool_d[ipool] is the one allocating; the ones after it are reset and waiting */
@@ -127,6 +129,9 @@ static struct {
     u32 stream_cur;
     u64 stream_used;
     u64 stream_since; /* the bytes it handed out since the last submit (frame_check) */
+    /* frame_ring_cap's last answer (0: none), and the ring bytes, the caps and vk_mem_budget_gen it was made at */
+    u64 cap, cap_rings, cap_caps;
+    u32 cap_gen;
     u64 submits[VK_SUB_N]; /* submissions since the start, by why (statistics, tests) */
     u32 stage_told; /* the staging ring's memory type is in the log */
     /* log level 2: the requests for big buffers since the last report, the bytes they asked and the size classes
@@ -137,11 +142,12 @@ static struct {
 
 static Frame g_fr[VK_FRAMES];
 static u64 g_dead_bytes; /* every frame's dead_bytes */
+static u64 g_dead_moved; /* every frame's dead_moved */
 static u32 g_cur;
 static u32 g_cb_begun = 1; /* command buffers begun, so a command buffer's state is told from an earlier one's */
 static u64 g_frame_id;
 static VkSemaphore g_gsem; /* graphics timeline: submission n signals n */
-static u64 g_gval;         /* the last submission */
+static _Atomic u64 g_gval; /* the last submission */
 static u64 g_landed;       /* submissions whose storage results vk_buf_frame_done has landed */
 static u64 g_sub_ns;       /* when the last submission was made */
 static VkSemaphoreSubmitInfo g_after[2]; /* vk_submit_after's wait and signal, for the next submission (semaphore 0: none) */
@@ -193,6 +199,13 @@ u64 vk_sample_hash(u64 gva, u64 len) {
     return vk_hash(tmp, n);
 }
 
+/* the size of the ring chunk whose buffer b is, 0 when b is no chunk's: how far a window of the chunk may reach (the
+   constant buffers' windows, vk/render.c) */
+u64 vk_stage_buffer_size(VkBuffer b) {
+    for (u32 i = 0; b && i < g_cmd.nchunk; i++)
+        if (g_cmd.chunk[i].buf == b) return g_cmd.chunk[i].size;
+    return 0;
+}
 u64 vk_stage_align(void) {
     static u64 al;
     if (!al) {
@@ -318,6 +331,14 @@ static int bar_room(const DevMemBudget* b, u64 add, int back) {
    with the GPU idle at the last value submitted and 2 MB of commands not recorded. The run ended there as "GPU
    stopped", where the GPU had nothing to do */
 #define VK_GPU_STUCK_NS 15000000000ull
+/* A device whose GPU is the CPU (lavapipe) compiles a pipeline's program at its first dispatch, inside the submission,
+   on one thread of a host that runs everything else too: the BC7 encoder's first submission finished nothing for
+   over 15 s on a CI runner with four tests abreast, and on a 2-core laptop its encoders' first ones took up to 22 s
+   alone and 51 s four tests at once, compiling in LLVM. Such a device is stopped only past VK_CPU_STUCK_NS */
+#define VK_CPU_STUCK_NS 120000000000ull
+static u64 stuck_ns(void) {
+    return g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? VK_CPU_STUCK_NS : VK_GPU_STUCK_NS;
+}
 /* The driver gives the GPU's own report of a fault (VK_EXT_device_fault, record.c's fault_dump) only once it has
    declared the device lost, and a GPU that stopped is not lost yet: the driver's own timeout comes later than
    VK_GPU_STUCK_NS. A stopped GPU gets 20 s more to become a lost one, so that the report has the fault */
@@ -365,13 +386,13 @@ void vk_wait_semaphore(VkSemaphore sem, u64 value) {
         } else if (idle) { /* the queue has work again: the clock of a stopped GPU starts now */
             idle = 0;
             moved = plat_ns();
-        } else if (plat_ns() - moved >= VK_GPU_STUCK_NS) {
+        } else if (plat_ns() - moved >= stuck_ns()) {
             stopped_wait_lost(sem, value);
             vk_checkpoint_dump("GPU stopped");
             vk_ck_report(); /* what the submissions it has not finished hold */
             fatal("vulkan: the GPU stopped responding: no work finished for %llu s (at submission %llu, waiting for "
                   "%llu)",
-                  VK_GPU_STUCK_NS / 1000000000ull, (unsigned long long)now, (unsigned long long)value);
+                  stuck_ns() / 1000000000ull, (unsigned long long)now, (unsigned long long)value);
         }
     }
 }
@@ -379,7 +400,7 @@ void vk_wait_semaphore(VkSemaphore sem, u64 value) {
 /* the waits on a path's own timeline since the last statistics and their time, from whichever thread waited (a bind
    of sparse memory, a granule of the mirror, a landing): each is a round trip to the GPU that vk_finish's sites and
    the graphics timeline's waits do not count */
-static u64 g_host_waits, g_host_wait_ns;
+static _Atomic u64 g_host_waits, g_host_wait_ns;
 u64 vk_host_next(VkHostTimeline* t) {
     if (!t->sem) {
         VkSemaphoreTypeCreateInfo tci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
@@ -403,7 +424,7 @@ int vk_host_bind_sparse(VkHostTimeline* t, const VkBindSparseInfo* bi) {
     vk_queue_unlock(g_vk.gfx);
     return ok && vk_host_wait(t, value);
 }
-/* no submission of the runtime's own paths takes seconds: a wait that does is a stopped GPU */
+/* no submission of the runtime's own paths takes seconds on a GPU: a wait that does is a stopped GPU */
 int vk_host_wait(const VkHostTimeline* t, u64 value) {
     VkSemaphoreWaitInfo wi = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &t->sem, .pValues = &value};
@@ -411,16 +432,16 @@ int vk_host_wait(const VkHostTimeline* t, u64 value) {
     for (;;) {
         VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull);
         if (r != VK_TIMEOUT) {
-            __atomic_fetch_add(&g_host_waits, 1, __ATOMIC_RELAXED);
-            __atomic_fetch_add(&g_host_wait_ns, plat_ns() - t0, __ATOMIC_RELAXED);
+            atomic_fetch_add_explicit(&g_host_waits, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_host_wait_ns, plat_ns() - t0, memory_order_relaxed);
             return VK_OK(r);
         }
-        if (plat_ns() - t0 >= VK_GPU_STUCK_NS) {
+        if (plat_ns() - t0 >= stuck_ns()) {
             stopped_wait_lost(t->sem, value);
             vk_checkpoint_dump("GPU stopped");
             vk_ck_report();
             fatal("vulkan: the GPU stopped responding: a submission of the runtime's own wasn't done for %llu s",
-                  VK_GPU_STUCK_NS / 1000000000ull);
+                  stuck_ns() / 1000000000ull);
         }
     }
 }
@@ -527,9 +548,9 @@ static void land_through(u64 value) {
    it is recycled: the GPU thread waits for it with no lock held (vk_frame_ready). It waited in frame_recycle with
    vk_lock held, up to 3.1 s at a time in one game's menus, and the game's threads that landed results, changed
    memory or performed releases waited for vk_lock behind it */
-static u64 g_recycle_at;
+static _Atomic u64 g_recycle_at;
 void vk_frame_ready(void) {
-    u64 at = __atomic_load_n(&g_recycle_at, __ATOMIC_ACQUIRE), submitted = 0, done = 0;
+    u64 at = atomic_load_explicit(&g_recycle_at, memory_order_acquire), submitted = 0, done = 0;
     if (!at || vk_lock_held()) return;
     vk_submit_progress(&submitted, &done);
     if (at > submitted || at <= done) return; /* not handed to the GPU yet (frame_recycle waits then), or done */
@@ -542,7 +563,7 @@ static void pool_recycle(Frame* f);
 static void frame_recycle(Frame* f) {
     u64 done, landed = 0;
     SNX_ZONE(z, "vk frame recycle");
-    __atomic_store_n(&g_recycle_at, 0, __ATOMIC_RELEASE);
+    atomic_store_explicit(&g_recycle_at, 0, memory_order_release);
     while ((done = f->last > f->hold ? f->last : f->hold) != landed) {
         timeline_wait(done, VK_WAIT_RECYCLE, __FILE__, __LINE__); /* one site: any vk_cmd */
         land_through(done);
@@ -555,6 +576,8 @@ static void frame_recycle(Frame* f) {
     dead_free(f);
     g_dead_bytes -= f->dead_bytes;
     f->dead_bytes = 0;
+    g_dead_moved -= f->dead_moved;
+    f->dead_moved = 0;
     vkResetCommandPool(g_vk.dev, f->pool, 0);
     /* the pools stay, reset: a frame's draws fill several, and making them again every frame costs. Only those the
        slot's recent uses never reached go */
@@ -580,6 +603,13 @@ int vk_cmd_ready(void) {
 
 static u64 g_cmd_uses;
 u64 vk_cmd_uses(void) { return g_cmd_uses; }
+/* how many command buffers a slot that has n adds at once: as many as it has, 4 at least and none past the frame's
+   most submissions (vk_frame_check ends a frame at 128) */
+#define CB_MOST 129u
+static u32 cb_grow(u32 n) {
+    const u32 want = n < 4 ? 4 : n;
+    return n >= CB_MOST ? 1 : n + want > CB_MOST ? CB_MOST - n : want;
+}
 VkCommandBuffer vk_cmd(void) {
     Frame* f = &g_fr[g_cur];
     g_cmd_uses++;
@@ -594,17 +624,20 @@ VkCommandBuffer vk_cmd(void) {
         }
         if (f->icb == f->ncb) {
             /* the pool's command buffers may still be recording on the recording thread, and a pool is used by one
-               thread at a time. A frame's slot only grows to its most submissions, so this is rare */
+               thread at a time: the wait for the recording thread takes as long as what it has queued. The slot grows
+               by as many as it has (CB_GROW), so it waits a few times as it grows to its most submissions, not at each
+               one. One game's loads, which submit often, waited so up to 550 ms for one buffer */
             vk_rec_sync();
+            const u32 n = cb_grow(f->ncb);
             VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                               .commandPool = f->pool,
                                               .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                              .commandBufferCount = 1};
-            VkCommandBuffer* cbs = realloc(f->cbs, sizeof *cbs * (f->ncb + 1));
+                                              .commandBufferCount = n};
+            VkCommandBuffer* cbs = realloc(f->cbs, sizeof *cbs * (f->ncb + n));
             if (!cbs) fatal("vulkan: out of memory for command buffers");
             f->cbs = cbs;
             VK_OK(vkAllocateCommandBuffers(g_vk.dev, &ai, &f->cbs[f->ncb]));
-            f->ncb++;
+            f->ncb += n;
         }
         vk_rec_begin(f->cbs[f->icb]);
         vk_gpuprof_cb_begin(f->cbs[f->icb]);
@@ -676,8 +709,14 @@ static u32 chunk_new(u32 ring, u64 size, int bar, u32 slot) {
                                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                        VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
                                        VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                                       (g_vk.has_xfb ? VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT : 0),
+                                       (g_vk.has_xfb ? VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT : 0) |
+                                       /* an indirect copy's list is read at its device address (owned.c) */
+                                       (g_vk.has_copy_indirect ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0) |
+                                       /* and global memory copies that SM86 programs read by address (gbuf_address) */
+                                       (g_vk.has_gbuf_address ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    /* the ASTC stream on the compute queue reads staging and writes the readback ring (astc.c) */
+    vk_both_queues(&bci.sharingMode, &bci.queueFamilyIndexCount, &bci.pQueueFamilyIndices);
     DevMemWant aci = {.at = bar ? DM_WINDOW : DM_HOST, .mapped = 1};
     DevMemInfo info;
     VkBuffer buf;
@@ -689,7 +728,7 @@ static u32 chunk_new(u32 ring, u64 size, int bar, u32 slot) {
     } else if (ring == XRING_DEVICE)
         aci = (DevMemWant){.at = DM_DEVICE};
     else if (stage_cached() && (!bar || g_vk.mem_model == VK_MEM_UMA)) /* a discrete GPU's window has no such type */
-        aci.at = DM_CACHED;
+        aci.at = DM_CACHED; /* chunk_take asks for no window there (window_ring) */
     while (i < g_cmd.nchunk && g_cmd.chunk[i].buf) i++;
     if (i == g_cmd.capchunk) {
         u32 cap = g_cmd.capchunk ? g_cmd.capchunk * 2 : 32;
@@ -781,9 +820,16 @@ static int pool_before(const Chunk* c, const Chunk* than) {
    needs. A ring that wants a chunk outside the window with none left in the pool hands out of its smallest pooled big
    buffer instead, up to that buffer's size: a frame of more small requests than the pool kept chunks for (an ASTC
    texture's strips after a texture's bands) writes memory written before, not new chunks. 0 when none could be made */
+/* whether a chunk of ring can be in the window (chunk_new): not the device's or the back ring's, and not where the
+   rings are in cached memory on unified memory. Asked for there, the window was never what a chunk was made in, so
+   none of the pool's suited, and the staging ring made new chunks each frame (two a frame of small uploads) */
+static int window_ring(u32 ring) {
+    return ring != XRING_DEVICE && ring != XRING_BACK && !(stage_cached() && g_vk.mem_model == VK_MEM_UMA);
+}
 static u32 chunk_take(u32 ring, u64 size, int big, int bar, u32 slot) {
     u32 here = 0, other = 0, lend = 0; /* the chunks of the pool in the memory wanted, in the other memory, and the
                                           big buffer a ring with none of them hands out of */
+    bar = bar && window_ring(ring);
     for (u32 i = 0; i < g_cmd.nchunk; i++) {
         const Chunk* c = &g_cmd.chunk[i];
         u32* pick;
@@ -899,7 +945,8 @@ u8* vk_stream_upload(u64 size, u64 align, VkBuffer* buf, u64* off) {
 static void stream_carry(void) {
     for (u32 i = 0; i < g_cmd.nchunk; i++) {
         Chunk* c = &g_cmd.chunk[i];
-        if (c->buf && c->ring == XRING_STREAM && c->sub >= g_gval) c->sub = g_gval + 2;
+        if (c->buf && c->ring == XRING_STREAM && c->sub >= atomic_load_explicit(&g_gval, memory_order_relaxed))
+            c->sub = atomic_load_explicit(&g_gval, memory_order_relaxed) + 2;
     }
 }
 /* the stream's chunks that work not yet done reads: their bytes, and the oldest of their submissions that is on the
@@ -912,7 +959,8 @@ static u64 stream_busy(u64* oldest) {
         const Chunk* c = &g_cmd.chunk[i];
         if (!c->buf || c->ring != XRING_STREAM || c->sub <= done) continue;
         bytes += c->size;
-        if (c->sub <= g_gval && (!*oldest || c->sub < *oldest)) *oldest = c->sub;
+        if (c->sub <= atomic_load_explicit(&g_gval, memory_order_relaxed) && (!*oldest || c->sub < *oldest))
+            *oldest = c->sub;
     }
     return bytes;
 }
@@ -1098,8 +1146,7 @@ int vk_stage_device_at(const char* file, int line, u64 size, u64 align, VkBuffer
 
 /* the host writes to the chunks the staging and output rings hand out of, and to those they filled and the frame's
    big buffers since the last submit, made visible to the GPU */
-static void rings_flush(const Frame* f) {
-    g_cmd.stream_since = 0;
+static void rings_flush_host(const Frame* f) {
     for (u32 r = XRING_STAGE; r <= XRING_OUTPUT; r++)
         if (f->ring[r].cur) vk_devmem_flush(g_cmd.chunk[f->ring[r].cur - 1].mem, 0, VK_WHOLE_SIZE);
     for (u32 i = 0; g_cmd.unflushed && i < g_cmd.nchunk; i++)
@@ -1108,6 +1155,24 @@ static void rings_flush(const Frame* f) {
             g_cmd.chunk[i].flush = 0;
             g_cmd.unflushed--;
         }
+}
+static void rings_flush(const Frame* f) {
+    g_cmd.stream_since = 0;
+    rings_flush_host(f);
+}
+/* the same before a submission to another queue that reads them (astc.c's stream), the frame's submission still to
+   come */
+void vk_stage_flush(void) { rings_flush_host(&g_fr[g_cur]); }
+/* a resource that the graphics and the compute queue both use, one at a time, with no ownership transfers (astc.c's
+   stream): CONCURRENT where they are two families */
+void vk_both_queues(VkSharingMode* mode, u32* count, const u32** families) {
+    static u32 fam[2];
+    fam[0] = g_vk.gfx_family;
+    fam[1] = g_vk.compute_family;
+    const int two = g_settings.astc_compute_queue && g_vk.compute && g_vk.compute != g_vk.gfx && fam[0] != fam[1];
+    *mode = two ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    *count = two ? 2 : 0;
+    *families = two ? fam : NULL;
 }
 
 static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
@@ -1124,12 +1189,15 @@ static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src_stage, VkA
    why (VK_SUB_*: the statistics) */
 static void submit(const VkSemaphoreSubmitInfo* xw, const VkSemaphoreSubmitInfo* xs, int land, int why) {
     SNX_ZONE(z_submit, "vk submit");
+    /* the ASTC uploads recorded for the compute queue first: this submission waits for them (below), as its draws
+       sample their textures and its frame's staging and descriptor sets hold what they read */
+    vk_astc_stream_submit();
     vk_render_end();
     g_rec_unsafe++;
     Frame* f = &g_fr[g_cur];
     VkCommandBuffer cb = vk_cmd(); /* a submit with nothing recorded still has to wait and signal */
     vk_query_flush(cb);            /* the samples-passed counts of the passes ended (query.c) */
-    vk_buf_host_barrier(cb, g_gval + 1);
+    vk_buf_host_barrier(cb, atomic_load_explicit(&g_gval, memory_order_relaxed) + 1);
     VkCommandBuffer up = VK_NULL_HANDLE;
     if (f->up) { /* the upload command buffer's copies and fills before everything the frame's command buffer reads or
                     writes */
@@ -1140,7 +1208,7 @@ static void submit(const VkSemaphoreSubmitInfo* xw, const VkSemaphoreSubmitInfo*
     }
     /* staging memory may not be host coherent: the host writes are made visible to the GPU here */
     rings_flush(f);
-    VkSemaphoreSubmitInfo w[3];
+    VkSemaphoreSubmitInfo w[VK_SUBMIT_WAITS];
     u32 nw = 0;
     if (g_after[0].semaphore) { /* at most one of the two: vk_submit_after's comes with no other */
         xw = &g_after[0];
@@ -1154,30 +1222,40 @@ static void submit(const VkSemaphoreSubmitInfo* xw, const VkSemaphoreSubmitInfo*
                                           .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
         g_vk_cs_wait_value = 0;
     }
+    if (g_vk_astc_wait_value) { /* the ASTC uploads on the compute queue (astc.c's stream) */
+        w[nw++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                                          .semaphore = g_vk_astc_sem,
+                                          .value = g_vk_astc_wait_value,
+                                          .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        g_vk_astc_wait_value = 0;
+    }
     if (vk_sparse_flush(&w[nw])) nw++; /* after the sparse binds made since the last submission (memory.c) */
     VkSemaphoreSubmitInfo s[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                                    .semaphore = g_gsem,
-                                   .value = g_gval + 1,
+                                   .value = atomic_load_explicit(&g_gval, memory_order_relaxed) + 1,
                                    .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
     if (xs) s[1] = *xs;
     vk_ck(cb, VK_CK_SUBMIT, (u32)why, 0, 0, 0);
-    vk_gpuprof_cb_end(cb, why, g_gval + 1);
+    vk_gpuprof_cb_end(cb, why, atomic_load_explicit(&g_gval, memory_order_relaxed) + 1);
     /* ended and submitted after its commands, on the recording thread (a submission that fails signals the timeline
        from the host there, so waits for it end) */
     vk_rec_submit(up, cb, w, nw, s, xs ? 2u : 1u);
     memset(g_after, 0, sizeof g_after);
-    __atomic_store_n(&g_gval, g_gval + 1, __ATOMIC_RELAXED); /* read by the stall report too */
+    atomic_store_explicit(&g_gval, atomic_load_explicit(&g_gval, memory_order_relaxed) + 1,
+                          memory_order_relaxed); /* read by the stall report too */
     g_cmd.submits[why]++;
     g_sub_ns = plat_ns();
     f->recording = 0;
     f->icb++;
     SNX_ZONE_VALUE(z_submit, f->icb);
-    f->last = g_gval;
+    f->last = atomic_load_explicit(&g_gval, memory_order_relaxed);
     g_rec_unsafe--;
     /* results of submissions the GPU has finished land now, so a later release doesn't find them pending */
     u64 done = 0;
     if (land && VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done)))
-        land_through(done < g_gval ? done : g_gval);
+        land_through(done < atomic_load_explicit(&g_gval, memory_order_relaxed)
+                         ? done
+                         : atomic_load_explicit(&g_gval, memory_order_relaxed));
     SNX_ZONE_END(z_submit);
 }
 
@@ -1199,17 +1277,18 @@ VkCommandBuffer vk_cmd_upload(int gpu) {
     Frame* f = &g_fr[g_cur];
     vk_cmd(); /* the frame's command buffer recording too: every submit then takes this one with it */
     if (!f->up) {
-        if (f->icb >= f->nup) { /* up to this submission's: the ones before it may have had none */
+        if (f->icb >= f->nup) { /* up to this submission's, and as many again (cb_grow), as the frame's own grow */
             vk_rec_sync();
+            const u32 n = f->icb + 1 - f->nup + cb_grow(f->icb + 1);
             VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                               .commandPool = f->pool,
                                               .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                              .commandBufferCount = f->icb + 1 - f->nup};
-            VkCommandBuffer* ups = realloc(f->ups, sizeof *ups * (f->icb + 1));
+                                              .commandBufferCount = n};
+            VkCommandBuffer* ups = realloc(f->ups, sizeof *ups * (f->nup + n));
             if (!ups) fatal("vulkan: out of memory for command buffers");
             f->ups = ups;
             VK_OK(vkAllocateCommandBuffers(g_vk.dev, &ai, &f->ups[f->nup]));
-            f->nup = f->icb + 1;
+            f->nup += n;
         }
         vk_rec_begin_upload(f->ups[f->icb]);
         f->up = 1;
@@ -1252,11 +1331,42 @@ void vk_submit_background(void) {
 void vk_submit_recorded(void) {
     if (g_fr[g_cur].recording) submit_why(VK_NULL_HANDLE, 0, VK_NULL_HANDLE, VK_SUB_OTHER);
 }
-/* What is recorded goes to the GPU, and this waits until the GPU has done it. It lands nothing, so it may run while a
-   draw is set up: that draw starts its setup again on the new submission number */
-void vk_submit_upload_wait(void) {
+void vk_submit_pace(void) {
     if (g_fr[g_cur].recording) submit(NULL, NULL, 0, VK_SUB_OTHER);
-    timeline_wait(g_gval, VK_WAIT_FINISH, __FILE__, __LINE__);
+}
+/* What is recorded goes to the GPU, and this waits until the GPU has done it, or with upto (non-zero) the submissions
+   up to that one only: 0 at once when they are done. It lands nothing, so it may run while a draw is set up: that draw
+   starts its setup again on the new submission number.
+
+   With let_go, the wait lets go of vk_lock when this thread holds it once, outside a landing or a recycling: 1 when it
+   did. The BC7 encoder's pace (astc.c) waited here with the lock held, part-way through a draw's setup, and the threads
+   landing results waited behind it: in one game (game-d1ed1846) 41 waits, 600 ms of 71 s, of which 462 ms overlapped
+   the landing thread's long waits for the lock. Other threads may record, submit and land meanwhile; the setup starts
+   again anyway, as this submitted. A refresh of the window (vkr_refresh) is not taken meanwhile (vk_upload_letting_go):
+   two frame advances would recycle the slot whose pools and rings the setup holds */
+static int g_letting_go; /* under vk_lock */
+int vk_upload_letting_go(void) { return g_letting_go; }
+int vk_submit_upload_wait(int let_go, u64 upto) {
+    if (g_fr[g_cur].recording) submit(NULL, NULL, 0, VK_SUB_OTHER);
+    /* other threads submit meanwhile: this waits for its own, or for upto where that is older */
+    const u64 gval = atomic_load_explicit(&g_gval, memory_order_relaxed);
+    const u64 at = upto && upto < gval ? upto : gval;
+    u64 done = 0;
+    if (upto && VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done)) && done >= at) return 0; /* no wait */
+    int paused = 0;
+    if (let_go && !g_rec_unsafe && !g_landing && !g_letting_go) {
+        g_letting_go = 1;
+        paused = vk_lock_pause();
+        if (!paused) g_letting_go = 0;
+    }
+    SNX_ZONE_V(z, "vk upload wait", paused);
+    timeline_wait(at, VK_WAIT_FINISH, __FILE__, __LINE__);
+    SNX_ZONE_END(z);
+    if (paused) {
+        vk_lock_resume(1);
+        g_letting_go = 0;
+    }
+    return paused;
 }
 void vk_submit_after(VkSemaphore sem, u64 wait, u64 signal) {
     g_after[0] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = sem,
@@ -1274,8 +1384,8 @@ void vk_finish_at(const char* file, int line) {
     u64 t0 = plat_ns();
     SNX_ZONE(z_finish, "vk finish");
     submit_why(VK_NULL_HANDLE, 0, VK_NULL_HANDLE, VK_SUB_FINISH);
-    timeline_wait(g_gval, VK_WAIT_FINISH, NULL, 0);
-    land_through(g_gval);
+    timeline_wait(atomic_load_explicit(&g_gval, memory_order_relaxed), VK_WAIT_FINISH, NULL, 0);
+    land_through(atomic_load_explicit(&g_gval, memory_order_relaxed));
     u64 ns = plat_ns() - t0;
     g_vk_finishes++;
     g_vk_finish_ns += ns;
@@ -1291,8 +1401,8 @@ void vk_finishes_log(void) {
             100.0 * (double)n / (double)total, (double)ns / 1e6, f ? f + 1 : w->file, w->line);
     }
     while (vk_site_take(g_finish_sites, FINISH_SITES, &n, &ns)) {} /* the rest, zeroed */
-    u64 hosts = __atomic_exchange_n(&g_host_waits, 0, __ATOMIC_RELAXED),
-        host_ns = __atomic_exchange_n(&g_host_wait_ns, 0, __ATOMIC_RELAXED);
+    u64 hosts = atomic_exchange_explicit(&g_host_waits, 0, memory_order_relaxed),
+        host_ns = atomic_exchange_explicit(&g_host_wait_ns, 0, memory_order_relaxed);
     if (hosts)
         LOG("vulkan:   %llu waits for a timeline of its own (%.1f ms): sparse binds, the mirror's granules and "
             "landings\n",
@@ -1320,10 +1430,54 @@ void vk_frame_next(void) {
     g_fr[g_cur].fresh = 1;
     g_frame_id++;
     const Frame* f = &g_fr[g_cur];
-    __atomic_store_n(&g_recycle_at, f->last > f->hold ? f->last : f->hold, __ATOMIC_RELEASE);
+    atomic_store_explicit(&g_recycle_at, f->last > f->hold ? f->last : f->hold, memory_order_release);
 }
 /* the GPU thread's recording time a submission holds at most */
 #define SUBMIT_EVERY_NS 1000000
+/* The last graphics submission the GPU has done, as a thread that waits on the timeline publishes it (atomic): the
+   submit below asks it at the start of each draw, where vkGetSemaphoreCounterValue is a call into the kernel each time.
+   The thread waits for the next value whether or not it is submitted yet (a timeline's wait before its signal), in
+   slices of a second, and stops on a lost device, which the other waits report */
+static _Atomic u64 g_gdone;
+static int g_gwatch;     /* the thread started: the GPU thread's */
+static _Atomic u32 g_gwatch_tid; /* its thread: vk_timeline_tid */
+static void gdone_watch(void* arg) {
+    u64 done = 0;
+    (void)arg;
+    SNX_THREAD_NAME("Vulkan timeline");
+    atomic_store_explicit(&g_gwatch_tid, plat_tid(), memory_order_release);
+    for (;;) {
+        u64 want = done + 1;
+        VkSemaphoreWaitInfo wi = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_gsem, .pValues = &want};
+        VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull);
+        if (r == VK_TIMEOUT) continue;
+        if (r != VK_SUCCESS || vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, &done) != VK_SUCCESS) return;
+        atomic_store_explicit(&g_gdone, done, memory_order_release);
+    }
+}
+/* Whether the GPU is on the last submission it has, or has none: what is recorded then goes to it, so it has the next
+   work queued before it runs out. While it has more than that, a submission made now only waits behind them, and costs
+   its own call into the kernel, on the recording thread. On a Steam Deck each took about 150 us and some 12 us more
+   for each MB of guest memory imported, which amdgpu takes again at each submission. One game's race holds about
+   180 MB of imports: it made 56 submissions a present, 41 of them for the millisecond alone, the recording thread
+   spent 87% of its time in the kernel, and the GPU stood idle 100 ms of each 180 ms present waiting for them. Without
+   the thread, every millisecond is a submission, as before */
+u32 vk_timeline_tid(void) { return atomic_load_explicit(&g_gwatch_tid, memory_order_acquire); }
+static int gpu_short_of_work(void) {
+    if (!g_gwatch) {
+        g_gwatch = 1;
+        if (plat_thread(gdone_watch, NULL, (size_t)256 << 10)) {
+            char why[256];
+            WARN("vulkan: could not start the thread that follows the GPU's timeline (%s): a submission each "
+                 "millisecond of recording\n",
+                 snx_os_error(why, sizeof why));
+            g_gwatch = -1;
+        }
+    }
+    return g_gwatch < 0 || atomic_load_explicit(&g_gdone, memory_order_acquire) + 1 >=
+                               atomic_load_explicit(&g_gval, memory_order_relaxed);
+}
 /* A frame that goes long without a present (a loading screen) still has to hand its pools and rings back: one with
    many submissions, descriptor pools or descriptor tables ends here, at the start of a draw or dispatch, before
    anything is set up (a draw's setup must not submit). Otherwise what was recorded goes to the GPU once it holds a
@@ -1349,12 +1503,23 @@ static u64 frame_rings(const Frame* f) {
 }
 /* the bytes a frame writes to its rings before it ends, as it has written rings already: VK_FRAME_RING_CAPS
    allocations, and on a GPU that shares the system's memory, where the rings are memory the caches budget, an eighth
-   of the budget, but no less than two chunks (uma_budget.h). The budget is asked only past those two */
+   of the budget, but no less than two chunks (uma_budget.h). The budget is asked only past those two, and then again
+   only once the rings grew by a chunk since the last answer, or the budget can have moved (vk_mem_budget_gen): each
+   draw asked it, which takes devmem.c's lock and reads every heap. A frame then ends a chunk later at most */
 static u64 frame_ring_cap(u64 rings) {
     u64 caps = VK_FRAME_RING_CAPS * g_vk.alloc_cap, floor = 2 * chunk_size(), usage, budget;
     if (g_vk.mem_model != VK_MEM_UMA || rings < floor) return caps;
+    u32 gen = vk_mem_budget_gen();
+    if (rings < g_cmd.cap_rings) g_cmd.cap_rings = rings; /* a submit took the stream's bytes, or a new frame began */
+    if (g_cmd.cap && g_cmd.cap_caps == caps && g_cmd.cap_gen == gen && rings - g_cmd.cap_rings < chunk_size())
+        return g_cmd.cap;
     vk_mem_use(&usage, &budget);
-    return vk_uma_ring_cap(caps, budget, floor);
+    g_cmd.cap = vk_uma_ring_cap(caps, budget, floor);
+    g_cmd.cap_caps = caps;
+    g_cmd.cap_rings = rings;
+    /* the generation before the ask: a budget the ask or another thread fetched after it is asked for again next */
+    g_cmd.cap_gen = gen;
+    return g_cmd.cap;
 }
 static void frame_check(void) {
     const Frame* f = &g_fr[g_cur];
@@ -1394,7 +1559,7 @@ static void frame_check(void) {
         submit(NULL, NULL, 1, VK_SUB_PERIODIC);
         if (stream_busy(&oldest) >= 2 * cap && oldest) vk_wait_submit(oldest);
     }
-    else if (f->recording && plat_ns() - g_sub_ns >= SUBMIT_EVERY_NS)
+    else if (f->recording && plat_ns() - g_sub_ns >= SUBMIT_EVERY_NS && gpu_short_of_work())
         submit(NULL, NULL, 1, VK_SUB_PERIODIC);
 }
 void vk_frame_check(void) {
@@ -1410,19 +1575,23 @@ u64 vk_ring_bytes(void) {
 }
 u64 vk_ring_made(void) { return g_cmd.made; }
 
-u64 vk_submit_number(void) { return g_gval + 1; }
+u64 vk_submit_number(void) { return atomic_load_explicit(&g_gval, memory_order_relaxed) + 1; }
 u32 vk_cb_begun(void) { return g_cb_begun; }
 u32 vk_frame_recycles(void) { return g_cmd.recycles; }
 u64 vk_submits(int why) { return g_cmd.submits[why]; }
-u64 vk_last_submit(void) { return g_gval; }
+u64 vk_last_submit(void) { return atomic_load_explicit(&g_gval, memory_order_relaxed); }
 VkSemaphore vk_gfx_timeline(void) { return g_gsem; }
 void vk_submit_progress(u64* submitted, u64* done) {
-    *submitted = __atomic_load_n(&g_gval, __ATOMIC_RELAXED);
+    *submitted = atomic_load_explicit(&g_gval, memory_order_relaxed);
     *done = 0;
     if (g_gsem) VK_OK(vkGetSemaphoreCounterValue(g_vk.dev, g_gsem, done));
 }
 void vk_wait_submit_at(u64 value, const char* file, int line) { timeline_wait(value, VK_WAIT_SUBMIT, file, line); }
-void vk_land_through(u64 value) { land_through(value < g_gval ? value : g_gval); }
+void vk_land_through(u64 value) {
+    land_through(value < atomic_load_explicit(&g_gval, memory_order_relaxed)
+                     ? value
+                     : atomic_load_explicit(&g_gval, memory_order_relaxed));
+}
 u64 vk_frame_id(void) { return g_frame_id; }
 void vk_frame_hold(u64 frame_id) {
     if (frame_id + 1 != g_frame_id) return; /* this frame's own rings, or an older frame's, landed when reused */
@@ -1430,14 +1599,18 @@ void vk_frame_hold(u64 frame_id) {
 }
 u32 vk_frame_slot(void) { return g_cur; }
 
-static u32 g_desc_pools; /* the pools that exist: the GPU, recording and compute threads make them */
+static _Atomic u32 g_desc_pools; /* the pools that exist: the GPU, recording and compute threads make them */
 VkDescriptorPool vk_desc_pool_new(u32 array_sets) {
     /* a thousand sets of the stage layout (gpu/vk/pipeline.c): a frame chains more pools when it needs them */
-    static u32 said[3]; /* the line of each kind of pool once: compute's, a frame's, a frame's for more arrays */
+    static _Atomic u32
+        said[3]; /* the line of each kind of pool once: compute's, a frame's, a frame's for more arrays */
     VkDescriptorPoolSize sz[VK_POOL_TYPES];
     VkDescriptorPoolCreateInfo ci = {0};
     vk_pool_sizes(sz, 1024, array_sets);
-    if (!__atomic_exchange_n(&said[!array_sets ? 0 : array_sets == VK_POOL_ARRAY_SETS ? 1 : 2], 1, __ATOMIC_RELAXED)) {
+    if (!atomic_exchange_explicit(&said[!array_sets                        ? 0
+                                        : array_sets == VK_POOL_ARRAY_SETS ? 1
+                                                                           : 2],
+                                  1, memory_order_relaxed)) {
         char arrays[96]; /* the arrays the sets hold, which a device without them leaves out (vk_pool_sizes) */
         snx_vk_pool_arrays_text(arrays, sizeof arrays, array_sets, vk_texture_array_elements());
         LOG("vulkan: descriptor pools of 1024 sets, %s: %u uniform and %u storage buffers, %u combined image samplers, "
@@ -1450,10 +1623,11 @@ VkDescriptorPool vk_desc_pool_new(u32 array_sets) {
     ci.poolSizeCount = VK_POOL_TYPES;
     ci.pPoolSizes = sz;
     VkDescriptorPool p = VK_NULL_HANDLE;
-    if (VK_OK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &p))) __atomic_add_fetch(&g_desc_pools, 1, __ATOMIC_RELAXED);
+    if (VK_OK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &p)))
+        atomic_fetch_add_explicit(&g_desc_pools, 1, memory_order_relaxed);
     return p;
 }
-u32 vk_desc_pools(void) { return __atomic_load_n(&g_desc_pools, __ATOMIC_RELAXED); }
+u32 vk_desc_pools(void) { return atomic_load_explicit(&g_desc_pools, memory_order_relaxed); }
 /* Each window of VK_DESC_POOL_USES uses of a slot, the pools past the most one of them took are destroyed (one stays):
    the slot's work is done when it is reset, so no set of them is in use. A pool's memory is made whole when it is
    (Qualcomm's: 98 MiB a frame's pool), and a load's burst of sets left pools its steady frames never reach */
@@ -1465,7 +1639,7 @@ void vk_desc_pools_keep(VkDescriptorPool* pools, int* npool, int* peak, u32* use
     while (*npool > keep) {
         vkDestroyDescriptorPool(g_vk.dev, pools[--*npool], NULL);
         pools[*npool] = VK_NULL_HANDLE;
-        __atomic_sub_fetch(&g_desc_pools, 1, __ATOMIC_RELAXED);
+        atomic_fetch_sub_explicit(&g_desc_pools, 1, memory_order_relaxed);
     }
     if (*npool < n0)
         LOG_LIMIT(20,
@@ -1475,11 +1649,11 @@ void vk_desc_pools_keep(VkDescriptorPool* pools, int* npool, int* peak, u32* use
     *uses = 0;
     *peak = 0;
 }
-static u64 g_desc_array_sets; /* sets of the arrays layouts taken from the frames' pools, for the statistics */
+static _Atomic u64 g_desc_array_sets; /* sets of the arrays layouts taken from the frames' pools, for the statistics */
 void vk_desc_taken(VkDescriptorSetLayout layout, u32 n) {
-    if (n && vk_dslayout_arrays(layout)) __atomic_add_fetch(&g_desc_array_sets, n, __ATOMIC_RELAXED);
+    if (n && vk_dslayout_arrays(layout)) atomic_fetch_add_explicit(&g_desc_array_sets, n, memory_order_relaxed);
 }
-u64 vk_desc_array_sets(void) { return __atomic_load_n(&g_desc_array_sets, __ATOMIC_RELAXED); }
+u64 vk_desc_array_sets(void) { return atomic_load_explicit(&g_desc_array_sets, memory_order_relaxed); }
 /* count sets of layout from the frame's pools into sets: count, or 1 when a pool can't hold that many, 0 on failure */
 static u32 desc_alloc_n(Frame* f, VkDescriptorSetLayout layout, VkDescriptorSet* sets, u32 count) {
     VkDescriptorSetLayout layouts[SPARE_SETS];
@@ -1548,9 +1722,14 @@ static Frame* dead_slot(void) {
     return f;
 }
 void vk_defer_image(VkImage img, DevMem a, VkImageView v1, VkImageView v2) {
+    vk_devmem_owner(a, NULL); /* not moved once it is let go (devmem.h) */
+    if (!a && img) vk_image_sparse_mover(img, NULL); /* nor are a sparse image's blocks */
     dead_push(dead_slot(), (Dead){.img = img, .mem = a, .v1 = v1, .v2 = v2});
 }
-void vk_defer_buffer(VkBuffer b, DevMem a) { dead_push(dead_slot(), (Dead){.buf = b, .mem = a}); }
+void vk_defer_buffer(VkBuffer b, DevMem a) {
+    vk_devmem_owner(a, NULL); /* not moved once it is let go (devmem.h) */
+    dead_push(dead_slot(), (Dead){.buf = b, .mem = a});
+}
 /* on the list its release goes on, so they leave the count when the release is performed: counted on a fresh slot
    before the release that started it, they left at that slot's recycling */
 void vk_defer_bytes(u64 bytes) {
@@ -1559,6 +1738,12 @@ void vk_defer_bytes(u64 bytes) {
     g_dead_bytes += bytes;
 }
 u64 vk_deferred_bytes(void) { return g_dead_bytes; }
+void vk_defer_moved(u64 bytes) {
+    if (!bytes) return;
+    dead_slot()->dead_moved += bytes;
+    g_dead_moved += bytes;
+}
+u64 vk_deferred_moved(void) { return g_dead_moved; }
 void vk_defer_buffer_view(VkBufferView v) { dead_push(dead_slot(), (Dead){.view = v}); }
 void vk_defer_call(void (*fn)(void*), void* arg) { dead_push(dead_slot(), (Dead){.fn = fn, .arg = arg}); }
 

@@ -8,6 +8,7 @@
 #ifndef SNX_OVERLAY_H
 #define SNX_OVERLAY_H
 #include "common/utilities/notice.h"
+#include "common/utilities/run_theme.h"
 #include "nx/runtime/platform/ui.h"
 
 /* the 3DS's, the Vita's and the GBA's notices are drawn as this menu's (common/utilities/notice.h) */
@@ -85,6 +86,9 @@ int overlay_shortcut_listening(void);
 void overlay_shortcut_key(unsigned key, unsigned mods);
 /* Backspace: on the Shortcuts page the row in focus back to its default key, as a key given; elsewhere overlay_back */
 int overlay_backspace(void);
+/* Delete, and a controller's Y: the setting in focus that the game's picks hold (its value marked *) back to Global,
+   the launcher's for every game (options.h's ini_unpick); on the Shortcuts page as Backspace */
+int overlay_delete(void);
 /* a tap at x, y on a picture of sw x sh: what it did, OVERLAY_CLOSE outside the panel */
 int overlay_tap(float x, float y, int sw, int sh);
 /* a finger or the mouse (touch.h's SNX_TOUCH_MOUSE) on the open menu, at x, y in the picture's pixels: down off the
@@ -98,18 +102,53 @@ void overlay_pointer_move(u64 id, float x, float y, const int safe[4]);
 int overlay_pointer_up(u64 id, float x, float y, int sw, int sh);
 void overlay_pointer_cancel(u64 id);
 void overlay_pointers_reset(void);
-/* the menu, and over the game a notification until its time is up, at now_ns (plat_ns) */
+/* the menu, and over the game the notifications until their time is up, at now_ns (plat_ns) */
 void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns);
 /* a notification of one line in the picture's corner for SNX_OVERLAY_TOAST_MS from now_ns: a save state saved or
-   loaded, a screenshot taken. Under ui_lock */
+   loaded, a screenshot taken. After a blank cell, icon (gui/icons.h's), one the launcher draws for the same thing, then
+   text; GUI_ICON_NONE for none, which draws text alone, as the 3DS's notice is drawn (common/utilities/notice.h).
+   Each one a line of its own, the oldest at the top and each its own time, OVERLAY_TOASTS at most, a new one past
+   them taking the oldest's place; one of the same subject takes its line where it is, from its words on: a setting's
+   (overlay_setting_toast), its key, another's its icon (a save state's, a controller's). Empty text takes its
+   subject's line out. Under ui_lock */
 #define SNX_OVERLAY_TOAST_MS SNX_NOTICE_MS
-void overlay_toast(const char* text, u64 now_ns);
+#define OVERLAY_TOASTS       4
+void overlay_toast(unsigned icon, const char* text, u64 now_ns);
+/* the notification of a setting of the game's .ini changed (its key: fps_limit), after the icon the launcher gives it
+   (overlay_setting_icon), its line its key's. Under ui_lock */
+void overlay_setting_toast(const char* key, const char* text, u64 now_ns);
+/* the icon of the launcher's Settings for a setting by its key: its page's where its page has one, else its group's
+   (gui/icons.h's gui_group_icon, of its section in settings.txt); GUI_ICON_NONE for a key no section holds */
+unsigned overlay_setting_icon(const char* key);
+/* the icon of a runtime key's row on F1's page (hotkeys.h's action), the launcher's F1 box's: the notification of
+   what it did shows it (a screenshot's, a pause's); GUI_ICON_NONE for an action with no row */
+unsigned overlay_key_icon(int action);
+/* A line comes in from its start and goes at its end as the launcher's screens fade in from black and out to it: over
+   the fade_in_ms and fade_out_ms of theme (common/utilities/run_theme.h), or of YoRHa's built in for NULL, where the
+   launcher's can't be read; 0 for no fade, as it is until told. What it takes into ms, in and out. The alpha of the
+   line'th from the top at now_ns, 0 to 255 (255 between the fades, 0 once its time is up or for no such line): what
+   the launcher's black leaves of its screen at the same point of a fade as long (run_theme.h's snx_fade_shade), the
+   lesser of the two where they meet. While it fades its quads are a faded span of the layer (ui.h's ui_fade_set), the
+   same quads at another alpha each frame. Under ui_lock */
+void overlay_fades(const SnxRunTheme* theme, u32 ms[2]);
+int overlay_toast_alpha(int line, u64 now_ns);
+/* a save state's notification (loaded, its slot picked, not saved), after the icon of the menu's Save States, the
+   launcher's too. Under ui_lock */
+void overlay_state_toast(const char* text, u64 now_ns);
 /* the toast of a save state saved to slot (its words, "slot 2"), "Saved over" one that held a state (over) */
 void overlay_state_saved(const char* slot, int over, u64 now_ns);
-int overlay_toasting(u64 now_ns); /* one shows */
-/* the same from any thread, with or without ui_lock (RenderDoc's notices, gpu/vk/renderdoc.c): its time starts as the
-   next frame draws it, the last one given before then shown */
-void overlay_notice(const char* text);
+int overlay_toasting(u64 now_ns); /* one shows: from any thread */
+/* overlay_toast from any thread, with or without ui_lock (RenderDoc's notices, gpu/vk/renderdoc.c): its time starts as
+   the next frame draws it, the last one given before then shown */
+void overlay_notice(unsigned icon, const char* text);
+/* The caches of earlier runs found empty as the game starts, which the frames to come wait on: shaders, the shader
+   cache (no shader or pipeline of an earlier run), textures, the BC7 cache (no ASTC level encoded before). Its words,
+   "Compiling shaders" where the shaders' is, else "Encoding textures"; NULL for neither */
+const char* overlay_cold_cache_words(int shaders, int textures);
+/* those words as overlay_notice's, once a run, from any thread, after the icon of the stats' line of that work
+   (stats.h's SNX_STATS_ICON_COMPILE, SNX_STATS_ICON_ENCODE): 1 when this call gave them. shaders -1, the shader cache
+   still being read (gpu/vk's vk_pipeline_cache_cold), gives none yet */
+int overlay_cold_cache(int shaders, int textures);
 /* The save states' pages: a row per slot, the focused one's thumbnail beside them, and Save, Load and Delete for one
    (Load and Delete asked first). Slot 0 is the one a load saves over first, which only loads or goes */
 #define OVERLAY_SLOTS_MAX 33
@@ -166,6 +205,15 @@ typedef struct {
 } OverlayKeyboard;
 /* the box for k, in place of one that shows */
 void overlay_keyboard_show(const OverlayKeyboard* k);
+/* What the menu's and the box's hints name: the keyboard's keys, or a controller's buttons, as the last of them
+   pressed says (the backend's events: a key, or a button, a stick or a trigger past SNX_PAD_TRIGGER; a finger or the
+   mouse changes nothing). For a controller, ok and back are the names its face gives the controls that send the
+   console's A and B ("B" and "A" on an Xbox pad, "Circle" and "Cross" on a PlayStation one), NULL for "A" and "B";
+   OVERLAY_INPUT_NAME bytes each at most. The keyboard's until then, on Android the on-screen controls' (a
+   controller's) */
+#define OVERLAY_INPUT_NAME 16
+void overlay_input_keys(void);
+void overlay_input_pad(const char* ok, const char* back);
 /* the box for ticket taken away unanswered, as the game takes its keyboard away; another one stays */
 void overlay_keyboard_hide(u32 ticket);
 int overlay_keyboard_shown(void); /* for any thread */

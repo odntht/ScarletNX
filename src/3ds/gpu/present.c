@@ -2,8 +2,8 @@
    Copyright 2026 the ScarletNX contributors
    The shown framebuffers, on the 3DS's Vulkan device (vk/device.c): a compute shader (vk/shaders/present.comp)
    reads each one where the guest has it in RAM, decodes it and turns it to the console's landscape screen in an
-   image, and the window's swapchain shows both screens, the top one above the bottom one as on the console, each
-   keeping its shape (frame_layout). With separate screens each one has its own window and fills it. Nothing of the
+   image, and the window's swapchain shows both screens as ctr_screen_layout arranges them, each keeping its shape
+   (snx_ctr_layout_rects). With separate screens each one has its own window and fills it. Nothing of the
    frame passes through the CPU. The frame dumps (the first eight, then each screen's latest about once a second, in
    frame_dir), the tests' hashes and --shot read a frame back: the shader writes those frames' RGBA pixels to a
    host-visible buffer as well, and a latest dump is written once the GPU is done, without a wait for it. --shot copies
@@ -22,6 +22,7 @@
 #include "3ds/gpu/vk/vk_render.h"
 #include "common/utilities/bits.h"
 #include "common/gpu/vk/notice.h"
+#include "common/gpu/vk/present_fx.h"
 #include "common/gpu/vk/swapchain.h"
 #include "common/utilities/build_info.h"
 #include "common/utilities/common.h"
@@ -35,6 +36,11 @@
 #include <string.h>
 
 #define MAX_SIDE 1024u /* the largest framebuffer side presented */
+/* The large layout's small screen is its size over 2.25 = 9/4: Azahar's Android large_screen_proportion, the one
+   proportion on every platform (FloatSetting.kt at 11eceda5). The steps run in integers, so each rectangle is exact
+   and the same on every host. The small screen's sides take Azahar's floors (320 / 2.25 = 142, 240 / 2.25 = 106) */
+#define LARGE_SCREEN_NUM 4u
+#define LARGE_SCREEN_DEN 9u
 
 static volatile sig_atomic_t g_quit; /* a headless run's Ctrl+C or SIGTERM */
 static void quit_signal(int signal_number) {
@@ -58,10 +64,17 @@ static struct {
     VkDeviceMemory readback_memory;
     unsigned char* readback_view;
     SnxVkSwapchain swap[2]; /* the combined window's, or each screen's own */
+    /* each screen drawn into the window by the effects (common/gpu/vk/present_fx.h): the upscaler and the
+       anti-aliasing as the settings say, or the screen sampled in sharp pixels with both Off. A screen's own, as both
+       are drawn in one recording, whose frame slot each keeps its images by */
+    SnxFxConfig fx_config;
+    SnxFx* fx[2];
     /* each submission slot's: a slot is free again only once its submission is done, and so are they */
-    VkSemaphore acquire[2][SNX_CTR_VK_SLOTS], presented[2][SNX_CTR_VK_SLOTS];
+    VkSemaphore acquire[2][SNX_CTR_VK_SLOTS];
+    /* each swapchain image's: free again only once that image is acquired again (a present's wait has no fence) */
+    VkSemaphore presented[2][SNX_VK_SWAP_IMAGES];
     /* a line over the game for a few seconds, as a Switch game shows one: Esc's first press. In the window it was
-       asked in, each window's band copied by its own (common/gpu/vk/notice.h) */
+       asked in, each window's band drawn by its own (common/gpu/vk/notice.h) */
     SnxNotice notice;
     SDL_WindowID notice_window;
     SnxVkNotice* notice_vk[2];
@@ -108,9 +121,10 @@ static bool swap_create(unsigned screen) {
     SnxVkSwapchainInfo info = {.surface = surface,
                                .formats = formats,
                                .format_count = sizeof formats / sizeof *formats,
-                               .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                               .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                                .window = snx_vk_window_extent(&v->host, fallback),
-                               .unsynced = !g_settings.vsync};
+                               .unsynced = !g_settings.vsync,
+                               .views = true};
     if (window != v->host.window) { /* the second window's own size */
         int width = 0, height = 0;
         info.window = SDL_GetWindowSizeInPixels(window, &width, &height) && width > 0 && height > 0
@@ -129,7 +143,8 @@ static bool frame_make(Frame* f, unsigned width, unsigned height, unsigned scale
                             .arrayLayers = 1,
                             .samples = VK_SAMPLE_COUNT_1_BIT,
                             .tiling = VK_IMAGE_TILING_OPTIMAL,
-                            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                     VK_IMAGE_USAGE_SAMPLED_BIT, /* the upscaler's and anti-aliasing's source */
                             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     if (vkCreateImage(v->device, &ii, NULL, &f->image) != VK_SUCCESS) return false;
@@ -164,11 +179,34 @@ static void frame_free(Frame* f) {
 }
 
 static bool semaphores(const SnxCtrVk* v, const VkSemaphoreCreateInfo* si) {
-    for (unsigned screen = 0; screen < 2; ++screen)
+    for (unsigned screen = 0; screen < 2; ++screen) {
         for (unsigned i = 0; i < SNX_CTR_VK_SLOTS; ++i)
-            if (vkCreateSemaphore(v->device, si, NULL, &g_present.acquire[screen][i]) != VK_SUCCESS ||
-                vkCreateSemaphore(v->device, si, NULL, &g_present.presented[screen][i]) != VK_SUCCESS)
-                return false;
+            if (vkCreateSemaphore(v->device, si, NULL, &g_present.acquire[screen][i]) != VK_SUCCESS) return false;
+        for (unsigned i = 0; i < SNX_VK_SWAP_IMAGES; ++i)
+            if (vkCreateSemaphore(v->device, si, NULL, &g_present.presented[screen][i]) != VK_SUCCESS) return false;
+    }
+    return true;
+}
+static void fx_log(const char* text) { fprintf(stderr, "3ds gpu: %s\n", text); }
+/* the upscaler and the anti-aliasing the settings ask for, said once, and each screen's draw: false, said, where one
+   could not be made */
+static bool fx_init(const SnxCtrVk* v) {
+    char said[512];
+    SnxFxConfig* c = &g_present.fx_config;
+    if (snx_fx_settings(c, g_settings.upscaler, g_settings.upscaler_sharpness, g_settings.anti_aliasing, said,
+                        sizeof said))
+        fprintf(stderr, "3ds gpu: settings: %s\n", said);
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!(g_present.fx[i] = snx_fx_create(v->phys, v->device, VK_NULL_HANDLE, SNX_CTR_VK_SLOTS, fx_log))) {
+            fprintf(stderr, "3ds gpu: the %s screen's draw into the window could not be made on this device\n",
+                    i ? "bottom" : "top");
+            return false;
+        }
+        snx_fx_set_sharpness(g_present.fx[i], c->sharpness);
+        snx_fx_set_off_sharp(g_present.fx[i], 1); /* the window's own scale, in sharp pixels */
+    }
+    fprintf(stderr, "3ds gpu: upscaler %s, anti-aliasing %s\n", snx_fx_upscale_label(c->upscaler),
+            snx_fx_aa_label(c->aa));
     return true;
 }
 bool snx_ctr_present_init(SnxCtrMemory* memory, const char* frame_dir, bool headless) {
@@ -195,7 +233,11 @@ bool snx_ctr_present_init(SnxCtrMemory* memory, const char* frame_dir, bool head
     g_present.up = 1;
     const SnxCtrVk* v = snx_ctr_vk();
     g_present.frame_dir = frame_dir;
-    g_present.separate = g_settings.ctr_separate_screens && v->second && v->second_surface;
+    g_present.separate = g_settings.ctr_screen_layout == SNX_CTR_LAYOUT_SEPARATE && v->second && v->second_surface;
+    if (!fx_init(v)) {
+        snx_ctr_present_free();
+        return false;
+    }
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                              .size = (VkDeviceSize)MAX_SIDE * MAX_SIDE * 4,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -319,10 +361,99 @@ static void write_pending(bool wait) {
     g_present.pending.active = false;
     write_ppm(g_present.pending.screen, g_present.pending.width, g_present.pending.height, g_present.readback_view);
 }
-/* The blit rectangle of a screen in swapchain pixels: in one window the pair scaled to fit and centred, each screen
-   centred across the layout; in its own window the screen scaled to fit and centred. The layout takes each screen at
-   the console's size (its frame's size over its render scale), so screens at different scales keep the console's
-   proportions. False before a layout and a swapchain exist. */
+/* a screen's rectangle in the window's pixels, each edge truncated: the right and bottom edges from the position plus
+   the size, so the size is their difference from the left and top edges */
+static void set_rect(SnxCtrRect* r, double x, double y, double width, double height) {
+    r->x = (int32_t)x;
+    r->y = (int32_t)y;
+    r->width = (int32_t)(x + width) - r->x;
+    r->height = (int32_t)(y + height) - r->y;
+}
+/* no rectangle for a screen that has not presented (present.h's contract) */
+static void shown_rects(SnxCtrRects* rects, const bool shown[2]) {
+    if (!shown[0]) rects->top = (SnxCtrRect){0};
+    if (!shown[1]) rects->bottom = (SnxCtrRect){0};
+}
+bool snx_ctr_layout_rects(SnxCtrLayout layout, bool swap, uint32_t window_width, uint32_t window_height,
+                          SnxCtrScreens screens, SnxCtrRects* rects) {
+    if (!window_width || !window_height) return false;
+    const SnxCtrScreens given = screens;
+    rects->top = rects->bottom = (SnxCtrRect){0};
+    /* A screen with no frame has no size. In the one-screen layout the missing screen gets no rectangle, so that
+       window shows black until it has a frame; the console's size only keeps the arithmetic defined there. In the
+       large and side layouts the other screen keeps its place, the console's size standing in for the missing one
+       in the box. In the stacked layout the missing screen adds no width and no height instead, so the other one fills
+       the box alone */
+    const SnxCtrScreens console = {400, 240, 320, 240};
+    bool shown[2] = {screens.top_width && screens.top_height, screens.bottom_width && screens.bottom_height};
+    if (!shown[0]) screens.top_width = console.top_width;
+    if (!shown[0]) screens.top_height = console.top_height;
+    if (!shown[1]) screens.bottom_width = console.bottom_width;
+    if (!shown[1]) screens.bottom_height = console.bottom_height;
+    /* the settings' range keeps to the five (ini_read clamps); another caller's value is shown stacked */
+    /* separate reaches here only when no second window was made: the one window then shows the screens stacked */
+    if ((unsigned)layout >= SNX_CTR_LAYOUT_COUNT || layout == SNX_CTR_LAYOUT_SEPARATE) layout = SNX_CTR_LAYOUT_STACKED;
+    if (layout == SNX_CTR_LAYOUT_SINGLE) {
+        /* the one screen, the top or with the swap the bottom, scaled to fit and centred */
+        uint32_t width = swap ? screens.bottom_width : screens.top_width;
+        uint32_t height = swap ? screens.bottom_height : screens.top_height;
+        double scale = (double)window_width / width < (double)window_height / height ? (double)window_width / width
+                                                                                     : (double)window_height / height;
+        set_rect(swap ? &rects->bottom : &rects->top, (window_width - width * scale) / 2,
+                 (window_height - height * scale) / 2, width * scale, height * scale);
+        shown_rects(rects, shown);
+        return true;
+    }
+    if (layout == SNX_CTR_LAYOUT_STACKED) {
+        /* one above the other in a box the wider screen's width by both heights, the box scaled to fit and centred,
+           each screen centred across it */
+        uint32_t width = snx_max_u32(given.top_width, given.bottom_width);
+        uint32_t height = given.top_height + given.bottom_height;
+        /* no frame in either screen, nothing to place: the scale below would divide by zero */
+        if (!width || !height) return true;
+        double scale = (double)window_width / width < (double)window_height / height ? (double)window_width / width
+                                                                                     : (double)window_height / height;
+        double x = (window_width - width * scale) / 2, y = (window_height - height * scale) / 2;
+        set_rect(&rects->top, x + (width - given.top_width) * scale / 2, swap ? y + given.bottom_height * scale : y,
+                 given.top_width * scale, given.top_height * scale);
+        set_rect(&rects->bottom, x + (width - given.bottom_width) * scale / 2, swap ? y : y + given.top_height * scale,
+                 given.bottom_width * scale, given.bottom_height * scale);
+        shown_rects(rects, shown);
+        return true;
+    }
+    /* Azahar's LargeFrameLayout at 11eceda5 (src/core/frontend/framebuffer_layout.cpp, GPL-3.0-or-later), step by step:
+       the large screen at the console's size and the small one at its own size over 2.25 (Azahar's Android default),
+       centred vertically at the large one's right (Azahar's MiddleRight), make one box, scaled to fit the window and
+       centred, the large one at the box's left. Side by side gives the small one its whole size. A narrow or a tall
+       window still leaves a rectangle for each, but a window of a few pixels, too small for the box, leaves none */
+    const uint64_t num = layout == SNX_CTR_LAYOUT_LARGE ? LARGE_SCREEN_NUM : 1;
+    const uint64_t den = layout == SNX_CTR_LAYOUT_LARGE ? LARGE_SCREEN_DEN : 1;
+    const uint32_t large_w = swap ? screens.bottom_width : screens.top_width;
+    const uint32_t large_h = swap ? screens.bottom_height : screens.top_height;
+    const uint32_t small_w = swap ? screens.top_width : screens.bottom_width;
+    const uint32_t small_h = swap ? screens.top_height : screens.bottom_height;
+    const uint64_t sw = small_w * num / den, sh = small_h * num / den;
+    const uint64_t box_w = large_w + sw, box_h = sh > large_h ? sh : large_h;
+    uint64_t fit_w = window_width, fit_h = window_height;
+    if (window_width * box_h <= window_height * box_w)
+        fit_h = window_width * box_h / box_w;
+    else
+        fit_w = window_height * box_w / box_h;
+    const uint64_t x = (window_width - fit_w) / 2, y = (window_height - fit_h) / 2;
+    const uint64_t large_pw = large_w * fit_h / box_h, large_ph = large_h * fit_h / box_h;
+    const uint64_t small_pw = sw * fit_h / box_h, small_ph = sh * fit_h / box_h;
+    const SnxCtrRect large = {(int32_t)x, (int32_t)y, (int32_t)large_pw, (int32_t)large_ph};
+    const int64_t small_y = (int64_t)y + ((int64_t)large_ph - (int64_t)small_ph) / 2;
+    const SnxCtrRect small = {(int32_t)(x + large_pw), (int32_t)small_y, (int32_t)small_pw, (int32_t)small_ph};
+    rects->top = swap ? small : large;
+    rects->bottom = swap ? large : small;
+    shown_rects(rects, shown);
+    return true;
+}
+/* The blit rectangle of a screen in swapchain pixels: in one window the layout's (snx_ctr_layout_rects), in its own
+   window the screen scaled to fit and centred. The layout takes each screen at the console's size, its frame's size
+   over its render scale. False before a layout and a swapchain exist, and for a screen the layout leaves no rectangle:
+   the hidden one, or one with no frame yet */
 static bool screen_rect(unsigned screen, VkOffset2D rect[2]) {
     const Frame* frames = g_present.frames;
     uint32_t width[2], height[2];
@@ -342,18 +473,18 @@ static bool screen_rect(unsigned screen, VkOffset2D rect[2]) {
         rect[1] = (VkOffset2D){(int32_t)(x + width[screen] * scale), (int32_t)(y + height[screen] * scale)};
         return true;
     }
-    uint32_t layout_w = snx_max_u32(width[0], width[1]);
-    uint32_t layout_h = height[0] + height[1];
-    if (!layout_w || !layout_h || !e.width || !e.height) return false;
-    double scale = (double)e.width / layout_w < (double)e.height / layout_h ? (double)e.width / layout_w
-                                                                            : (double)e.height / layout_h;
-    double x = (e.width - layout_w * scale) / 2 + (layout_w - width[screen]) * scale / 2;
-    double y = (e.height - layout_h * scale) / 2 + (screen ? height[0] * scale : 0);
-    rect[0] = (VkOffset2D){(int32_t)x, (int32_t)y};
-    rect[1] = (VkOffset2D){(int32_t)(x + width[screen] * scale), (int32_t)(y + height[screen] * scale)};
+    SnxCtrScreens screens = {width[0], height[0], width[1], height[1]};
+    SnxCtrRects rects = {0};
+    if (!snx_ctr_layout_rects((SnxCtrLayout)g_settings.ctr_screen_layout, g_settings.ctr_screen_swap != 0, e.width,
+                              e.height, screens, &rects))
+        return false;
+    const SnxCtrRect* r = screen ? &rects.bottom : &rects.top;
+    if (r->width <= 0 || r->height <= 0) return false;
+    rect[0] = (VkOffset2D){r->x, r->y};
+    rect[1] = (VkOffset2D){r->x + r->width, r->y + r->height};
     return true;
 }
-/* The touch screen's pixel under a pointer at x and y, in the window's points as SDL reports them. The blit's own scale
+/* The touch screen's pixel under a pointer at x and y, in the window's points as SDL reports them. The draw's own scale
    maps them, so a swapchain whose pixels differ from the window's points still lands on what is shown. As the Switch
    runtime's finger handling does, a press off the screen starts nothing and a drag off it keeps to its edge. Whether
    it touched the screen */
@@ -501,41 +632,37 @@ static void image_barrier(VkCommandBuffer cb, VkImage image, VkImageLayout old, 
                          NULL, 1, &b);
 }
 static void notice_log(const char* text) { fprintf(stderr, "3ds gpu: %s\n", text); }
-/* The window's picture: in one window the top screen above the bottom one, which is centred under it (400 and 320
-   pixels wide, 240 high), the pair scaled as one to fit the swapchain's image and centred in it, the rest black; in
-   separate windows this screen alone, scaled to fit and centred. Over it the notice while one shows in that window,
-   its band in slot's buffer */
-static void show_screens(VkCommandBuffer cb, VkImage target, unsigned screen, unsigned slot) {
-    image_barrier(cb, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkClearColorValue black = {.float32 = {0, 0, 0, 1}};
-    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
-    /* the blits below overwrite the clear's pixels: their writes must wait for it */
-    image_barrier(cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+/* The window's picture: in one window both screens where the layout puts them (snx_ctr_layout_rects), the rest
+   black; in separate windows this screen alone, scaled to fit and centred. Each screen drawn into the window's
+   rendering by its effects (slot: the recording's), the upscaler's and the anti-aliasing's last pass or, with both
+   off, the screen in sharp pixels. Over it the notice while one shows in that window, its band in slot's buffer */
+static void show_screens(VkCommandBuffer cb, unsigned window, uint32_t index, unsigned screen, unsigned slot) {
+    const SnxVkSwapchain* sc = &g_present.swap[window];
+    const SnxFxConfig* c = &g_present.fx_config;
+    bool drawn[2] = {false, false};
+    /* every pass but each screen's last, outside the window's rendering */
     for (unsigned i = 0; i < 2; ++i) {
         if (g_present.separate && i != screen) continue;
         Frame* f = &g_present.frames[i];
         VkOffset2D rect[2];
         /* a screen not drawn yet stays black */
         if (!f->image || f->layout == VK_IMAGE_LAYOUT_UNDEFINED || !screen_rect(i, rect)) continue;
-        image_barrier(cb, f->image, f->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        f->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                            .srcOffsets = {{0, 0, 0}, {(int32_t)f->width, (int32_t)f->height, 1}},
-                            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                            .dstOffsets = {{rect[0].x, rect[0].y, 0}, {rect[1].x, rect[1].y, 1}}};
-        vkCmdBlitImage(cb, f->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       1, &blit, VK_FILTER_NEAREST);
+        VkRect2D to = {rect[0], {(uint32_t)(rect[1].x - rect[0].x), (uint32_t)(rect[1].y - rect[0].y)}};
+        image_barrier(cb, f->image, f->layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        f->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        drawn[i] = snx_fx_prepare(g_present.fx[i], cb, slot, f->view, f->layout, f->width, f->height, 0, 0, f->width,
+                                  f->height, 0, to, sc->format.format, c->upscaler, c->aa);
     }
+    snx_vk_swapchain_begin(cb, sc, index);
+    for (unsigned i = 0; i < 2; ++i)
+        if (drawn[i]) snx_fx_draw(g_present.fx[i], cb, slot);
     /* the notice over the window it was asked in: the screen's own, or the one both share */
-    unsigned shown = g_present.separate ? screen : 0;
-    SDL_Window* window = screen_window(shown);
-    if (window && SDL_GetWindowID(window) == g_present.notice_window)
-        (void)snx_vk_notice_record(g_present.notice_vk[shown], cb, slot, target, g_present.swap[shown].format.format,
-                                   g_present.swap[shown].extent.width, g_present.swap[shown].extent.height,
-                                   snx_display_percent(SDL_GetWindowDisplayScale(window)), &g_present.notice,
-                                   SDL_GetTicksNS(), notice_log);
-    image_barrier(cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    SDL_Window* shown = screen_window(window);
+    if (shown && SDL_GetWindowID(shown) == g_present.notice_window)
+        (void)snx_vk_notice_draw(g_present.notice_vk[window], cb, slot, sc->format.format, sc->extent.width,
+                                 sc->extent.height, snx_display_percent(SDL_GetWindowDisplayScale(shown)),
+                                 &g_present.notice, SDL_GetTicksNS(), notice_log);
+    snx_vk_swapchain_end(cb, sc, index);
 }
 bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigned height, unsigned format,
                            unsigned pitch, uint64_t* hash) {
@@ -570,7 +697,7 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
     if (!from_target || scaled.kept) /* the draws over it stored, and its stale pages in the copy */
         snx_ctr_vk_sync(pa, pitch * (height - 1) + width * bytes, false);
     VkCommandBuffer cb = snx_ctr_vk_commands();
-    unsigned slot = snx_ctr_vk_slot(); /* the open recording's, whose semaphores it takes */
+    unsigned slot = snx_ctr_vk_slot(); /* the open recording's, whose acquire semaphore it takes */
     uint64_t recording = snx_ctr_vk_serial();
     snx_ctr_vk_compute_barrier(cb);    /* after what the GPU wrote to the framebuffer */
     image_barrier(cb, f->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL); /* the shader writes all of it */
@@ -662,20 +789,20 @@ bool snx_ctr_present_frame(unsigned screen, uint32_t pa, unsigned width, unsigne
     }
     if (show) {
         g_present.bottom_alone = 0;
-        show_screens(cb, g_present.swap[window_index].images[index], screen, slot);
+        show_screens(cb, window_index, index, screen, slot);
     }
     /* submitted, waited for only when the host reads the frame (a dump, a test's hash) */
     bool ok = true;
     if (show) {
         uint64_t serial =
-            snx_ctr_vk_submit_with(g_present.acquire[window_index][slot], g_present.presented[window_index][slot]);
+            snx_ctr_vk_submit_with(g_present.acquire[window_index][slot], g_present.presented[window_index][index]);
         ok = !waited || snx_ctr_vk_wait(serial, UINT64_MAX);
     } else if (waited)
         ok = snx_ctr_vk_finish();
     if (show && ok) {
         VkPresentInfoKHR present = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                                     .waitSemaphoreCount = 1,
-                                    .pWaitSemaphores = &g_present.presented[window_index][slot],
+                                    .pWaitSemaphores = &g_present.presented[window_index][index],
                                     .swapchainCount = 1,
                                     .pSwapchains = &g_present.swap[window_index].swapchain,
                                     .pImageIndices = &index};
@@ -855,12 +982,14 @@ void snx_ctr_present_free(void) {
         if (g_present.swap[screen].swapchain) swap_destroy(screen);
     for (unsigned i = 0; i < 2; ++i) frame_free(&g_present.frames[i]);
     frame_free(&g_present.source_dummy);
+    for (unsigned i = 0; i < 2; ++i) snx_fx_destroy(g_present.fx[i]);
     for (unsigned screen = 0; screen < 2; ++screen) snx_vk_notice_destroy(g_present.notice_vk[screen]);
-    for (unsigned screen = 0; screen < 2; ++screen)
-        for (unsigned i = 0; i < SNX_CTR_VK_SLOTS; ++i) {
+    for (unsigned screen = 0; screen < 2; ++screen) {
+        for (unsigned i = 0; i < SNX_CTR_VK_SLOTS; ++i)
             if (g_present.acquire[screen][i]) vkDestroySemaphore(v->device, g_present.acquire[screen][i], NULL);
+        for (unsigned i = 0; i < SNX_VK_SWAP_IMAGES; ++i)
             if (g_present.presented[screen][i]) vkDestroySemaphore(v->device, g_present.presented[screen][i], NULL);
-        }
+    }
     if (g_present.readback_view) vkUnmapMemory(v->device, g_present.readback_memory);
     if (g_present.readback) vkDestroyBuffer(v->device, g_present.readback, NULL);
     if (g_present.readback_memory) vkFreeMemory(v->device, g_present.readback_memory, NULL);

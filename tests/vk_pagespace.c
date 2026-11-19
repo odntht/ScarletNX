@@ -34,6 +34,7 @@ static struct {
     u8 region[SPACE];      /* the region's buffer, where a granule has memory */
     u8 bound[SPACE >> 16]; /* the granules with memory */
     u32 wrote[NPAGES];     /* the clock at a page's last write by the CPU */
+    u8 dirty[NPAGES];      /* the tracking's dirty bit of a page: set at each write, cleared by the cache */
     u32 clock, epoch;
     u64 sub;
     u8 stage[STAGE];
@@ -41,6 +42,7 @@ static struct {
     u32 stage_refuse; /* the piece of the ring refused, counted down: 1 refuses the next */
     u32 before;       /* vk_present_before's answer */
     u32 copies, binds, unbinds;
+    u32 trapped_asks; /* calls of own_trapped */
 } g_t;
 
 VkState g_vk;
@@ -81,6 +83,20 @@ int vk_written_since(const u8* host, u64 len, u32 since) {
         if (g_t.wrote[p] > since) return 1;
     return 0;
 }
+/* the dirty bits (buffer.c): the cache asks them where it is in dirty mode, the default */
+int vk_ww_take(const u8* host, u64 len) {
+    (void)host, (void)len;
+    return 0;
+}
+int vk_ww_dirty_init(void) { return 0; }
+int vk_ww_dirty_any(u64 cpu, u64 len) {
+    for (u64 p = cpu >> 12, e = (cpu + len - 1) >> 12; p <= e; p++)
+        if (g_t.dirty[p]) return 1;
+    return 0;
+}
+void vk_ww_dirty_clear(u64 cpu, u64 len) {
+    for (u64 p = cpu >> 12, e = (cpu + len - 1) >> 12; p <= e; p++) g_t.dirty[p] = 0;
+}
 void vk_written_runs(const u8* host, u64 len, u32 since, void (*fn)(void*, u64, u64), void* user) {
     u64 first = (u64)(host - g_t.mem) >> 12, n = (len + 4095) >> 12;
     for (u64 p = 0; p < n; p++) {
@@ -105,6 +121,7 @@ u32 own_lookup(u64 addr, u64 size, OwnRange* out, u32 max) {
 }
 int own_trapped(u64 addr, u64 size) {
     (void)addr, (void)size;
+    g_t.trapped_asks++;
     return 0;
 }
 void own_acquire(u64 addr, u64 size) { (void)addr, (void)size; }
@@ -116,6 +133,7 @@ void vk_own_res_unref(VkOwnRes* r) { (void)r; }
 void vk_own_res_wrote(VkOwnRes* r) { (void)r; }
 void vk_own_publish(u64 cpu, u64 size, VkOwnRes* r, u64 off) { (void)cpu, (void)size, (void)r, (void)off; }
 void vk_mem_track(DevMem a, u32 owner) { (void)a, (void)owner; }
+void vk_descriptor_heaps_lasting(VkBuffer buffer) { (void)buffer; } /* no descriptor heaps here */
 u64 vk_submit_number(void) { return g_t.sub; }
 u32 vk_present_before(u64 ago_ns, u32 presents) {
     (void)ago_ns, (void)presents;
@@ -159,6 +177,14 @@ VkResult vk_devmem_alloc(const VkMemoryRequirements* req, const DevMemWant* want
     return VK_SUCCESS;
 }
 void vk_devmem_free(DevMem mem) { (void)mem; }
+/* the defrag's: no block is emptied here, so a granule is never moved. Its owner is the granule, tagged */
+void vk_devmem_owner(DevMem mem, void* owner) {
+    (void)mem;
+    CHECK(!owner || VK_MOVE_IS_PAGE(owner));
+}
+void vk_devmem_info(DevMem mem, DevMemInfo* info) {
+    *info = (DevMemInfo){.memory = (VkDeviceMemory)(uintptr_t)mem, .size = 65536};
+}
 /* the slabs' calls: the model's device has sparse buffers, so the cache makes no slab here */
 VkResult vk_buffer_create(const VkBufferCreateInfo* info, const DevMemWant* allocation, VkBuffer* buffer, DevMem* memory,
                           DevMemInfo* allocation_info) {
@@ -210,7 +236,7 @@ static u32 rnd(void) {
 /* the CPU writes [at, at + n): new bytes, and its pages written now */
 static void cpu_write(u64 at, u64 n) {
     for (u64 i = 0; i < n; i++) g_t.mem[at + i] = (u8)rnd();
-    for (u64 p = at >> 12; p <= (at + n - 1) >> 12; p++) g_t.wrote[p] = ++g_t.clock;
+    for (u64 p = at >> 12; p <= (at + n - 1) >> 12; p++) g_t.wrote[p] = ++g_t.clock, g_t.dirty[p] = 1;
 }
 /* the next submission of a stream's job, and its next job: the CPU's writes so far are what its checks look for */
 static void next_submission(void) {
@@ -231,6 +257,47 @@ static int get(u64 at, u64 n) {
     for (u64 g = at >> 16; g <= (at + n - 1) >> 16; g++) CHECK(g_t.bound[g]);
     CHECK(!memcmp(g_t.region + at, g_t.mem + at, n));
     return 1;
+}
+
+/* A range that takes no page and holds none of the cache's own is marked a granule at a time (bring): each granule
+   over it is found unwritten in the epoch for the range's pages alone, keeps the bits of its other pages from earlier
+   in the same epoch, and is stamped with the present and the submission. Nothing else of a granule changes. With
+   nothing written and no page new, ask does not look up the trapped pages (own_trapped), also with an owner in the
+   space. A page written since: it is taken, and they are looked up */
+static void check_still(void) {
+    const u64 x = 0x710000, g0 = x >> 16; /* granules no range asked for before */
+    PgGran was[8];
+    next_epoch();
+    CHECK(get(x, 0x60000)); /* granules g0 to g0 + 5, all their pages taken */
+    PgRegion* r = g_pages.region[0];
+    CHECK(r && !r->gran[g0 - 1] && !r->gran[g0 + 6]);
+    next_epoch();
+    for (u32 i = 0; i < 6; i++) was[i] = *r->gran[g0 + i];
+    g_own.nown = 1; /* an owner in the space, so that own_trapped can be asked */
+    g_t.trapped_asks = 0;
+    g_vk_present += 7;
+    u32 copies = g_t.copies;
+    /* from page 4 of the first granule to page 4 of the last */
+    CHECK(get(x + 0x4800, 0x50000) && g_t.copies == copies && !g_t.trapped_asks);
+    static const u16 mask[6] = {0xFFF0, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x001F};
+    for (u32 i = 0; i < 6; i++) {
+        const PgGran *q = r->gran[g0 + i], *w = &was[i];
+        CHECK(q->ck_epoch == g_t.epoch && q->ck_mask == mask[i] && q->used == g_vk_present && q->given == g_t.sub);
+        CHECK(q->mem == w->mem && q->own == w->own && q->full == w->full && q->cpu_wrote == w->cpu_wrote);
+        CHECK(q->gw_min == w->gw_min && q->seen_min == w->seen_min);
+        CHECK(!memcmp(q->seen, w->seen, sizeof q->seen) && !memcmp(q->gw, w->gw, sizeof q->gw));
+    }
+    CHECK(!r->gran[g0 - 1] && !r->gran[g0 + 6]);
+    /* the same epoch, the next submission: pages 8 and 9 of the last granule add their bits */
+    next_submission();
+    CHECK(get(x + 0x58000, 0x2000) && g_t.copies == copies && !g_t.trapped_asks);
+    CHECK(r->gran[g0 + 5]->ck_mask == (0x001F | 0x0300) && r->gran[g0 + 5]->given == g_t.sub);
+    CHECK(r->gran[g0 + 4]->ck_mask == 0xFFFF && r->gran[g0 + 4]->given == g_t.sub - 1);
+    /* a page written since: it is taken, and the trapped pages are looked up */
+    cpu_write(x + 0x20000, 0x10);
+    next_epoch();
+    CHECK(get(x + 0x4800, 0x50000) && g_t.copies == copies + 1 && g_t.trapped_asks);
+    g_own.nown = 0;
 }
 
 int main(void) {
@@ -278,6 +345,7 @@ int main(void) {
     next_submission();
     CHECK(get(0x200000 + PG_STAGE * 4096 - 0x800, 0x1000)); /* the pages on both sides of the refusal */
     CHECK(get(0x200000, 0x500000));
+    check_still();
 
     /* ranges of every size over the memory, the CPU writing between the epochs, a piece of the ring refused now and
        then: what the cache serves is memory's bytes */

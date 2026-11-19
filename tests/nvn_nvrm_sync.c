@@ -166,6 +166,13 @@ u32 nvmap_handle_new(u64 addr, u64 size) {
     return 0;
 }
 void nvmap_handle_drop(u32 h) { (void)h; }
+/* the page table's changes the GPU thread makes later (hle/services/nvdrv.c), which no test here reads */
+u32 gmmu_later(GmmuLaterKind kind, u64 gva, u64 cpu, u64 size, u32 nvmap) {
+    (void)kind, (void)gva, (void)cpu, (void)size;
+    nvmap_handle_drop(nvmap);
+    return 1;
+}
+void gmmu_later_post(u32 seq) { (void)seq; }
 void nvn_cmd_memory_back(u64 memory, u64 size) {
     (void)memory;
     (void)size;
@@ -176,7 +183,8 @@ void nvn_draw_device(u32 origin, u32 depth_mode) {
 }
 int nvn_fmt_bpb(int format, int* bw, int* bh) {
     (void)format;
-    *bw = *bh = 1;
+    if (bw) *bw = 1;
+    if (bh) *bh = 1;
     return 0;
 }
 void nvn_read_texels(u64 t, u64 v, u64 region, u64 dst, i64 row, i64 image) {

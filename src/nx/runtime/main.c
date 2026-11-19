@@ -14,6 +14,7 @@
 #include "common/utilities/common.h"
 #include "common/utilities/ini_lines.h"
 #include "common/utilities/run_mark.h"
+#include "nx/gpu/gl/gl_census.h"
 #include "nx/gpu/gpu.h"
 #include "nx/gpu/nvn/nvn_loader.h"
 #include "nx/gpu/nvn/nvn_state.h"
@@ -62,6 +63,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -99,10 +101,10 @@ const SnxModule* g_mod;
 const SnxVariants* g_variants;
 const SnxRoutes* g_routes;
 const SnxNros* g_nros;
-GuestFn* g_disp;
+_Atomic GuestFn* g_disp;
 
 /* A build that links a game's code into the runtime defines it; none does yet (src/nx/CMakeLists.txt) */
-const SnxModule* snx_module_static(void) __attribute__((weak));
+[[gnu::weak]] const SnxModule* snx_module_static(void);
 
 typedef const SnxModule* (*ModuleFn)(void);
 typedef const SnxArmModule* (*ArmModuleFn)(void);
@@ -361,13 +363,16 @@ static void dispatch_init(void) {
     if (g_code_hi <= g_code_lo) return;
     words = (g_code_hi - g_code_lo) / 4;
     if (words > SIZE_MAX / sizeof *g_disp) fatal("The game's code range is too large");
-    g_disp = (GuestFn*)calloc((size_t)words, sizeof *g_disp);
+    g_disp = (_Atomic GuestFn*)calloc((size_t)words, sizeof *g_disp);
     if (!g_disp)
         fatal("Out of memory for the game's dispatch table (%llu MiB)",
               (unsigned long long)(words * sizeof *g_disp >> 20));
     for (i = 0; i < g_mod->nentries; i++) {
         u64 a = g_mod->entry_addr[i];
-        if (a >= g_code_lo && a < g_code_hi && !(a & 3)) g_disp[(a - g_code_lo) / 4] = g_mod->entry_fn[i];
+        if (a >= g_code_lo && a < g_code_hi && !(a & 3))
+            atomic_store_explicit(&g_disp[(a - g_code_lo) / 4],
+                                  atomic_load_explicit(&g_mod->entry_fn[i], memory_order_relaxed),
+                                  memory_order_relaxed);
     }
 }
 
@@ -677,6 +682,7 @@ void snx_save_before_exit(void) {
         svc_core_exit();
         jit_report();
         kernel_core_report();
+        gl_census_report();
         saved = 1;
     }
     pm_unlock(&lock);
@@ -697,7 +703,8 @@ static void write_threads(u64 second) {
     snprintf(path, sizeof path, "%sthreads.txt", g_statedir);
     f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "second %llu, frames %d\n", (unsigned long long)second, __atomic_load_n(&g_frames, __ATOMIC_RELAXED));
+    fprintf(f, "second %llu, frames %d\n", (unsigned long long)second,
+            atomic_load_explicit(&g_frames, memory_order_relaxed));
     t_plat.log_redirect = f; /* this thread's lines only: the others keep the log */
     kernel_dump_threads();
     t_plat.log_redirect = NULL;
@@ -867,7 +874,8 @@ static void frontend_loop(void) {
             SNX_ZONE_END(z_hid);
         }
         if (plat_ns() >= vsync) vsync = vsync_signal(vsync, paused);
-        if (++tick % 60 == 0) ini_poll(0);
+        int due = ini_poll_due(); /* a pick the menu took out, shown at once */
+        if (++tick % 60 == 0 || due) ini_poll(0);
         frontend_frame();
         switch_tick();
         SNX_ZONE_END(z_frontend);
@@ -878,14 +886,14 @@ static void frontend_loop(void) {
             u64 waits = 0, timeouts = 0;
             syncpt_wait_stats(&waits, &timeouts);
             RatePlot rates[] = {
-                {"io read MB/s", __atomic_load_n(&g_fs_bytes_read, __ATOMIC_RELAXED), 1u << 20},
-                {"io write MB/s", __atomic_load_n(&g_fs_bytes_written, __ATOMIC_RELAXED), 1u << 20},
+                {"io read MB/s", atomic_load_explicit(&g_fs_bytes_read, memory_order_relaxed), 1u << 20},
+                {"io write MB/s", atomic_load_explicit(&g_fs_bytes_written, memory_order_relaxed), 1u << 20},
                 {"own traps/s", own_faults(), 1},
                 {"own land MB/s", own_land_bytes(), 1u << 20},
-                {"texture cache hits/s", __atomic_load_n(&g_tex_cache_hits, __ATOMIC_RELAXED), 1},
-                {"texture cache misses/s", __atomic_load_n(&g_tex_cache_misses, __ATOMIC_RELAXED), 1},
-                {"texture upload MB/s", __atomic_load_n(&g_tex_upload_bytes, __ATOMIC_RELAXED), 1u << 20},
-                {"texture frees/s", __atomic_load_n(&g_tex_frees, __ATOMIC_RELAXED), 1},
+                {"texture cache hits/s", atomic_load_explicit(&g_tex_cache_hits, memory_order_relaxed), 1},
+                {"texture cache misses/s", atomic_load_explicit(&g_tex_cache_misses, memory_order_relaxed), 1},
+                {"texture upload MB/s", atomic_load_explicit(&g_tex_upload_bytes, memory_order_relaxed), 1u << 20},
+                {"texture frees/s", atomic_load_explicit(&g_tex_frees, memory_order_relaxed), 1},
                 {"syncpt waits/s", waits, 1},
                 {"syncpt timeouts/s", timeouts, 1},
                 {"hid updates/s", hid_updates(), 1},
@@ -907,7 +915,7 @@ static void frontend_loop(void) {
            a verbose run explicitly opts into periodic snapshots. */
         if (tick % 900 == 0 && g_settings.log_level >= 2) write_threads(tick / VI_REFRESH_HZ);
         now = plat_ns();
-        shown = __atomic_load_n(&g_frames, __ATOMIC_RELAXED);
+        shown = atomic_load_explicit(&g_frames, memory_order_relaxed);
         /* the pace the game is shown at, in the log every five seconds: a phone has no overlay to read it from */
         if (now - rate_at >= 5000000000u) {
             LOG("perf: %.1f frames a second over %.1f s (%d shown in all)\n",
@@ -1061,6 +1069,30 @@ static void prepare_wait(const char* title) {
         (unsigned long long)((plat_ns() - t0) / 1000000u), g_quit ? "would have started" : "started", p.shipped,
         p.pipes_made, p.pipes, how, ended);
     unattended_start(); /* scripted presses and the timed exit count from the game's start */
+}
+/* the notification over the game fades in and out as the launcher's screens do: the fade_in_ms and fade_out_ms of the
+   theme it shows, or YoRHa's built in where that can't be read. Nothing shows on a headless run; a window minimized
+   now shows them later */
+static void toast_fades(void) {
+    SnxRunTheme theme = {0};
+    char* dir;
+    u32 ms[2];
+    int themed;
+    if (g_opt_headless) return;
+    dir = snx_menu_run_theme ? backend_launcher_folder() : NULL;
+    if (dir) snx_menu_run_theme(dir, &theme);
+    free(dir);
+    themed = theme.ink != theme.page; /* all zeros when the launcher couldn't say */
+    ui_lock();
+    overlay_fades(themed ? &theme : NULL, ms);
+    ui_unlock();
+    if (themed)
+        LOG("overlay: notifications fade in over %u ms and out over %u ms, as the %s theme's screens\n", ms[0], ms[1],
+            theme.name);
+    else
+        LOG("overlay: notifications fade in over %u ms and out over %u ms, as YoRHa's built in: the launcher's theme "
+            "could not be read\n",
+            ms[0], ms[1]);
 }
 
 /* ---- startup ---- */
@@ -1321,7 +1353,7 @@ static void switch_tick(void) {
     if (!g_switch.on) return;
     now = plat_ns();
     waited = (now - g_switch.opened) / 1000000u;
-    if (__atomic_load_n(&g_frames, __ATOMIC_RELAXED)) {
+    if (atomic_load_explicit(&g_frames, memory_order_relaxed)) {
         ui_lock();
         prepare_screen_switch(NULL, NULL, -1, NULL, 0, NULL, 0);
         ui_unlock();
@@ -1522,6 +1554,8 @@ int snx_main(int argc, char** argv) {
     nnprepo_init();
     hook_install(); /* before NVN, which takes what a slot holds, and the JIT, which reads the slots */
     nvn_loader_init();
+    /* after the hooks and NVN: it counts in front of what they put in a slot */
+    gl_census_init();
     linker_init(); /* after the hooks and NVN, whose slots it leaves alone */
     entry = linker_entry(entry);
     /* after NVN, which says whether calls must go through the slots it takes. The JIT compiles A64: a 32-bit
@@ -1559,6 +1593,7 @@ int snx_main(int argc, char** argv) {
         video_init(title, addons);
     }
     switch_start(title);
+    toast_fades();
     /* the log's line on the host's power state, and the mode docked's Auto picks, before the game's first thread */
     options_tv_mode_start();
     if (g_settings.profiler) {

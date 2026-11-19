@@ -55,6 +55,7 @@
 #include "nx/gpu/vk/ledger.h"
 #include "nx/gpu/vk/descriptors.h"
 #include "nx/gpu/vk/pagespace.h"
+#include "nx/gpu/vk/descriptor_heaps.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/memory/mem.h"
 #include "nx/memory/own.h"
@@ -95,8 +96,13 @@ static u64 g_pages_system; /* granules that took system memory, the GPU's having
    since the oldest of its pages was taken */
 enum { PG_CUR, PG_NEW, PG_OLD, PG_MINE, PG_OLD_CPU /* PG_OLD, by a write of the CPU */, PG_CPU = 0x10, PG_GPU = 0x20 };
 
+struct PgRegion;
 typedef struct {
     DevMem mem;  /* a sparse region's granule: its memory */
+    /* its region and its index there, for a move of its memory (vk_pages_move_begin): a granule in the GPU's memory
+       has VK_MOVE_PAGE of itself as the owner of its memory until a draw writes it (own) */
+    struct PgRegion* region;
+    u32 index;
     u32 slab;    /* with slabs: the region's slab it is in, plus one */
     /* the owner its pages are published under once a draw wrote them (vk_pages_write), with a reference: NULL until
        then. A landing waits for the submission that last wrote this granule, not the region */
@@ -122,7 +128,7 @@ typedef struct {
        upload commands run before all of them */
     u64 late;
 } PgSlab;
-typedef struct {
+typedef struct PgRegion {
     VkBuffer buf; /* the sparse buffer, or none with slabs */
     PgSlab* slab;
     u32 nslab;
@@ -140,6 +146,7 @@ typedef struct {
 static struct {
     int on;    /* -1 until vk_pages_on has decided */
     int slabs; /* the regions' bytes are in slabs, not in sparse buffers */
+    int dirty; /* the write tracking's dirty bits tell which pages were written, not the clocks: 0 without them */
     u32 nslabs;
     VkMemoryRequirements req;
     PgRegion** region; /* by region of guest memory, NULL where no range was asked for */
@@ -210,6 +217,10 @@ int vk_pages_on(void) {
             "in granules of %llu KiB%s (vk_buffer_pages=%d)\n",
             (unsigned long long)(PG_REGION >> 30), g_pages.region_max, (unsigned long long)(PG_SIZE >> 10),
             g_settings.buffer_pages >= 2 ? ", and draws write guest memory there" : "", g_settings.buffer_pages);
+    if (vk_ww_dirty_init() < 0)
+        LOG("vulkan: no memory for the page cache's dirty bits: it compares the clocks of the pages\n");
+    else
+        g_pages.dirty = 1;
     return g_pages.on = 1;
 }
 
@@ -230,14 +241,15 @@ static VkBufferCreateInfo pg_buffer_info(VkBufferCreateFlags flags, u64 size, u3
         /* whatever a draw or a dispatch binds guest memory as, and a copy's source and destination (buffer.c's
            make_own_); what a draw writes there, transform feedback's captures too (owned.c vk_own_res_new); its
            address too where descriptors are written into buffers (descriptors.c vk_buffer_create) */
-        .usage =
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
-            VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-            (g_vk.has_xfb ? VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT : 0) |
-            (g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-                                                                             : 0),
+        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 (g_vk.has_xfb ? VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT : 0) |
+                 (g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support || g_vk.has_gbuf_address
+                      ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                      : 0),
         .sharingMode = fam[0] != fam[1] ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = fam[0] != fam[1] ? 2 : 0,
         .pQueueFamilyIndices = fam};
@@ -270,6 +282,7 @@ static PgRegion* region_get(u64 rg) {
             return NULL;
         }
     }
+    vk_descriptor_heaps_lasting(r->buf); /* it lives as long as the cache: its descriptors are kept */
     g_pages.nregion++;
     return g_pages.region[rg] = r;
 }
@@ -281,7 +294,8 @@ static PgGran* gran_get(PgRegion* r, u64 g) {
     if (!q) return NULL;
     VkMemoryRequirements req = g_pages.req;
     req.size = PG_SIZE;
-    DevMemWant aci = {.at = DM_DEVICE};
+    /* in the GPU's memory it moves out of a block that is emptied (vk_pages_move_begin), until a draw writes it */
+    DevMemWant aci = {.at = DM_DEVICE, .moves = 1};
     DevMemInfo info;
     /* the GPU's memory, else system memory, where the GPU reads it over the bus: a range refused for want of memory
        is copied to the ring at every submission, and on a GPU of 2 GB under a desktop the GPU's memory has no room
@@ -289,6 +303,7 @@ static PgGran* gran_get(PgRegion* r, u64 g) {
     VkResult got = vk_devmem_alloc(&req, &aci, &q->mem, &info);
     if (got != VK_SUCCESS) {
         aci.at = DM_SYSTEM;
+        aci.moves = 0;
         got = vk_devmem_alloc(&req, &aci, &q->mem, &info);
         if (got == VK_SUCCESS) g_pages_system++;
     }
@@ -304,16 +319,61 @@ static PgGran* gran_get(PgRegion* r, u64 g) {
         return NULL;
     }
     vk_mem_track(q->mem, VK_OWN_BUFFER);
+    q->region = r;
+    q->index = (u32)g;
+    if (aci.moves) vk_devmem_owner(q->mem, VK_MOVE_PAGE(q));
     g_pages.bound++;
     return r->gran[g] = q;
 }
 
 u64 vk_pages_system(void) { return g_pages_system; }
+
+/* A granule moved out of a block that is emptied (the defrag, texture.c), as a sparse texture's block is: its bytes
+   copied out to scratch on the GPU and submitted, its range of the sparse buffer bound to the new memory in the batch,
+   which waits for that work, and its bytes copied back in the next submission. Not one a draw wrote (own), whose
+   writes may come from the compute queue, which none of these waits for. The owner is the granule, which gives up
+   its memory's owner before it goes (gran_drop) */
+int vk_pages_move_begin(void* owner, DevMem a, DevMem* to, VkBuffer* buf, u64* offset) {
+    *to = 0;
+    const PgGran* q = (const PgGran*)(void*)((uintptr_t)owner & ~(uintptr_t)3u);
+    if (q->mem != a || q->own || !q->region || !q->region->buf) return -1;
+    *buf = q->region->buf;
+    *offset = (u64)q->index << PG_SHIFT;
+    VkMemoryRequirements req = g_pages.req;
+    req.size = PG_SIZE;
+    const DevMemWant want = {.at = DM_DEVICE, .existing = 1};
+    DevMemInfo info;
+    return vk_devmem_alloc(&req, &want, to, &info) == VK_SUCCESS ? 1 : 0;
+}
+int vk_pages_move_end(void* owner, DevMem a, DevMem to) {
+    PgGran* q = (PgGran*)(void*)((uintptr_t)owner & ~(uintptr_t)3u);
+    if (q->mem != a || q->own) { /* gone meanwhile, or written: nothing moves */
+        vk_devmem_free(to);
+        return 0;
+    }
+    DevMemInfo info;
+    vk_devmem_info(to, &info);
+    const VkSparseMemoryBind b = {.resourceOffset = (u64)q->index << PG_SHIFT,
+                                  .size = PG_SIZE,
+                                  .memory = info.memory,
+                                  .memoryOffset = info.offset};
+    vk_devmem_owner(a, NULL); /* not given out again: freed after the batch */
+    if (!vk_buffer_sparse_bind(q->region->buf, &b, a, PG_SIZE, VK_BIND_MOVE)) { /* no room for the bind: it stays */
+        vk_devmem_owner(a, owner);
+        vk_devmem_free(to);
+        return 0;
+    }
+    vk_mem_track(to, VK_OWN_BUFFER);
+    vk_devmem_owner(to, owner);
+    q->mem = to;
+    return 1;
+}
 /* granule g of r gives its memory back, once the work that may still read it is done */
 static void gran_drop(PgRegion* r, u64 g) {
     PgGran* q = r->gran[g];
     VkSparseMemoryBind b = {.resourceOffset = g << PG_SHIFT, .size = PG_SIZE};
     if (!vk_buffer_sparse_bind(r->buf, &b, q->mem, PG_SIZE, 1)) return; /* no room for the bind now: it stays */
+    vk_devmem_owner(q->mem, NULL); /* not moved once it is let go (devmem.h) */
     r->gran[g] = NULL;
     g_pages.bound--;
     g_pages.stats.let_go++;
@@ -405,6 +465,7 @@ static u32 slab_join(PgRegion* r, u64 g0, u64 g1, u64 sub) {
         return 0;
     }
     vk_mem_track(made.mem, VK_OWN_BUFFER);
+    vk_descriptor_heaps_lasting(made.buf); /* kept descriptors until slab_retire's buffer goes (devmem.c forgets) */
     VkCommandBuffer cb = VK_NULL_HANDLE;
     for (u64 g = lo; g <= hi; g++) {
         PgGran* q = r->gran[g];
@@ -538,6 +599,7 @@ typedef struct {
     u64 sub, gnow;  /* the submission, and the clocks read before any byte: a write after them shows at the next ask */
     u32 now, epoch;
     u64 stale;   /* the pages that take bytes */
+    int mine;    /* a page of it holds bytes the cache owns (PG_MINE) */
     u64 covered; /* the range's bytes that the cache owns already */
     int hot;   /* one of them was given out in this submission: they are copied after its draws */
     VkBuffer buf; /* what the range binds (bring): the region's buffer, or its slab's */
@@ -548,6 +610,11 @@ static void cpu_note(void* user, u64 at, u64 n) {
     PgAsk* a = user;
     for (u64 p = at >> 12, e = (at + n - 1) >> 12; p <= e; p++)
         if ((a->take[p] & 15) == PG_CUR) a->take[p] |= PG_CPU;
+}
+/* the pages of a with their dirty bit set, written since they were taken (cpu_note's, from vk_ww_dirty_any) */
+static void dirty_note(PgAsk* a, u64 n) {
+    for (u64 p = 0; p < n; p++)
+        if ((a->take[p] & 15) == PG_CUR && vk_ww_dirty_any(a->base + (p << 12), 4096)) a->take[p] |= PG_CPU;
 }
 static void gpu_note(void* user, u64 at, u64 n) { /* at: a GPU address (gpu_mem_dirty_runs) */
     PgAsk* a = user;
@@ -567,10 +634,9 @@ static int ask(u64 gva, u64 len, u64 align, int patch, int whole, PgAsk* a) {
     a->at = cpu & (PG_REGION - 1);
     if (cpu + len > AS_SIZE || (cpu + len - 1) >> PG_REGION_SHIFT != rg) return refuse(PG_NO_REGION);
     if (align > 1 && a->at % align) return refuse(PG_NO_ALIGN);
-    u32 now = a->now = vk_ww_now(), epoch = a->epoch = vk_ww_epoch();
+    u32 epoch = a->epoch = vk_ww_epoch();
     a->gnow = gpu_mem_generation();
     a->sub = vk_submit_number();
-    if (!now) return refuse(PG_NO_TRACK); /* a stamp of 0 is a page with no bytes */
     PgRegion* r = a->r = region_get(rg);
     if (!r) return refuse(PG_NO_MEMORY);
     u64 p0 = a->p0 = a->at >> 12, p1 = a->p1 = (a->at + len - 1) >> 12, n = p1 - p0 + 1;
@@ -578,6 +644,7 @@ static int ask(u64 gva, u64 len, u64 align, int patch, int whole, PgAsk* a) {
     u64 bgva = a->bgva = gva - (cpu - base); /* the pages of a run go on alike */
     memset(a->take, PG_CUR, n);
     a->stale = a->covered = 0;
+    a->mine = 0;
     a->hot = 0;
     /* the pages with bytes the cache owns, which hold the truth; another owner's bytes in the range are not here at
        all */
@@ -589,6 +656,7 @@ static int ask(u64 gva, u64 len, u64 align, int patch, int whole, PgAsk* a) {
             const PgGran* q = r->gran[at >> PG_SHIFT];
             if (q && q->own && o[i].res == q->own) {
                 for (u64 p = at >> 12, e = (at + o[i].size - 1) >> 12; p <= e; p++) a->take[p - p0] = PG_MINE;
+                a->mine = 1;
                 u64 lo = o[i].addr > cpu ? o[i].addr : cpu;
                 u64 hi = o[i].addr + o[i].size < cpu + len ? o[i].addr + o[i].size : cpu + len;
                 if (hi > lo) a->covered += hi - lo;
@@ -635,7 +703,13 @@ static int ask(u64 gva, u64 len, u64 align, int patch, int whole, PgAsk* a) {
         gpu_mem_dirty_runs(oldest, bgva, n << 12, gpu_note, a);
         looks = 1;
     }
-    if (unasked) {
+    if (unasked && g_pages.dirty) {
+        if (vk_ww_take(GP(base), n << 12) < 0) return refuse(PG_NO_TRACK);
+        if (vk_ww_dirty_any(base, n << 12)) {
+            dirty_note(a, n);
+            looks = 1;
+        }
+    } else if (unasked) {
         int w = vk_written_since(GP(base), n << 12, first);
         if (w < 0) return refuse(PG_NO_TRACK);
         if (w) {
@@ -643,8 +717,14 @@ static int ask(u64 gva, u64 len, u64 align, int patch, int whole, PgAsk* a) {
             looks = 1;
         }
     }
-    /* a page to be read from guest memory must not be trapped there, and one to be the cache's own must have no watch */
-    int trapped = own_any() && own_trapped(base, n << 12);
+    /* the clock after the query, before any byte is read: the pages it took in are marked with this clock at most, so
+       a page taken now is not found written again for them */
+    a->now = vk_ww_now();
+    if (!a->now) return refuse(PG_NO_TRACK); /* a stamp of 0 is a page with no bytes */
+    /* a page to be read from guest memory must not be trapped there, and one to be the cache's own must have no watch.
+       With nothing written since and no page new, a page is read only to be the cache's own (whole): a range that
+       neither takes nor publishes a page walks none of them, where each draw that bound it walked all */
+    int trapped = (looks || whole || a->stale) && own_any() && own_trapped(base, n << 12);
     for (u64 p = p0; p <= p1 && (looks || trapped); p++) {
         u8 t = a->take[p - p0];
         if (t == PG_MINE) continue;
@@ -654,7 +734,7 @@ static int ask(u64 gva, u64 len, u64 align, int patch, int whole, PgAsk* a) {
             u32 k = (u32)(p & (PG_PAGES - 1));
             int old = (t & PG_GPU) && gpu_mem_dirty_since(q->gw[k], bgva + ((p - p0) << 12), 4096), by_cpu = 0;
             if (!old && (t & PG_CPU) && (q->ck_epoch != epoch || !(q->ck_mask >> k & 1))) {
-                int w = vk_written_since(GP(pcpu), 4096, q->seen[k]);
+                int w = g_pages.dirty ? vk_ww_dirty_any(pcpu, 4096) : vk_written_since(GP(pcpu), 4096, q->seen[k]);
                 if (w < 0) return refuse(PG_NO_TRACK);
                 old = by_cpu = w;
             }
@@ -706,6 +786,25 @@ static int bring(PgAsk* a) {
         vk_render_end(); /* copies happen outside rendering passes */
         g_pages.stats.patched++;
     }
+    /* nothing to take, and none of the cache's own: the pages are marked found unwritten in this epoch, a granule's at
+       once, where the walk below went page by page for each draw that bound the range (most bind one that held still,
+       and a window has thousands of pages) */
+    if (!left && !a->mine) {
+        for (u64 g = p0 >> (PG_SHIFT - 12); g <= p1 >> (PG_SHIFT - 12); g++) {
+            PgGran* q = r->gran[g];
+            u64 lo = g << (PG_SHIFT - 12), hi = lo + PG_PAGES - 1;
+            if (lo < p0) lo = p0;
+            if (hi > p1) hi = p1;
+            if (q->ck_epoch != a->epoch) {
+                q->ck_epoch = a->epoch;
+                q->ck_mask = 0;
+            }
+            q->used = g_vk_present;
+            q->given = a->sub;
+            q->ck_mask |= (u16)(((1u << (hi - lo + 1)) - 1) << (lo & (PG_PAGES - 1)));
+        }
+        return 1;
+    }
     VkBuffer sb = VK_NULL_HANDLE;
     u64 so = 0;
     u8* host = NULL;
@@ -742,6 +841,7 @@ static int bring(PgAsk* a) {
                 }
             }
             memcpy(host + (done << 12), GP(a->base + ((p - p0) << 12)), 4096);
+            vk_ww_dirty_clear(a->base + ((p - p0) << 12), 4096); /* taken: a later stamp sets it again */
             q->seen[k] = a->now;
             q->gw[k] = a->gnow;
             q->full |= (u16)(1u << k);
@@ -820,6 +920,8 @@ int vk_pages_write(u64 gva, u64 len, u64 align, int ordered, VkBuffer* buf, u64*
             g_pages.stats.write_refused[PG_WNO_OWNER]++;
             return 0;
         }
+        /* a draw writes it now, and its writes may come from the compute queue, which a move does not wait for */
+        vk_devmem_owner(q->mem, NULL);
         /* the first of all: the reads recorded so far in this submission were not kept */
         if (!g_pages.owners++) {
             order_begin();
@@ -913,7 +1015,7 @@ void vk_pages_frame(void) {
 /* For the budget (surface.c vk_mem_trim, through vk_buf_reclaim): the granules nothing read since `before`, whose
    pages hold no bytes of the GPU's (no owner: their bytes are memory's), give their memory back, until want bytes go;
    a range that reads one again binds it again, or is copied to the ring. vk_pages_frame waits twenty seconds for a
-   granule, which on a GPU of 2 GB held 150 to 190 MB while Mario Kart World's textures were evicted for room every
+   granule, which on a GPU of 2 GB held 150 to 190 MB while a racing game's textures were evicted for room every
    few frames. The bytes let go */
 u64 vk_pages_reclaim(u32 before, u64 want) {
     u64 freed = 0;

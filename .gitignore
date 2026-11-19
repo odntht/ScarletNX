@@ -84,6 +84,9 @@ __pycache__/
 .claude/settings.local.json
 .claude/worktrees/
 
+# OpenCode's MCP config for this checkout, with local absolute paths
+/opencode.json
+
 edenprobe-run/
 # Metal frame captures (renderdoc= on iOS): they hold the game's textures and buffers
 *.gputrace

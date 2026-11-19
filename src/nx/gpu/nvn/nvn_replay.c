@@ -26,8 +26,10 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/runtime/platform/tracy.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 /* What the CPU sees of a submission: a fence's syncpoint increment, or bytes the stream writes (counter reports, event
    writes, an event's add of v to what is there) */
@@ -53,17 +55,28 @@ u32 nvn_replay_shown_syncpt(void) { return g_nvn.replay.shown; }
 typedef void (*RecordFn)(void* ctx, u32 op, u64 payload, u32 size);
 /* each record of the recording at p, in order: a JUMP continues in another segment, a CALL runs another recording,
    the recording's last record (or the empty recording's END) returns */
+/* own_acquire for a record header at p, once for each 4 KiB page a pass reads (*page, ~0 at its start): what the GPU
+   holds of a page lands at the first header the pass reads there, and the headers after it on the same page took
+   own.c's locks again for nothing, while other threads took the same locks to stage guest memory (own_stage) */
+static void acquire_header(u64 p, u64* page) {
+    if (!own_any()) return;
+    u64 at = p & ~(u64)4095;
+    if (at == *page && ((p + sizeof(NvnRecHdr) - 1) & ~(u64)4095) == at) return;
+    own_acquire(p, sizeof(NvnRecHdr));
+    *page = ((p + sizeof(NvnRecHdr) - 1) & ~(u64)4095) == at ? at : ~(u64)0;
+}
 static void walk(u64 p, RecordFn fn, void* ctx, int depth, int sync_only) {
     if (depth > 8) fatal("nvn: recordings call each other more than 8 deep (at %llx)", (unsigned long long)p);
     u32 prev = OP_BEGIN;
     u64 start = p, piece = p; /* piece: where the records walked now start, its handle or the last JUMP's target */
+    u64 page = ~(u64)0;
     for (;;) {
         NvnRecHdr h;
         u32 op;
         /* the submitting game thread, without the renderer's lock: what the GPU holds of the record lands first */
-        if (own_any()) own_acquire(p, sizeof h);
+        acquire_header(p, &page);
         memcpy(&h, GP(p), sizeof h);
-        __atomic_thread_fence(__ATOMIC_ACQUIRE); /* a JUMP's target is written before its header (nvn_cmd.c) */
+        atomic_thread_fence(memory_order_acquire); /* a JUMP's target is written before its header (nvn_cmd.c) */
         op = NVN_REC_OP(h.op);
         if (op >= OP_COUNT_ || h.size < 8 || (h.size & 7)) {
             char where[512];
@@ -99,7 +112,7 @@ static void walk(u64 p, RecordFn fn, void* ctx, int depth, int sync_only) {
 }
 
 void nvn_sync_hold(u64* ready, u32* shown, const NvnSync* s) {
-    if (!__atomic_load_n(&s->fenced, __ATOMIC_ACQUIRE)) return;
+    if (!atomic_load_explicit(&s->fenced, memory_order_acquire)) return;
     if (s->ready > *ready) *ready = s->ready;
     if (!*shown || (s->shown && (i32)(s->shown - *shown) > 0)) *shown = s->shown;
 }
@@ -123,7 +136,7 @@ static void promise(void* ctx, u32 op, u64 payload, u32 size) {
     }
     if (op == OP_WAIT_SYNC) {
         s = NVN_OBJ(NvnSync, gr64(payload));
-        int fenced = __atomic_load_n(&s->fenced, __ATOMIC_ACQUIRE);
+        int fenced = atomic_load_explicit(&s->fenced, memory_order_acquire);
         if (!fenced)
             LOG_LIMIT(4, "nvn: a recording waits for sync %llx, which nothing fenced before its submission\n",
                       (unsigned long long)gr64(payload));
@@ -144,9 +157,14 @@ static void promise(void* ctx, u32 op, u64 payload, u32 size) {
     s = NVN_OBJ(NvnSync, gr64(payload));
     s->syncpt = pr->syncpt;
     s->value = syncpt_promise(pr->syncpt, 1);
+    if (snx_tracy_attached()) { /* the fences a recording promises, for the waits' zones (nvn_queue.c trace_msg) */
+        char msg[64];
+        int n = snprintf(msg, sizeof msg, "nvn recorded fence %u=%u", s->syncpt, s->value);
+        if (n > 0 && n < (int)sizeof msg) SNX_MSG(msg, (size_t)n);
+    }
     s->ready = pr->ready;
     s->shown = pr->shown;
-    __atomic_store_n(&s->fenced, 1, __ATOMIC_RELEASE);
+    atomic_store_explicit(&s->fenced, 1, memory_order_release);
 }
 
 /* Fences before a wait must be able to signal. Retain these submissions before publishing a fence, so command
@@ -195,6 +213,19 @@ static void snapshot(void* ctx, u32 op, u64 payload, u32 size) {
         memcpy(s->data + s->size + sizeof h, GP(payload), size);
     nvn_record_relocate((u64)(uintptr_t)(s->data + s->size) - (u64)(uintptr_t)g_mem, payload - sizeof h, op, h.size);
     s->size = end;
+}
+
+/* a record's promise, then its copy: one walk for both, the waits captured before the copy takes them */
+typedef struct {
+    Promise* p;
+    Snapshot* s;
+} PromiseSnapshot;
+static void promise_snapshot(void* ctx, u32 op, u64 payload, u32 size) {
+    PromiseSnapshot* b = ctx;
+    if (op == OP_WAIT_SYNC || op == OP_WAIT_EVENT || op == OP_FENCE_SYNC) promise(b->p, op, payload, size);
+    b->s->waits = b->p->waits;
+    b->s->nwaits = b->p->nwaits;
+    snapshot(b->s, op, payload, size);
 }
 
 /* a syncpoint increment once the renderer's work before it is done (gpu.c's stream_incr) */
@@ -307,6 +338,7 @@ static int wait_over(const NvnJob* j, u32 op, u64 pc, u32 size, NvnReplayWait* s
    direct submissions keep CALL cursors so nested recordings do not repeat earlier draws. */
 static int replay_records(NvnJob* j, NvnReplayQueue* q) {
     Replay replay_context = {.q = q};
+    u64 page = ~(u64)0; /* acquire_header's page for this pass */
     while (j->handle < j->n) {
         if (!j->depth) {
             j->cursor[0].pc = j->cursor[0].piece = j->handles[j->handle];
@@ -321,22 +353,34 @@ static int replay_records(NvnJob* j, NvnReplayQueue* q) {
                 continue;
             }
             NvnRecHdr h;
-            if (own_any()) own_acquire(pc, sizeof h);
+            acquire_header(pc, &page);
             memcpy(&h, GP(pc), sizeof h);
-            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            atomic_thread_fence(memory_order_acquire);
             u32 op = NVN_REC_OP(h.op);
             if (op >= OP_COUNT_ || h.size < 8 || (h.size & 7))
                 fatal("nvn: invalid resumed record at %llx: op %u size %u after %u", (unsigned long long)pc, op, h.size,
                       j->cursor[level].previous);
             if (op == OP_WAIT_EVENT || op == OP_WAIT_SYNC) {
                 effects(q);
-                if (!j->waiting && g_renderer->stream_end) g_renderer->stream_end();
                 NvnReplayWait sync;
-                if (!wait_over(j, op, pc, h.size, &sync)) {
+                int over = wait_over(j, op, pc, h.size, &sync);
+                /* A wait for this queue's own fence, whose increment is already in the stream: the GPU runs the
+                   stream in its order, so a barrier of all the work before it is the wait, and the replay goes on.
+                   Stopped here, the replay waited for the GPU to finish the work and the release to come back, once
+                   a frame and about 2.7 ms each in one game */
+                if (!over && !j->waiting && op == OP_WAIT_SYNC && sync.syncpt && sync.syncpt == q->syncpt &&
+                    g_renderer->release_value && g_renderer->method_barrier &&
+                    (i32)(g_renderer->release_value(sync.syncpt) - sync.value) >= 0) {
+                    g_renderer->method_barrier(4);
+                    over = 1;
+                }
+                if (!over && !j->waiting && g_renderer->stream_end) g_renderer->stream_end();
+                if (!over) {
                     j->waiting = 1;
+                    gpu_poll_why(op == OP_WAIT_EVENT ? GPU_POLL_EVENT : GPU_POLL_SYNC);
                     return 0;
                 }
-                __atomic_thread_fence(__ATOMIC_ACQUIRE);
+                atomic_thread_fence(memory_order_acquire);
                 j->waiting = 0;
                 /* What released the wait came after the CPU's writes it covers: a stream's signal after its submission
                    (or its own wait), or a CPU signal, which starts an epoch before it (gpu_cpu_signal). The epochs so
@@ -431,12 +475,16 @@ static int run(void* arg) {
             if (!sync_over(&j->wait)) {
                 if (!j->waiting && g_renderer->stream_end) g_renderer->stream_end();
                 j->waiting = 1;
+                gpu_poll_why(GPU_POLL_SYNC);
                 return 0;
             }
             break;
         case JOB_FENCE: stream_incr(q->syncpt); break;
         case JOB_SETTLE:
-            if (!settled()) return 0;
+            if (!settled()) {
+                gpu_poll_why(GPU_POLL_SETTLE);
+                return 0;
+            }
             stream_incr(g_nvn.replay.settled);
             break;
         case JOB_DESTROY:
@@ -444,7 +492,10 @@ static int run(void* arg) {
             stream_incr(q->syncpt);
             break;
         case JOB_PRESENT: {
-            if (j->present_order != g_nvn.replay.present_walked + 1) return 0;
+            if (j->present_order != g_nvn.replay.present_walked + 1) {
+                gpu_poll_why(GPU_POLL_PRESENT);
+                return 0;
+            }
             const NvnReplayPresent* p = &j->present;
             u64 cpu = p->gva ? gmmu_translate(p->gva) : 0;
             if (g_renderer_up && cpu) {
@@ -471,12 +522,12 @@ static int run(void* arg) {
     POOL_PUT(j);
     /* A later queue can finish while an older one waits. Reclaim command spill memory only through the first
        unfinished submission, never by the number of jobs that happened to complete out of order. */
-    u64 frontier = __atomic_load_n(&g_nvn.replay.submitted, __ATOMIC_RELAXED);
+    u64 frontier = atomic_load_explicit(&g_nvn.replay.submitted, memory_order_relaxed);
     for (u32 i = 0; i < NVN_JOBS; i++) {
         u64 serial = g_nvn.replay.jobs[i].serial;
         if (serial && serial <= frontier) frontier = serial - 1;
     }
-    __atomic_store_n(&g_nvn.replay.walked, frontier, __ATOMIC_RELEASE);
+    atomic_store_explicit(&g_nvn.replay.walked, frontier, memory_order_release);
     pm_unlock(&g_nvn.replay.lock);
     return 1;
 }
@@ -511,11 +562,30 @@ void nvn_replay_submit(u32 queue, u32 n, u64 handles, u64* ready, u32* shown) {
     if (g_renderer->mem_may_have_changed) g_renderer->mem_may_have_changed();
     pm_lock(&g_nvn.replay.lock);
     /* Every header and nested call is still read: the guest can rewrite command memory between submissions.
-       Only waits and fences affect promises, so ordinary records need no callback in this pass. */
-    for (i = 0; i < n; i++) walk(j->handles[i], promise, &p, 0, 1);
+       Only waits and fences affect promises, so ordinary records need no callback in the first pass, and a
+       submission with a wait is walked again for its copy. When the queue's last submission waited, one walk takes
+       both, and the copy is dropped if this one has no wait: two walks were most of the submitting thread's time in
+       one game, about 2.4 ms a frame before the GPU thread could start the submission */
+    NvnReplayQueue* rq = &g_nvn.replay.q[queue - 1];
+    Snapshot s = {0};
+    if (rq->waited) {
+        PromiseSnapshot b = {&p, &s};
+        for (i = 0; i < n; i++) walk(j->handles[i], promise_snapshot, &b, 0, 0);
+        if (!p.has_wait) {
+            free(s.data);
+            s = (Snapshot){0};
+        }
+    } else {
+        for (i = 0; i < n; i++) walk(j->handles[i], promise, &p, 0, 1);
+        if (p.has_wait) {
+            s = (Snapshot){.waits = p.waits, .nwaits = p.nwaits};
+            for (i = 0; i < n; i++) walk(j->handles[i], snapshot, &s, 0, 0);
+        }
+    }
+    rq->waited = p.has_wait;
     if (p.has_wait) {
-        Snapshot s = {.waits = p.waits, .nwaits = p.nwaits};
-        for (i = 0; i < n; i++) walk(j->handles[i], snapshot, &s, 0, 0);
+        s.waits = p.waits;
+        s.nwaits = p.nwaits;
         snapshot(&s, OP_END, 0, 0);
         if (s.wait != p.nwaits) fatal("nvn: command memory changed its sync waits during submission");
         j->snapshot = s.data;
@@ -523,16 +593,16 @@ void nvn_replay_submit(u32 queue, u32 n, u64 handles, u64* ready, u32* shown) {
         j->n = 1;
     }
     free(p.waits);
-    j->serial = __atomic_add_fetch(&g_nvn.replay.submitted, 1, __ATOMIC_RELEASE);
+    j->serial = (atomic_fetch_add_explicit(&g_nvn.replay.submitted, 1, memory_order_release) + 1);
     gpu_call_poll(run, j, queue - 1);
     pm_unlock(&g_nvn.replay.lock);
     *ready = p.ready;
     *shown = p.shown;
 }
-u64 nvn_replay_submitted(void) { return __atomic_load_n(&g_nvn.replay.submitted, __ATOMIC_ACQUIRE); }
-u64 nvn_replay_walked(void) { return __atomic_load_n(&g_nvn.replay.walked, __ATOMIC_ACQUIRE); }
+u64 nvn_replay_submitted(void) { return atomic_load_explicit(&g_nvn.replay.submitted, memory_order_acquire); }
+u64 nvn_replay_walked(void) { return atomic_load_explicit(&g_nvn.replay.walked, memory_order_acquire); }
 void nvn_replay_wait(u32 queue, const NvnSync* s) {
-    if (!__atomic_load_n(&s->fenced, __ATOMIC_ACQUIRE) || !s->syncpt) return;
+    if (!atomic_load_explicit(&s->fenced, memory_order_acquire) || !s->syncpt) return;
     pm_lock(&g_nvn.replay.lock);
     NvnJob* j = job(queue, JOB_WAIT, 0);
     j->wait = (NvnReplayWait){s->syncpt, s->value};
@@ -546,7 +616,7 @@ void nvn_replay_fence(u32 queue, u64 sync, u64 ready, u32 shown) {
     s->value = syncpt_promise(s->syncpt, 1);
     s->ready = ready;
     s->shown = shown;
-    __atomic_store_n(&s->fenced, 1, __ATOMIC_RELEASE);
+    atomic_store_explicit(&s->fenced, 1, memory_order_release);
     gpu_call_poll(run, job(queue, JOB_FENCE, 0), queue - 1);
     pm_unlock(&g_nvn.replay.lock);
 }
@@ -563,6 +633,7 @@ void nvn_replay_queue_free(u32 queue) {
     pm_unlock(&g_nvn.replay.lock);
 }
 void nvn_replay_finish(u32 queue) {
+    SNX_ZONE(z, "nvn queue finish");
     u32 id = nvn_replay_syncpt(queue), value;
     pm_lock(&g_nvn.replay.lock);
     value = syncpt_promise(id, 1);

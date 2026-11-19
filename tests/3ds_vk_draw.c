@@ -51,6 +51,7 @@ static uint32_t g_fcram = 0x20000000u, g_vram = 0x18000000u, g_vertices = 0x2011
 #define AFTER_SPAN   0x20000u
 #define AFTER_FILL   0x1000u
 #define SECOND_COLOR (VRAM + 0x300000u)
+#define THIRD_COLOR (VRAM + 0x380000u)
 #define STORE_AT     (COLOR + 0x1000)
 #define RELOAD_AT    (COLOR + (H - 2) * W * 4) /* the tiled guest buffer's last two 8x8 tiles, a corner of the target */
 #define RELOAD_SPAN  (2 * W * 4)
@@ -288,7 +289,7 @@ static void compare(const Scene* s, const unsigned char* sw, const unsigned char
             bool wrong = e > (dbpp == 2 ? 64u : 16384u) || stencil;
             if (wrong && depth_off < 4)
                 printf("    depth at (%u, %u): the reference's 0x%06x stencil %u, the GPU's 0x%06x stencil %u\n", i % W,
-                       i / W, a, dbpp == 4 ? sw_depth[i * 4 + 3] : 0, b, dbpp == 4 ? gpu_depth[i * 4 + 3] : 0);
+                       i / W, a, dbpp == 4 ? sw_depth[i * 4 + 3] : 0u, b, dbpp == 4 ? gpu_depth[i * 4 + 3] : 0u);
             depth_off += wrong;
         }
     }
@@ -1077,8 +1078,45 @@ static void scaled_layout(SnxCtrMemory* m) {
     printf("%-24s the top at %ux; a press on the bottom screen's pixel (160, 220) %s, the touch (%u, %u): %s\n",
            s->name, scaled.scale, in.touch ? "touched it" : "missed it", in.touch_x, in.touch_y, pass ? "ok" : "FAIL");
     if (!pass) ++failures;
+    /* a press on the bottom screen's pixel (160, 220) under each layout that shows the bottom screen, with and without
+       the swap (the one-screen layout only with the swap). The press is the centre of that pixel in the rectangle
+       snx_ctr_layout_rects gives this window, so the presenter's screen_rect and touch mapping must use the same
+       layout and swap to land on it */
+    static const struct {
+        int layout;
+        bool swap;
+    } views[] = {{0, false}, {0, true}, {1, true}, {2, false}, {2, true}, {3, false}, {3, true}};
+    const SnxCtrScreens sizes = {400, 240, 320, 240};
+    const int layout_was = g_settings.ctr_screen_layout, swap_was = g_settings.ctr_screen_swap;
+    for (size_t i = 0; i < sizeof views / sizeof views[0]; ++i) {
+        g_settings.ctr_screen_layout = views[i].layout;
+        g_settings.ctr_screen_swap = views[i].swap;
+        SnxCtrRects rects = {0};
+        bool laid =
+            snx_ctr_layout_rects((SnxCtrLayout)views[i].layout, views[i].swap, (uint32_t)w, (uint32_t)h, sizes, &rects);
+        float px = (float)rects.bottom.x + 160.5f * (float)rects.bottom.width / 320.0f;
+        float py = (float)rects.bottom.y + 220.5f * (float)rects.bottom.height / 240.0f;
+        event_mouse(SDL_EVENT_MOUSE_BUTTON_DOWN, id, px, py);
+        snx_ctr_input_read(&in);
+        event_mouse(SDL_EVENT_MOUSE_BUTTON_UP, id, px, py);
+        bool hit = laid && in.touch && in.touch_x == 160 && in.touch_y == 220;
+        printf("%-24s layout %d, swap %s: a press on the bottom screen's pixel (160, 220) %s, "
+               "the touch (%u, %u): %s\n",
+               s->name, views[i].layout, views[i].swap ? "on" : "off", hit ? "touched it" : "missed it", in.touch_x,
+               in.touch_y, hit ? "ok" : "FAIL");
+        if (!hit) ++failures;
+    }
+    g_settings.ctr_screen_layout = layout_was;
+    g_settings.ctr_screen_swap = swap_was;
     free(s);
     g_settings.ctr_top_resolution = top;
+}
+/* The screens' layout again through FSR 1 and FXAA: each screen's passes but its last before the window's rendering,
+   and its FXAA pass drawn into the window there (the presenter's snx_fx_prepare and snx_fx_draw) */
+static void scaled_layout_effects(SnxCtrMemory* m) {
+    snprintf(g_settings.upscaler, sizeof g_settings.upscaler, "%s", "fsr1");
+    snprintf(g_settings.anti_aliasing, sizeof g_settings.anti_aliasing, "%s", "fxaa");
+    scaled_layout(m);
 }
 /* A game alternates a screen's picture between two framebuffers of one size: a display transfer fills one while the
    other is shown, so the copy the presenter looks up must be the destination's and not the last transfer's. A GPU
@@ -1120,6 +1158,339 @@ static void scaled_rotating(SnxCtrMemory* m) {
     g_settings.ctr_top_resolution = top;
 }
 
+/* the top screen's framebuffer, which the render scale takes at its height of 400 rows */
+#define SCALED_TARGET_W     240u
+#define SCALED_TARGET_H     400u
+#define SCALED_TARGET_BYTES (SCALED_TARGET_W * SCALED_TARGET_H * 4)
+/* a colour target of the top screen's size at at, its rows from the top, or from y = 0 up when flip is set */
+static void screen_target(List* l, uint32_t at, bool flip) {
+    put(l, FB_COLOR_ADDR, at / 8);
+    put(l, 0x041, f24(SCALED_TARGET_W / 2.0f));
+    put(l, 0x043, f24(SCALED_TARGET_H / 2.0f));
+    put(l, 0x11e, SCALED_TARGET_W | (SCALED_TARGET_H - 1) << 12 | (flip ? 0 : 1u << 24));
+}
+/* texture unit 0 over a top screen sized image at address: nearest and repeated, in the PICA format */
+static void screen_texture(List* l, uint32_t address, unsigned format) {
+    put(l, TEX_MAIN, 1);
+    put(l, TEX0_SIZE, SCALED_TARGET_W << 16 | SCALED_TARGET_H);
+    put(l, TEX0_PARAMS, 2u << 8 | 2u << 12);
+    put(l, TEX0_ADDRESS, address / 8);
+    put(l, TEX0_FORMAT, format);
+    put(l, TEV_STAGE0, 0x00030003u); /* colour and alpha from texture 0 */
+}
+/* a colour as a texel of a texture in the format: what the console stores of it, read back */
+static void quantised(unsigned format, const uint8_t color[4], uint8_t texel[4]) {
+    unsigned char bytes[4];
+    snx_ctr_pixel_encode(format, color, bytes);
+    snx_ctr_pixel_decode(format, bytes, texel);
+}
+/* a colour as the word that vertex() takes: red in the top byte */
+static uint32_t color_word(const uint8_t color[4]) {
+    return (uint32_t)color[0] << 24 | (uint32_t)color[1] << 16 | (uint32_t)color[2] << 8 | color[3];
+}
+/* Target A is drawn at scale and sampled by B at once, with no CPU step between: B's recording stores A to memory.
+   Above scale 1, the texture is made from A's scaled image: B's pixel (i, j) reads texel (i, j) of that image,
+   quantised in the format. Texture row j reads image row j, or the last one less j when A is flipped
+   (scaled_texture.comp). */
+static void scaled_texture_case(SnxCtrMemory* m, const char* name, unsigned pica, unsigned pixel, unsigned scale,
+                                bool flip) {
+    static const uint8_t inside[4] = {100, 50, 200, 255}, outside[4] = {20, 220, 90, 255};
+    static unsigned char clear[SCALED_TARGET_BYTES], zeros[SCALED_TARGET_BYTES], after[SCALED_TARGET_BYTES];
+    size_t bpp = snx_ctr_pixel_bytes(pixel);
+    /* the rectangle's left and top edges at console coordinate 1/scale, which is the scaled coordinate 1.0 */
+    float left = 2.0f / (float)(scale * SCALED_TARGET_W) - 1.0f;
+    float top = 2.0f / (float)(scale * SCALED_TARGET_H) - 1.0f;
+    uint32_t word = color_word(inside);
+    Scene* a = scene(name, pica, 0xff);
+    screen_target(&a->list, COLOR, flip);
+    a->vertices[0] = vertex(left, top, -0.5f, word, 0, 0);
+    a->vertices[1] = vertex(1.0f, top, -0.5f, word, 0, 0);
+    a->vertices[2] = vertex(left, 1.0f, -0.5f, word, 0, 0);
+    a->vertices[3] = vertex(1.0f, top, -0.5f, word, 0, 0);
+    a->vertices[4] = vertex(1.0f, 1.0f, -0.5f, word, 0, 0);
+    a->vertices[5] = vertex(left, 1.0f, -0.5f, word, 0, 0);
+    a->vertex_count = 6;
+    array_draw(a);
+    list_end(&a->list);
+    for (unsigned p = 0; p < SCALED_TARGET_W * SCALED_TARGET_H; ++p)
+        snx_ctr_pixel_encode(pixel, outside, clear + p * bpp);
+    setup_clear(m, a);
+    bool ok = snx_ctr_phys_write(m, COLOR, clear, SCALED_TARGET_W * SCALED_TARGET_H * bpp) == SNX_CTR_MEM_OK;
+    ok = ok && record(m, a, &vulkan); /* A's rectangle, its rendering open */
+    Scene* b = scene(name, 0, 0xff);
+    screen_target(&b->list, SECOND_COLOR, false);
+    screen_texture(&b->list, COLOR, pica);
+    float tc = 1.0f / (float)scale;
+    b->vertices[0] = vertex(-1.0f, -1.0f, -0.5f, 0xffffffffu, 0, 0);
+    b->vertices[1] = vertex(1.0f, -1.0f, -0.5f, 0xffffffffu, tc, 0);
+    b->vertices[2] = vertex(-1.0f, 1.0f, -0.5f, 0xffffffffu, 0, tc);
+    b->vertices[3] = vertex(1.0f, 1.0f, -0.5f, 0xffffffffu, tc, tc);
+    b->vertex_count = 4;
+    put(&b->list, SNX_PICA_TOPOLOGY, 1u << 8);
+    strip_draw(&b->list, 0);
+    list_end(&b->list);
+    ok = ok && snx_ctr_phys_write(m, SECOND_COLOR, zeros, SCALED_TARGET_BYTES) == SNX_CTR_MEM_OK;
+    ok = ok && snx_ctr_phys_write(m, VERTICES, b->vertices, sizeof b->vertices) == SNX_CTR_MEM_OK;
+    ok = ok && snx_ctr_phys_write(m, LIST, b->list.w, b->list.n * 4) == SNX_CTR_MEM_OK;
+    ok = ok && record(m, b, &vulkan); /* B's quad samples A */
+    ok = snx_ctr_vk_finish() && ok;
+    ok = ok && snx_ctr_phys_read(m, SECOND_COLOR, after, SCALED_TARGET_BYTES) == SNX_CTR_MEM_OK;
+    unsigned wrong = 0;
+    for (unsigned j = 0; j < SCALED_TARGET_H; ++j)
+        for (unsigned i = 0; i < SCALED_TARGET_W; ++i) {
+            unsigned row = flip ? scale * SCALED_TARGET_H - 1 - j : j;
+            uint8_t texel[4];
+            unsigned char want[4];
+            quantised(pixel, (i >= 1 && row >= 1) ? inside : outside, texel);
+            snx_ctr_pixel_encode(SNX_CTR_PIX_RGBA8, texel, want);
+            /* B is not flipped, so its row j is memory row H - 1 - j */
+            unsigned y = SCALED_TARGET_H - 1 - j;
+            size_t at = snx_ctr_morton_offset(i, y, 4) + (size_t)(y & ~7u) * SCALED_TARGET_W * 4;
+            wrong += memcmp(after + at, want, sizeof want) != 0;
+        }
+    bool pass = ok && wrong == 0;
+    printf("%-24s %6u of %u pixels differ from the oracle: %s\n", name, wrong, SCALED_TARGET_W * SCALED_TARGET_H,
+           pass ? "ok" : "FAIL");
+    if (!pass) ++failures;
+    free(a);
+    free(b);
+}
+/* target A in each format at scale 1 (the control), 2 and 3, unflipped and flipped */
+static void scaled_texture_from_target(SnxCtrMemory* m) {
+    static const struct {
+        const char* name;
+        unsigned pica, pixel;
+    } formats[] = {{"RGBA8", SNX_CTR_TEX_RGBA8, SNX_CTR_PIX_RGBA8},
+                   {"RGB8", SNX_CTR_TEX_RGB8, SNX_CTR_PIX_RGB8},
+                   {"RGB5A1", SNX_CTR_TEX_RGB5A1, SNX_CTR_PIX_RGB5A1},
+                   {"RGB565", SNX_CTR_TEX_RGB565, SNX_CTR_PIX_RGB565},
+                   {"RGBA4", SNX_CTR_TEX_RGBA4, SNX_CTR_PIX_RGBA4}};
+    int top = g_settings.ctr_top_resolution;
+    for (size_t f = 0; f < sizeof formats / sizeof *formats; ++f)
+        for (unsigned scale = 1; scale <= 3; ++scale)
+            for (unsigned flip = 0; flip < 2; ++flip) {
+                char name[64];
+                snprintf(name, sizeof name, "%s at %ux, %s", formats[f].name, scale, flip ? "flipped" : "unflipped");
+                g_settings.ctr_top_resolution = (int)scale;
+                scaled_texture_case(m, name, formats[f].pica, formats[f].pixel, scale, flip != 0);
+            }
+    g_settings.ctr_top_resolution = top;
+    snx_ctr_vk_finish();
+}
+
+/* a depth format read as the texture format that depth_texel pairs with it: the words depth.comp stores for depth 1.0
+   (far) and 0.25 (near), and the pixel format that decodes them (word_texel) */
+typedef struct {
+    const char* name;
+    unsigned depth, texture, pixel; /* FB_DEPTH_FORMAT, the PICA's texture format, transfer.h's pixel format */
+    uint32_t far_word, near_word;
+} DepthTexel;
+static const DepthTexel depth_texels[] = {
+    {"D24S8 as RGBA8", 3, 0, SNX_CTR_PIX_RGBA8, 0x00ffffffu, 0x00400000u},
+    {"D24 as RGB8", 2, 1, SNX_CTR_PIX_RGB8, 0x00ffffffu, 0x00400000u},
+    {"D16 as RGB5A1", 0, 2, SNX_CTR_PIX_RGB5A1, 0xffffu, 0x4000u},
+    {"D16 as RGB565", 0, 3, SNX_CTR_PIX_RGB565, 0xffffu, 0x4000u},
+    {"D16 as RGBA4", 0, 4, SNX_CTR_PIX_RGBA4, 0xffffu, 0x4000u},
+};
+/* the texel of a depth word read in a texture of pixel format pixel: the word's low bytes, least significant first,
+   decoded by the CPU reference (snx_ctr_pixel_decode), so the oracle does not share the GPU's decode */
+static void word_texel(unsigned pixel, uint32_t word, uint8_t texel[4]) {
+    unsigned char bytes[4];
+    for (unsigned k = 0; k < snx_ctr_pixel_bytes(pixel); ++k) bytes[k] = (unsigned char)(word >> (8 * k));
+    snx_ctr_pixel_decode(pixel, bytes, texel);
+}
+/* A texture made from a scaled target's depth buffer keeps the render scale. Target A is a top screen sized colour
+   target with a D24S8 depth buffer, drawn at scale: the buffer is cleared to 1.0, and a rectangle at 0.25 covers the
+   scaled columns and rows from 1 on, its left and top edges at scaled coordinate 1.0 (as scaled_texture_case does).
+   B samples the buffer as RGBA8 with nearest filtering, so B's console pixel (i, j) reads the scaled texel (i, j) of
+   A's depth image, or row 400 * scale - 1 - j when A is flipped. The texel is the word depth.comp stores for the
+   depth, its stencil in the top byte, read as RGBA8: 0x00ffffff is (0, 255, 255, 255), and 0.25 stores 0x00400000
+   (0.25 * 16777215 rounds to 4194304), which is (0, 64, 0, 0). At scale 1 the texture is the 1x words the store
+   wrote, the control. The other rows of depth_texels read their words in their own texture formats the same way. */
+static void scaled_depth_texture_case(SnxCtrMemory* m, const char* name, const DepthTexel* t, unsigned scale,
+                                      bool flip) {
+    static unsigned char clear[SCALED_TARGET_BYTES], zeros[SCALED_TARGET_BYTES], after[SCALED_TARGET_BYTES];
+    uint8_t far_texel[4], near_texel[4];
+    unsigned bpp = snx_ctr_pixel_bytes(t->pixel);
+    word_texel(t->pixel, t->far_word, far_texel);
+    word_texel(t->pixel, t->near_word, near_texel);
+    for (unsigned p = 0; p < SCALED_TARGET_W * SCALED_TARGET_H; ++p)
+        for (unsigned k = 0; k < bpp; ++k)
+            clear[p * bpp + k] = (unsigned char)(t->far_word >> (8 * k)); /* depth 1.0 */
+    /* the rectangle's left and top edges at console coordinate 1/scale, which is the scaled coordinate 1.0 */
+    float left = 2.0f / (float)(scale * SCALED_TARGET_W) - 1.0f;
+    float top = 2.0f / (float)(scale * SCALED_TARGET_H) - 1.0f;
+    Scene* a = scene(name, 0, 0xff);
+    screen_target(&a->list, COLOR, flip);
+    depth_target(&a->list, t->depth); /* the depth buffer at DEPTH, written */
+    put(&a->list, 0x107, 0x1041u); /* depth test LESS, and the write on */
+    a->vertices[0] = vertex(left, top, -0.25f, 0xffffffffu, 0, 0);
+    a->vertices[1] = vertex(1.0f, top, -0.25f, 0xffffffffu, 0, 0);
+    a->vertices[2] = vertex(left, 1.0f, -0.25f, 0xffffffffu, 0, 0);
+    a->vertices[3] = vertex(1.0f, top, -0.25f, 0xffffffffu, 0, 0);
+    a->vertices[4] = vertex(1.0f, 1.0f, -0.25f, 0xffffffffu, 0, 0);
+    a->vertices[5] = vertex(left, 1.0f, -0.25f, 0xffffffffu, 0, 0);
+    a->vertex_count = 6;
+    array_draw(a);
+    list_end(&a->list);
+    setup_clear(m, a);
+    bool ok = snx_ctr_phys_write(m, COLOR, zeros, SCALED_TARGET_BYTES) == SNX_CTR_MEM_OK;
+    ok = ok && snx_ctr_phys_write(m, DEPTH, clear, SCALED_TARGET_W * SCALED_TARGET_H * bpp) == SNX_CTR_MEM_OK;
+    ok = ok && record(m, a, &vulkan); /* A's rectangle over the cleared depth, its rendering open */
+    Scene* b = scene(name, 0, 0xff);
+    screen_target(&b->list, SECOND_COLOR, false);
+    /* A's depth buffer, read as the texture */
+    screen_texture(&b->list, DEPTH, t->texture);
+    float tc = 1.0f / (float)scale;
+    b->vertices[0] = vertex(-1.0f, -1.0f, -0.5f, 0xffffffffu, 0, 0);
+    b->vertices[1] = vertex(1.0f, -1.0f, -0.5f, 0xffffffffu, tc, 0);
+    b->vertices[2] = vertex(-1.0f, 1.0f, -0.5f, 0xffffffffu, 0, tc);
+    b->vertices[3] = vertex(1.0f, 1.0f, -0.5f, 0xffffffffu, tc, tc);
+    b->vertex_count = 4;
+    put(&b->list, SNX_PICA_TOPOLOGY, 1u << 8);
+    strip_draw(&b->list, 0);
+    list_end(&b->list);
+    ok = ok && snx_ctr_phys_write(m, SECOND_COLOR, zeros, SCALED_TARGET_BYTES) == SNX_CTR_MEM_OK;
+    ok = ok && snx_ctr_phys_write(m, VERTICES, b->vertices, sizeof b->vertices) == SNX_CTR_MEM_OK;
+    ok = ok && snx_ctr_phys_write(m, LIST, b->list.w, b->list.n * 4) == SNX_CTR_MEM_OK;
+    ok = ok && record(m, b, &vulkan); /* B's quad samples A's depth buffer */
+    ok = snx_ctr_vk_finish() && ok;
+    ok = ok && snx_ctr_phys_read(m, SECOND_COLOR, after, SCALED_TARGET_BYTES) == SNX_CTR_MEM_OK;
+    unsigned wrong = 0;
+    for (unsigned j = 0; j < SCALED_TARGET_H; ++j)
+        for (unsigned i = 0; i < SCALED_TARGET_W; ++i) {
+            /* B's row j reads texel row j, which is image row j, or the last one less j when A is flipped */
+            unsigned row = flip ? scale * SCALED_TARGET_H - 1 - j : j;
+            unsigned char want[4];
+            snx_ctr_pixel_encode(SNX_CTR_PIX_RGBA8, (i >= 1 && row >= 1) ? near_texel : far_texel, want);
+            /* B is not flipped, so its row j is memory row H - 1 - j */
+            unsigned y = SCALED_TARGET_H - 1 - j;
+            size_t at = snx_ctr_morton_offset(i, y, 4) + (size_t)(y & ~7u) * SCALED_TARGET_W * 4;
+            wrong += memcmp(after + at, want, sizeof want) != 0;
+        }
+    bool pass = ok && wrong == 0;
+    printf("%-24s %6u of %u pixels differ from the oracle: %s\n", name, wrong, SCALED_TARGET_W * SCALED_TARGET_H,
+           pass ? "ok" : "FAIL");
+    if (!pass) ++failures;
+    free(a);
+    free(b);
+}
+/* target A at render scale 1 (the control), 2 and 3, unflipped and flipped, for each row of depth_texels */
+static void scaled_texture_from_depth(SnxCtrMemory* m) {
+    int top = g_settings.ctr_top_resolution;
+    for (size_t t = 0; t < sizeof depth_texels / sizeof *depth_texels; ++t)
+        for (unsigned scale = 1; scale <= 3; ++scale)
+            for (unsigned flip = 0; flip < 2; ++flip) {
+                char name[64];
+                snprintf(name, sizeof name, "%s at %ux, %s", depth_texels[t].name, scale,
+                         flip ? "flipped" : "unflipped");
+                g_settings.ctr_top_resolution = (int)scale;
+                scaled_depth_texture_case(m, name, &depth_texels[t], scale, flip != 0);
+            }
+    g_settings.ctr_top_resolution = top;
+    snx_ctr_vk_finish();
+}
+
+/* B takes A's depth at the render scale when it opens, not the buffer's 1x reload. A is cleared to 1.0, with a
+   rectangle at 0.25 whose left and top edges are at scaled coordinate 1.0. B is cleared to green by a full quad
+   with the depth test ALWAYS and no write. A full quad of red at 0.5, with LESS and no write, then shows where
+   the rectangle is not. C samples B over the top-left 1/scale, so its console pixel (i, j) is B's texel (i, j):
+   green where i >= 1 and j >= 1, red elsewhere. Without the change the 1x reload gives the far depth to the texels
+   with i < scale or j < scale, so those with i and j >= 1 show red: 637 pixels at scale 2, 1272 at scale 3. */
+static void scaled_shared_depth_case(SnxCtrMemory* m, const char* name, unsigned scale) {
+    static const uint8_t red[4] = {255, 0, 0, 255}, green[4] = {0, 255, 0, 255};
+    static unsigned char clear[SCALED_TARGET_BYTES], zeros[SCALED_TARGET_BYTES], after[SCALED_TARGET_BYTES];
+    for (unsigned p = 0; p < SCALED_TARGET_W * SCALED_TARGET_H; ++p)
+        clear[p * 4] = clear[p * 4 + 1] = clear[p * 4 + 2] = 0xff; /* depth 1.0, stencil 0 */
+    /* the rectangle's left and top edges at console coordinate 1/scale, which is the scaled coordinate 1.0 */
+    float left = 2.0f / (float)(scale * SCALED_TARGET_W) - 1.0f;
+    float top = 2.0f / (float)(scale * SCALED_TARGET_H) - 1.0f;
+    Scene* a = scene(name, 0, 0xff);
+    screen_target(&a->list, COLOR, false);
+    depth_target(&a->list, 3); /* D24S8 at DEPTH, written */
+    put(&a->list, 0x107, 0xf00 | 1u | 4u << 4 | 1u << 12); /* colour written, depth test LESS, and the write on */
+    a->vertices[0] = vertex(left, top, -0.25f, 0xffffffffu, 0, 0);
+    a->vertices[1] = vertex(1.0f, top, -0.25f, 0xffffffffu, 0, 0);
+    a->vertices[2] = vertex(left, 1.0f, -0.25f, 0xffffffffu, 0, 0);
+    a->vertices[3] = vertex(1.0f, top, -0.25f, 0xffffffffu, 0, 0);
+    a->vertices[4] = vertex(1.0f, 1.0f, -0.25f, 0xffffffffu, 0, 0);
+    a->vertices[5] = vertex(left, 1.0f, -0.25f, 0xffffffffu, 0, 0);
+    a->vertex_count = 6;
+    array_draw(a);
+    list_end(&a->list);
+    setup_clear(m, a);
+    bool ok = snx_ctr_phys_write(m, COLOR, zeros, SCALED_TARGET_BYTES) == SNX_CTR_MEM_OK;
+    ok = ok && snx_ctr_phys_write(m, DEPTH, clear, SCALED_TARGET_BYTES) == SNX_CTR_MEM_OK;
+    ok = ok && record(m, a, &vulkan); /* A's rectangle over the cleared depth, its rendering open */
+    Scene* b = scene(name, 0, 0xff);
+    screen_target(&b->list, SECOND_COLOR, false);
+    depth_target(&b->list, 3);
+    uint32_t green_word = color_word(green), red_word = color_word(red);
+    b->vertices[0] = vertex(-1.0f, -1.0f, -0.5f, green_word, 0, 0);
+    b->vertices[1] = vertex(1.0f, -1.0f, -0.5f, green_word, 0, 0);
+    b->vertices[2] = vertex(-1.0f, 1.0f, -0.5f, green_word, 0, 0);
+    b->vertices[3] = vertex(1.0f, 1.0f, -0.5f, green_word, 0, 0);
+    b->vertices[4] = vertex(-1.0f, -1.0f, -0.5f, red_word, 0, 0);
+    b->vertices[5] = vertex(1.0f, -1.0f, -0.5f, red_word, 0, 0);
+    b->vertices[6] = vertex(-1.0f, 1.0f, -0.5f, red_word, 0, 0);
+    b->vertices[7] = vertex(1.0f, 1.0f, -0.5f, red_word, 0, 0);
+    b->vertex_count = 8;
+    put(&b->list, SNX_PICA_TOPOLOGY, 1u << 8);
+    put(&b->list, 0x107, 0xf00 | 1u | 1u << 4); /* the clear: colour written, depth test ALWAYS, and no write */
+    strip_draw(&b->list, 0);
+    put(&b->list, 0x107, 0xf00 | 1u | 4u << 4); /* colour written, depth test LESS, and no write */
+    strip_draw(&b->list, 4);
+    list_end(&b->list);
+    ok = ok && snx_ctr_phys_write(m, VERTICES, b->vertices, sizeof b->vertices) == SNX_CTR_MEM_OK;
+    ok = ok && snx_ctr_phys_write(m, LIST, b->list.w, b->list.n * 4) == SNX_CTR_MEM_OK;
+    ok = ok && record(m, b, &vulkan); /* B's quads: its depth is A's, copied when B opened */
+    Scene* c = scene(name, 0, 0xff);
+    screen_target(&c->list, THIRD_COLOR, false);
+    screen_texture(&c->list, SECOND_COLOR, 0); /* RGBA8 over B's colour */
+    float tc = 1.0f / (float)scale;
+    c->vertices[0] = vertex(-1.0f, -1.0f, -0.5f, 0xffffffffu, 0, 0);
+    c->vertices[1] = vertex(1.0f, -1.0f, -0.5f, 0xffffffffu, tc, 0);
+    c->vertices[2] = vertex(-1.0f, 1.0f, -0.5f, 0xffffffffu, 0, tc);
+    c->vertices[3] = vertex(1.0f, 1.0f, -0.5f, 0xffffffffu, tc, tc);
+    c->vertex_count = 4;
+    put(&c->list, SNX_PICA_TOPOLOGY, 1u << 8);
+    strip_draw(&c->list, 0);
+    list_end(&c->list);
+    ok = ok && snx_ctr_phys_write(m, VERTICES, c->vertices, sizeof c->vertices) == SNX_CTR_MEM_OK;
+    ok = ok && snx_ctr_phys_write(m, LIST, c->list.w, c->list.n * 4) == SNX_CTR_MEM_OK;
+    ok = ok && record(m, c, &vulkan); /* C samples B's scaled colour */
+    ok = snx_ctr_vk_finish() && ok;
+    ok = ok && snx_ctr_phys_read(m, THIRD_COLOR, after, SCALED_TARGET_BYTES) == SNX_CTR_MEM_OK;
+    unsigned wrong = 0;
+    for (unsigned j = 0; j < SCALED_TARGET_H; ++j)
+        for (unsigned i = 0; i < SCALED_TARGET_W; ++i) {
+            unsigned char want[4];
+            snx_ctr_pixel_encode(SNX_CTR_PIX_RGBA8, (i >= 1 && j >= 1) ? green : red, want);
+            /* C is not flipped, so its row j is memory row H - 1 - j */
+            unsigned y = SCALED_TARGET_H - 1 - j;
+            size_t at = snx_ctr_morton_offset(i, y, 4) + (size_t)(y & ~7u) * SCALED_TARGET_W * 4;
+            wrong += memcmp(after + at, want, sizeof want) != 0;
+        }
+    bool pass = ok && wrong == 0;
+    printf("%-24s %6u of %u pixels differ from the oracle: %s\n", name, wrong, SCALED_TARGET_W * SCALED_TARGET_H,
+           pass ? "ok" : "FAIL");
+    if (!pass) ++failures;
+    free(a);
+    free(b);
+    free(c);
+}
+/* the shared depth buffer at render scale 1 (the control), 2 and 3 */
+static void scaled_shared_depth(SnxCtrMemory* m) {
+    int top = g_settings.ctr_top_resolution;
+    for (unsigned scale = 1; scale <= 3; ++scale) {
+        char name[64];
+        snprintf(name, sizeof name, "shared D24S8 at %ux", scale);
+        g_settings.ctr_top_resolution = (int)scale;
+        scaled_shared_depth_case(m, name, scale);
+    }
+    g_settings.ctr_top_resolution = top;
+    snx_ctr_vk_finish();
+}
 /* Shadow maps (Azahar's sw_framebuffer.cpp DrawShadowMapPixel and sw_rasterizer.cpp TextureColor): the colour buffer
    of a shadow pass holds one word per pixel, its bytes the depth from the most significant byte, then the strength */
 #define TEX_CUBE   0x086
@@ -1656,21 +2027,37 @@ typedef struct {
 } Mode;
 static const Mode scenes = {NULL, "the scenes", all_scenes};
 /* the validation runs record only the commands under test */
-static const Mode modes[] = {{"--present", "the presented screens", screens},
-                             {"--scaled-present", "the frames shown from scaled targets", scaled_present},
-                             {"--scaled-transfer", "the scaled targets' transfers", scaled_transfer},
-                             {"--scaled-rotating", "the rotating destinations", scaled_rotating},
-                             {"--scaled-verify", "a destination whose bytes the guest changed", scaled_verify},
-                             {"--scaled-layout", "the screens' layout at different render scales", scaled_layout},
-                             {"--after-draw", "the commands after a draw", presented_after_draw},
-                             {"--texture-after-draw", "the textures after a draw", texture_after_draw},
-                             {"--draw-after-index-copy", "the indices copied before a draw", draw_after_index_copy},
-                             {"--draw-after-submit", "a draw after a submission", draw_after_submit},
-                             {"--async", "the draws with async_pipelines", async_pipelines},
-                             {"--pipeline-cache", "the pipeline cache kept between runs", pipeline_cache},
-                             {"--shadow", "the shadow maps", shadows}};
+static const Mode modes[] = {
+    {"--present", "the presented screens", screens},
+    {"--scaled-present", "the frames shown from scaled targets", scaled_present},
+    {"--scaled-transfer", "the scaled targets' transfers", scaled_transfer},
+    {"--scaled-rotating", "the rotating destinations", scaled_rotating},
+    {"--scaled-verify", "a destination whose bytes the guest changed", scaled_verify},
+    {"--scaled-layout", "the screens' layout at different render scales", scaled_layout},
+    {"--scaled-layout-effects", "the screens' layout through FSR 1 and FXAA", scaled_layout_effects},
+    {"--after-draw", "the commands after a draw", presented_after_draw},
+    {"--texture-after-draw", "the textures after a draw", texture_after_draw},
+    {"--draw-after-index-copy", "the indices copied before a draw", draw_after_index_copy},
+    {"--draw-after-submit", "a draw after a submission", draw_after_submit},
+    {"--async", "the draws with async_pipelines", async_pipelines},
+    {"--pipeline-cache", "the pipeline cache kept between runs", pipeline_cache},
+    {"--scaled-texture-from-target", "the textures made from scaled targets", scaled_texture_from_target},
+    {"--scaled-texture-from-depth", "the textures made from scaled depth buffers", scaled_texture_from_depth},
+    {"--scaled-shared-depth", "two targets over one depth buffer at render scale", scaled_shared_depth},
+    {"--shadow", "the shadow maps", shadows}};
 
 int main(int argc, char** argv) {
+    /* No window on a host that has a display: these checks render offscreen, and the ones that present do it through
+       SDL's dummy driver, which is the driver a CI host with no display gives them. A window here takes the desktop's
+       focus from whatever the user runs at the time. A caller that names a driver keeps it: ctest sets one for the
+       layout check, which needs a window */
+    if (!getenv("SDL_VIDEO_DRIVER")) {
+#ifdef _WIN32
+        _putenv_s("SDL_VIDEO_DRIVER", "dummy");
+#else
+        setenv("SDL_VIDEO_DRIVER", "dummy", 1);
+#endif
+    }
     g_model = test_ctr_model(&argc, argv);
     if (g_model == SNX_CTR_NEW) { /* the scenes in the memory only a New 3DS has */
         g_fcram = 0x28000000u;

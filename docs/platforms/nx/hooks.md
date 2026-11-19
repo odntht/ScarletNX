@@ -37,7 +37,8 @@ Every call to a hooked function goes through its slot in the dispatch table, `g_
 
 The recompiler routes only the symbols of the route list (`src/nx/loader/hook_routes.c`): each symbol that
 `hooks.hook` and `gpu/nvn/nvn.hook` name in any version, and the `route` lines of the functions the runtime wraps with
-code of its own (`nvnBootstrapLoader` and `nvnDeviceGetProcAddress`, `nvn_loader.c`). `hookgen --routes` generates
+code of its own (`nvnBootstrapLoader` and `nvnDeviceGetProcAddress`, `nvn_loader.c`; a GL driver's
+`eglGetProcAddress`, `gl_census.c`). `hookgen --routes` generates
 the list. A direct call to any other function stays a direct call. `SNX_ABI` 15 and 16 first routed every function
 that a module exports, but some games export nearly all of their main executable: 88% to 98% of its functions in
 three games, so that 51% to 64% of all their direct calls became indirect calls (`tools/hook_census.py`). On one of
@@ -331,10 +332,12 @@ there. A 32-bit game's hooks are not invalidated either: their slots are blocks 
 ## A mod's call of the original
 
 `src/nx/hle/hook/ext_skyline.hooks` holds native hooks for the detours loaders are known to make (skyline's and
-Cobalt's on `nn::fs::MountRom`, skyline's on `nn::ro::Initialize`), each with the handler and arguments of the
-function's native hook, in a table of its own (prefix `skyline`, `ext_skyline.c`). They are not installed at the
-start: once a function's native hook is invalidated, a dispatch miss at a pc (`rt_miss`, `hook_trampoline`) checks
-whether the code there is the mod's trampoline of that function, its first instructions as `hook_install` saw them
+Cobalt's on `nn::fs::MountRom`, one game's optimizer mod's on `nn::fs::MountRom` by name alone,
+`nn::fs::MountSdCard` and `nn::fs::OpenFile`, skyline's on `nn::ro::Initialize`), each with the handler and
+arguments of the function's native hook (`tests/ext_skyline_hooks.py` checks them against it), in a table of its own
+(prefix `skyline`, `ext_skyline.c`). They are not installed at the start: once a function's native hook is
+invalidated, a dispatch miss at a pc (`rt_miss`, `hook_trampoline`) checks whether the code there is the mod's
+trampoline of that function, its first instructions as `hook_install` saw them
 (1, or 4 or 5 when the hook was too far for a `b`) followed by a jump back to the one after them (a `b`, or
 `ldr x17, #8` and `br x17` of the address, after a `nop` that aligns it), as skyline's and exlaunch's
 And64InlineHook writes it. The first time it runs, the hook takes the trampoline's slot, and the mod's call of the

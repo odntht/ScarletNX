@@ -25,6 +25,7 @@ static struct {
     PFN_vkCreateGraphicsPipelines create;
     PFN_vkBeginCommandBuffer begin;
     PFN_vkCmdBindPipeline bind;
+    PFN_vkCmdBindShadersEXT bind_shaders;
     PFN_vkCmdSetVertexInputEXT set;
     PFN_vkDestroyPipeline destroy;
     PFN_vkCmdDraw draw;
@@ -156,6 +157,20 @@ static VKAPI_ATTR void VKAPI_CALL viw_bind(VkCommandBuffer cb, VkPipelineBindPoi
     }
     g_viw.bind(cb, bp, p);
 }
+/* shader objects (VK_EXT_shader_object) always take the vertex input as dynamic state, and the vertex stage's object
+   stands for the draw's program as a pipeline does */
+static VKAPI_ATTR void VKAPI_CALL viw_bind_shaders(VkCommandBuffer cb, u32 n, const VkShaderStageFlagBits* stages,
+                                                   const VkShaderEXT* shaders) {
+    pm_lock(&g_viw.lock);
+    VIWBuffer* b = viw_buffer(cb);
+    for (u32 i = 0; b && shaders && i < n; i++)
+        if (stages[i] == VK_SHADER_STAGE_VERTEX_BIT && shaders[i]) {
+            b->pipe = (VkPipeline)(void*)shaders[i];
+            b->dynamic = 1;
+        }
+    pm_unlock(&g_viw.lock);
+    g_viw.bind_shaders(cb, n, stages, shaders);
+}
 static VKAPI_ATTR void VKAPI_CALL viw_set(VkCommandBuffer cb, u32 nb, const VkVertexInputBindingDescription2EXT* bd,
                                           u32 na, const VkVertexInputAttributeDescription2EXT* ad) {
     pm_lock(&g_viw.lock);
@@ -238,6 +253,7 @@ static void viw_install(void) {
     g_viw.create = vkCreateGraphicsPipelines;
     g_viw.begin = vkBeginCommandBuffer;
     g_viw.bind = vkCmdBindPipeline;
+    g_viw.bind_shaders = vkCmdBindShadersEXT;
     g_viw.destroy = vkDestroyPipeline;
     g_viw.set = vkCmdSetVertexInputEXT;
     g_viw.draw = vkCmdDraw;
@@ -249,6 +265,7 @@ static void viw_install(void) {
     vkCreateGraphicsPipelines = viw_create;
     vkBeginCommandBuffer = viw_begin;
     vkCmdBindPipeline = viw_bind;
+    if (g_viw.bind_shaders) vkCmdBindShadersEXT = viw_bind_shaders;
     vkDestroyPipeline = viw_destroy;
     if (g_viw.set) vkCmdSetVertexInputEXT = viw_set;
     vkCmdDraw = viw_draw0;
@@ -399,13 +416,13 @@ static int check_vertex_input_layouts(void) {
     for (u32 i = 0; i < drawn; i++) {
         Surf* surface = vk_rt_find(targets + 0x1000 * i);
         CHECK(surface);
-        vk_surf_use(vk_cmd(), surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+        vk_surf_use(vk_cmd(), surface, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                     VK_ACCESS_2_TRANSFER_READ_BIT);
         VkBufferImageCopy copy = {.bufferOffset = 4 * i,
                                   .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                   .imageOffset = {1, 1, 0},
                                   .imageExtent = {1, 1, 1}};
-        rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
+        rec_CmdCopyImageToBuffer(vk_cmd(), surface->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), buffer, 1, &copy);
     }
     vk_finish(); /* the ring drained: every draw went through the watch */
     vk_readback_ready();

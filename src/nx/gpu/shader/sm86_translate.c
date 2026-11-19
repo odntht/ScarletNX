@@ -14,6 +14,7 @@
 #include "nx/gpu/shader/sm86.h"
 #include "nx/gpu/shader/translator.h"
 #include "nx/gpu/shader/write_log.h"
+#include "nx/gpu/shader/fuse.h"
 #include "nx/gpu/shader/minmax_spirv.h"
 #include "common/utilities/spirv_emit.h"
 #include "common/utilities/bits.h"
@@ -48,6 +49,15 @@ typedef struct {
     u32 nmat;        /* the matrices, one for each M block */
     u32 mat[2];
 } CoopAcc;
+/* the jump table of a BRX, as brx_resolve found it: the instructions that its entries name. state is 0 before the
+   search, 1 when count entries were found (in targets, malloc'd), and 2 when no table reaches the BRX on every path
+   (c->failed says why). The targets are not kept by instruction: the code window is 0x80000 bytes, so 64 words for
+   each of its 32768 instructions would be 8.6 MB of zeroing for a program that may have no BRX at all */
+typedef struct {
+    u32 count;
+    u32* targets;
+    u8 state;
+} BrxTable;
 typedef struct {
     SpvEmitter e;
     ShaderInfo* si;
@@ -65,12 +75,18 @@ typedef struct {
     u32 cbuf[18], cbuf_ptr, root;
     u32 gbuf[16], gbuf_ptr, smap;
     u32 gbuf_f32[16];  /* each global buffer's view as floats, for OpAtomicFAddEXT (atomic_fadd) */
+    /* gbuf_address in this program (gbuf_by_address): gbuf[] are ids that only name the slots, and no storage buffer
+       is declared for them */
+    int gbuf_addressed;
     u32 cas_var;       /* atomic_fadd's loop's word, made at the start where the device has no float atomics */
     u32 wpages, mbase; /* SNX_VKB_WPAGES, and SNX_VKB_MBASE (the windows of pointer tables, SH_GBUF_TABLE) */
     u32 gkey;         /* the global buffer the last global_address named */
     u32 shared, shared_ptr, shared_words;
     u32 local, local_ptr, local_words; /* LDL and STL's memory: a Function array, made at the start */
     u32 in_attr[32], out_attr[32], position, point_size, fragcoord, color[8], depth;
+    /* a vertex program of vertex_fetch: each component of the attributes it reads, as bits, from its prologue
+       (vertex_fetch_prologue), which dominates all its code */
+    u32 fetched[32][4], fetched_mask;
     u32 vertex_index, instance_index, base_instance, local_id, group_id, lane_id;
     u32 num_groups, hmma_count;  /* NumWorkgroups and the HMMAs so far, for hmma_zero */
     int coop;                    /* HMMA takes hmma_coop (coop_wanted), and the module the Vulkan memory model */
@@ -80,10 +96,20 @@ typedef struct {
     u32 nfrags, nacc;
     u32 coop_gen[256];               /* the writes each register took, which the matrices are held against */
     u32 stage_slots;                 /* hmma's A and B staged a warp each (g_spirv_translate.hmma_stage, Workgroup) */
+    u32 warp_base;                   /* warp_read's index high bits, made once a block (coop_flow forgets it) */
     u32 push, push_ptr; /* a vertex program's push constant vec4: the base instance, the depth fix (vk/render.c) */
+    /* with cb_windows, a vertex or fragment program's one push block (unified_push): the members of push and
+       scaled_push, then the three uvec4 of its constant buffers' window offsets from member cbw_member */
+    u32 cbw_member, cbw_u32_ptr;
+    /* with tex_table: the push member of the words' window offsets (SH_PUSH_TEX_WORDS), the words' uniform buffer,
+       the samplers' table, and each kind of image's table (table_kind) */
+    u32 tw_member, tex_words, tex_words_ptr, table_samplers;
+    u32 table_kinds, table_kind_key[32], table_kind_var[32], table_kind_sampled[32];
+    u32 tex_images[SH_MAXTEX]; /* a table slot's image table, 0 for a slot of its own variable */
     u32 centroid_mask;  /* the inputs decorated Centroid */
     u32 legacy_fs;      /* a fragment program's legacy varying groups (shader_legacy_group), read as generics 17-31 */
     u32 point_coord, front_facing, primitive_id;
+    u32 frag_size; /* FragmentSizeNV or ShadingRateKHR (g_spirv_translate.shading_rate) */
     /* a geometry program: its input position (an array of the input primitive's vertices, as its in_attr are), its
        PrimitiveId in and out (passthrough), the viewport mask it writes (a Function variable, 1 until written) and
        whether its SPH asks for passthrough */
@@ -128,7 +154,13 @@ typedef struct {
     u32 pairs[8][2], npairs; /* the two constant buffer bases of an address that adds both (track_step) */
     u32* jump_first; /* by instruction, the first of the BRAs and BRX that go to it in jump_from (n + 1 words), and */
     u32* jump_from;  /* those instructions: made the first time reg_const_at needs them (flow_sources) */
+    BrxTable* brx_table; /* by instruction, the jump table that brx_resolve found for its BRX */
+    int brx_resolved;    /* brx_resolve has looked for the tables */
     u32 cur;         /* the instruction being written */
+    /* the registers an IPA that ipa_over_w takes writes, and those a MUFU.RCP writes, a bit each, made at the first
+       FMUL fmul_over_w looks at: an FMUL of two others needs no search */
+    u32 over_w_ipa[8], over_w_rcp[8];
+    int over_w_known;
     u32 branch_cond; /* the condition of the BRA that ends the body before, 0 for always */
     u32 branch_target; /* the instruction that the BRX which ends the body before goes to */
     /* a task or mesh program's ISBE (isbe_var): a mesh program's attribute area and map (Workgroup), a task
@@ -292,6 +324,7 @@ static u32 root_var(Ctx* c, u32 end) {
 /* the word at byte offset off of a bank, plus the register value index when it isn't 0. A root table's bytes are
    past those of the tables before it, and an index stays in the tables */
 static u32 push_component(Ctx* c, u32 k);
+static u32 cbuf_window(Ctx* c, u32 bank, u32 element);
 static u32 builtin_u32(Ctx* c, u32* var, u32 builtin);
 static u32 cbuf_load(Ctx* c, u32 bank, u32 off, u32 index) {
     /* The draw's base instance, which the console's driver writes into bank 0 for a vertex program to add to its
@@ -324,6 +357,7 @@ static u32 cbuf_load(Ctx* c, u32 bank, u32 off, u32 index) {
         element = cu(c, (off >> 4) & (elements - 1));
         component = cu(c, (off >> 2) & 3);
     }
+    if (!root) element = cbuf_window(c, bank, element);
     return spv_emit_uniform_component(&c->e, c->cbuf_ptr, var, c->zero, element, component, c->t_u32);
 }
 /* NAK's MemType U8 (0), I8 (1), U16 (2), I16 (3) at byte offset off of a bank, plus index when it isn't 0: a byte or
@@ -504,6 +538,33 @@ static u32 nocontract(Ctx* c, u32 v) {
     spv_emit_no_contraction(&c->e, v);
     return v;
 }
+/* p + q for two pairs of floats, rounded to odd: where the sum is not exact, the f32 next to it whose last bit is 1,
+   toward the exact sum. HFMA2 rounds a * b + c once to f16, and a * b is exact in f32, but the sum rounded to the
+   nearest f32 and then by PackHalf2x16 to the nearest f16 can land on an f16 tie that the exact sum is not on (1.5 *
+   35040 + 0.0018 is 52560.0018: 52576, not 52544). The odd f32 is never on one, and f32's 13 more bits make its
+   nearest f16 the exact sum's. TwoSum's error of the nearest sum is exact, as Vulkan's f32 adds are rounded correctly (a sum
+   of f16 values is a multiple of 2^-48, so neither is below the normals); a sum not a number keeps its error from
+   moving it */
+static u32 sum_to_odd(Ctx* c, u32 p, u32 q) {
+    u32 t = c->t_v2f, tu = c->t_v2u, tb = spv_emit_type_vector(&c->e, c->t_bool, 2);
+    u32 s = nocontract(c, op2(c, SPV_OP_F_ADD, t, p, q));
+    u32 qs = nocontract(c, op2(c, SPV_OP_F_SUB, t, s, p)), ps = nocontract(c, op2(c, SPV_OP_F_SUB, t, s, qs));
+    u32 err = nocontract(c, op2(c, SPV_OP_F_ADD, t, nocontract(c, op2(c, SPV_OP_F_SUB, t, p, ps)),
+                                nocontract(c, op2(c, SPV_OP_F_SUB, t, q, qs))));
+    u32 fzero = spv_emit_constant_vec2(&c->e, t, cf(c, 0.0f), cf(c, 0.0f));
+    u32 one = spv_emit_constant_vec2(&c->e, tu, cu(c, 1), cu(c, 1)),
+        zero = spv_emit_constant_vec2(&c->e, tu, c->zero, c->zero);
+    u32 bits = spv_emit_unary(&c->e, SPV_OP_BITCAST, tu, s);
+    u32 even = op2(c, SPV_OP_I_EQUAL, tb, op2(c, SPV_OP_BITWISE_AND, tu, bits, one), zero);
+    u32 move = op2(c, SPV_OP_LOGICAL_AND, tb, op2(c, SPV_OP_F_ORD_NOT_EQUAL, tb, err, fzero), even);
+    /* away from zero where the error has the sum's sign: one more of the magnitude's bits, else one less */
+    u32 away = op2(c, SPV_OP_LOGICAL_EQUAL, tb, op2(c, SPV_OP_F_ORD_LESS_THAN, tb, err, fzero),
+                   op2(c, SPV_OP_F_ORD_LESS_THAN, tb, s, fzero));
+    u32 step = spv_emit_ternary(&c->e, SPV_OP_SELECT, tu, away, one,
+                                spv_emit_constant_vec2(&c->e, tu, cu(c, ~0u), cu(c, ~0u)));
+    bits = spv_emit_ternary(&c->e, SPV_OP_SELECT, tu, move, op2(c, SPV_OP_I_ADD, tu, bits, step), bits);
+    return spv_emit_unary(&c->e, SPV_OP_BITCAST, t, bits);
+}
 /* NAK's FRndMode (bits 78-79): 0 to nearest even, 1 toward -inf, 2 toward +inf, 3 toward zero. r is the result
    rounded to nearest, and above and below say if the exact result is above or below it. A directed mode moves r
    one step (one unit of its bits) when the exact result is on the other side of it */
@@ -612,7 +673,7 @@ static u32 float_mul(Ctx* c, u32 mode, u32 scale, u32 x, u32 y) {
    exact sum of the product (exact in a double) and z */
 static u32 float_fma(Ctx* c, u32 mode, u32 x, u32 y, u32 z) {
     if (!g_spirv_translate.float64) mode = 0;
-    if (mode == 0) return spv_emit_glsl_ternary(&c->e, c->t_f32, c->glsl, SPV_GLSL_FMA, x, y, z);
+    if (mode == 0) return nocontract(c, spv_emit_glsl_ternary(&c->e, c->t_f32, c->glsl, SPV_GLSL_FMA, x, y, z));
     u32 product = nocontract(c, op2(c, SPV_OP_F_MUL, f64_type(c), widen(c, x), widen(c, y)));
     return round_sum(c, mode, product, widen(c, z));
 }
@@ -621,12 +682,55 @@ static u32 float_fma(Ctx* c, u32 mode, u32 x, u32 y, u32 z) {
 
 /* component k of the vec4 at push constant offset 0, which the renderer gives a vertex program as it gives the
    Maxwell one (spirv_translate.c): x the base instance's bits, y not 0 when the depth fix is on */
+/* With cb_windows, a vertex or fragment program declares one push block for everything it reads of them: the vec4 at 0
+   (push_component), the fragment stage's members at 16, 32 and 96 (scaled_slot), then the window offsets of its
+   constant buffers (SH_PUSH_CB_WINDOW, SH_PUSH_CB_WINDOW_FS). A program has one push block at most */
+static int cb_windowed(const Ctx* c) {
+    return g_spirv_translate.cb_windows && (c->stage == ST_VS || c->stage == ST_FS);
+}
+static void unified_push(Ctx* c) {
+    if (c->push) return;
+    const int fs = c->stage == ST_FS;
+    u32 members[8], offsets[8], n = 0;
+    members[n] = c->t_v4f, offsets[n++] = 0;
+    if (fs) {
+        members[n] = c->t_v4f, offsets[n++] = 16;
+        members[n] = c->t_v4u, offsets[n++] = 32;
+        members[n] = c->t_v4u, offsets[n++] = 96;
+    }
+    c->cbw_member = n;
+    for (u32 k = 0; k < 3; k++)
+        members[n] = c->t_v4u, offsets[n++] = (fs ? SH_PUSH_CB_WINDOW_FS : SH_PUSH_CB_WINDOW) + 16 * k;
+    if (g_spirv_translate.tex_table) {
+        c->tw_member = n;
+        members[n] = c->t_v4u, offsets[n++] = SH_PUSH_TEX_WORDS;
+    }
+    u32 block = spv_emit_type_struct(&c->e, members, offsets, n);
+    spv_emit_decorate(&c->e, block, SPV_DECORATION_BLOCK, NULL, 0);
+    c->push = c->scaled_push = spv_emit_variable(&c->e, SPV_STORAGE_PUSH_CONSTANT, block);
+    c->push_ptr = spv_emit_type_pointer(&c->e, SPV_STORAGE_PUSH_CONSTANT, c->t_f32);
+    c->cbw_u32_ptr = spv_emit_type_pointer(&c->e, SPV_STORAGE_PUSH_CONSTANT, c->t_u32);
+    add_interface(c, c->push);
+}
 static u32 push_component(Ctx* c, u32 k) {
+    if (cb_windowed(c)) unified_push(c);
     if (!c->push) {
         c->push = spv_emit_push_vec4(&c->e, c->t_v4f, c->t_f32, 0, 0, &c->push_ptr);
         add_interface(c, c->push);
     }
     return spv_emit_push_component_f32(&c->e, c->push_ptr, c->push, c->zero, cu(c, k), c->t_f32);
+}
+/* element plus the bank's window offset in 16-byte units (a 16-bit field, two banks a word), with cb_windows */
+static u32 cbuf_window(Ctx* c, u32 bank, u32 element) {
+    if (!cb_windowed(c) || bank >= 18 || bank >= g_spirv_translate.uniform_cbufs) return element;
+    unified_push(c);
+    c->si->cb_window = 1;
+    const u32 word = bank / 2;
+    u32 packed = spv_emit_push_component_f32(&c->e, c->cbw_u32_ptr, c->push, cu(c, c->cbw_member + word / 4),
+                                             cu(c, word & 3), c->t_u32);
+    if (bank & 1) packed = spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, packed, cu(c, 16));
+    return spv_emit_iadd_u32(&c->e, c->t_u32, element,
+                             spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, packed, cu(c, 0xFFFF)));
 }
 /* The depth fix of spirv_translate.c's vertex_depth_fix: with the push constant's y not 0, z becomes (z + w) / 2,
    from the console's clip space depth of -w to w to Vulkan's of 0 to w */
@@ -730,6 +834,7 @@ static u32 input_var(Ctx* c, u32 i) {
 /* the bits of component k of generic input i. A fragment program's input that no output of the stage before writes
    (in_unfed_mask) reads 0, 0, 0, 1, as the Maxwell translator reads it, with no Input for the stage before to match */
 static u32 input_load(Ctx* c, u32 i, u32 k) {
+    if (c->stage == ST_VS && c->si->vertex_fetch) return c->fetched_mask >> i & 1 ? c->fetched[i][k] : c->zero;
     if (c->stage == ST_FS && (c->si->in_unfed_mask >> i & 1)) {
         c->si->in_mask |= 1u << i;
         return to_u(c, cf(c, k == 3 ? 1.0f : 0.0f));
@@ -778,6 +883,7 @@ static u32 scale_component(Ctx* c, u32 k) {
    push constant offset 16 (vk/render.c: x the slots 0 to 31, y 32 to 63), as a bool. With own, whether that target
    has the size of the one the draw renders to as well (render.c's own_size): its bit in the uvec4 at offset 96 */
 static u32 scaled_slot(Ctx* c, int slot, int own) {
+    if (cb_windowed(c)) unified_push(c); /* members 2 and 3 there too */
     if (!c->scaled_push) {
         const u32 members[3] = {c->t_v4f, c->t_v4u, c->t_v4u}, offsets[3] = {16, 32, 96};
         u32 block = spv_emit_type_struct(&c->e, members, offsets, 3);
@@ -786,7 +892,8 @@ static u32 scaled_slot(Ctx* c, int slot, int own) {
         add_interface(c, c->scaled_push);
     }
     u32 bits = spv_emit_push_component_f32(&c->e, spv_emit_type_pointer(&c->e, SPV_STORAGE_PUSH_CONSTANT, c->t_u32),
-                                           c->scaled_push, cu(c, own ? 2 : 1), cu(c, slot >= 32), c->t_u32);
+                                           c->scaled_push, cu(c, (cb_windowed(c) ? 1u : 0u) + (own ? 2u : 1u)),
+                                           cu(c, slot >= 32), c->t_u32);
     u32 bit = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32,
                               spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, bits, cu(c, (u32)slot & 31)),
                               cu(c, 1));
@@ -964,7 +1071,8 @@ static void attr_store(Ctx* c, u32 addr, u32 bits) {
     }
     if (addr == 0x5c) {
         /* NAK's NAK_ATTR_VPRS_TABLE_INDEX from SM86, the primitive's shading rate: the default rate, one fragment
-           a pixel, is what the translation gives without it */
+           a pixel, is what the translation gives without it. The game's driver writes no table for the index (the
+           hardware's reset table), so the rate it selects is not known */
         return;
     } else if (addr == 0x6c) {
         /* a geometry program's point size needs GeometryPointSize, which the device may lack: then it is 1, as the
@@ -1074,6 +1182,252 @@ static void gs_passthrough(Ctx* c) {
 
 /* ---- global and shared memory ---- */
 
+/* the buffer that names local memory to mem_ptr, mem_load and mem_store */
+#define MEM_LOCAL 0xffffffffu
+/* ---- global memory by device address (ShCaps.gbuf_address) ---- */
+
+static u32 record_word(Ctx* c, u32 k);
+/* A vertex or fragment program of the texture table reads its global buffers by address: the record of the draw holds
+   each slot's address and length (SH_RECORD_GBUF), where the renderer bound a descriptor of the same bytes before.
+   The word index into the slot (and the atlas's table, SNX_VKB_SMAP) stays as it was */
+static int gbuf_by_address(const Ctx* c) {
+    return g_spirv_translate.gbuf_address && g_spirv_translate.tex_table && cb_windowed(c);
+}
+static int gbuf_slot_of(const Ctx* c, u32 buffer) {
+    int slot = 0;
+    while (slot < 15 && c->gbuf[slot] != buffer) slot++;
+    return slot;
+}
+static int gbuf_is_address(const Ctx* c, u32 buffer) { return c->gbuf_addressed && buffer && buffer != MEM_LOCAL; }
+/* a pointer of pointee type to word index of the slot of buffer. Robustness doesn't cover addresses: an index at or past
+   the slot's length takes the record's scratch word, where a store is dropped. A load through it reads 0, as a
+   descriptor's did (mem_word_load) */
+static u32 gbuf_pointer(Ctx* c, u32 buffer, u32 index, u32 type) {
+    const u32 rec = 4u * (u32)gbuf_slot_of(c, buffer);
+    u32 address = pair64(c, record_word(c, rec), record_word(c, rec + 1));
+    u32 words = spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, record_word(c, rec + 2), cu(c, 2));
+    u32 inside = spv_emit_binary(&c->e, SPV_OP_U_LESS_THAN, c->t_bool, index, words);
+    address = op2(c, SPV_OP_I_ADD, u64_type(c), address,
+                  op2(c, SPV_OP_SHIFT_LEFT_LOGICAL, u64_type(c), to64(c, index), c64(c, 2)));
+    u32 scratch = pair64(c, record_word(c, SH_RECORD_SCRATCH), record_word(c, SH_RECORD_SCRATCH + 1));
+    address = spv_emit_ternary(&c->e, SPV_OP_SELECT, u64_type(c), inside, address, scratch);
+    return spv_emit_address_pointer(&c->e, type, address);
+}
+/* ---- a vertex program's own attribute fetch (ShCaps.vertex_fetch) ---- */
+
+/* An SM86 vertex program of the record reads its generic attributes from the vertex streams by device address, where
+   the draw bound vertex buffers and set a vertex input state before. Attribute i's 4 words in the record
+   (SH_RECORD_ATTR + 4 i) give the address of its first element, the bytes from there to its stream's end, and its
+   format in the SH_ATTR_ fields (vk/render.c's fetch_plan). The element is the vertex's (VertexIndex holds the draw's
+   first vertex and vertex offset), or for an attribute stepped per instance firstInstance + (InstanceIndex -
+   firstInstance) / divisor, as Vulkan's fetch has it, BaseInstance being firstInstance */
+static int vertex_fetches(const Ctx* c) {
+    return g_spirv_translate.vertex_fetch && g_spirv_translate.draw_parameters && c->stage == ST_VS &&
+           gbuf_by_address(c);
+}
+static u32 ubits(Ctx* c, u32 v, u32 offset, u32 count) {
+    return spv_emit_ternary(&c->e, SPV_OP_BIT_FIELD_U_EXTRACT, c->t_u32, v, cu(c, offset), cu(c, count));
+}
+static u32 u_equal(Ctx* c, u32 a, u32 b) { return spv_emit_binary(&c->e, SPV_OP_I_EQUAL, c->t_bool, a, b); }
+static u32 u_select(Ctx* c, u32 cond, u32 a, u32 b) {
+    return spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32, cond, a, b);
+}
+static u32 f_select(Ctx* c, u32 cond, u32 a, u32 b) {
+    return spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_f32, cond, a, b);
+}
+/* the n aligned words from address al on, each 0 where it starts at or past lim, the stream's end: robustness doesn't
+   cover addresses, so such a word's load reads the record's scratch word. The word with the stream's last bytes ends
+   past lim where the stream ends inside a word, and the renderer binds that word whole (render_draw_main) */
+static void fetch_words(Ctx* c, u32 al, u32 lim, u32 scratch, u32 n, u32* w) {
+    const u32 t64 = u64_type(c);
+    for (u32 j = 0; j < n; j++) {
+        u32 at = j ? op2(c, SPV_OP_I_ADD, t64, al, c64(c, 4u * j)) : al;
+        u32 inside = op2(c, SPV_OP_U_LESS_THAN, c->t_bool, at, lim);
+        u32 pointer =
+            spv_emit_address_pointer(&c->e, c->t_u32, spv_emit_ternary(&c->e, SPV_OP_SELECT, t64, inside, at, scratch));
+        w[j] = u_select(c, inside, spv_emit_load_aligned(&c->e, c->t_u32, pointer, 4, 0), c->zero);
+    }
+}
+/* the first m words of the attribute's bytes, which start sh bits into w[0] (sh 0, 8, 16 or 24): w[j] >> sh, with
+   the low bits of w[j + 1] above. (x << 1) << (31 - sh) is x << (32 - sh), and defined at sh 0, where it is 0 */
+static void fetch_align(Ctx* c, const u32* w, u32 n, u32 sh, u32 m, u32* aw) {
+    for (u32 j = 0; j < m; j++) {
+        aw[j] = op2(c, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, w[j], sh);
+        if (j + 1 >= n) continue;
+        u32 high =
+            op2(c, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, op2(c, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, w[j + 1], cu(c, 1)),
+                op2(c, SPV_OP_I_SUB, c->t_u32, cu(c, 31), sh));
+        aw[j] = op2(c, SPV_OP_BITWISE_OR, c->t_u32, aw[j], high);
+    }
+}
+/* an unsigned float of 5 exponent bits over mb mantissa bits (B10G11R11's components) as f32 bits: a denormal is
+   m 2^(-14 - mb), exponent 31 an infinity or a NaN */
+static u32 small_float(Ctx* c, u32 v, u32 mb) {
+    u32 m = ubits(c, v, 0, mb), e = ubits(c, v, mb, 5);
+    u32 mantissa = op2(c, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, m, cu(c, 23 - mb));
+    u32 normal =
+        op2(c, SPV_OP_BITWISE_OR, c->t_u32,
+            op2(c, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, spv_emit_iadd_u32(&c->e, c->t_u32, e, cu(c, 112)), cu(c, 23)),
+            mantissa);
+    u32 special = op2(c, SPV_OP_BITWISE_OR, c->t_u32, cu(c, 0x7F800000u), mantissa);
+    u32 denormal = to_u(c, op2(c, SPV_OP_F_MUL, c->t_f32, spv_emit_unary(&c->e, SPV_OP_CONVERT_U_TO_F, c->t_f32, m),
+                               cf(c, 1.0f / (float)(1u << (14 + mb)))));
+    return u_select(c, u_equal(c, e, c->zero), denormal, u_select(c, u_equal(c, e, cu(c, 31)), special, normal));
+}
+/* component k of an attribute as the program reads it, from its bits r (zero-extended) of wd bits (0: the format has
+   no such component) and the attribute's type: an integer attribute (attr_int_mask) its integer's bits, as its Input
+   variable had them, and else a float. A missing component is 0, and 1 as the last */
+static u32 fetch_decode(Ctx* c, u32 r, u32 wd, u32 type, u32 k, int integer) {
+    u32 s = to_u(c, spv_emit_ternary(&c->e, SPV_OP_BIT_FIELD_S_EXTRACT, c->t_i32,
+                                     spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, r), c->zero, wd));
+    u32 value = u_select(c, u_equal(c, type, cu(c, 3)), s, r);
+    u32 one = cu(c, integer ? 1u : 0x3F800000u);
+    if (!integer) {
+        /* the largest value of wd bits: (1 << (wd & 31)) - 1 is defined at wd 32 too, where the select takes ~0 */
+        u32 most = u_select(c, u_equal(c, wd, cu(c, 32)), cu(c, 0xFFFFFFFFu),
+                            op2(c, SPV_OP_I_SUB, c->t_u32,
+                                op2(c, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, cu(c, 1),
+                                    op2(c, SPV_OP_BITWISE_AND, c->t_u32, wd, cu(c, 31))),
+                                cu(c, 1)));
+        u32 fu = spv_emit_unary(&c->e, SPV_OP_CONVERT_U_TO_F, c->t_f32, r);
+        u32 fs =
+            spv_emit_unary(&c->e, SPV_OP_CONVERT_S_TO_F, c->t_f32, spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, s));
+        /* the largest value is exactly 1, as Vulkan's fixed-function conversion makes it: OpFDiv may be 2.5 ulp off */
+        const u32 smost = op2(c, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, most, cu(c, 1));
+        u32 unorm =
+            f_select(c, u_equal(c, r, most), cf(c, 1.0f),
+                     op2(c, SPV_OP_F_DIV, c->t_f32, fu, spv_emit_unary(&c->e, SPV_OP_CONVERT_U_TO_F, c->t_f32, most)));
+        u32 snorm =
+            f_select(c, u_equal(c, s, smost), cf(c, 1.0f),
+                     f_select(c, u_equal(c, s, op2(c, SPV_OP_I_SUB, c->t_u32, c->zero, smost)), cf(c, -1.0f),
+                              spv_emit_glsl_binary(&c->e, c->t_f32, c->glsl, SPV_GLSL_F_MAX,
+                                                   op2(c, SPV_OP_F_DIV, c->t_f32, fs,
+                                                       spv_emit_unary(&c->e, SPV_OP_CONVERT_U_TO_F, c->t_f32, smost)),
+                                                   cf(c, -1.0f))));
+        u32 half = spv_emit_vec4_extract(&c->e, c->t_f32, SPV_EXT(&c->e, c->t_v2f, SPV_GLSL_UNPACK_HALF2X16, r), 0);
+        /* float: 32 bits as they are, 16 a half, and the 8-bit and packed formats unorm (the renderer gives those
+           type 2) */
+        u32 flt =
+            f_select(c, u_equal(c, wd, cu(c, 32)), to_f(c, r), f_select(c, u_equal(c, wd, cu(c, 16)), half, unorm));
+        u32 f = f_select(
+            c, u_equal(c, type, cu(c, 1)), snorm,
+            f_select(c, u_equal(c, type, cu(c, 2)), unorm,
+                     f_select(c, u_equal(c, type, cu(c, 5)), fu, f_select(c, u_equal(c, type, cu(c, 6)), fs, flt))));
+        u32 is_int = op2(c, SPV_OP_LOGICAL_OR, c->t_bool, u_equal(c, type, cu(c, 3)), u_equal(c, type, cu(c, 4)));
+        value = u_select(c, is_int, value, to_u(c, f));
+    }
+    return u_select(c, u_equal(c, wd, c->zero), k == 3 ? one : c->zero, value);
+}
+/* The size codes a vertex program fetches: the attribute's bytes, the bytes of each component (0 for a packed
+   format), and its components */
+static const struct {
+    u8 code, bytes, comp, n;
+} g_fetch_sizes[] = {{0x01, 16, 4, 4}, {0x02, 12, 4, 3}, {0x04, 8, 4, 2}, {0x12, 4, 4, 1}, {0x03, 8, 2, 4},
+                     {0x05, 6, 2, 3},  {0x0F, 4, 2, 2},  {0x1B, 2, 2, 1}, {0x0A, 4, 1, 4}, {0x13, 3, 1, 3},
+                     {0x18, 2, 1, 2},  {0x1D, 1, 1, 1},  {0x30, 4, 0, 4}, {0x31, 4, 0, 3}};
+enum { FETCH_SIZES = sizeof g_fetch_sizes / sizeof *g_fetch_sizes };
+/* The fetch of each attribute the program reads, in its first block, before its code: what each ALD of a generic
+   reads is then a value of the prologue (input_load). Each attribute reads the aligned words that hold its bytes and
+   decodes them in a switch on its size code, uniform in the draw: an attribute marked constant takes the default,
+   where no case writes a component */
+static void vertex_fetch_prologue(Ctx* c) {
+    if (!vertex_fetches(c)) return;
+    c->si->vertex_fetch = 1;
+    u32 mask = 0;
+    for (u32 i = 0; i < c->n; i++) {
+        const Sm86Insn* in = &c->in[i];
+        if (in->op != SM86_ALD) continue;
+        const u32 addr = sm86_field(in, 40, 10), comps = sm86_field(in, 74, 2) + 1;
+        for (u32 k = 0; k < comps; k++)
+            if (addr + 4 * k >= 0x80 && addr + 4 * k < 0x280) mask |= 1u << ((addr + 4 * k - 0x80) >> 4);
+    }
+    if (!mask) return;
+    /* the Function variables the cases write, before the first block's other instructions */
+    const u32 ptr = spv_emit_type_function_pointer(&c->e, c->t_u32);
+    u32 raw[4], width[4];
+    for (u32 k = 0; k < 4; k++) {
+        raw[k] = spv_emit_function_variable_init(&c->e, ptr, c->zero);
+        width[k] = spv_emit_function_variable_init(&c->e, ptr, c->zero);
+    }
+    const u32 t64 = u64_type(c);
+    u32 scratch = pair64(c, record_word(c, SH_RECORD_SCRATCH), record_word(c, SH_RECORD_SCRATCH + 1));
+    u32 vertex = builtin_u32(c, &c->vertex_index, SPV_BUILT_IN_VERTEX_INDEX);
+    spv_emit_draw_parameters_capability(&c->e);
+    u32 first = builtin_u32(c, &c->base_instance, SPV_BUILT_IN_BASE_INSTANCE);
+    u32 since = op2(c, SPV_OP_I_SUB, c->t_u32, builtin_u32(c, &c->instance_index, SPV_BUILT_IN_INSTANCE_INDEX), first);
+    for (u32 i = 0; i < 32; i++) {
+        if (!(mask >> i & 1)) continue;
+        const u32 rec = SH_RECORD_ATTR + 4 * i;
+        u32 addr = pair64(c, record_word(c, rec), record_word(c, rec + 1));
+        u32 lim = op2(c, SPV_OP_I_ADD, t64, addr, to64(c, record_word(c, rec + 2)));
+        u32 info = record_word(c, rec + 3);
+        u32 stride = op2(c, SPV_OP_BITWISE_AND, c->t_u32, info, cu(c, SH_ATTR_STRIDE_MASK));
+        u32 size = ubits(c, info, SH_ATTR_SIZE_SHIFT, 6), type = ubits(c, info, SH_ATTR_TYPE_SHIFT, 3);
+        /* instanced, constant, BGRA */
+        const u32 bits[3] = {SH_ATTR_INSTANCED, SH_ATTR_CONSTANT, SH_ATTR_BGRA};
+        u32 flag[3];
+        for (u32 f = 0; f < 3; f++)
+            flag[f] = spv_emit_binary(&c->e, SPV_OP_I_NOT_EQUAL, c->t_bool,
+                                      op2(c, SPV_OP_BITWISE_AND, c->t_u32, info, cu(c, bits[f])), c->zero);
+        u32 divisor = record_word(c, SH_RECORD_DIVISOR + i);
+        divisor = u_select(c, u_equal(c, divisor, c->zero), cu(c, 1), divisor);
+        u32 element =
+            u_select(c, flag[0],
+                     spv_emit_iadd_u32(&c->e, c->t_u32, first, op2(c, SPV_OP_U_DIV, c->t_u32, since, divisor)), vertex);
+        u32 at = op2(c, SPV_OP_I_ADD, t64, addr, op2(c, SPV_OP_I_MUL, t64, to64(c, element), to64(c, stride)));
+        u32 al = op2(c, SPV_OP_BITWISE_AND, t64, at, c64(c, ~(u64)3));
+        u32 sh = op2(c, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32,
+                     op2(c, SPV_OP_BITWISE_AND, c->t_u32, lo32(c, at), cu(c, 3)), cu(c, 3));
+        for (u32 k = 0; k < 4; k++) spv_emit_store(&c->e, width[k], c->zero);
+        u32 merge = spv_emit_id(&c->e), literals[FETCH_SIZES], labels[FETCH_SIZES];
+        for (u32 f = 0; f < FETCH_SIZES; f++) {
+            literals[f] = g_fetch_sizes[f].code;
+            labels[f] = spv_emit_id(&c->e);
+        }
+        /* the selector before the merge: OpSelectionMerge must come right before the OpSwitch */
+        const u32 selector = u_select(c, flag[1], c->zero, size);
+        coop_merge(c, merge);
+        coop_switch(c, selector, merge, literals, labels, FETCH_SIZES);
+        for (u32 f = 0; f < FETCH_SIZES; f++) {
+            const u32 bytes = g_fetch_sizes[f].bytes, comp = g_fetch_sizes[f].comp, code = g_fetch_sizes[f].code;
+            const u32 n = (bytes + 6) / 4, m = (bytes + 3) / 4; /* the words that hold the bytes at any sh */
+            u32 w[5], aw[4];
+            coop_label(c, labels[f]);
+            fetch_words(c, al, lim, scratch, n, w);
+            fetch_align(c, w, n, sh, m, aw);
+            for (u32 k = 0; k < g_fetch_sizes[f].n; k++) {
+                u32 r, wd;
+                if (code == 0x30) { /* A2B10G10R10: 10 bits each from bit 0, the last 2 */
+                    r = ubits(c, aw[0], 10 * k, k < 3 ? 10 : 2);
+                    wd = k < 3 ? 10 : 2;
+                } else if (code == 0x31) { /* B10G11R11 UFLOAT: 6 and 5 mantissa bits, then 5 */
+                    r = small_float(c, ubits(c, aw[0], 11 * k, k < 2 ? 11 : 10), k < 2 ? 6 : 5);
+                    wd = 32;
+                } else {
+                    r = comp == 4 ? aw[k] : ubits(c, aw[k * comp / 4], (k * comp % 4) * 8, comp * 8);
+                    wd = comp * 8;
+                }
+                spv_emit_store(&c->e, raw[k], r);
+                spv_emit_store(&c->e, width[k], cu(c, wd));
+            }
+            coop_branch(c, merge);
+        }
+        coop_label(c, merge);
+        u32 r[4], wd[4];
+        for (u32 k = 0; k < 4; k++) {
+            r[k] = spv_emit_load(&c->e, c->t_u32, raw[k]);
+            wd[k] = spv_emit_load(&c->e, c->t_u32, width[k]);
+        }
+        /* BGRA8: the first and third components swap */
+        const u32 x = r[0];
+        r[0] = u_select(c, flag[2], r[2], x);
+        r[2] = u_select(c, flag[2], x, r[2]);
+        const int integer = c->si->attr_int_mask >> i & 1;
+        for (u32 k = 0; k < 4; k++) c->fetched[i][k] = fetch_decode(c, r[k], wd[k], type, k, integer);
+    }
+    c->fetched_mask = mask;
+    c->si->in_mask |= mask;
+}
 static u32 gbuf_slot(Ctx* c, u32 key, int write) {
     int slot = -1;
     for (int i = 0; i < c->si->ngbuf; i++)
@@ -1087,6 +1441,11 @@ static u32 gbuf_slot(Ctx* c, u32 key, int write) {
         }
         slot = c->si->ngbuf++;
         c->si->gbuf_cbuf_off[slot] = key;
+    }
+    if (!c->gbuf[slot] && gbuf_by_address(c)) {
+        c->gbuf_addressed = 1;
+        c->si->gbuf_address = 1;
+        c->gbuf[slot] = spv_emit_id(&c->e); /* a name: gbuf_pointer reads the slot's address from the record */
     }
     if (!c->gbuf[slot]) {
         u32 array = spv_emit_type_runtime_array(&c->e, c->t_u32, 4);
@@ -1224,12 +1583,14 @@ static u32 global_address(Ctx* c, const Sm86Insn* in, int uniform_form, int writ
    windows of a pointer table (SH_GBUF_TABLE): its culling programs count and fill their lists at pointers they load
    from cbuf 4 */
 enum { DYN_STORE, DYN_LOAD, DYN_ATOMIC };
+/* the registers a load of mem_type (NAK's MemType) writes: 64 bits two, 128 four */
+static u32 mem_words(u32 type) { return type == 5 ? 2 : type == 6 ? 4 : 1; }
 static void mem_load(Ctx* c, u32 buffer, u32 address, u32 type, u32 dst, int uniform_dst);
 static void mem_store(Ctx* c, u32 buffer, u32 address, u32 type, u32 data);
 static u32 atomic_fadd(Ctx* c, u32 buffer, u32 address, u32 data);
 static void global_dynamic(Ctx* c, const Sm86Insn* in, int kind, u32 opcode, int fadd) {
     int op = in->op, ldst_uniform = op == SM86_LDG || op == SM86_STG;
-    u32 type = sm86_field(in, 73, 3), words = kind == DYN_ATOMIC ? 1 : type == 5 ? 2 : type == 6 ? 4 : 1;
+    u32 type = sm86_field(in, 73, 3), words = kind == DYN_ATOMIC ? 1 : mem_words(type);
     u32 reg = sm86_field(in, 24, 8), imm = sm86_field(in, 40, 24);
     u32 hi = sm86_field(in, ldst_uniform ? 90 : 72, 1) && reg < SM86_RZ ? rd(c, reg + 1) : c->zero;
     u32 address = pair64(c, rd(c, reg), hi);
@@ -1466,7 +1827,7 @@ static void track_step(Ctx* c, u32 i, TrackState* s) {
         return;
     }
     if (op == SM86_LDS || op == SM86_LDL) { /* data from memory, as a load from global memory's */
-        u32 type = sm86_field(in, 73, 3), words = type == 5 ? 2 : type == 6 ? 4 : 1;
+        u32 type = sm86_field(in, 73, 3), words = mem_words(type);
         for (u32 w = 0; w < words && in->dst + w < SM86_RZ; w++) {
             track_write(c, s, 0, in->dst + w, 0, 0, 1, (u16)op, always);
             s->rtab[in->dst + w] = 0, s->rtabx[in->dst + w] = 0, s->rcell[in->dst + w] = 0;
@@ -1778,10 +2139,10 @@ static u32 shared_block_base(Ctx* c) {
                                                   builtin_vec3(c, &c->num_groups, SPV_BUILT_IN_NUM_WORKGROUPS, k)));
     return spv_emit_binary(&c->e, SPV_OP_I_MUL, c->t_u32, place, cu(c, c->shared_words));
 }
-/* the buffer that names local memory to mem_ptr, mem_load and mem_store */
-#define MEM_LOCAL 0xffffffffu
 static u32 smap_word(Ctx* c, u32 index) {
-    return spv_emit_load(&c->e, c->t_u32, spv_emit_storage_access_u32(&c->e, c->gbuf_ptr, c->smap, c->zero, index));
+    /* the table's own pointer type: a program of gbuf_address has no global buffer variable to take it from */
+    const u32 ptr = spv_emit_type_storage_pointer(&c->e, c->t_u32);
+    return spv_emit_load(&c->e, c->t_u32, spv_emit_storage_access_u32(&c->e, ptr, c->smap, c->zero, index));
 }
 /* Where a word of a global buffer is in what is bound. A draw whose writable storage shares a page with another of its
    buffers has them all bound as one atlas of pages (vk_buf_draw_prepare), and a table (SNX_VKB_SMAP) gives each
@@ -1796,12 +2157,23 @@ static u32 smap_slot(Ctx* c, u32 buffer) {
         c->smap = spv_emit_storage_buffer(
             &c->e, spv_emit_type_struct_one(&c->e, spv_emit_type_runtime_array(&c->e, c->t_u32, 4)),
             (u32)shader_vk_set(c->stage), SNX_VKB_SMAP);
+        /* NonWritable: no instruction writes the table (the write log, SNX_VKB_WPAGES on the same binding, is a
+           compute program's, which has no table), so the shared optimizer (spv_opt_values) reads each word of it
+           once where it dominates. Before, each word of global memory loaded it again: a third of the module */
+        spv_emit_decorate(&c->e, c->smap, 24, NULL, 0);
         add_interface(c, c->smap);
     }
     return slot;
 }
-static u32 gbuf_word_index(Ctx* c, u32 buffer, u32 word) {
-    if (c->stage == ST_CS) return word;
+/* The n words from word on (n 1, 2 or 4) in index[]. The table's offset is the buffer's place in its first page of
+   guest memory, so at counts the words from the start of a page; the hardware aligns an access of 8 or 16 bytes to
+   its size, so its words are in one page, and one lookup of the page gives them all. Each word has its own check of
+   the buffer's end */
+static void gbuf_word_indices(Ctx* c, u32 buffer, u32 word, u32 n, u32 index[4]) {
+    if (c->stage == ST_CS) {
+        for (u32 k = 0; k < n; k++) index[k] = k ? spv_emit_iadd_u32(&c->e, c->t_u32, word, cu(c, k)) : word;
+        return;
+    }
     u32 slot = smap_slot(c, buffer);
     u32 first = smap_word(c, cu(c, slot)), offset = smap_word(c, cu(c, 16 + slot)),
         count = smap_word(c, cu(c, 32 + slot));
@@ -1815,14 +2187,26 @@ static u32 gbuf_word_index(Ctx* c, u32 buffer, u32 word) {
         spv_emit_binary(&c->e, SPV_OP_BITWISE_OR, c->t_u32,
                         spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, smap_word(c, entry), cu(c, 10)),
                         spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, at, cu(c, 1023)));
-    mapped = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32,
-                              spv_emit_binary(&c->e, SPV_OP_U_LESS_THAN, c->t_bool, word, count), mapped, cu(c, ~0u));
-    return spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32, none, word, mapped);
+    for (u32 k = 0; k < n; k++) {
+        u32 w = k ? spv_emit_iadd_u32(&c->e, c->t_u32, word, cu(c, k)) : word;
+        u32 m = k ? spv_emit_iadd_u32(&c->e, c->t_u32, mapped, cu(c, k)) : mapped;
+        m = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32,
+                             spv_emit_binary(&c->e, SPV_OP_U_LESS_THAN, c->t_bool, w, count), m, cu(c, ~0u));
+        index[k] = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32, none, w, m);
+    }
+}
+static u32 gbuf_word_index(Ctx* c, u32 buffer, u32 word) {
+    u32 index[4];
+    gbuf_word_indices(c, buffer, word, 1, index);
+    return index[0];
 }
 /* A global buffer's bytes as the program sees them: the array's length where it is bound whole, and in an atlas of
    pages its own words that SNX_VKB_SMAP gives, as gbuf_word_index takes them */
 static u32 gbuf_bytes(Ctx* c, u32 buffer) {
-    u32 bound = SPV(&c->e, SPV_OP_ARRAY_LENGTH, c->t_u32, buffer, 0);
+    u32 bound = gbuf_is_address(c, buffer)
+                    ? spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32,
+                                      record_word(c, 4u * (u32)gbuf_slot_of(c, buffer) + 2), cu(c, 2))
+                    : SPV(&c->e, SPV_OP_ARRAY_LENGTH, c->t_u32, buffer, 0);
     if (c->stage != ST_CS) {
         u32 slot = smap_slot(c, buffer);
         u32 none = spv_emit_binary(&c->e, SPV_OP_I_EQUAL, c->t_bool, smap_word(c, cu(c, slot)), cu(c, ~0u));
@@ -1833,17 +2217,18 @@ static u32 gbuf_bytes(Ctx* c, u32 buffer) {
 /* a word of global (buffer), shared (buffer 0) or local (MEM_LOCAL) memory at the byte address. An address past
    the local memory wraps in it, as spirv_translate.c keeps Maxwell's LDL and STL in theirs */
 static u32 mem_ptr(Ctx* c, u32 buffer, u32 address, u32 word) {
-    u32 index = spv_emit_iadd_u32(
-        &c->e, c->t_u32, spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, address, cu(c, 2)), cu(c, word));
+    u32 index = spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, address, cu(c, 2));
+    if (word) index = spv_emit_iadd_u32(&c->e, c->t_u32, index, cu(c, word));
     if (buffer == MEM_LOCAL)
         return spv_emit_function_element_pointer(
             &c->e, c->local_ptr, c->local,
             spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, index, cu(c, c->local_words - 1)));
+    if (gbuf_is_address(c, buffer)) return gbuf_pointer(c, buffer, gbuf_word_index(c, buffer, index), c->t_u32);
     if (buffer)
         return spv_emit_storage_access_u32(&c->e, c->gbuf_ptr, buffer, c->zero, gbuf_word_index(c, buffer, index));
     u32 shared = shared_var(c), last = cu(c, c->shared_words - 1);
-    index = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32,
-                             spv_emit_binary(&c->e, SPV_OP_U_LESS_THAN, c->t_bool, last, index), last, index);
+    /* the clamp is one UMin, not a compare and a select: ucas proved the two equal over the whole u32 domain */
+    index = SPV_EXT(&c->e, c->t_u32, SPV_GLSL_U_MIN, last, index);
     if (c->si->shared_spill)
         return spv_emit_storage_access_u32(&c->e, c->shared_ptr, shared, c->zero,
                                            spv_emit_iadd_u32(&c->e, c->t_u32, shared_block_base(c), index));
@@ -1874,21 +2259,49 @@ static u32 atomic_opcode(u32 type, u32 how) {
    barriers order for the workgroup's other invocations) */
 static u32 mem_word_load(Ctx* c, u32 buffer, u32 ptr) {
     if (buffer && buffer != MEM_LOCAL && c->coop) return spv_emit_atomic_load_u32(&c->e, c->t_u32, ptr);
+    /* by address: Volatile for what Coherent gave the descriptor's (gbuf_slot), and the alignment it must name. A
+       word past the slot's length (gbuf_pointer's scratch word) reads 0, as robustness gave the descriptor's: the
+       scratch word holds what the last dropped store left */
+    if (gbuf_is_address(c, buffer)) {
+        const u32 t64 = u64_type(c);
+        u32 scratch = pair64(c, record_word(c, SH_RECORD_SCRATCH), record_word(c, SH_RECORD_SCRATCH + 1));
+        u32 past =
+            spv_emit_binary(&c->e, SPV_OP_I_EQUAL, c->t_bool, spv_emit_pointer_address(&c->e, t64, ptr), scratch);
+        return u_select(c, past, c->zero, spv_emit_load_aligned(&c->e, c->t_u32, ptr, 4, 1));
+    }
     return buffer ? spv_emit_load(&c->e, c->t_u32, ptr) : spv_emit_load_nonprivate(&c->e, c->t_u32, ptr);
 }
 static void mem_word_store(Ctx* c, u32 buffer, u32 ptr, u32 value) {
     if (buffer && buffer != MEM_LOCAL && c->coop)
         spv_emit_atomic_store_u32(&c->e, c->t_u32, ptr, value);
+    else if (gbuf_is_address(c, buffer))
+        spv_emit_store_aligned(&c->e, ptr, value, 4, 1);
     else if (buffer)
         spv_emit_store(&c->e, ptr, value);
     else
         spv_emit_store_nonprivate(&c->e, ptr, value);
 }
+/* the n words (1, 2 or 4) of one access at the byte address: a global buffer's through one lookup of their page
+   (gbuf_word_indices) */
+static void mem_ptrs(Ctx* c, u32 buffer, u32 address, u32 n, u32 ptrs[4]) {
+    if (!buffer || buffer == MEM_LOCAL) {
+        for (u32 k = 0; k < n; k++) ptrs[k] = mem_ptr(c, buffer, address, k);
+        return;
+    }
+    u32 index[4];
+    gbuf_word_indices(c, buffer, spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, address, cu(c, 2)), n,
+                      index);
+    for (u32 k = 0; k < n; k++)
+        ptrs[k] = gbuf_is_address(c, buffer)
+                      ? gbuf_pointer(c, buffer, index[k], c->t_u32)
+                      : spv_emit_storage_access_u32(&c->e, c->gbuf_ptr, buffer, c->zero, index[k]);
+}
 /* a load of mem_type (NAK's MemType) into registers dst on */
 static void mem_load(Ctx* c, u32 buffer, u32 address, u32 type, u32 dst, int uniform_dst) {
-    u32 words = type == 5 ? 2 : type == 6 ? 4 : 1;
+    u32 words = mem_words(type), ptrs[4];
+    mem_ptrs(c, buffer, address, dst >= SM86_RZ ? 1 : words, ptrs);
     for (u32 k = 0; k < words; k++) {
-        u32 v = mem_word_load(c, buffer, mem_ptr(c, buffer, address, k));
+        u32 v = mem_word_load(c, buffer, ptrs[k]);
         if (type < 4) {
             /* a byte or a halfword of the word, sign or zero extended */
             u32 shift = spv_emit_binary(
@@ -1937,9 +2350,9 @@ static void mem_store(Ctx* c, u32 buffer, u32 address, u32 type, u32 data) {
         }
         return;
     }
-    u32 words = type == 5 ? 2 : type == 6 ? 4 : 1;
-    for (u32 k = 0; k < words; k++)
-        mem_word_store(c, buffer, mem_ptr(c, buffer, address, k), rd(c, data >= SM86_RZ ? data : data + k));
+    u32 words = mem_words(type), ptrs[4];
+    mem_ptrs(c, buffer, address, words, ptrs);
+    for (u32 k = 0; k < words; k++) mem_word_store(c, buffer, ptrs[k], rd(c, data >= SM86_RZ ? data : data + k));
 }
 
 /* RED.ADD.F32 and ATOMG.ADD.F32 (NAK's AtomType F32, .FTZ.RN): a float atomic add to the word of a global buffer at
@@ -1949,6 +2362,14 @@ static void mem_store(Ctx* c, u32 buffer, u32 address, u32 type, u32 data) {
    of the lanes that race on a word succeeds each time round. Its sum flushes subnormals as the instruction does
    (ftz) */
 static u32 atomic_fadd(Ctx* c, u32 buffer, u32 address, u32 data) {
+    if (g_spirv_translate.float_atomic_add && gbuf_is_address(c, buffer)) {
+        spv_emit_extension(&c->e, "SPV_EXT_shader_atomic_float_add");
+        spv_emit_capability(&c->e, SPV_CAPABILITY_ATOMIC_FLOAT32_ADD_EXT);
+        u32 index =
+            gbuf_word_index(c, buffer, spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, address, cu(c, 2)));
+        return to_u(c, SPV(&c->e, SPV_OP_ATOMIC_F_ADD_EXT, c->t_f32, gbuf_pointer(c, buffer, index, c->t_f32),
+                           cu(c, SPV_SCOPE_DEVICE), cu(c, SPV_MEMORY_SEMANTICS_RELAXED), to_f(c, data)));
+    }
     if (g_spirv_translate.float_atomic_add) {
         u32 slot = 0;
         while (slot < 15 && c->gbuf[slot] != buffer) slot++;
@@ -2037,9 +2458,8 @@ static u32 isbe_ptr(Ctx* c, u32 var, u32 storage, u32 index) {
 static u32 isbe_load(Ctx* c, u32 var, u32 storage, u32 words, u32 index) {
     u32 last = cu(c, words - 1);
     u32 inside = spv_emit_binary(&c->e, SPV_OP_U_LESS_THAN, c->t_bool, index, cu(c, words));
-    u32 v =
-        spv_emit_load(&c->e, c->t_u32,
-                      isbe_ptr(c, var, storage, spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32, inside, index, last)));
+    u32 at = SPV_EXT(&c->e, c->t_u32, SPV_GLSL_U_MIN, last, index); /* a clamp of the index, not a compare */
+    u32 v = spv_emit_load(&c->e, c->t_u32, isbe_ptr(c, var, storage, at));
     return spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32, inside, v, c->zero);
 }
 /* value into word index of an ISBE array of words: a store past its end goes nowhere */
@@ -2149,18 +2569,21 @@ static int falls_through(const Sm86Insn* in) {
     return !((in->op == SM86_BRA || is_brx(in->op) || in->op == SM86_EXIT) && sm86_always(in)) && in->op != SM86_RET;
 }
 static u32 brx_targets(Ctx* c, u32 i, u32* targets, u32 max);
+static u32 brx_targets_scan(Ctx* c, u32 i, u32* targets, u32 max);
+static int brx_resolve(Ctx* c);
 /* the instructions that jump to each one, build_structure's edges: a BRA's target, a BRX's cases. Returns 0 when it
    can't be made */
 static int flow_sources(Ctx* c) {
     if (c->jump_first) return 1;
-    u32 n = c->n, total = 0, t[64];
+    if (!brx_resolve(c)) return 0;
+    u32 n = c->n, total = 0;
     for (u32 i = 0; i < n; i++) {
         const Sm86Insn* in = &c->in[i];
         if (sm86_never(in)) continue;
         if (in->op == SM86_BRA)
             total++;
         else if (is_brx(in->op))
-            total += brx_targets(c, i, t, 64);
+            total += c->brx_table[i].count;
     }
     u32* first = calloc((size_t)n + 1 + total + 1, sizeof *first);
     if (!first) return 0;
@@ -2174,17 +2597,23 @@ static int flow_sources(Ctx* c) {
         for (u32 i = 0; i < n; i++) {
             const Sm86Insn* in = &c->in[i];
             if (sm86_never(in)) continue;
-            u32 count = 0;
-            if (in->op == SM86_BRA)
-                t[count++] = sm86_branch_target(in, i);
-            else if (is_brx(in->op))
-                count = brx_targets(c, i, t, 64);
-            for (u32 k = 0; k < count; k++) {
-                if (t[k] >= n) continue;
+            if (in->op == SM86_BRA) {
+                u32 t = sm86_branch_target(in, i);
+                if (t >= n) continue;
                 if (pass == 0)
-                    first[t[k] + 1]++;
+                    first[t + 1]++;
                 else
-                    from[first[t[k]] + fill[t[k]]++] = i;
+                    from[first[t] + fill[t]++] = i;
+            } else if (is_brx(in->op)) {
+                const BrxTable* table = &c->brx_table[i];
+                for (u32 k = 0; k < table->count; k++) {
+                    u32 t = table->targets[k];
+                    if (t >= n) continue;
+                    if (pass == 0)
+                        first[t + 1]++;
+                    else
+                        from[first[t] + fill[t]++] = i;
+                }
             }
             if (pass == 0 && i + 1 == n)
                 for (u32 k = 0; k < n; k++) first[k + 1] += first[k];
@@ -2296,6 +2725,10 @@ static int may_write(const Sm86Insn* in, u32 r) {
         case SM86_SUATOM_CAS_B:
         case SM86_HMMA:
         case SM86_LDSM: return in->dst < SM86_RZ && r >= in->dst && r < in->dst + 4u;
+        case SM86_LDSM_HMMA: /* the pair's two halves: the HMMA's D and the LDSM's fragments */
+            return (in->dst < SM86_RZ && r >= in->dst && r < in->dst + 4u) ||
+                   (sm86_fuse_ldsm_dst(in) < SM86_RZ && r >= sm86_fuse_ldsm_dst(in) &&
+                    r < sm86_fuse_ldsm_dst(in) + 4u);
         default: return in->dst < SM86_RZ && r >= in->dst && r < in->dst + 2u;
     }
 }
@@ -2341,11 +2774,56 @@ static int reg_const_at(Ctx* c, u32 i, u32 r, u32* value) {
     *value = v;
     return 1;
 }
+/* whether a texture instruction's results go two halves a register: .F16 (bit 79, NAK's note on TLD) on a float
+   result, which all but TXQ's are */
+static int tex_halves(const Sm86Insn* in) {
+    return sm86_field(in, 79, 1) && in->op != SM86_TXQ && in->op != SM86_TXQ_B && in->op != SM86_TXQ_U;
+}
+/* the registers a texture instruction writes (tex_results): one a component of its channel mask, or one a pair of
+   them with tex_halves */
+static u32 tex_result_count(const Sm86Insn* in) {
+    u32 n = snx_popcount64(sm86_field(in, 72, 4));
+    return tex_halves(in) ? (n + 1) / 2 : n;
+}
+/* the register a texture instruction's result k goes to: the first two (one with tex_halves) into dst and on, the
+   others into dst1 (bits 64-71) and on, or on from dst when dst1 is RZ */
+static u32 tex_result_reg(const Sm86Insn* in, u32 k) {
+    u32 d0 = in->dst, d1 = sm86_field(in, 64, 8), first = tex_halves(in) ? 1u : 2u;
+    if (d1 < SM86_RZ && k >= first) return d1 + k - first;
+    return d0 >= SM86_RZ ? d0 : d0 + k;
+}
 /* may_write, of the words an instruction really writes where its type tells: an ALU's result is one but for those of
-   64 bits, and an LDC's as its size says */
+   64 bits, an IPA's one, a load's as its size says, and a texture instruction's those its channel mask selects */
 static int writes_word(const Sm86Insn* in, u32 r) {
     if (!may_write(in, r)) return 0;
-    if (in->op == SM86_LDC) return r < in->dst + (sm86_field(in, 73, 3) == 5 ? 2u : 1u);
+    switch (in->op) {
+        case SM86_IPA: return r == in->dst;
+        case SM86_LDC: return r < in->dst + (sm86_field(in, 73, 3) == 5 ? 2u : 1u);
+        case SM86_LDG:
+        case SM86_LDG_NOU:
+        case SM86_LDL: return r < in->dst + mem_words(sm86_field(in, 73, 3));
+        case SM86_TEX:
+        case SM86_TEX_B:
+        case SM86_TLD:
+        case SM86_TLD_B:
+        case SM86_TLD4:
+        case SM86_TLD4_B:
+        case SM86_TMML:
+        case SM86_TMML_B:
+        case SM86_TXD:
+        case SM86_TXD_B:
+        case SM86_TXQ:
+        case SM86_TXQ_B:
+        case SM86_TEX_U:
+        case SM86_TLD_U:
+        case SM86_TLD4_U:
+        case SM86_TXD_U:
+        case SM86_TXQ_U:
+            for (u32 k = 0; k < tex_result_count(in); k++)
+                if (tex_result_reg(in, k) == r) return 1;
+            return 0;
+        default: break;
+    }
     if (sm86_ops[in->op].kind != SM86_K_ALU) return 1;
     switch (in->op) {
         case SM86_DADD:
@@ -2405,6 +2883,76 @@ static u32 offset_vector(Ctx* c, int known, u32 value, u32 x, u32 dims, u32 used
                      : spv_emit_vec3_construct(&c->e, type, v[0], v[1], v[2]);
 }
 
+/* ---- the texture table (ShCaps.tex_table) ---- */
+
+static u32 uniform_word(Ctx* c, u32 pointer, u32 buffer, u32 index);
+/* the image table of a kind of texture, declared once a kind: all at binding 0 of the table's set */
+static u32 table_kind(Ctx* c, u32 type, u32 array, u32 shadow, u32 ms, u32* sampled) {
+    const u32 key = type | array << 4 | shadow << 5 | ms << 6;
+    for (u32 k = 0; k < c->table_kinds; k++)
+        if (c->table_kind_key[k] == key) {
+            *sampled = c->table_kind_sampled[k];
+            return c->table_kind_var[k];
+        }
+    if (c->table_kinds == 32) return 0; /* never: 3 types, array, shadow and ms make 24 kinds */
+    u32 var = spv_emit_image_table(&c->e, c->t_f32, c->t_u32, g_spirv_translate.table_set, 0, type, (int)array,
+                                   (int)shadow, ms ? 1 : 0, SNX_TABLE_IMAGES, sampled);
+    add_interface(c, var);
+    c->table_kind_key[c->table_kinds] = key;
+    c->table_kind_var[c->table_kinds] = var;
+    c->table_kind_sampled[c->table_kinds++] = *sampled;
+    return var;
+}
+/* Slot i reads its texture through the table where the program's stage has it: its tex[] is made at each instruction
+   that samples it (table_element). 0 where the slot keeps a variable of its own */
+static int tex_table_slot(Ctx* c, int i, u32 type, u32 array, u32 shadow, u32 ms) {
+    c->tex_images[i] = 0;
+    if (!g_spirv_translate.tex_table || !cb_windowed(c)) return 0;
+    /* a 1D texture is bound as a 2D one (shader.h) */
+    c->tex_images[i] = table_kind(c, type == 0 ? 1 : type, array, shadow, ms ? 1 : 0, &c->tex_sampled[i]);
+    if (!c->tex_images[i]) return 0;
+    c->si->tex_table = 1;
+    c->tex[i] = 0;
+    return 1;
+}
+/* For this instruction, a table slot's tex[]: its word from the draw's words (the window offset at SH_PUSH_TEX_WORDS,
+   x the vertex stage's, y the fragment stage's, in 16-byte units, plus the slot), and the image and the sampler that
+   the word names */
+/* word k of the stage's record in the draw's words: the window offset at SH_PUSH_TEX_WORDS (x the vertex stage's, y the
+   fragment stage's, in 16-byte units), plus k */
+static u32 record_word(Ctx* c, u32 k) {
+    if (!c->tex_words) {
+        c->tex_words = spv_emit_uniform_vec4_array(&c->e, c->t_v4u, c->t_u32, c->t_u32, (u32)shader_vk_set(c->stage),
+                                                   SNX_VKB_TEXWORDS, 4096, &c->tex_words_ptr);
+        add_interface(c, c->tex_words);
+    }
+    unified_push(c);
+    u32 base = spv_emit_push_component_f32(&c->e, c->cbw_u32_ptr, c->push, cu(c, c->tw_member),
+                                           cu(c, c->stage == ST_FS), c->t_u32);
+    u32 index = spv_emit_iadd_u32(
+        &c->e, c->t_u32, spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, base, cu(c, 2)), cu(c, k));
+    return uniform_word(c, c->tex_words_ptr, c->tex_words, index);
+}
+static void table_element(Ctx* c, int slot) {
+    if (!c->tex_images[slot]) return;
+    if (!c->table_samplers) {
+        c->table_samplers = spv_emit_sampler_table(&c->e, c->t_u32, g_spirv_translate.table_set, 1, SNX_TABLE_SAMPLERS);
+        add_interface(c, c->table_samplers);
+    }
+    /* after the attributes in a vertex program that fetches them, else after the global buffers, as render.c's
+       stage_set_ writes them: by the stage too, as a ShaderInfo that a vertex program's translation set vertex_fetch on
+       keeps it */
+    const u32 at = c->stage == ST_VS && c->si->vertex_fetch ? SH_RECORD_TEX_FETCH
+                   : g_spirv_translate.gbuf_address         ? SH_RECORD_GBUF
+                                                            : 0;
+    u32 word = record_word(c, at + (u32)slot);
+    /* the image index within the table's array whatever the word holds: an index past an array is undefined, where
+       robustness doesn't reach */
+    u32 image = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, word, cu(c, SNX_TABLE_IMAGES - 1));
+    u32 sampler = spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, word, cu(c, SNX_TABLE_SAMPLER_SHIFT));
+    c->tex[slot] =
+        spv_emit_table_element(&c->e, c->tex_sampled[slot], c->tex_images[slot], image, c->table_samplers, sampler);
+}
 /* the texture slot of a handle at byte offset off of a bank */
 /* the texture slot of the handle at c[bank][off] with that view: ms for a multisampled 2D texture (ShTex.flags bit 1,
    which the renderer binds a multisampled view for) */
@@ -2430,8 +2978,9 @@ static int tex_slot(Ctx* c, u32 bank, u32 off, u32 type, u32 array, u32 shadow, 
     t.bl_cbuf = (u8)bank;
     t.flags = ms ? 2 : 0;
     si->tex[i] = t;
+    if (tex_table_slot(c, i, type, array, shadow, ms)) return i;
     /* a 1D texture is bound as a 2D one (shader.h) */
-    c->tex[i] = spv_emit_sampler_image(&c->e, c->t_f32, (u32)shader_vk_set(c->stage), SNX_VKB_TEX + (u32)i,
+    c->tex[i] = spv_emit_sampler_image(&c->e, c->t_f32, (u32)shader_vk_tex_set(c->stage), SNX_VKB_TEX + (u32)i,
                                        type == 0 ? 1 : type, (int)array, (int)shadow, ms ? 1 : 0, &c->tex_sampled[i]);
     add_interface(c, c->tex[i]);
     return i;
@@ -2463,7 +3012,7 @@ static int tex_slot_indexed(Ctx* c, u32 bank, u32 off, u32 type, u32 array, u32 
     t.stride = (u16)stride;
     t.count = (u16)count;
     si->tex[i] = t;
-    u32 set = (u32)shader_vk_set(c->stage), dim = type == 0 ? 1 : type;
+    u32 set = (u32)shader_vk_tex_set(c->stage), dim = type == 0 ? 1 : type;
     int same = 0;
     while (same < i && !((si->tex[same].flags & SNX_TEX_INDEXED) &&
                          shader_same_indexed_kind(si->tex, si->tex_int_mask, si->tex_sint_mask, same, i)))
@@ -2519,8 +3068,7 @@ static u32 uniform_word(Ctx* c, u32 pointer, u32 buffer, u32 index) {
    shader_direct_swap_element does. Returns the array's element */
 static u32 indexed_element(Ctx* c, int slot, u32 var) {
     u32 limit = cu(c, SNX_TEX_ARRAY - 1), index = spv_emit_load(&c->e, c->t_u32, var);
-    index = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32,
-                             spv_emit_binary(&c->e, SPV_OP_U_LESS_THAN, c->t_bool, limit, index), limit, index);
+    index = SPV_EXT(&c->e, c->t_u32, SPV_GLSL_U_MIN, limit, index); /* a clamp, not a compare and a select */
     index = spv_emit_iadd_u32(&c->e, c->t_u32, index, cu(c, indexed_table(c->si, slot) * SNX_TEX_ARRAY));
     u32 element = uniform_word(c, c->tex_map_ptr, c->tex_map, index);
     c->tex[slot] = spv_emit_sampler_array_element(&c->e, c->tex_sampled[slot], c->tex_array[slot], element);
@@ -2591,16 +3139,15 @@ static int tex_operands(const Sm86Insn* in, u32 n0, u32 n1, u32* regs) {
    with a zero high half. One game's text programs take an alpha that way (HADD2.F32 R, -RZ, R.H0_H0), and with each
    component in a register of its own their glyphs read the low bits of a float */
 static void tex_results(Ctx* c, const Sm86Insn* in, u32 value, u32 scalar) {
-    u32 mask = sm86_field(in, 72, 4), d0 = in->dst, d1 = sm86_field(in, 64, 8), written = 0;
-    if (scalar == c->t_f32 && sm86_field(in, 79, 1)) {
+    u32 mask = sm86_field(in, 72, 4), written = 0;
+    if (tex_halves(in)) {
         u32 half[4], n = 0;
         for (u32 k = 0; k < 4; k++)
             if (mask & (1u << k)) half[n++] = spv_emit_vec4_extract(&c->e, scalar, value, k);
         for (u32 p = 0; 2 * p < n; p++) {
             u32 pair =
                 spv_emit_vec2_construct(&c->e, c->t_v2f, half[2 * p], 2 * p + 1 < n ? half[2 * p + 1] : cf(c, 0.0f));
-            u32 r = p == 0 || d1 >= SM86_RZ ? (d0 >= SM86_RZ ? d0 : d0 + p) : d1;
-            wr(c, r, pack_half(c, pair));
+            wr(c, tex_result_reg(in, p), pack_half(c, pair));
         }
         return;
     }
@@ -2608,9 +3155,7 @@ static void tex_results(Ctx* c, const Sm86Insn* in, u32 value, u32 scalar) {
         if (!(mask & (1u << k))) continue;
         u32 v = spv_emit_vec4_extract(&c->e, scalar, value, k);
         if (scalar != c->t_u32) v = to_u(c, v);
-        u32 r = written < 2 || d1 >= SM86_RZ ? (d0 >= SM86_RZ ? d0 : d0 + written) : d1 + written - 2;
-        wr(c, r, v);
-        written++;
+        wr(c, tex_result_reg(in, written++), v);
     }
 }
 static u32 coord_vector(Ctx* c, const u32* f, u32 count) {
@@ -2652,6 +3197,7 @@ static void texture(Ctx* c, const Sm86Insn* in) {
     int slot = bindless || memory ? (int)c->handle[c->cur].slot - 1
                                   : tex_slot(c, (handle >> 14) & 31, (handle & 0x3fff) * 4, type, array, shadow, 0);
     if (slot < 0) return;
+    table_element(c, slot);
     /* list1: a TEX.B's handle (prepare_handles), the LOD or bias, the offset, the depth reference
        (nak_nir_lower_tex.c) */
     u32 n0 = array + coords, n1 = (u32)bindless + (lod_mode == 2 || lod_mode == 3) + offset + shadow, regs[8];
@@ -2825,6 +3371,7 @@ static void texture_grad(Ctx* c, const Sm86Insn* in) {
     int slot = in->op == SM86_TXD_U ? (int)c->handle[c->cur].slot - 1 /* memory_handles' */
                                     : tex_slot(c, (handle >> 14) & 31, (handle & 0x3fff) * 4, type, array, 0, 0);
     if (slot < 0) return;
+    table_element(c, slot);
     u32 a = sm86_field(in, 24, 8), b = sm86_field(in, 32, 8), f[4], dx[3], dy[3], count = 0;
 #define TXD_REG(base, k) ((base) < SM86_RZ ? (base) + (k) : SM86_RZ)
     for (u32 k = 0; k < coords; k++, count++) {
@@ -2868,6 +3415,7 @@ static void texel_fetch(Ctx* c, const Sm86Insn* in) {
     int slot = in->op == SM86_TLD_U ? (int)c->handle[c->cur].slot - 1 /* memory_handles' */
                                     : tex_slot(c, (handle >> 14) & 31, (handle & 0x3fff) * 4, type, array, 0, ms);
     if (slot < 0) return;
+    table_element(c, slot);
     /* list1: the level, the offset (four bits a component), then the sample, as Maxwell's TLD orders them */
     u32 n0 = array + coords, n1 = (lod_mode == 3) + offset + ms, regs[8];
     if (!tex_operands(in, n0, n1, regs)) {
@@ -2922,6 +3470,7 @@ static void texture_query(Ctx* c, const Sm86Insn* in) {
         ms = c->in[k].op == SM86_TLD && sm86_field(&c->in[k], 78, 1) && sm86_field(&c->in[k], 40, 19) == handle;
     if (slot < 0 && !mem) slot = tex_slot(c, bank, off * 4, 1, 0, 0, ms);
     if (slot < 0) return;
+    table_element(c, slot);
     const ShTex* t = &c->si->tex[slot];
     ms = t->flags & 2;
     u32 dims = (t->type == 2 ? 3 : 2) + t->array; /* a 1D texture is a 2D one, a cube's size is its face's */
@@ -3056,29 +3605,41 @@ static u32 system_value(Ctx* c, u32 sr);
 static u32 warp_lane(Ctx* c) {
     return spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, system_value(c, 0), cu(c, 31));
 }
-/* value as lane j (0-31) of the invocation's own 32 holds it */
+/* value as lane j (0-31) of the invocation's own 32 holds it. The index's high bits are the address of the lanes'
+   own 32 in the subgroup's, which every read of a block takes as one value (warp_base) */
 static u32 warp_read(Ctx* c, u32 value, u32 j) {
-    u32 own = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, system_value(c, 0), cu(c, ~31u));
+    if (!c->warp_base)
+        c->warp_base = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, system_value(c, 0), cu(c, ~31u));
     spv_emit_capability(&c->e, SPV_CAPABILITY_GROUP_NON_UNIFORM_SHUFFLE);
     return SPV(&c->e, SPV_OP_GROUP_NON_UNIFORM_SHUFFLE, c->t_u32, cu(c, SPV_SCOPE_SUBGROUP), value,
-               spv_emit_binary(&c->e, SPV_OP_BITWISE_OR, c->t_u32, own, j));
+               spv_emit_binary(&c->e, SPV_OP_BITWISE_OR, c->t_u32, c->warp_base, j));
 }
 /* value as lane l ^ mask of the invocation's own 32 holds it, for lane l (mask below 32) */
 static u32 warp_xor(Ctx* c, u32 value, u32 mask) {
     spv_emit_capability(&c->e, SPV_CAPABILITY_GROUP_NON_UNIFORM_SHUFFLE);
     return SPV(&c->e, SPV_OP_GROUP_NON_UNIFORM_SHUFFLE_XOR, c->t_u32, cu(c, SPV_SCOPE_SUBGROUP), value, cu(c, mask));
 }
-/* value as lane 4g + p of the invocation's own 32 holds it, g4 = 4g for the reader's own g: a quad broadcast where the
-   stage has quad operations, which AMD makes a DPP move where a shuffle goes through LDS. Vulkan's quad is four
-   invocations of adjacent subgroup ids, the first a multiple of 4, in every stage that has them; so in a subgroup of
-   64 too the reader's quad is lanes 4g to 4g + 3 of its own 32, and quad lane p is lane 4g + p */
-static u32 quad_read(Ctx* c, u32 value, u32 g4, u32 p) {
+/* the lane of the invocation's own 32 that a read takes: base with k, one of the 16 B words or a quad lane, which is
+   base itself for lane 0 */
+static u32 warp_index(Ctx* c, u32 base, u32 k) {
+    return k ? spv_emit_binary(&c->e, SPV_OP_BITWISE_OR, c->t_u32, base, cu(c, k)) : base;
+}
+/* 4g, the first lane of the reader's own quad: made once, where a read or staged A needs it */
+static u32 quad_base(Ctx* c, u32 lane, u32* g4) {
+    if (!*g4) *g4 = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, lane, cu(c, 28));
+    return *g4;
+}
+/* value as lane 4g + p of the invocation's own 32 holds it: a quad broadcast where the stage has quad operations,
+   which AMD makes a DPP move where a shuffle goes through LDS. Vulkan's quad is four invocations of adjacent subgroup
+   ids, the first a multiple of 4, in every stage that has them; so in a subgroup of 64 too the reader's quad is lanes
+   4g to 4g + 3 of its own 32, and quad lane p is lane 4g + p */
+static u32 quad_read(Ctx* c, u32 value, u32 lane, u32* g4, u32 p) {
     if (c->stage == ST_CS ? g_spirv_translate.quad_compute : c->stage == ST_FS && g_spirv_translate.quad) {
         spv_emit_capability(&c->e, SPV_CAPABILITY_GROUP_NON_UNIFORM);
         spv_emit_subgroup_quad_capability(&c->e);
         return spv_emit_subgroup_quad_u32(&c->e, c->t_u32, value, 0, cu(c, p));
     }
-    return warp_read(c, value, spv_emit_binary(&c->e, SPV_OP_BITWISE_OR, c->t_u32, g4, cu(c, p)));
+    return warp_read(c, value, warp_index(c, quad_base(c, lane, g4), p));
 }
 static u32 half_pair(Ctx* c, u32 bits) { return SPV_EXT(&c->e, c->t_v2f, SPV_GLSL_UNPACK_HALF2X16, bits); }
 void shader_hmma_choose(int subgroups, int radv_warp32, int shuffle_loops, int shared_max) {
@@ -3147,8 +3708,9 @@ static u32 hmma_zero(Ctx* c) {
    whatever the 64 words after its 8 hold (the start of D's), which only reach D's columns 8-15, never read back. A
    16 wide K pads a .1688's k of 8 with zeros in A's columns and B's rows 8-15, as stale words there could be
    infinities or NaNs, and 0 times those poisons the sums; a 16x8x8 shape splits a .16816's K in two products and an
-   8x8x8 its M in two more. The accumulator starts at zero and C is added to the lane's four elements of D after the
-   product: staging C as well (4 stores, 8 loads) cost one game's video upscaler half of the gain. A subgroup barrier
+   8x8x8 its M in two more. The accumulator starts at zero and an f16 D's C is added to the lane's four elements of D
+   after the product: staging C as well (4 stores, 8 loads) cost one game's video upscaler half of the gain. An f32 D,
+   which stays in its matrix (below), takes a C from the registers staged as its accumulator. A subgroup barrier
    comes before the stores (the last HMMA's loads of the slot), between them and the matrix loads, and between D's
    store and the lanes' loads of it; RADV makes them no instruction, a wave's LDS accesses being in order.
    The products of two f16 are exact in f32, and the device sums them in f32 inside the instruction, rounded as it
@@ -3179,7 +3741,7 @@ static int coop_wanted(const Ctx* c) {
     u32 own = c->si->shared_size > 0 ? (u32)c->si->shared_size : 16384u; /* shared_var's */
     if (own + lanes / 32 * COOP_WORDS * 4 > (u32)g_spirv_translate.hmma_coop) return 0;
     for (u32 i = 0; i < c->n; i++)
-        if (c->in[i].op == SM86_HMMA) return 1;
+        if (c->in[i].op == SM86_HMMA || c->in[i].op == SM86_LDSM_HMMA) return 1;
     return 0;
 }
 static void coop_barrier(Ctx* c) {
@@ -3219,19 +3781,20 @@ static u32 coop_base(Ctx* c) {
     return spv_emit_binary(&c->e, SPV_OP_I_MUL, c->t_u32,
                            builtin_u32(c, &c->subgroup_id, SPV_BUILT_IN_SUBGROUP_ID), cu(c, COOP_WORDS));
 }
-/* a lane's words (g = l / 4, t = l % 4): g8 = 8g and t */
-static void coop_lane(Ctx* c, u32* g8, u32* t) {
+/* a lane's words (g = l / 4, t = l % 4): 8g, or 16g where the shape's D rows are 16 words (wide), and t. ucas
+   proved the mask form of 8g equal to the two shifts over every lane, and the model prices it one less; the wide
+   row's one shift more is the same mask's, so it is made at the same time */
+static void coop_lane(Ctx* c, u32* g8, u32* t, int wide) {
     u32 lane = warp_lane(c);
     *g8 = spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32,
-                          spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, lane, cu(c, 2)), cu(c, 3));
+                          spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, lane, cu(c, 28)), cu(c, wide ? 2 : 1));
     *t = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, lane, cu(c, 3));
 }
 /* the lane's first D word in its slot: row g of a 16 wide shape's 16 words a row at 2g8, and of an 8 wide one's 8 at
    g8, then its two columns. Its four words are that one, the next, and both a row of 8 lanes further on */
 static u32 coop_d_at(Ctx* c, u32 shape) {
-    u32 cols = coop_dim[shape][1], drow, g8, t;
-    coop_lane(c, &g8, &t);
-    drow = cols == 16 ? spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, g8, cu(c, 1)) : g8;
+    u32 cols = coop_dim[shape][1], drow, t;
+    coop_lane(c, &drow, &t, cols == 16);
     return spv_emit_iadd_u32(
         &c->e, c->t_u32, coop_base(c),
         spv_emit_iadd_u32(&c->e, c->t_u32, drow,
@@ -3277,9 +3840,7 @@ static int coop_acc_find(Ctx* c, u32 r) {
     }
     return -1;
 }
-/* the words of a D matrix to its registers: the words take a store, so one block's matrices are stored between one
-   pair of subgroup barriers (coop_flow) where there are many, or one matrix alone where one register asks. Both take
-   the slot's base and the lane's word, which a block of matrices makes once */
+/* the words of a D matrix to its registers go through the slot's D words, one matrix's room (coop_acc_write) */
 static void coop_d_store(Ctx* c, u32 shape, const u32* mat, u32 nmat, u32 base) {
     for (u32 m = 0; m < nmat; m++)
         SPV_VOID(&c->e, SPV_OP_COOPERATIVE_MATRIX_STORE_KHR,
@@ -3292,6 +3853,17 @@ static void coop_d_read(Ctx* c, u32 shape, u32 at_d, u32 out[4]) {
     for (u32 k = 0; k < 4; k++)
         out[k] = to_f(c, spv_emit_load_nonprivate(&c->e, c->t_u32, coop_d_word(c, shape, at_d, k)));
 }
+/* a held D's words to its registers, through the slot's D words: stored, then read back by each lane. The barrier
+   before the store keeps the last reads of those words (another D's, or a 16 wide B's, which spans their start) from
+   it, and the one after it the reads from the store */
+static void coop_acc_write(Ctx* c, const CoopAcc* a, u32 base) {
+    u32 out[4];
+    coop_barrier(c);
+    coop_d_store(c, a->shape, a->mat, a->nmat, base);
+    coop_barrier(c);
+    coop_d_read(c, a->shape, coop_d_at(c, a->shape), out);
+    for (u32 k = 0; k < 4; k++) wr(c, a->first + k, to_u(c, out[k]));
+}
 /* the words of the matrix r's register is one of, before a read or a write of it: an other entry stays held, and its
    words are still the matrix's */
 static void coop_acc_take(Ctx* c, u32 r) {
@@ -3300,15 +3872,20 @@ static void coop_acc_take(Ctx* c, u32 r) {
     CoopAcc a = c->coop_acc[i];
     c->coop_acc[i] = c->coop_acc[c->nacc - 1];
     c->nacc--; /* the writes below must not find it again */
-    u32 base = coop_base(c), at_d = coop_d_at(c, a.shape), out[4];
-    coop_d_store(c, a.shape, a.mat, a.nmat, base);
-    coop_barrier(c);
-    coop_d_read(c, a.shape, at_d, out);
-    for (u32 k = 0; k < 4; k++) wr(c, a.first + k, to_u(c, out[k]));
+    coop_acc_write(c, &a, coop_base(c));
 }
 /* an HMMA's f32 result kept as the D matrix of the registers it names, instead of their words: 1 where it is held,
-   0 where the block already holds its share of matrices and the words must be written */
+   0 where the block already holds its share of matrices and the words must be written. A held D of the same four
+   registers is this one's to replace, and one that shares only some of them goes to its registers first: the others
+   keep its words */
 static int coop_acc_hold(Ctx* c, u32 d, u32 shape, const u32* mat, u32 nmat) {
+    for (u32 k = 0; k < 4; k++) {
+        int i = coop_acc_find(c, d + k);
+        if (i >= 0 && c->coop_acc[i].first == d)
+            c->coop_acc[i] = c->coop_acc[--c->nacc];
+        else if (i >= 0)
+            coop_acc_take(c, d + k);
+    }
     for (u32 k = 0; k < 4; k++) c->coop_gen[d + k]++; /* the words are the matrix's now */
     if (c->nacc == COOP_ACC) return 0;
     CoopAcc* a = &c->coop_acc[c->nacc++];
@@ -3317,28 +3894,18 @@ static int coop_acc_hold(Ctx* c, u32 d, u32 shape, const u32* mat, u32 nmat) {
     for (u32 k = 0; k < nmat; k++) a->mat[k] = mat[k];
     return 1;
 }
-/* the block's end, at its branches and labels: D's words back to their registers, and the caches empty. A matrix
-   defined here has no value at a label the block's other arms reach too */
+/* the block's end, at its branches and labels: D's words back to their registers, one held D after the other, and the
+   caches empty. A matrix defined here has no value at a label the block's other arms reach too, nor has warp_read's
+   lane base, which the next block that reads another lane makes again */
 static void coop_flow(Ctx* c) {
-    if (!c->nacc && !c->nfrags) return;
-    if (c->nacc) {
-        u32 n = c->nacc;
-        c->nacc = c->nfrags = 0; /* the writes below must not find them again */
-        u32 base = coop_base(c), at_d = coop_d_at(c, c->coop_acc[0].shape);
-        for (u32 i = 0; i < n; i++)
-            coop_d_store(c, c->coop_acc[i].shape, c->coop_acc[i].mat, c->coop_acc[i].nmat, base);
-        coop_barrier(c);
-        for (u32 i = 0; i < n; i++) {
-            CoopAcc a = c->coop_acc[i];
-            u32 out[4], at = a.shape == c->coop_acc[0].shape ? at_d : coop_d_at(c, a.shape);
-            coop_d_read(c, a.shape, at, out);
-            for (u32 k = 0; k < 4; k++) wr(c, a.first + k, to_u(c, out[k]));
-        }
-        return;
-    }
-    c->nfrags = 0;
+    c->warp_base = 0;
+    u32 n = c->nacc;
+    c->nacc = c->nfrags = 0; /* the writes below must not find them again */
+    if (!n) return;
+    u32 base = coop_base(c);
+    for (u32 i = 0; i < n; i++) coop_acc_write(c, &c->coop_acc[i], base);
 }
-static void hmma_coop(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 rb, u32 rc) {
+static void hmma_coop(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 rb, u32 rc, const u32* ldsm_a) {
     u32 na = k16 ? 4 : 2, nb = k16 ? 2 : 1, ncd = f32 ? 4 : 2, a[4], b[2], cc[4], k;
     spv_emit_capability(&c->e, SPV_CAPABILITY_FLOAT16);
     spv_emit_capability(&c->e, SPV_CAPABILITY_GROUP_NON_UNIFORM);
@@ -3373,7 +3940,7 @@ static void hmma_coop(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 
     int c_chain = 0;
     if (f32 && rc < SM86_RZ) {
         int i = coop_acc_find(c, rc);
-        if (i >= 0 && c->coop_acc[i].shape == shape) {
+        if (i >= 0 && c->coop_acc[i].shape == shape && c->coop_acc[i].first == rc) {
             for (u32 m = 0; m < mblocks; m++) c_mat[m] = c->coop_acc[i].mat[m];
             c_chain = 1;
         } else if (i >= 0)
@@ -3382,38 +3949,52 @@ static void hmma_coop(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 
     /* the words the staging writes: a .1688's second K half is zeros where the shape's K is 16, and an 8 wide K reads
        only the first half's, whose .1688 has none to zero */
     u32 ka = k16 || depth == 16 ? 4 : 2, kb = k16 || depth == 16 ? 2 : 1;
-    /* C's words, which the product takes from the registers where no matrix stands for them: added to the lane's
-       words after the product, as they were before the matrices stayed. Staging them instead costs a matrix load for
-       the 4 word loads and adds it takes */
+    /* C's words, which the product takes from the registers where no matrix stands for them: an f16 D's are added to
+       the lane's words after the product, as they were before the matrices stayed (staging them costs a matrix load
+       for the 4 word loads and adds it takes), and an f32 D's are staged as the product's accumulator, as that D
+       stays in its matrix, where nothing would add them after */
+    int stage_c = f32 && rc < SM86_RZ && !c_chain;
     if (rc < SM86_RZ && !c_chain)
         for (k = 0; k < ncd; k++) cc[k] = rd(c, rc + k);
     /* the fragments no matrix stands for, staged in the slot, with the barrier that keeps the last HMMA's loads of it
        away. An RZ fragment's zeros stage too, as the words there can be anything */
-    int words = (ra < SM86_RZ ? fa < 0 : 1) || (rb < SM86_RZ ? fb < 0 : 1);
+    int words = (ra < SM86_RZ ? fa < 0 : 1) || (rb < SM86_RZ ? fb < 0 : 1) || stage_c;
     u32 base = words || fa < 0 || fb < 0 ? coop_base(c) : 0, g8 = 0, t = 0, at_a = 0, at_b = 0;
     if (words) {
-        if (ra < SM86_RZ && fa < 0)
-            for (k = 0; k < na; k++) a[k] = rd(c, ra + k);
-        if (rb < SM86_RZ && fb < 0)
-            for (k = 0; k < nb; k++) b[k] = rd(c, rb + k);
-        coop_lane(c, &g8, &t);
+        if (fa < 0) /* an RZ fragment's too: zeros */
+            for (k = 0; k < na; k++) a[k] = ra >= SM86_RZ ? c->zero : ldsm_a ? ldsm_a[k] : rd(c, ra + k);
+        if (fb < 0)
+            for (k = 0; k < nb; k++) b[k] = rb >= SM86_RZ ? c->zero : rd(c, rb + k);
+        coop_lane(c, &g8, &t, 0);
         at_a = spv_emit_iadd_u32(&c->e, c->t_u32, base, spv_emit_iadd_u32(&c->e, c->t_u32, g8, t));
         at_b = coop_add(c, at_a, COOP_B);
         coop_barrier(c);
         static const u32 a_at[4] = {0, 64, 4, 68};
+        /* a .1688's K pad: -0 halves in A's and +0 in B's, whose -0 products leave the sum and its sign of zero */
         if (ra < SM86_RZ ? fa < 0 : 1)
             for (k = 0; k < ka; k++)
                 spv_emit_store_nonprivate(&c->e, coop_ptr(c, coop_add(c, at_a, a_at[k])),
-                                          k < na ? a[k] : c->zero);
+                                          k < na ? a[k] : cu(c, 0x80008000u));
         if (rb < SM86_RZ ? fb < 0 : 1)
             for (k = 0; k < kb; k++)
                 spv_emit_store_nonprivate(&c->e, coop_ptr(c, coop_add(c, at_b, 4 * k)), k < nb ? b[k] : c->zero);
+        if (stage_c) { /* where the lane reads its D words back: B's spare columns of a 16 wide one take them too */
+            u32 at_c = coop_d_at(c, shape);
+            for (k = 0; k < 4; k++) spv_emit_store_nonprivate(&c->e, coop_d_word(c, shape, at_c, k), cc[k]);
+        }
         coop_barrier(c);
     }
+    for (u32 m = 0; stage_c && m < mblocks; m++)
+        c_mat[m] =
+            SPV(&c->e, SPV_OP_COOPERATIVE_MATRIX_LOAD_KHR, t_acc,
+                coop_ptr(c, coop_add(c, coop_add(c, base, COOP_D), m ? 64 : 0)),
+                cu(c, SPV_COOPERATIVE_MATRIX_LAYOUT_ROW_MAJOR_KHR), cu(c, cols), SPV_MEMORY_ACCESS_NON_PRIVATE_POINTER);
     /* the products: an 8 wide K splits a .16816's K in two, an 8 wide M its 16 rows in two blocks of 8, each block's
        K halves adding into one accumulator. A 16 wide K is one product */
     static const u32 half_at[2] = {0, 4}, block_at[2] = {0, 64};
-    u32 zero_acc = spv_emit_const_composite(&c->e, t_acc, (const u32[]){cf(c, 0.0f)}, 1);
+    /* the sum's start where no C is in it: an RZ C's +0, which the console adds, or -0 where a C is added after, so
+       that the sum of -0 products and a -0 C stays -0 */
+    u32 zero_acc = spv_emit_const_composite(&c->e, t_acc, (const u32[]){cf(c, rc < SM86_RZ ? -0.0f : 0.0f)}, 1);
     u32 d_mat[2], ma_mat[4], mb_mat[2];
     for (u32 h = 0; h < kblocks; h++) /* B's matrix, one a k half: the same words for every M block */
         if (fb < 0)
@@ -3422,7 +4003,7 @@ static void hmma_coop(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 
                              cu(c, SPV_COOPERATIVE_MATRIX_LAYOUT_COLUMN_MAJOR_KHR), cu(c, 8),
                              SPV_MEMORY_ACCESS_NON_PRIVATE_POINTER);
     for (u32 m = 0; m < mblocks; m++) {
-        u32 acc = c_chain ? c_mat[m] : 0;
+        u32 acc = c_chain || stage_c ? c_mat[m] : 0;
         for (u32 h = 0; h < kblocks; h++) {
             u32 ma = fa >= 0 ? c->coop_frags[fa].mat[m * kblocks + h]
                              : SPV(&c->e, SPV_OP_COOPERATIVE_MATRIX_LOAD_KHR, t_a,
@@ -3450,7 +4031,7 @@ static void hmma_coop(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32 
     coop_barrier(c);
     u32 acc[4];
     coop_d_read(c, shape, at_d, acc);
-    if (rc < SM86_RZ && !c_chain) /* C was the product's accumulator operand where its matrix stayed */
+    if (rc < SM86_RZ && !c_chain && !stage_c) /* C was the product's accumulator where it had a matrix */
         for (u32 i = 0; i < 2; i++) {
             u32 pair = f32 ? 0 : half_pair(c, cc[i]);
             for (u32 j = 0; j < 2; j++) {
@@ -3619,7 +4200,9 @@ static void hmma_astat(Ctx* c, const Sm86Insn* in, int k16, int f32, u32 ra, u32
    its pair's, the other two, with a xor of 4, which RADV makes a DPP move where a shuffle at any index is a permute
    through LDS. Its A pairs follow the same quad lanes, in the same order: quad broadcasts of lanes u and 2 + u, the
    one G0 picks. Only the order of the sums changes, lanes of G0 1 adding quad lanes 2 and 3's pairs first */
-static void hmma(Ctx* c, const Sm86Insn* in) {
+/* an HMMA and its two fragments: the words a fused pair's LDSM read are given (a and b, NULL where they come from
+   the registers), so that the fused block writes them into the slot without a read of the registers */
+static void hmma(Ctx* c, const Sm86Insn* in, const u32* ldsm_a, const u32* ldsm_b) {
     u32 v = sm86_field(in, 72, 19);
     if (v & ~0x18u) {
         fail(c, "HMMA variant %#x", v);
@@ -3628,7 +4211,7 @@ static void hmma(Ctx* c, const Sm86Insn* in) {
     int k16 = (int)(v >> 3 & 1), f32 = (int)(v >> 4 & 1);
     u32 ra = sm86_field(in, 24, 8), rb = sm86_field(in, 32, 8), rc = sm86_field(in, 64, 8);
     if (c->coop) {
-        hmma_coop(c, in, k16, f32, ra, rb, rc);
+        hmma_coop(c, in, k16, f32, ra, rb, rc, ldsm_a);
         return;
     }
     if (g_spirv_translate.hmma_astat && !g_spirv_translate.hmma_f16) {
@@ -3636,17 +4219,16 @@ static void hmma(Ctx* c, const Sm86Insn* in) {
         return;
     }
     u32 na = k16 ? 4 : 2, nb = k16 ? 2 : 1, ncd = f32 ? 4 : 2, a[4], b[2], cc[4], k;
-    for (k = 0; k < na; k++) a[k] = ra >= SM86_RZ ? c->zero : rd(c, ra + k);
+    for (k = 0; k < na; k++) a[k] = ldsm_a ? ldsm_a[k] : (ra >= SM86_RZ ? c->zero : rd(c, ra + k));
     u32 zero = rb >= SM86_RZ ? 0 : hmma_zero(c);
     for (k = 0; k < nb; k++) {
-        b[k] = rb >= SM86_RZ ? c->zero : rd(c, rb + k);
+        b[k] = ldsm_b ? ldsm_b[k] : (rb >= SM86_RZ ? c->zero : rd(c, rb + k));
         if (zero) b[k] = spv_emit_binary(&c->e, SPV_OP_BITWISE_OR, c->t_u32, b[k], zero);
     }
     for (k = 0; k < ncd; k++) cc[k] = rc >= SM86_RZ ? c->zero : rd(c, rc + k);
     u32 lane = warp_lane(c);
-    u32 g4 = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, lane, cu(c, 28));
-    u32 t8 = spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32,
-                             spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, lane, cu(c, 3)), cu(c, 3));
+    u32 g4 = 0; /* 4g, which quad_read and a staged A make where they need it */
+    u32 t8 = 0; /* (lane % 4) * 8, which the paths that read B by a shuffle or as a pair take: staged B's row is 16t */
     /* the pairs as two f16 for OpFDot2MixAcc32VALVE (a bitcast: no instruction), or unpacked to two f32 */
     int mixed = g_spirv_translate.mixed_dot && g_spirv_translate.float16;
     /* The products and their sum in half floats, two products to an OpFma where the f32 sum takes two instructions
@@ -3712,13 +4294,22 @@ static void hmma(Ctx* c, const Sm86Insn* in) {
         for (k = 0; k < nb; k++) spv_emit_store_nonprivate(&c->e, stage_ptr(c, coop_add(c, own_b, k)), b[k]);
         coop_barrier(c);
         a_at = spv_emit_iadd_u32(&c->e, c->t_u32, slot,
-                                 spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, g4, cu(c, 2)));
+                                 spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32,
+                                                 quad_base(c, lane, &g4), cu(c, 2)));
+        /* B's row t at 16t: ucas found the two shifts by constants (8t, then one more) one */
         b_at = spv_emit_iadd_u32(
             &c->e, c->t_u32, slot,
             spv_emit_iadd_u32(&c->e, c->t_u32,
-                              spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, t8, cu(c, 1)), cu(c, 128)));
+                              spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32,
+                                              spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, lane, cu(c, 3)),
+                                              cu(c, 4)),
+                              cu(c, 128)));
     }
     u32 g0 = 0, t8h = 0, mine[2][2][2]; /* pairs: [column 2t + j][B's register h][quad lane 2 G0 + u]'s word */
+    if (!stage) {
+        t8 = spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32,
+                             spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, lane, cu(c, 3)), cu(c, 3));
+    }
     if (pairs) {
         u32 half = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32,
                                    spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, lane, cu(c, 1)),
@@ -3733,10 +4324,10 @@ static void hmma(Ctx* c, const Sm86Insn* in) {
             if (stage)
                 bits = spv_emit_load_nonprivate(&c->e, c->t_u32, stage_ptr(c, coop_add(c, a_at, 4 * p + k)));
             else if (pairs) {
-                u32 x = quad_read(c, a[k], g4, p & 1), y = quad_read(c, a[k], g4, 2 + (p & 1));
+                u32 x = quad_read(c, a[k], lane, &g4, p & 1), y = quad_read(c, a[k], lane, &g4, 2 + (p & 1));
                 bits = spv_emit_ternary(&c->e, SPV_OP_SELECT, c->t_u32, g0, p < 2 ? y : x, p < 2 ? x : y);
             } else
-                bits = quad_read(c, a[k], g4, p);
+                bits = quad_read(c, a[k], lane, &g4, p);
             av[k] = mixed || packed ? spv_emit_unary(&c->e, SPV_OP_BITCAST, t_v2h, bits) : half_pair(c, bits);
         }
         for (u32 j = 0; j < 2; j++)
@@ -3747,10 +4338,10 @@ static void hmma(Ctx* c, const Sm86Insn* in) {
                         spv_emit_load_nonprivate(&c->e, c->t_u32, stage_ptr(c, coop_add(c, b_at, 8 * j + 2 * p + k)));
                 else if (!pairs)
                     bits =
-                        warp_read(c, b[k], spv_emit_binary(&c->e, SPV_OP_BITWISE_OR, c->t_u32, t8, cu(c, 4 * j + p)));
+                        warp_read(c, b[k], warp_index(c, t8, 4 * j + p));
                 else if (p < 2)
                     bits = mine[j][k][p] =
-                        warp_read(c, b[k], spv_emit_binary(&c->e, SPV_OP_BITWISE_OR, c->t_u32, t8h, cu(c, 4 * j + p)));
+                        warp_read(c, b[k], warp_index(c, t8h, 4 * j + p));
                 else
                     bits = warp_xor(c, mine[j][k][p - 2], 4);
                 bv[j][k] = mixed || packed ? spv_emit_unary(&c->e, SPV_OP_BITCAST, t_v2h, bits) : half_pair(c, bits);
@@ -3803,28 +4394,24 @@ static u32 shared_u16(Ctx* c, u32 address) {
    rows 0 to 7 (the register at 24 plus the signed offset at 40-63; bit 91, a uniform register at 32, is not taken),
    and lane l receives row l / 4's elements at columns 2(l % 4) and 2(l % 4) + 1, or transposed (MT88, bit 78) column
    l / 4's at rows 2(l % 4) and 2(l % 4) + 1 */
-static void ldsm(Ctx* c, const Sm86Insn* in) {
-    u32 count = sm86_field(in, 72, 2), trans = sm86_field(in, 78, 1);
-    if (count > 2 || sm86_field(in, 74, 4) || sm86_field(in, 79, 12) || sm86_field(in, 91, 1)) {
-        fail(c, "LDSM variant %#x", sm86_field(in, 72, 20));
-        return;
-    }
+/* an LDSM's reads: the fragments it fills, one word a matrix. The fields are given, which a fused pair of an LDSM
+   and an HMMA (fuse.c) packs into its own (sm86_fuse_ldsm_*) */
+static void ldsm_words(Ctx* c, u32 reg, u32 imm, u32 count, int trans, u32* out) {
     shared_var(c); /* before mem_ptr, which bounds the index by its size: as LDS does, for a program whose LDSM comes
                       before any other access to shared memory */
-    u32 imm = sm86_field(in, 40, 24), bias = imm & 0x800000u ? imm | 0xff000000u : imm;
-    u32 addr = spv_emit_iadd_u32(&c->e, c->t_u32, rd(c, sm86_field(in, 24, 8)), cu(c, bias));
+    u32 addr = spv_emit_iadd_u32(&c->e, c->t_u32, rd(c, reg), cu(c, imm));
     u32 lane = warp_lane(c), g = spv_emit_binary(&c->e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, lane, cu(c, 2));
-    u32 t = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, lane, cu(c, 3)), out[4];
+    u32 t = spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, lane, cu(c, 3));
     for (u32 m = 0; m < (1u << count); m++) {
+        u32 m8 = 8 * m;
         if (!trans) {
-            u32 row = warp_read(c, addr, spv_emit_iadd_u32(&c->e, c->t_u32, g, cu(c, 8 * m)));
+            u32 row = warp_read(c, addr, m8 ? spv_emit_iadd_u32(&c->e, c->t_u32, g, cu(c, m8)) : g);
             u32 at = spv_emit_iadd_u32(&c->e, c->t_u32, row,
                                        spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, t, cu(c, 2)));
             out[m] = spv_emit_load_nonprivate(&c->e, c->t_u32, mem_ptr(c, 0, at, 0));
         } else {
-            u32 r0 = spv_emit_iadd_u32(&c->e, c->t_u32,
-                                       spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, t, cu(c, 1)),
-                                       cu(c, 8 * m));
+            u32 t2 = spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, t, cu(c, 1));
+            u32 r0 = m8 ? spv_emit_iadd_u32(&c->e, c->t_u32, t2, cu(c, m8)) : t2;
             u32 col = spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, g, cu(c, 1));
             u32 lo = shared_u16(c, spv_emit_iadd_u32(&c->e, c->t_u32, warp_read(c, addr, r0), col));
             u32 hi = shared_u16(
@@ -3834,8 +4421,38 @@ static void ldsm(Ctx* c, const Sm86Insn* in) {
                                      spv_emit_binary(&c->e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, hi, cu(c, 16)));
         }
     }
+}
+/* the LDSM's reads into out (a fused pair's, which its HMMA takes), and the destination registers' words */
+static void ldsm_do(Ctx* c, u32 dst, u32 reg, u32 imm, u32 count, int trans, u32* out) {
+    u32 out4[4];
+    if (!out) out = out4;
+    ldsm_words(c, reg, imm, count, trans, out);
     for (u32 m = 0; m < (1u << count); m++)
-        if (in->dst < SM86_RZ) wr(c, in->dst + m, out[m]);
+        wr(c, dst + m, out[m]);
+}
+static void ldsm(Ctx* c, const Sm86Insn* in) {
+    u32 count = sm86_field(in, 72, 2), trans = sm86_field(in, 78, 1);
+    if (count > 2 || sm86_field(in, 74, 4) || sm86_field(in, 79, 12) || sm86_field(in, 91, 1)) {
+        fail(c, "LDSM variant %#x", sm86_field(in, 72, 20));
+        return;
+    }
+    u32 imm = sm86_field(in, 40, 24), bias = imm & 0x800000u ? imm | 0xff000000u : imm;
+    ldsm_do(c, in->dst, sm86_field(in, 24, 8), bias, count, (int)trans, NULL);
+}
+/* the fused pair of an LDSM and the HMMA that reads its fragments (fuse.c's SM86_LDSM_HMMA): the LDSM's reads of the
+   tiles, once, write the destination registers and go to the HMMA as A's words, which it then takes without a read
+   of those registers */
+static void fused_ldsm_hmma(Ctx* c, const Sm86Insn* in) {
+    u32 count = sm86_fuse_ldsm_count(in), trans = sm86_fuse_ldsm_trans(in);
+    u32 imm = sm86_field(in, 40, 24), bias = imm & 0x800000u ? imm | 0xff000000u : imm;
+    int k16 = (int)(sm86_field(in, 72, 19) >> 3 & 1);
+    u32 na = k16 ? 4 : 2, a[4], out[4];
+    ldsm_do(c, sm86_fuse_ldsm_dst(in), sm86_fuse_ldsm_a(in), bias, count, trans, out);
+    if (c->failed) return;
+    if (1u << count < 4u)
+        for (u32 k = 1u << count; k < 4; k++) out[k] = c->zero; /* fewer fragments: the rest is zero */
+    for (u32 k = 0; k < na; k++) a[k] = out[k];
+    hmma(c, in, a, NULL);
 }
 /* MOVM.16.MT88 (0x23a): the 8x8 matrix of 16-bit elements in the warp's register at 24, transposed into the
    destination, as PTX's movmatrix.sync.aligned.m8n8.trans.b16. Lane l holds row l / 4 at columns 2(l % 4) and
@@ -3871,9 +4488,8 @@ static u32 ballot32(Ctx* c, u32 pred) {
     return SPV(&c->e, SPV_OP_VECTOR_EXTRACT_DYNAMIC, c->t_u32, all, half);
 }
 
-/* IPA of component k of generic input i: at the centroid (loc 1) or the default place, and with the program's
-   multiply by w taken back for a perspective input of frequency 0 */
-static u32 ipa_input(Ctx* c, u32 i, u32 k, u32 loc, u32 freq) {
+/* component k of generic input i as Vulkan interpolates it, at the centroid (loc 1) or the default place */
+static u32 ipa_attr(Ctx* c, u32 i, u32 k, u32 loc) {
     u32 v = to_f(c, input_load(c, i, k));
     if (loc == 1 && c->in_attr[i] && !(c->centroid_mask & (1u << i))) {
         /* a variable has one location: centroid when any IPA of the input asks for it. An input that no stage
@@ -3882,6 +4498,12 @@ static u32 ipa_input(Ctx* c, u32 i, u32 k, u32 loc, u32 freq) {
         spv_emit_decorate(&c->e, c->in_attr[i], SPV_DECORATION_CENTROID, NULL, 0);
         c->centroid_mask |= 1u << i;
     }
+    return v;
+}
+/* IPA of component k of generic input i, with the program's multiply by w taken back for a perspective input of
+   frequency 0 */
+static u32 ipa_input(Ctx* c, u32 i, u32 k, u32 loc, u32 freq) {
+    u32 v = ipa_attr(c, i, k, loc);
     /* The hardware interpolates attr/w for a perspective input, and the program multiplies by w (the reciprocal of
        a[0x7c]). Vulkan's input is attr itself: times the interpolated 1/w, FragCoord.w */
     if (interp_mode(c, i) == 2 && freq == 0) {
@@ -3890,13 +4512,70 @@ static u32 ipa_input(Ctx* c, u32 i, u32 k, u32 loc, u32 freq) {
     }
     return v;
 }
+/* the last instruction before i in program order that writes register r (writes_word), -1 for none */
+static int nearest_write(Ctx* c, u32 i, u32 r) {
+    for (u32 j = i; j-- > 0;)
+        if (writes_word(&c->in[j], r)) return (int)j;
+    return -1;
+}
+/* the attribute address the IPA at k reads where ipa_input multiplies it by FragCoord.w (a perspective generic at
+   frequency 0, read as the IPA case reads it, which refuses the program for the IPA forms it doesn't take), 0 for
+   another */
+static u32 ipa_over_w(Ctx* c, u32 k) {
+    const Sm86Insn* in = &c->in[k];
+    if (in->op != SM86_IPA || sm86_field(in, 78, 2)) return 0;
+    u32 addr = sm86_field(in, 64, 8) * 4;
+    if (shader_legacy_group(addr) >= 0) addr = shader_legacy_address(addr);
+    return addr >= 0x80 && addr < 0x280 && interp_mode(c, (addr - 0x80) >> 4) == 2 ? addr : 0;
+}
+/* the FMUL at i, with no scale, of two registers with no modifier: one an IPA's that ipa_input multiplied by
+   FragCoord.w (ipa_over_w), the other MUFU.RCP, with no modifier, of IPA's read of a[0x7c] at frequency 0, which is
+   FragCoord.w. Each the one write that reaches its use however control went (reaching_write). That product is the
+   input itself: as Vulkan interpolates it, with neither multiply, whose roundings (the FMUL's in its own mode, toward
+   zero in one game's programs) and infinity past the float range it doesn't take. 0 for another FMUL */
+static u32 fmul_over_w(Ctx* c, u32 i) {
+    const Sm86Insn* in = &c->in[i];
+    if (sm86_field(in, 84, 3) != 4 || in->b.kind != SM86_SRC_REG || in->a.neg || in->a.abs || in->b.neg || in->b.abs)
+        return 0;
+    if (!c->over_w_known) {
+        for (u32 j = 0; j < c->n; j++) {
+            const Sm86Insn* x = &c->in[j];
+            if (x->dst >= SM86_RZ) continue;
+            if (ipa_over_w(c, j)) c->over_w_ipa[x->dst >> 5] |= 1u << (x->dst & 31);
+            if (x->op == SM86_MUFU && sm86_field(x, 74, 6) == 4) c->over_w_rcp[x->dst >> 5] |= 1u << (x->dst & 31);
+        }
+        c->over_w_known = 1;
+    }
+    for (u32 side = 0; side < 2; side++) {
+        /* each operand's write before it in program order first, which costs no walk of the flow, then the walks that
+           prove it the one that reaches it */
+        u32 ra = side ? in->b.reg : in->a.reg, rb = side ? in->a.reg : in->b.reg;
+        if (!(c->over_w_ipa[ra >> 5] >> (ra & 31) & 1) || !(c->over_w_rcp[rb >> 5] >> (rb & 31) & 1)) continue;
+        int k = nearest_write(c, i, ra), m = nearest_write(c, i, rb);
+        u32 addr = k >= 0 ? ipa_over_w(c, (u32)k) : 0;
+        if (!addr || m < 0) continue;
+        const Sm86Insn* r = &c->in[m];
+        if (r->op != SM86_MUFU || sm86_field(r, 74, 6) != 4 || sm86_field(r, 73, 1) || r->b.kind != SM86_SRC_REG ||
+            r->b.neg || r->b.abs)
+            continue;
+        int w = nearest_write(c, (u32)m, r->b.reg);
+        if (w < 0) continue;
+        const Sm86Insn* v = &c->in[w];
+        if (v->op == SM86_IPA && sm86_field(v, 64, 8) * 4 == 0x7c && !sm86_field(v, 78, 2) &&
+            reaching_write(c, i, ra) == k && reaching_write(c, i, rb) == m && reaching_write(c, (u32)m, r->b.reg) == w)
+            return ipa_attr(c, (addr - 0x80) >> 4, (addr >> 2) & 3, sm86_field(&c->in[k], 76, 2));
+    }
+    return 0;
+}
 
 /* ---- one instruction ---- */
 
 /* the fragment program's outputs from the registers when it ends: the colours of the render targets the SPH's omap
    enables, four registers a target, then the sample mask's register and the depth's after it (Maxwell's layout, as
    emit_flow.c reads it: the depth is the last colour register plus two whether the program writes a sample mask or
-   not, as nouveau's nvc0_fp_assign_output_slots has it from Kepler on) */
+   not, as nouveau's nvc0_fp_assign_output_slots has it from Kepler on). An integer target (the key's rt_int_mask,
+   signed in rt_sint_mask) takes the registers' bits in an output of its own numeric type: Vulkan leaves a float
+   output's values undefined in an integer attachment */
 static void epilogue(Ctx* c) {
     if (c->stage == ST_VS && c->position && !(c->si->clip_enable & SNX_SH_NOT_LAST)) vertex_depth_fix(c);
     if (c->stage == ST_GS && c->passthrough) gs_passthrough(c);
@@ -3904,13 +4583,18 @@ static void epilogue(Ctx* c) {
     u32 target = c->sph[18], reg = 0;
     for (u32 rt = 0; rt < 8; rt++) {
         if (!((target >> (rt * 4)) & 15)) continue;
+        int integer = c->si->rt_int_mask >> rt & 1, sign = integer && (c->si->rt_sint_mask >> rt & 1);
+        u32 type = !integer ? c->t_v4f : sign ? spv_emit_type_vec4(&c->e, c->t_i32) : c->t_v4u;
         if (!c->color[rt]) {
-            c->color[rt] = spv_emit_output_vec4(&c->e, c->t_v4f, rt);
+            c->color[rt] = spv_emit_output_vec4(&c->e, type, rt);
             add_interface(c, c->color[rt]);
         }
         u32 v[4];
-        for (u32 k = 0; k < 4; k++) v[k] = to_f(c, rd(c, reg + k));
-        spv_emit_store(&c->e, c->color[rt], spv_emit_vec4_construct(&c->e, c->t_v4f, v));
+        for (u32 k = 0; k < 4; k++) {
+            u32 bits = rd(c, reg + k);
+            v[k] = !integer ? to_f(c, bits) : sign ? spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, bits) : bits;
+        }
+        spv_emit_store(&c->e, c->color[rt], spv_emit_vec4_construct(&c->e, type, v));
         reg += 4;
     }
     /* reg: the sample mask, which a single-sampled target ignores */
@@ -3923,6 +4607,44 @@ static void epilogue(Ctx* c) {
     }
 }
 /* an S2R system register */
+/* a fragment's size in pixels as NAK_SV_VARIABLE_RATE packs it: the width in bits 8-15, the height in bits 16-23 */
+static u32 frag_size(Ctx* c) {
+    SpvEmitter* e = &c->e;
+    int how = g_spirv_translate.shading_rate;
+    if (how == SH_RATE_NONE) return cu(c, 1u << 8 | 1u << 16);
+    if (!c->frag_size) {
+        if (how == SH_RATE_NV) {
+            spv_emit_extension(e, "SPV_NV_shading_rate");
+            spv_emit_capability(e, SPV_CAPABILITY_SHADING_RATE_NV);
+            c->frag_size = spv_emit_interface_variable(e, SPV_STORAGE_INPUT, c->t_v2u, c->t_u32, 0,
+                                                       SPV_BUILT_IN_FRAGMENT_SIZE_NV, 0, 0);
+        } else {
+            spv_emit_extension(e, "SPV_KHR_fragment_shading_rate");
+            spv_emit_capability(e, SPV_CAPABILITY_FRAGMENT_SHADING_RATE_KHR);
+            c->frag_size = spv_emit_builtin_input_u32(e, c->t_u32, SPV_BUILT_IN_SHADING_RATE_KHR);
+        }
+        spv_emit_flat(e, c->frag_size);
+        add_interface(c, c->frag_size);
+    }
+    u32 w, h;
+    if (how == SH_RATE_NV) {
+        u32 v = spv_emit_load(e, c->t_v2u, c->frag_size);
+        w = spv_emit_vec4_extract(e, c->t_u32, v, 0);
+        h = spv_emit_vec4_extract(e, c->t_u32, v, 1);
+    } else {
+        /* log2 of the height in bits 0-1 (Vertical2Pixels, Vertical4Pixels), of the width in bits 2-3 */
+        u32 v = spv_emit_load(e, c->t_u32, c->frag_size);
+        w = spv_emit_binary(e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, cu(c, 1),
+                            spv_emit_binary(e, SPV_OP_BITWISE_AND,
+                                            c->t_u32, spv_emit_binary(e, SPV_OP_SHIFT_RIGHT_LOGICAL, c->t_u32, v, cu(c, 2)),
+                                            cu(c, 3)));
+        h = spv_emit_binary(e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, cu(c, 1),
+                            spv_emit_binary(e, SPV_OP_BITWISE_AND, c->t_u32, v, cu(c, 3)));
+    }
+    return spv_emit_binary(e, SPV_OP_BITWISE_OR, c->t_u32,
+                           spv_emit_binary(e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, w, cu(c, 8)),
+                           spv_emit_binary(e, SPV_OP_SHIFT_LEFT_LOGICAL, c->t_u32, h, cu(c, 16)));
+}
 static u32 system_value(Ctx* c, u32 sr) {
     switch (sr) {
         case 0x1d:
@@ -3960,14 +4682,14 @@ static u32 system_value(Ctx* c, u32 sr) {
         }
         case 0x84:
             /* NAK's NAK_SV_VARIABLE_RATE, a fragment's shading rate: its width in pixels in bits 8-15 and its height
-               in bits 16-23 (1, 2 or 4), which nak_nir.c reads for load_frag_shading_rate. The runtime shades every
-               pixel at the full rate (nvn_cmd.c), so each fragment is 1 by 1. One game's fragment programs take its
-               width with PRMT R, R, 0x7771, RZ */
+               in bits 16-23 (1, 2 or 4), which nak_nir.c reads for load_frag_shading_rate. One game's fragment
+               programs take its width with PRMT R, R, 0x7771, RZ. The device's own size of the fragment, as an
+               Ounce's shading rate image gives it (vk/shading_rate.c), else 1 by 1 */
             if (c->stage != ST_FS) {
                 fail(c, "S2R system register 0x84 outside a fragment program");
                 return c->zero;
             }
-            return cu(c, 1u << 8 | 1u << 16);
+            return frag_size(c);
         case 0x1e:
         case 0x1f:
             /* SR_WSCALEFACTOR_XY and SR_WSCALEFACTOR_Z (NAK's numbering): the factors of clip space w scaling, by
@@ -4252,8 +4974,11 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
             int on = (int)sm86_field(in, 80, 1);
             u32 mode = sm86_field(in, 78, 2), scale = sm86_field(in, 84, 3), v;
             note_ftz(c, on);
-            u32 x = ftz(c, src_f(c, &in->a), on);
-            if (op == SM86_FADD)
+            u32 attr = op == SM86_FMUL ? fmul_over_w(c, c->cur) : 0;
+            u32 x = attr ? 0 : ftz(c, src_f(c, &in->a), on);
+            if (attr)
+                v = attr;
+            else if (op == SM86_FADD)
                 v = float_add(c, mode, x, ftz(c, src_f(c, second(in)), on));
             else if (op == SM86_FMUL) {
                 if (!scale) {
@@ -4885,10 +5610,10 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                 j = spv_emit_binary(&c->e, SPV_OP_BITWISE_OR, c->t_u32, min_lane,
                                     spv_emit_binary(&c->e, SPV_OP_BITWISE_AND, c->t_u32, b, not_seg));
                 ok = op2(c, SPV_OP_U_LESS_THAN_EQUAL, c->t_bool, j, max_lane);
-            } else if (mode == 1) {
+            } else if (mode == 1) { /* UP: in range from the clamp's lane on, as PTX's j >= maxLane */
                 j = spv_emit_binary(&c->e, SPV_OP_I_SUB, c->t_u32, lane, b);
                 ok = op2(c, SPV_OP_S_GREATER_THAN_EQUAL, c->t_bool, spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, j),
-                         spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, min_lane));
+                         spv_emit_unary(&c->e, SPV_OP_BITCAST, c->t_i32, max_lane));
             } else {
                 j = mode == 2 ? spv_emit_iadd_u32(&c->e, c->t_u32, lane, b)
                               : spv_emit_binary(&c->e, SPV_OP_BITWISE_XOR, c->t_u32, lane, b);
@@ -4908,10 +5633,11 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
         case SM86_VOTE:
         case SM86_UVOTE: {
             /* NAK's OpVote: the ballot of the predicate at 87-90 into the destination, and ALL (0), ANY (1) or EQ
-               (2, bits 72-73) of it into the predicate at 81-83. The ballot is of the invocation's 32 lanes */
+               (2, bits 72-73) of it into the predicate at 81-83. The ballot, and the vote, are of the invocation's 32
+               lanes, from the ballots of the predicate and of the active lanes: a vote of the subgroup takes both
+               warps of a subgroup of 64 */
             u32 pred = prd(c, sm86_field(in, 87, 3), sm86_field(in, 90, 1), 0), how = sm86_field(in, 72, 2);
             spv_emit_capability(&c->e, SPV_CAPABILITY_GROUP_NON_UNIFORM_BALLOT);
-            spv_emit_capability(&c->e, SPV_CAPABILITY_GROUP_NON_UNIFORM_VOTE);
             u32 ballot = ballot32(c, pred);
             if (op == SM86_UVOTE)
                 uwr(c, sm86_field(in, 16, 6), ballot);
@@ -4921,11 +5647,12 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                 fail(c, "VOTE mode %u", how);
                 return;
             }
-            u32 vote = SPV(&c->e,
-                           how == 0   ? SPV_OP_GROUP_NON_UNIFORM_ALL
-                           : how == 1 ? SPV_OP_GROUP_NON_UNIFORM_ANY
-                                      : SPV_OP_GROUP_NON_UNIFORM_ALL_EQUAL /* All, Any, AllEqual */,
-                           c->t_bool, cu(c, SPV_SCOPE_SUBGROUP), pred);
+            u32 active = ballot32(c, c->true_v);
+            u32 all = op2(c, SPV_OP_I_EQUAL, c->t_bool, ballot, active),
+                none = op2(c, SPV_OP_I_EQUAL, c->t_bool, ballot, c->zero);
+            u32 vote = how == 0   ? all
+                       : how == 1 ? spv_emit_unary(&c->e, SPV_OP_LOGICAL_NOT, c->t_bool, none)
+                                  : op2(c, SPV_OP_LOGICAL_OR, c->t_bool, all, none);
             pwr(c, sm86_field(in, 81, 3), vote, op == SM86_UVOTE);
             return;
         }
@@ -5118,7 +5845,7 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                                          op2(c, SPV_OP_U_LESS_THAN, c->t_bool, more, sum));
                 sum = more;
             }
-            if (!is_signed) pwr(c, sm86_field(in, 81, 3), carry, uniform);
+            pwr(c, sm86_field(in, 81, 3), carry, uniform); /* signed too: its 64 bits' carry, as IMAD.WIDE's */
             dwr(c, in, hi32(c, sum));
             return;
         }
@@ -5193,7 +5920,8 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                modifiers at 83 (abs) and 84 (neg), not where a three-source float's are. Bit 79 is .RELU: a result at or
                below zero becomes zero where the predicate at 87 holds, while infinity and NaN stay. Bit 86 is .H0_NH1:
                b's halves swap and the new low one is negated, the second term of a complex product. Bits 78 and 85 are
-               refused. A product of two halves is exact in a float of 32 bits */
+               refused. A product of two halves is exact in a float of 32 bits, and its sum with c is rounded once
+               (sum_to_odd), as the console's fused multiply-add of halves is */
             int relu = (int)sm86_field(in, 79, 1), h0_nh1 = (int)sm86_field(in, 86, 1);
             if (sm86_field(in, 78, 1) || sm86_field(in, 85, 1) || (relu && sm86_field(in, 77, 1))) {
                 fail(c, "HFMA2 with modes 0x%x, 0x%x, saturate %u", sm86_field(in, 78, 2), sm86_field(in, 85, 2),
@@ -5234,8 +5962,8 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
                 if (neg) pair = SPV(&c->e, SPV_OP_F_NEGATE, c->t_v2f, pair);
                 v[k] = pair;
             }
-            u32 r = nocontract(c, op2(c, SPV_OP_F_ADD, c->t_v2f,
-                                      nocontract(c, spv_emit_binary(&c->e, SPV_OP_F_MUL, c->t_v2f, v[0], v[1])), v[2]));
+            u32 p = nocontract(c, spv_emit_binary(&c->e, SPV_OP_F_MUL, c->t_v2f, v[0], v[1]));
+            u32 r = sum_to_odd(c, p, v[2]);
             if (sm86_field(in, 77, 1))
                 r = SPV_EXT(&c->e, c->t_v2f, SPV_GLSL_N_CLAMP, r,
                             spv_emit_vec2_construct(&c->e, c->t_v2f, cf(c, 0.0f), cf(c, 0.0f)),
@@ -5589,8 +6317,9 @@ static void emit_insn(Ctx* c, const Sm86Insn* in) {
         case SM86_SUST_P:
         case SM86_SURED:
         case SM86_SUATOM: surface(c, in); return;
-        case SM86_HMMA: hmma(c, in); return;
+        case SM86_HMMA: hmma(c, in, NULL, NULL); return;
         case SM86_LDSM: ldsm(c, in); return;
+        case SM86_LDSM_HMMA: fused_ldsm_hmma(c, in); return;
         case SM86_MOVM: movm(c, in); return;
         case SM86_KILL:
             c->si->has_discard = 1; /* the renderer tests depth before the program only for one that keeps its pixels */
@@ -5819,27 +6548,32 @@ static int writer_before(Ctx* c, u32 k, u32 r) {
     }
     return -1;
 }
-/* The entries of the jump table that the LDC at k indexes with register r, as ptxas bounds a switch's index: an
-   unsigned IMNMX with an immediate, then an IMAD by 4 or a 32-bit SHF.L by 2 into r (index = min(x, last) * 4). 0 when
-   it isn't that */
-static u32 jump_table_entries(Ctx* c, u32 k, u32 r) {
-    int m = writer_before(c, k, r);
-    if (m < 0) return 0;
-    const Sm86Insn* mul = &c->in[m];
+/* whether the instruction is ptxas's times-4 of a switch index, into its own register: an IMAD by 4 or a 32-bit
+   SHF.L by 2, of a register, with no guard */
+static int jump_table_times_4(const Sm86Insn* mul) {
     int times_4 = (mul->op == SM86_IMAD && !sm86_field(mul, 74, 1) && mul->b.value == 4) ||
                   (mul->op == SM86_SHF && !sm86_field(mul, 76, 1) && !sm86_field(mul, 80, 1) &&
                    sm86_field(mul, 73, 2) >= 2 && mul->b.value == 2);
-    if (!times_4 || mul->pred != SM86_PT || mul->pred_not || mul->a.kind != SM86_SRC_REG ||
-        mul->b.kind != SM86_SRC_IMM || mul->c.kind != SM86_SRC_REG || mul->c.reg != SM86_RZ)
-        return 0;
-    int b = writer_before(c, (u32)m, mul->a.reg);
-    if (b < 0) return 0;
-    const Sm86Insn* bound = &c->in[b];
+    return times_4 && mul->pred == SM86_PT && !mul->pred_not && mul->a.kind == SM86_SRC_REG &&
+           mul->b.kind == SM86_SRC_IMM && mul->c.kind == SM86_SRC_REG && mul->c.reg == SM86_RZ;
+}
+/* the entries that ptxas's bound of a switch's index names, 0 when the instruction isn't that: an unsigned IMNMX with
+   an immediate */
+static u32 jump_table_bound_entries(const Sm86Insn* bound) {
     if (bound->op != SM86_IMNMX || bound->pred != SM86_PT || bound->pred_not || sm86_field(bound, 73, 1) ||
         sm86_field(bound, 87, 3) != SM86_PT || sm86_field(bound, 90, 1) || bound->b.kind != SM86_SRC_IMM ||
         bound->b.value >= 64)
         return 0;
     return bound->b.value + 1;
+}
+/* The entries of the jump table that the LDC at k indexes with register r, as ptxas bounds a switch's index: an
+   unsigned IMNMX with an immediate, then an IMAD by 4 or a 32-bit SHF.L by 2 into r (index = min(x, last) * 4). 0 when
+   it isn't that in the sixteen instructions before the load */
+static u32 jump_table_entries(Ctx* c, u32 k, u32 r) {
+    int m = writer_before(c, k, r);
+    if (m < 0 || !jump_table_times_4(&c->in[m])) return 0;
+    int b = writer_before(c, (u32)m, c->in[m].a.reg);
+    return b < 0 ? 0 : jump_table_bound_entries(&c->in[b]);
 }
 /* whether the instruction writes uniform register r: the uniform ALU's, and the loads and moves into one */
 static int writes_uniform(const Sm86Insn* w, u32 r) {
@@ -5848,6 +6582,14 @@ static int writes_uniform(const Sm86Insn* w, u32 r) {
     return (w->op == SM86_ULDC || w->op == SM86_ULDC_IDX || w->op == SM86_ULDCG || w->op == SM86_S2UR ||
             w->op == SM86_R2UR || w->op == SM86_UVOTE) &&
            sm86_field(w, 16, 6) == r;
+}
+/* writes_uniform, with the high word of a 64-bit load as a write of its own: a BRX's index register may be that word */
+static int writes_uniform_word(const Sm86Insn* w, u32 r) {
+    if (w->op == SM86_ULDC || w->op == SM86_ULDC_IDX) {
+        u32 d = sm86_field(w, 16, 6);
+        return r == d || (r == d + 1 && sm86_field(w, 73, 3) == 5 && d + 1 < SM86_URZ);
+    }
+    return writes_uniform(w, r);
 }
 /* the instruction before k, back to the last branch, that writes uniform register r: its index, or -1 */
 static int uniform_writer_before(Ctx* c, u32 k, u32 r) {
@@ -5890,14 +6632,268 @@ static u32 uniform_table_entries(Ctx* c, u32 k, u32 r) {
     }
     return 0;
 }
-/* The targets of the BRX at i: the jump table of the LDC before it that writes its register, read through
-   g_shader_cb_read as spirv_translate.c reads Maxwell's: as many entries as ptxas's bound on the index says, else up
-   to the first word that is no target. Two tables one after the other were read as one, and gave a BRX the other's
-   targets as its own. The count, or 0 */
-static u32 brx_targets(Ctx* c, u32 i, u32* targets, u32 max) {
+/* The LDC or ULDC.IDX of the table of the BRX at i, from the scan of its block: its index, or -1 */
+static int brx_scan_load(Ctx* c, u32 i) {
     const Sm86Insn* in = &c->in[i];
     int uniform = in->op == SM86_BRXU;
-    u32 reg = sm86_field(in, 24, uniform ? 6 : 8), bias = brx_bias(in, i);
+    u32 reg = sm86_field(in, 24, uniform ? 6 : 8);
+    for (u32 k = i; k-- > 0 && k + 32 > i;) {
+        const Sm86Insn* w = &c->in[k];
+        if (w->op == SM86_BRA || w->op == SM86_EXIT || is_brx(w->op)) break;
+        if (uniform) { /* BRXU: the ULDC.IDX that writes its uniform register */
+            if (!writes_uniform(w, reg)) continue;
+            if (w->op != SM86_ULDC_IDX || sm86_field(w, 73, 3) != 4) break;
+        } else {
+            if (w->dst != reg || sm86_ops[w->op].kind == SM86_K_UALU) continue;
+            if (w->op != SM86_LDC || sm86_field(w, 73, 3) != 4 || sm86_field(w, 78, 2)) break;
+        }
+        return (int)k;
+    }
+    return -1;
+}
+static int brx_load(Ctx* c, u32 i, const u32* first, const u32* from);
+/* The entries of the table of the load at k that the next table in its bank starts, as ptxas puts adjacent switches'
+   tables one after another: an unclamped read would take that table's words as its own (shader_brx_targets clamps
+   Maxwell's so). A later table is the one whose load reaches its BRX over the flow, or, without the flow, the scan of
+   its block. max when no other table is found */
+static u32 brx_table_limit(Ctx* c, u32 k, u32 max, const u32* first, const u32* from) {
+    const Sm86Insn* w = &c->in[k];
+    u32 bank = sm86_field(w, 54, 5), off = sm86_field(w, 38, 16), limit = max;
+    for (u32 i = 0; i < c->n; i++) {
+        if (!is_brx(c->in[i].op) || sm86_never(&c->in[i])) continue;
+        int other = first ? brx_load(c, i, first, from) : brx_scan_load(c, i);
+        if (other < 0 || (u32)other == k) continue;
+        const Sm86Insn* o = &c->in[other];
+        u32 ooff = sm86_field(o, 38, 16), words;
+        if (sm86_field(o, 54, 5) != bank || ooff < off + 4) continue;
+        words = (ooff - off) / 4;
+        if (words < limit) limit = words;
+    }
+    return limit;
+}
+/* The targets that the jump table of the load at k names, read through g_shader_cb_read as spirv_translate.c reads
+   Maxwell's: as many entries as ptxas's bound on the index says, else up to the first word that is no target, or the
+   next table in the bank. Two tables one after the other were read as one, and gave a BRX the other's targets as its
+   own. The count, or 0 */
+static u32 brx_read_words(Ctx* c, u32 k, u32 bias, u32 entries, u32* targets, u32 max, const u32* first,
+                          const u32* from) {
+    const Sm86Insn* w = &c->in[k];
+    u32 bank = sm86_field(w, 54, 5), off = sm86_field(w, 38, 16), count = 0;
+    if (entries > max) {
+        fail(c, "BRX with a jump table of %u entries", entries);
+        return 0;
+    }
+    u32 limit = entries ? entries : brx_table_limit(c, k, max, first, from);
+    for (; count < limit; count++) {
+        u32 entry;
+        if (!g_shader_cb_read(bank, off + 4 * count, &entry)) break;
+        u32 at = entry + bias;
+        if ((at & 15) || at / 16 >= c->n) break;
+        targets[count] = at / 16;
+    }
+    if (entries && count < entries) {
+        fail(c, "BRX whose jump table in c[%u][0x%x] has %u targets of its %u entries", bank, off, count, entries);
+        return 0;
+    }
+    if (!count) {
+        u32 first = 0;
+        int read = g_shader_cb_read(bank, off, &first);
+        fail(c, "BRX with no jump table in c[%u][0x%x] (%s 0x%x)", bank, off, read ? "word" : "no word, unread", first);
+    }
+    return count;
+}
+/* brx_read_words, with the entries that the scan of the load's block gives */
+static u32 brx_read_table(Ctx* c, u32 k, u32 bias, u32* targets, u32 max) {
+    const Sm86Insn* w = &c->in[k];
+    u32 entries = w->op == SM86_ULDC_IDX ? uniform_table_entries(c, k, sm86_field(w, 24, 6))
+                                         : jump_table_entries(c, k, sm86_field(w, 24, 8));
+    return brx_read_words(c, k, bias, entries, targets, max, NULL, NULL);
+}
+/* The predecessors of each instruction from the BRAs and the jump tables that brx_resolve has found: first[k] to
+   first[k + 1] index from[]. first is malloc'd (n + 1 + the edges words, from after them), NULL when memory runs out */
+static u32* brx_preds(Ctx* c, u32** from_out) {
+    u32 n = c->n, total = 0;
+    for (u32 i = 0; i < n; i++) {
+        const Sm86Insn* in = &c->in[i];
+        if (sm86_never(in)) continue;
+        if (in->op == SM86_BRA)
+            total++;
+        else if (is_brx(in->op))
+            total += c->brx_table[i].count;
+    }
+    u32* first = calloc((size_t)n + 1 + total + 1, sizeof *first);
+    if (!first) return NULL;
+    u32 *from = first + n + 1, *fill = calloc((size_t)n + 1, sizeof *fill);
+    if (!fill) {
+        free(first);
+        return NULL;
+    }
+    for (int pass = 0; pass < 2; pass++)
+        for (u32 i = 0; i < n; i++) {
+            const Sm86Insn* in = &c->in[i];
+            if (sm86_never(in)) continue;
+            if (in->op == SM86_BRA) {
+                u32 t = sm86_branch_target(in, i);
+                if (t >= n) continue;
+                if (pass == 0)
+                    first[t + 1]++;
+                else
+                    from[first[t] + fill[t]++] = i;
+            } else if (is_brx(in->op)) {
+                const BrxTable* table = &c->brx_table[i];
+                for (u32 k = 0; k < table->count; k++) {
+                    u32 t = table->targets[k];
+                    if (t >= n) continue;
+                    if (pass == 0)
+                        first[t + 1]++;
+                    else
+                        from[first[t] + fill[t]++] = i;
+                }
+            }
+            if (pass == 0 && i + 1 == n)
+                for (u32 k = 0; k < n; k++) first[k + 1] += first[k];
+        }
+    free(fill);
+    *from_out = from;
+    return first;
+}
+/* the instructions before k on each path, walked back over the flow that brx_preds holds: k - 1 when it goes on to
+   k, and the jumps to k */
+#define BRX_PREDS(k)                                                                                                   \
+    do {                                                                                                               \
+        if ((k) == 0) ok = 0; /* the program's start: r is not written on this path */                                 \
+        if ((k) > 0 && falls_through(&c->in[(k) - 1]) && !seen[(k) - 1]) seen[(k) - 1] = 1, stack[top++] = (k) - 1;    \
+        for (u32 j = first[k]; j < first[(k) + 1]; j++)                                                                \
+            if (!seen[from[j]]) seen[from[j]] = 1, stack[top++] = from[j];                                             \
+    } while (0)
+/* The one instruction that writes register r of the regular file, or of the uniform one, that reaches instruction i on
+   every path there, without a guard: its index, or -1 when that can't be shown */
+static int brx_writer(Ctx* c, const u32* first, const u32* from, u32 i, u32 r, int uniform) {
+    u32 n = c->n, *stack = malloc(((size_t)n + 1) * sizeof *stack), top = 0;
+    u8* seen = calloc((size_t)n + 1, 1);
+    if (!stack || !seen) {
+        free(stack);
+        free(seen);
+        return -2; /* out of memory, not a value the flow can't name */
+    }
+    int ok = 1, found = -1;
+    BRX_PREDS(i);
+    while (ok && top) {
+        u32 k = stack[--top];
+        const Sm86Insn* in = &c->in[k];
+        if (!(uniform ? writes_uniform_word(in, r) : writes_word(in, r))) {
+            BRX_PREDS(k);
+            continue;
+        }
+        if (in->pred != SM86_PT || in->pred_not || (found >= 0 && (u32)found != k))
+            ok = 0;
+        else
+            found = (int)k;
+    }
+    free(stack);
+    free(seen);
+    return ok ? found : -1;
+}
+#undef BRX_PREDS
+/* The load whose table the BRX at i indexes: the instruction that writes the branch's register on every path, or the
+   load behind a chain of moves of that value. k, or -1 when no LDC, or ULDC.IDX of a uniform one, reaches it */
+static int brx_load(Ctx* c, u32 i, const u32* first, const u32* from) {
+    const Sm86Insn* brx = &c->in[i];
+    int uniform = brx->op == SM86_BRXU;
+    u32 r = sm86_field(brx, 24, uniform ? 6 : 8), at = i;
+    for (u32 depth = 0; depth < 8; depth++) {
+        int k = brx_writer(c, first, from, at, r, uniform);
+        if (k == -2) return -2;
+        if (k < 0) return -1;
+        const Sm86Insn* w = &c->in[k];
+        if (uniform ? (w->op == SM86_ULDC_IDX && sm86_field(w, 73, 3) == 4)
+                    : (w->op == SM86_LDC && sm86_field(w, 73, 3) == 4 && !sm86_field(w, 78, 2)))
+            return k;
+        /* a move of the value, whose source's writer is then the load: what ptxas leaves between the two */
+        if (w->op != SM86_MOV && w->op != SM86_UMOV) return -1;
+        const Sm86Src* s = &w->b;
+        if (s->neg || s->abs) return -1;
+        if (s->kind == SM86_SRC_REG && s->reg < SM86_RZ)
+            uniform = 0, r = s->reg;
+        else if (s->kind == SM86_SRC_UREG && s->reg < SM86_URZ)
+            uniform = 1, r = s->reg;
+        else
+            return -1;
+        at = (u32)k;
+    }
+    return -1;
+}
+/* The entries of the table of the load at k, as ptxas bounds the index that reaches it: the writer of the load's index
+   register on every path, then the writer of that instruction's source, rather than the sixteen instructions before
+   the load. 0 when neither the flow nor the scan finds such a bound, and the table is then read until a word is no
+   target */
+static u32 brx_entries_flow(Ctx* c, const u32* first, const u32* from, u32 k) {
+    const Sm86Insn* w = &c->in[k];
+    int uniform = w->op == SM86_ULDC_IDX;
+    u32 reg = sm86_field(w, 24, uniform ? 6 : 8);
+    if (uniform) return uniform_table_entries(c, k, reg);
+    u32 entries = 0;
+    int m = brx_writer(c, first, from, k, reg, 0);
+    if (m >= 0 && jump_table_times_4(&c->in[m])) {
+        int b = brx_writer(c, first, from, (u32)m, c->in[m].a.reg, 0);
+        if (b >= 0) entries = jump_table_bound_entries(&c->in[b]);
+    }
+    return entries ? entries : jump_table_entries(c, k, reg); /* the bound beside the load, when the flow has none */
+}
+/* The jump tables of the program's BRXs, found by the writer of each branch's register that reaches it rather than by
+   a scan of the 32 instructions before it: a table loaded far before its BRX, or across a branch, is the one whose
+   load reaches it on every path. A table is found from the program's start on, and only before the first BRX whose
+   table isn't: past that one, a path may arrive from anywhere. A BRX that the flow can't explain is refused, not given
+   the table of one of its paths (a switch on another path's table jumps where the console does not). */
+static int brx_resolve(Ctx* c) {
+    if (c->brx_resolved) return 1;
+    c->brx_table = calloc(c->n ? c->n : 1, sizeof *c->brx_table);
+    if (!c->brx_table) return 0;
+    c->brx_resolved = 1;
+    for (;;) {
+        u32 at = c->n;
+        for (u32 i = 0; i < c->n; i++)
+            if (is_brx(c->in[i].op) && !sm86_never(&c->in[i]) && !c->brx_table[i].state) {
+                at = i;
+                break;
+            }
+        if (at == c->n) break;
+        u32* from = NULL;
+        u32* first = brx_preds(c, &from);
+        if (!first) return 0; /* out of memory */
+        int load = brx_load(c, at, first, from);
+        u32 entries = load >= 0 && g_shader_cb_read ? brx_entries_flow(c, first, from, (u32)load) : 0;
+        if (load == -2) {
+            free(first);
+            return 0; /* out of memory */
+        }
+        u32 words[64], count = 0;
+        if (load >= 0 && g_shader_cb_read)
+            count = brx_read_words(c, (u32)load, brx_bias(&c->in[at], at), entries, words, 64, first, from);
+        free(first);
+        if (!count) {
+            /* the flow names no single table load: the scan of the block gives the reason when that is the one, and
+               the scan's own table is not used, which may be another path's */
+            u32 scan[64];
+            if (brx_targets_scan(c, at, scan, 64) && !c->failed)
+                fail(c, "BRX whose jump table load doesn't reach it on every path");
+            c->brx_table[at].state = 2;
+            return 1;
+        }
+        u32* targets = malloc((size_t)count * sizeof *targets);
+        if (!targets) return 0; /* out of memory */
+        memcpy(targets, words, (size_t)count * sizeof *targets);
+        c->brx_table[at].targets = targets;
+        c->brx_table[at].count = count;
+        c->brx_table[at].state = 1;
+    }
+    return 1;
+}
+/* The targets of the BRX at i from a scan of the 32 instructions before it, as brx_targets found them before the flow
+   was searched: the jump table of the LDC that writes its register, read as brx_read_table does. The count, or 0. It
+   gives brx_resolve the reason that a BRX has no table, and is the answer for a context that was never resolved */
+static u32 brx_targets_scan(Ctx* c, u32 i, u32* targets, u32 max) {
+    const Sm86Insn* in = &c->in[i];
     if (!(in->pred == SM86_PT && !in->pred_not)) {
         fail(c, "BRX on a predicate");
         return 0;
@@ -5906,45 +6902,21 @@ static u32 brx_targets(Ctx* c, u32 i, u32* targets, u32 max) {
         fail(c, "BRX without a reader of constant buffers");
         return 0;
     }
-    for (u32 k = i; k-- > 0 && k + 32 > i;) {
-        const Sm86Insn* w = &c->in[k];
-        if (w->op == SM86_BRA || w->op == SM86_EXIT || is_brx(w->op)) break;
-        u32 entries;
-        if (uniform) { /* BRXU: the ULDC.IDX that writes its uniform register */
-            if (!writes_uniform(w, reg)) continue;
-            if (w->op != SM86_ULDC_IDX || sm86_field(w, 73, 3) != 4) break;
-            entries = uniform_table_entries(c, k, sm86_field(w, 24, 6));
-        } else {
-            if (w->dst != reg || sm86_ops[w->op].kind == SM86_K_UALU) continue;
-            if (w->op != SM86_LDC || sm86_field(w, 73, 3) != 4 || sm86_field(w, 78, 2)) break;
-            entries = jump_table_entries(c, k, sm86_field(w, 24, 8));
-        }
-        u32 bank = sm86_field(w, 54, 5), off = sm86_field(w, 38, 16), count = 0;
-        if (entries > max) {
-            fail(c, "BRX with a jump table of %u entries", entries);
-            return 0;
-        }
-        for (; count < (entries ? entries : max); count++) {
-            u32 entry;
-            if (!g_shader_cb_read(bank, off + 4 * count, &entry)) break;
-            u32 at = entry + bias;
-            if ((at & 15) || at / 16 >= c->n) break;
-            targets[count] = at / 16;
-        }
-        if (entries && count < entries) {
-            fail(c, "BRX whose jump table in c[%u][0x%x] has %u targets of its %u entries", bank, off, count, entries);
-            return 0;
-        }
-        if (!count) {
-            u32 first = 0;
-            int read = g_shader_cb_read(bank, off, &first);
-            fail(c, "BRX with no jump table in c[%u][0x%x] (%s 0x%x)", bank, off, read ? "word" : "no word, unread",
-                 first);
-        }
-        return count;
-    }
+    int k = brx_scan_load(c, i);
+    if (k >= 0) return brx_read_table(c, (u32)k, brx_bias(in, i), targets, max);
     fail(c, "BRX without the LDC of its jump table");
     return 0;
+}
+/* The targets of the BRX at i: the table that brx_resolve found, else the scan of its block, which is only for a
+   context that was never resolved (c->failed is already set when the flow refused a table) */
+static u32 brx_targets(Ctx* c, u32 i, u32* targets, u32 max) {
+    if (c->brx_table && c->brx_table[i].state) {
+        u32 count = c->brx_table[i].count;
+        if (!count || count > max) return 0;
+        memcpy(targets, c->brx_table[i].targets, (size_t)count * sizeof *targets);
+        return count;
+    }
+    return brx_targets_scan(c, i, targets, max);
 }
 
 /* the blocks that BRA, BRX and EXIT end, and their structure */
@@ -6151,7 +7123,7 @@ static u32 mh_words(const Sm86Insn* in) {
     u32 type = sm86_field(in, 73, 3);
     switch (in->op) {
         case SM86_LDG:
-        case SM86_LDG_NOU: return type == 5 ? 2 : type == 6 ? 4 : 1;
+        case SM86_LDG_NOU: return mem_words(type);
         case SM86_LDC:
         case SM86_ULDC:
         case SM86_ULDC_IDX: return type == 5 ? 2 : 1;
@@ -6446,9 +7418,12 @@ static int tex_slot_memory(Ctx* c, u32 tex_probe, int smp, u32 smp_probe, u32 ty
     t.bl2_off = smp ? smp_probe : 0;
     t.flags = (u8)(SNX_TEX_MEMORY | (ms ? 2 : 0));
     si->tex[i] = t;
-    c->tex[i] = spv_emit_sampler_image(&c->e, c->t_f32, (u32)shader_vk_set(c->stage), SNX_VKB_TEX + (u32)i,
-                                       type == 0 ? 1 : type, (int)array, (int)shadow, ms ? 1 : 0, &c->tex_sampled[i]);
-    add_interface(c, c->tex[i]);
+    if (!tex_table_slot(c, i, type, array, shadow, ms)) {
+        c->tex[i] =
+            spv_emit_sampler_image(&c->e, c->t_f32, (u32)shader_vk_tex_set(c->stage), SNX_VKB_TEX + (u32)i,
+                                   type == 0 ? 1 : type, (int)array, (int)shadow, ms ? 1 : 0, &c->tex_sampled[i]);
+        add_interface(c, c->tex[i]);
+    }
     return i;
 }
 static int tex_operands(const Sm86Insn* in, u32 n0, u32 n1, u32* regs);
@@ -6899,6 +7874,19 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
             }
             break;
         }
+    /* after the CALLs are inlined and before the passes that move instructions: the pairs of instructions that one
+       operation takes the place of (fuse.c), whose spans the array moves invalidate. A pair whose second half a jump
+       lands on (a BRA's target, a BRX's case, flow_sources' edges) stays two, as that jump runs the second alone */
+    {
+        u32 nfuse = 0, kept = 0;
+        FuseSpan* fuse = sm86_fuse_find(insn, n, &nfuse);
+        if (fuse && !flow_sources(c)) fail(c, "out of memory");
+        for (u32 s = 0; fuse && s < nfuse && !c->failed; s++) {
+            u32 second = fuse[s].pos + 1;
+            if (c->jump_first[second] == c->jump_first[second + 1]) fuse[kept++] = fuse[s];
+        }
+        sm86_fuse_make(insn, n, fuse, c->failed ? 0 : kept);
+    }
     if (!c->failed && !track_globals(c)) fail(c, "out of memory");
     ShStructure* st = c->failed ? NULL : build_structure(c);
     u32* out = NULL;
@@ -6988,6 +7976,8 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
         if (!se.label) abort();
         se.used = (u8*)(se.label + 4 * (size_t)st->nscopes + 2 * (size_t)st->ntokens + 1);
         if (st->uses_flag) se.flag = spv_emit_function_variable_init(e, reg_ptr, c->zero);
+        /* a vertex program's own attribute fetch, after the other Function variables: its code begins the block */
+        vertex_fetch_prologue(c);
         /* pair_partner's pairs: the first half's value, kept for the second, which writes the select */
         u32* pair_first = calloc((size_t)n + 1, sizeof *pair_first);
         u32* pair_value_of = calloc((size_t)n + 1, sizeof *pair_value_of);
@@ -7130,6 +8120,10 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
     free(c->mh_dep);
     free(c->mh_new);
     free(c->jump_first);
+    if (c->brx_table) {
+        for (u32 i = 0; i < c->n; i++) free(c->brx_table[i].targets);
+        free(c->brx_table);
+    }
     free(insn);
     free(words);
     free(c);

@@ -18,6 +18,7 @@ static bool keyboard_asked(SDL_Window* window) {
 #define SNX_SCREEN_TEST "gui_setup.c"
 #include "gui_screen.h"
 #include <assert.h>
+#include <stdatomic.h>
 
 #define FIRST "0123456789abcdeffedcba9876543210"
 
@@ -42,7 +43,8 @@ static char* text_of(const char* folder, const char* name) {
 }
 static void holds(const char* folder, const char* name, const char* words) {
     char* text = text_of(folder, name);
-    if (!text || !strstr(text, words)) fprintf(stderr, "%s/%s holds:\n%s\nnot: %s\n", folder, name, text, words);
+    if (!text || !strstr(text, words))
+        fprintf(stderr, "%s/%s holds:\n%s\nnot: %s\n", folder, name, text ? text : "(no file it could read)", words);
     assert(text && strstr(text, words));
     free(text);
 }
@@ -890,7 +892,7 @@ static void test_old_files(App* app) {
         free(account);
     }
     left_behind(app);
-    while (!__atomic_load_n(&app->left_space->done, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+    while (!atomic_load_explicit(&app->left_space->done, memory_order_acquire)) SDL_Delay(1);
     assert(app->lefts == 5 && left_groups(app) == 4);
     setup_start(app);
     assert(app->setup_on && app->setup_count == 1 && page(app) == SETUP_LEFT && !setup_steps(app));
@@ -1117,7 +1119,7 @@ static void test_saves_one_page(App* app) {
         put(path, "save");
     }
     left_behind(app);
-    while (!__atomic_load_n(&app->left_space->done, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+    while (!atomic_load_explicit(&app->left_space->done, memory_order_acquire)) SDL_Delay(1);
     assert(app->lefts == 14 && left_groups(app) == 1);
     setup_start(app);
     assert(app->setup_on && page(app) == SETUP_LEFT && setup_labels(app, labels) == 3 &&
@@ -1176,7 +1178,7 @@ static void test_data_saves(App* app) {
     assert(!snx_path_format(path, sizeof path, "%s/save/device/0100000000ABC000/d.bin", app->data_dir));
     put(path, "save");
     left_behind(app);
-    while (!__atomic_load_n(&app->left_space->done, __ATOMIC_ACQUIRE)) SDL_Delay(1);
+    while (!atomic_load_explicit(&app->left_space->done, memory_order_acquire)) SDL_Delay(1);
     assert(app->lefts == 1 && left_groups(app) == 1);
     setup_start(app);
     assert(app->setup_on && page(app) == SETUP_LEFT && setup_labels(app, labels) == 3 &&
@@ -1223,6 +1225,7 @@ static void test_ask_tones(App* app) {
                 {GUI_ASK_OUTSIDE, UI_ATTR_CAUTION},
                 {GUI_ASK_ROOM, UI_ATTR_CAUTION},
                 {GUI_ASK_CLEAN, UI_ATTR_CAUTION},
+                {GUI_ASK_CLEAN_OWN, UI_ATTR_CAUTION},
                 {GUI_ASK_RESET, UI_ATTR_CAUTION},
                 {GUI_ASK_PLACES, UI_ATTR_CAUTION},
                 {GUI_ASK_PLACE, UI_ATTR_CAUTION},
@@ -1237,6 +1240,7 @@ static void test_ask_tones(App* app) {
                 {GUI_ASK_ADDONS, 0},
                 {GUI_ASK_DELETE_OLD, UI_ATTR_DANGER},
                 {GUI_ASK_OVERWRITE, UI_ATTR_CAUTION},
+                {GUI_ASK_SAVES, UI_ATTR_CAUTION},
                 {GUI_ASK_ERROR, 0}};
     GuiConfirm was = app->confirm;
     assert(SDL_arraysize(asks) == GUI_ASK_ERROR + 1);
@@ -1559,7 +1563,7 @@ static char* stopped_run(App* app, const char* program, const char* name, const 
 }
 /* the run the menu did not see end, Last Run: a game Android stopped for its memory, a page first that says what ran,
    when it started, Android's reason, its process's PSS and RSS (none recorded where Android measured none, never 0
-   MB) and its log, OK alone; Run edenprobe without its
+   MB) and its log, OK alone; Run Amberlith without its
    summary, Continue (going on with it from its journal at once, a page after it held until its run is over) and Not
    Now; one that reached its
    summary, its counts in a box; a game that ended with an exit, or still runs, nothing but the log's line; with
@@ -1638,7 +1642,8 @@ static void test_last_run(App* app) {
     free(at);
     free(state);
     free(record);
-    /* Run edenprobe's launch Android stopped before its summary: Continue in focus, Not Now; the cases so far */
+    /* Run Amberlith's launch of an edenprobe build (its game edenprobe, its card sdmc:/edenprobe) Android stopped before
+       its summary, with no NRO left in its folder: read where it is; Continue in focus, Not Now; the cases so far */
     put(last, "runs/abc1234\n");
     put(report, "{\"type\":\"note\",\"text\":\"edenprobe 0.9.0 (abc1234) starting\"}\n"
                 "{\"type\":\"case\",\"suite\":\"cpu\",\"name\":\"a\",\"result\":\"pass\"}\n"
@@ -1663,8 +1668,8 @@ static void test_last_run(App* app) {
         key(app, SDLK_RETURN);
         assert(!app->setup_on && !app->stopped_go_on && !app->setup_held);
         if (go_on) { /* probe_start's Continue: here the NRO it needs, as GPU Drivers' Continue says, over the menu */
-            char* nro = join(probe, "edenprobe.nro");
-            at = snx_format("Run edenprobe needs %s", nro);
+            char* nro = join(probe, "amberlith.nro");
+            at = snx_format("Run Amberlith needs %s", nro);
             free(nro);
             assert(!strncmp(app->editor.note, at, strlen(at)) && app->confirm.shown &&
                    app->confirm.ask == GUI_ASK_ERROR && !strcmp(app->error_line, app->editor.note));
@@ -1676,7 +1681,7 @@ static void test_last_run(App* app) {
     }
     { /* Continue with a page after it (the notices due): the probe goes on at once, the page held until its run is
          over, here until the box of why it did not start is closed */
-        char* nro = join(probe, "edenprobe.nro");
+        char* nro = join(probe, "amberlith.nro");
         record = stopped_run(app, game, "edenprobe", probe, true);
         last_run_look(app);
         put(file, "[setup]\nversion = 1\nnotices = 0\n"); /* every notice due again */
@@ -1685,7 +1690,7 @@ static void test_last_run(App* app) {
         app->editor.note[0] = 0;
         app->errors_count = 0; /* said once a session: the loop above said it */
         key(app, SDLK_RETURN); /* Continue */
-        at = snx_format("Run edenprobe needs %s", nro);
+        at = snx_format("Run Amberlith needs %s", nro);
         assert(!app->setup_on && app->setup_held && !app->stopped_go_on && app->confirm.shown &&
                !strncmp(app->error_line, at, strlen(at)));
         pump(app);
@@ -1733,7 +1738,7 @@ static void test_last_run(App* app) {
     free(folder);
     free(file);
     free(config);
-    puts("PASS Last Run: a game Android stopped, Run edenprobe's Continue and Not Now, its summary's box");
+    puts("PASS Last Run: a game Android stopped, Run Amberlith's Continue and Not Now, its summary's box");
 }
 
 static void set_env(const char* name, const char* value) {

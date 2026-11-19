@@ -57,13 +57,15 @@ void vk_tex_evicted(const Surf* t) {
     vk_tex_evicted_add(&g_tex_report.evicted, key);
 }
 
-void vk_tex_made(const Surf* t) {
+u32 vk_tex_made(const Surf* t) {
     u64 key = tex_key(t);
-    if (!vk_tex_evicted_take(&g_tex_report.evicted, key)) return;
-    g_tex_report.back[age_class(g_vk_present - g_tex_report.when[key >> 20 & 4095])]++;
+    if (!vk_tex_evicted_take(&g_tex_report.evicted, key)) return 0;
+    const u32 after = g_vk_present - g_tex_report.when[key >> 20 & 4095];
+    g_tex_report.back[age_class(after)]++;
     g_tex_report.reloads++;
     g_tex_report.reload_guest += t->size;
     g_tex_report.reload_device += t->bytes;
+    return after + 1;
 }
 
 /* One report's sums over the textures of the cache */
@@ -208,7 +210,7 @@ static const char* host_format_name(u32 format, char* s, size_t n) {
 }
 
 /* text added to a line of size bytes at *at: what does not fit is cut */
-static void line_add(char* line, size_t size, size_t* at, const char* fmt, ...) __attribute__((format(printf, 4, 5)));
+[[gnu::format(printf, 4, 5)]] static void line_add(char* line, size_t size, size_t* at, const char* fmt, ...);
 static void line_add(char* line, size_t size, size_t* at, const char* fmt, ...) {
     if (*at >= size) return;
     va_list ap;

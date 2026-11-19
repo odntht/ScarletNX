@@ -53,10 +53,10 @@ static int pb_halves(u64 target, char half[2]) {
     VkBuffer buffer;
     u8* d = vk_readback_buffer(64, &buffer);
     CHECK(s && d);
-    vk_surf_use(vk_cmd(), s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+    vk_surf_use(vk_cmd(), s, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                 VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {4, 4, 1}};
-    rec_CmdCopyImageToBuffer(vk_cmd(), s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
+    rec_CmdCopyImageToBuffer(vk_cmd(), s->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), buffer, 1, &copy);
     vk_finish();
     vk_readback_ready();
     for (u32 h = 0; h < 2; h++) {
@@ -183,7 +183,7 @@ static int pb_owners_case(GpuChannel* ch, u64 target, u64 red, u64 staged, u64 c
     if (owned && how == PB_FRAME_CHECK && !before)
         fprintf(stderr,
                 "two owners: the copies' submission %llu was still recording at the first draw, after a wait "
-                "of %u us (cmd.c frame_check submits after 1000)\n",
+                "of %d us (cmd.c frame_check submits after 1000)\n",
                 (unsigned long long)copied, PB_WAIT_NS / 1000);
     CHECK(!owned || how == PB_WITH_DRAWS || before);
     u64 want = owned && !before ? 2 : 1;

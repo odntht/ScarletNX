@@ -216,15 +216,16 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   Driver are greyed, each row saying what the device lacks (*Android only*, *Unsupported GPU*...) and Enter
   the whole line; a package's box still opens for its Remove, its Use refused with that line. A
   game whose package does not load stops, saying why, and so does one whose package lists no Vulkan device, a driver
-  for another GPU. Under them, **edenprobe Mode** (Quick, the default:
-  `notime cpu graphics hooks`; Full adds `fs video audio kernel display`) and **Run edenprobe**, which plays
-  [edenprobe](../dev/edenprobe.md)'s probes as a game with the GPU driver picked here, from `probe/edenprobe.nro` of the
-  Logs folder, in a data folder of its own there (`probe/.scarletnx`: none of your settings, saves or users) with the
-  default settings, and the build as edenprobe's machine (`machine=scarletnx@<commit>`), whose ban list then skips the
-  cases that end ScarletNX every time. Its window shows edenprobe's own screens: the start screen with those families
+  for another GPU. Under them, **Amberlith Mode** (Quick, the default:
+  `notime cpu graphics hooks`; Full adds `fs video audio kernel display`) and **Run Amberlith**, which plays
+  [Amberlith](../dev/edenprobe.md)'s probes as a game with the GPU driver picked here, from `probe/amberlith.nro` of the
+  Logs folder (a release's `amberlith-<version>.nro` saved under that name; an older `probe/edenprobe.nro` when only
+  that one is there), in a data folder of its own there (`probe/.scarletnx`: none of your settings, saves or users)
+  with the default settings, and the build as the probe's machine (`machine=scarletnx@<commit>`), whose ban list then
+  skips the cases that end ScarletNX every time. Its window shows the probe's own screens: the start screen with those families
   chosen, which begins by itself after ten seconds, the running screen, then the results, which leave by themselves
   after ten seconds with nothing pressed (+ or - leaves them). A launch that ends before the report's summary is
-  followed by another, up to 16, which goes on after the case it ended inside (edenprobe's screen that asks first goes
+  followed by another, up to 16, which goes on after the case it ended inside (the probe's screen that asks first goes
   on by itself after ten seconds), while each adds cases; ESC ends it. At the end a box says the
   counts and the suites that failed or crashed, and where the report is. A next press after a whole run starts it
   over; after one that stopped inside a case (an iOS app ends with its game), it goes on. A run whose launches ended
@@ -264,7 +265,10 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   how many it would take out, then takes out the settings nothing reads any more: the `[Deprecated]` section the runtime
   gives a game's `.ini` for the keys it no longer uses (in the config folder's `recompiled/`, in `recompiled/`
   and in the player's folders), the keys of `settings.ini` that no setting of the runtime's takes
-  (only while the runtime lists its settings) and those of `app.ini` the menu does not know. A box
+  (only while the runtime lists its settings) and those of `app.ini` the menu does not know. While a game's own
+  picks (`<id>.picks`, [Settings](settings.md)) keep keys no setting takes, the question says how many and its
+  choices are **Keep the Games' Own** and **With the Games' Own**, in focus, which writes each of those files again
+  without them (removed with no pick left); Back takes out nothing. A box
   over the screen then lists each file and what was done to it, or why not, Up/Down and the wheel going over those
   that do not fit, until another key closes it;
   Share Log lists them too. **Move Old Files** (its value how many folders an older version left, the setup's Old Files
@@ -295,8 +299,11 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   ([Usage](usage.md)), and is kept for every game:
   what was changed, by the `.ini`'s sections and keys, in `settings.ini` of the config folder on
   Linux (`~/.config/scarletnx/`), else the data folder's `config/`. A run takes a setting from what that
-  run picks, then from the game's own picks (to come), then from these, and last from the game's
-  `.ini`. A row not at its default has `*` after its value (*On \**, *2 \**), a page's row and an **All** while
+  run picks, then from the game's own picks (`<id>.picks` beside its `.ini`, which its menu writes:
+  [Settings](settings.md)), then from these, and last from the game's `.ini`; a run is given them with
+  `--launcher-picks=1`, which puts the game's own over them. A setting the recompile takes too (NCE, Debug's SLP
+  vectorizer) goes to a game's recompile and runs as the game's own pick where it has one, since the recompile reads
+  its settings from its options alone. A row not at its default has `*` after its value (*On \**, *2 \**), a page's row and an **All** while
   any of their rows has; Del puts a setting back to its default, and App's **Reset to Defaults** every one.
   **Fullscreen** and
   **Show controls** are the launcher's own choices, Off or On, passed to every run over the `.ini`; `[default]` marks
@@ -350,7 +357,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   dumps/ listed and made as ScarletNX starts; `off`: neither, Remove from Library's), `recompiled_main` (`on`, the
   default; `off`: recompiled/ not listed, new games going to an Extra), `gpu_driver` (GPU Drivers' pick, a folder of
 `gpu_drivers/`; left out, the system's driver), `freedreno_env` (Freedreno Settings', `NAME=value` with a `;` between
-two; left out, none), `probe_mode` (edenprobe Mode's `quick`, the default, or `full`) and `language` (`auto`, `en` or a
+two; left out, none), `probe_mode` (Amberlith Mode's `quick`, the default, or `full`) and `language` (`auto`, `en` or a
   language's BCP 47
   tag, as `pt-BR` or `zh-Hans-CN`), and once one
   is picked `[folders]` with Folders' `data`, `recompiled`, `work`, `state` (Logs) and `cache` (Caches) (a full path,
@@ -427,7 +434,7 @@ two; left out, none), `probe_mode` (edenprobe Mode's `quick`, the default, or `f
   the system names none). The mark is `.running-<pid>` beside the log, made at the start, held while the launcher
   runs and deleted at its exit, Logs moving it; a game keeps its own beside its log, which the game's next start says
   the same way. The run going is kept beside its run log too, `last-run.ini` beside `last-run.log`, from its start
-  until the menu sees it end: a start that finds one did not see it end, says so (`last run: edenprobe, started
+  until the menu sees it end: a start that finds one did not see it end, says so (`last run: Amberlith, started
   2026-11-12 20:18:25, whose end this launcher did not see: it did not end with an exit: Android stopped it: low memory
   (...)`) and shows the setup's Last Run page ([Setup](#setup)) for a game that did not end with an exit. On Linux a
   run the kernel's out-of-memory killer ends (SIGKILL, while the OOM kills of the launcher's memory cgroup, its
@@ -552,14 +559,14 @@ game runs in). Its box says what ran and when it started, how it ended as the sy
 the reason Android keeps for the game's process, `Android stopped it: low memory (org.scarletnx:game, status 0,
 importance 100 foreground)`, the question then `Android stopped <game>`; elsewhere what it may have been), the memory
 that process held (`PSS 4.9 GB, RSS 1.9 GB`, `?` for what the system does not say, `none recorded by Android` where
-it measured none, as for a process killed by a signal) and the game's log. Run edenprobe
+it measured none, as for a process killed by a signal) and the game's log. Run Amberlith
 left before its summary has **Continue**, in focus, which goes on with it from its journal at once, as GPU Drivers'
 Continue does, the setup's other pages coming back after its run, and **Not Now**, which leaves it to that row; one that reached its summary shows its counts
 in a box instead. A game has OK alone, and the page comes only for one that did not end with an exit, its own mark left
 beside its log: one that ended with an exit, or that still runs, is said in the launcher log alone. The page writes
 nothing to `setup.ini`, the setup's Skip comes on the page after it, and `--no-setup` leaves it out. When the menu
 stays and only the game's process is ended, the run's screen says it as it says a crash, `The game stopped: Android
-stopped it: low memory (...); PSS 4.9 GB, RSS 1.9 GB` with Share Log blinking, and Run edenprobe's next launch goes on
+stopped it: low memory (...); PSS 4.9 GB, RSS 1.9 GB` with Share Log blinking, and Run Amberlith's next launch goes on
 as after any launch that ends before the summary, the launcher log saying how the last one ended.
 
 Once the last page is done the menu opens, `setup.ini` written. After an update that brings a notice, the setup
@@ -655,7 +662,8 @@ cannot be read is named and the others still listed.
   ([AOT packs](aot-packs.md)) through the same queue.
 - A finger held on a game half a second without moving, or a right click on it, opens its box: **Play** (**View
   Progress** for a game of the queue, which shows it on the Compile tab as Enter does), **Recompile** (R), and for a
-  recompiled Switch game **Mods** (M) and **Save States** (S). The finger's lift then taps nothing.
+  recompiled Switch game **Mods** (M), **Save States** (S) and **Settings**, its own (below), Back from them to
+  Games, then **AOT Pack** (B) where B builds one. The finger's lift then taps nothing.
 - **M** (on Android a tap on *Mods* at the foot) opens the box of the recompiled Switch game in focus, recent or on
   the page, that Enter opens for a game with updates, DLCs, mods, cheats or other programs beside it, and for a game
   with none of them too, whose **Add Mod** and **Add Cheats** copy a folder or a `.txt` the system's picker gives
@@ -666,7 +674,14 @@ cannot be read is named and the others still listed.
   Settings > App's pages for that game alone: GPU Driver's first row, **Global**, follows the launcher's pick, the
   game's own kept as `gpu_driver=` in its `.ini` (nothing: the system's driver); where no package loads the row is
   greyed, saying what the device lacks, unless the game is set to a package, to take that pick back. Freedreno
-  Settings with none of its own takes the launcher's. A collection's game ([Usage](usage.md#collections)) has a
+  Settings with none of its own takes the launcher's. **Settings** opens the Settings of that game alone, Back from
+  its groups to the box: a group a section of the runtime's (none of the launcher's own), each row **Global** and
+  the launcher's value (*Global (60%)*) until picked, a pick marked `*` and kept at once in the game's own picks
+  (`<id>.picks` beside its `.ini`, [Settings](settings.md)), which its runs take over the launcher's; Del puts a row
+  back to Global, the file going with its last pick, and **Reset to Global**, the last group, every row, asked first
+  with how many. A game with settings of its own, there or its GPU Driver and Freedreno Settings, has the sliders
+  icon after its name in Games and Recent Games, and the side panel lists them (*Own settings: volume=40,
+  gpu_driver=Turnip_v32*). A collection's game ([Usage](usage.md#collections)) has a
   **Play Program N** row for
   each other program it has made, which plays that program directly as Play plays the game's own (its menu, program
   0), the box's picks kept. On
@@ -776,8 +791,12 @@ run's output), never what the tips already say (what the row does, a game's kind
 box. The tips have a row of their own under the head, their letters a half step under the text's (1.5x by a 2x text),
 as the Status box's and the note at the foot of a Settings box are; the setup's go to the foot beside its keys, where they take one row,
 a long one sliding, or wrap over its rows with `[tips] wrap`, the last sliding what does not fit. At the foot the
-screen's keys, the whole width (the setup's beside its tips), in letters a size under the rest's: its own keys, ESC alone
-at the left of the row, **F1** last, which opens a box over the screen, Shortcuts, with every key it has, those every
+screen's keys, the whole width (the setup's beside its tips), in letters a size under the rest's, each after its icon
+(the one F1's box gives it): ESC alone at the left of the row, the screen's own first three, **More** (F3; on a phone
+the word *More*) where it has others, which opens the picks box over the screen with those others, a row each with its
+icon and key, a click, a tap, Enter or a pad's A pressing it as the keyboard does (Games' Save states, AOT pack,
+Folders, View and Refresh past Play, Recompile and Mods; a pad's foot leaves them to F1's box, its buttons pressing
+them all the same), and **F1** last, which opens a box over the screen, Shortcuts, with every key it has, those every
 screen has too (the arrows and the mouse, Enter, Space and a click, the pages, Tab and F2), as the other boxes over a
 screen are: the screen darkened under it, a row a key with its icon, the keys as the foot draws them, the screen's own
 first and those every screen has under the title Every screen (ESC among them; no title where all are those), OK under
@@ -975,7 +994,8 @@ keys = true
 failed = true
 [transitions]
 ; milliseconds, 0 to 10000; 0 turns the thing off. fade_out_ms: the menu as a run starts,
-; and a run ESC leaves; fade_in_ms: what comes after
+; and a run ESC leaves; fade_in_ms: what comes after. A notification over a game comes in
+; at fade_in_ms and goes at fade_out_ms
 fade_in_ms = 250
 fade_out_ms = 500
 ; how a step's line comes in: none | typing | slide | fade

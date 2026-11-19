@@ -4,8 +4,10 @@
    makes by the rules of Mesa's NAK encoder (sm70_encode.rs: set_opcode, encode_alu_base, set_pred, set_instr_deps,
    set_rel_offset) and its SPH (sph.rs), the search for programs in shader memory, and the translation of small
    programs, which spirv-val checks when the test gets its path. No word here comes from a game. */
+#include "nx/gpu/shader/fuse.h"
 #include "nx/gpu/shader/sm86.h"
 #include "common/utilities/endian.h"
+#include "common/utilities/spirv_emit.h"
 #include "support/spv_eval.h"
 #include <math.h>
 #include <stdio.h>
@@ -203,7 +205,7 @@ static void test_table(void) {
         }
         low9[in.op] = code & 0x1ff;
     }
-    for (int op = 1; op < SM86__COUNT; op++) {
+    for (int op = 1; op < SM86__DECODED; op++) { /* SM86_LDSM_HMMA is the fuse's, with no encoding */
         int ok = sm86_ops[op].kind == SM86_K_FIX ? codes[op] == 1 : codes[op] >= 1 && codes[op] <= 7;
         if (!ok) fprintf(stderr, "%s has %u codes\n", sm86_ops[op].name, codes[op]);
         CHECK(ok);
@@ -1316,8 +1318,8 @@ static void test_lane_masks(const char* dir) {
 
 /* SHFL with its lane operand and c each an immediate or a register (II 0xf89, RI 0x589, IR 0x989, RR 0x389), run at
    every lane of a warp: the lane it reads and whether that lane is in range are PTX's shfl.sync, the same in the
-   four forms. c 0x1c03 is a segment of 4 lanes, 0x1807 of 8, 0x1c1f a segment of 4 whose clamp says 32, 0x1f the
-   warp. A compute network's upscaler has c in a register */
+   four forms (UP's bound is maxLane, as for the others: j >= maxLane). c 0x1c03 is a segment of 4 lanes, 0x1807 of
+   8, 0x1c1f a segment of 4 whose clamp says 32, 0x1f the warp. A compute network's upscaler has c in a register */
 static Word predicated(Word x, u32 pred);
 static void test_shfl_operands(const char* dir) {
     static const u32 forms[4] = {0xf89, 0x589, 0x989, 0x389}, cs[4] = {0x1c03, 0x1807, 0x1c1f, 0x1f};
@@ -1373,7 +1375,7 @@ static void test_shfl_operands(const char* dir) {
                                 : mode == 1 ? lane - b
                                 : mode == 2 ? lane + b
                                             : lane ^ b;
-                        u32 ok = mode == 1 ? (i32)j >= (i32)min_lane : j <= max_lane;
+                        u32 ok = mode == 1 ? (i32)j >= (i32)max_lane : j <= max_lane;
                         SpvEvalEnv env = {0};
                         env.builtin[41][0] = lane;
                         env.shuffle_id = ~0u;
@@ -1391,6 +1393,94 @@ static void test_shfl_operands(const char* dir) {
                 }
     CHECK(bad == 0);
     if (bad) fprintf(stderr, "shfl: %d cases differ\n", bad);
+}
+
+/* VOTE.ALL, .ANY and .EQ (bits 72-73) of a predicate, on a subgroup of 64 lanes, two warps, as a device may run a
+   fragment or compute program: each warp's vote is of its own 32 lanes, as its ballot is. One warp's lanes all vote
+   true while the other's do not (or the other way): the subgroup's vote took both, so the first warp's ALL and EQ were
+   false (or its ANY true). Lane l's input is c[1][4 l]; its outputs at shared [16 l]: the ballot, then ALL, ANY, EQ */
+static Word sel_reg(u32 dst, u32 a, u32 pred);
+static Word ldc(u32 dst, u32 index, u32 bank, u32 off, u32 type);
+static void test_vote_warps(const char* dir) {
+    u8 code[16 * 16] = {0};
+    u32 n = 0;
+    Word x = fix(0x919); /* S2R R0, TID.X */
+    set(&x, 72, 8, 0x21);
+    put(code, n++, x);
+    x = alu(0x024, 4, 1, 0); /* IMAD R1, R0, 4, RZ */
+    set(&x, 32, 32, 4);
+    set(&x, 64, 8, 255);
+    put(code, n++, x);
+    put(code, n++, ldc(2, 1, 1, 0, 4)); /* LDC R2, c[1][R1] */
+    x = alu(0x00c, 4, 255, 2);          /* ISETP.NE.U32.AND P0, PT, R2, 0, PT */
+    set(&x, 76, 3, 5);
+    set(&x, 81, 3, 0);
+    set(&x, 84, 3, 7);
+    set(&x, 87, 3, 7);
+    put(code, n++, x);
+    for (u32 how = 0; how < 3; how++) { /* VOTE.ALL R3, P1, P0, then .ANY P2 and .EQ P3 (the ballot to R3 each time) */
+        x = fix(0x806);
+        set(&x, 16, 8, 3);
+        set(&x, 72, 2, how);
+        set(&x, 81, 3, 1 + how);
+        set(&x, 87, 3, 0);
+        put(code, n++, x);
+    }
+    put(code, n++, mov_imm(7, 1));
+    for (u32 k = 0; k < 3; k++) put(code, n++, sel_reg(4 + k, 7, 1 + k)); /* R4-R6 = P1-P3 */
+    x = alu(0x024, 4, 10, 0);                                             /* IMAD R10, R0, 16, RZ */
+    set(&x, 32, 32, 16);
+    set(&x, 64, 8, 255);
+    put(code, n++, x);
+    x = fix(0x388); /* STS.128 [R10], R3 */
+    set(&x, 24, 8, 10);
+    set(&x, 32, 8, 3);
+    set(&x, 73, 3, 6);
+    put(code, n++, x);
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    n++;
+    ShaderInfo si = {0};
+    si.cs_local[0] = 64, si.cs_local[1] = si.cs_local[2] = 1;
+    si.shared_size = 64 * 16;
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, n * 16, ST_CS, NULL, &si, &count);
+    CHECK(spv != NULL);
+    if (!spv) {
+        fprintf(stderr, "vote warps: %s\n", si.first_unsupported);
+        return;
+    }
+    CHECK(keep_module(dir, "vote_warps", spv, count));
+    for (u32 set_ = 0; set_ < 2; set_++) {
+        static u32 bank1[64];
+        static SpvEvalEnv env[64];
+        for (u32 l = 0; l < 64; l++) /* all true but lane 40, or all false but lane 40 */
+            bank1[l] = set_ ? l == 40 : l != 40;
+        memset(env, 0, sizeof env);
+        for (u32 l = 0; l < 64; l++) {
+            env[l].ubo[SNX_VKB_CB + 1] = bank1;
+            env[l].ubo_words[SNX_VKB_CB + 1] = 64;
+            env[l].builtin[27][0] = env[l].builtin[29][0] = env[l].builtin[41][0] = l;
+        }
+        const char* why = spv_eval_subgroup(spv, count, env, 64);
+        CHECK(!why && env[0].shared_words >= 64 * 4);
+        if (why) {
+            fprintf(stderr, "vote warps: the evaluator stops at %s\n", why);
+            break;
+        }
+        u32 bad = 0;
+        for (u32 l = 0; l < 64; l++) {
+            u32 ballot = 0, w = l / 32;
+            for (u32 k = 0; k < 32; k++) ballot |= (u32)(bank1[32 * w + k] != 0) << k;
+            u32 want[4] = {ballot, ballot == 0xffffffffu, ballot != 0, ballot == 0 || ballot == 0xffffffffu};
+            for (u32 k = 0; k < 4; k++)
+                if (env[0].shared[4 * l + k] != want[k] && bad++ < 4)
+                    fprintf(stderr, "vote warps, set %u: lane %u word %u (ballot, ALL, ANY, EQ) is 0x%x, not 0x%x\n",
+                            set_, l, k, env[0].shared[4 * l + k], want[k]);
+        }
+        CHECK(bad == 0);
+    }
+    free(spv);
 }
 
 /* LDC c[bank][R + offset] of NAK's MemType U8 (0), I8 (1), U16 (2) and I16 (3): the byte or halfword at the
@@ -2040,6 +2130,40 @@ static void spv_ftz_counts(const u32* w, size_t n, int* mode, int* tests) {
         i += count;
     }
 }
+/* FFMA rounds once: its GLSL Fma carries NoContraction, or a driver may split it into a multiply and an add. The
+   compute program with its FMUL made FFMA R2, R2, 2.0, R2 */
+static void test_ffma_fused(void) {
+    u8* code = calloc(1, 0x1000);
+    if (!code) abort();
+    u32 n = compute_program(code), fmul = n;
+    for (u32 i = 0; i < n; i++)
+        if ((code[16 * i] | (u32)(code[16 * i + 1] & 1) << 8) == 0x020) fmul = i;
+    CHECK(fmul < n);
+    if (fmul < n) {
+        Word x = alu(0x023, 4, 2, 2);
+        set(&x, 32, 32, 0x40000000u);
+        set(&x, 64, 8, 2);
+        put(code, fmul, x);
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv_ftz(code, n * 16, ST_CS, NULL, &si, &count, SH_FTZ_MODE);
+        CHECK(spv != NULL);
+        u32 fmas = 0, bare = 0;
+        for (size_t i = 5; spv && i < count && spv[i] >> 16; i += spv[i] >> 16) {
+            if ((spv[i] & 0xffff) != 12 || spv[i] >> 16 < 5 || spv[i + 4] != 50) continue;
+            u32 decorated = 0;
+            for (size_t j = 5; j < count && spv[j] >> 16; j += spv[j] >> 16)
+                decorated |=
+                    (spv[j] & 0xffff) == 71 && spv[j] >> 16 >= 3 && spv[j + 1] == spv[i + 2] && spv[j + 2] == 42;
+            fmas++;
+            bare += !decorated;
+        }
+        CHECK(fmas == 1 && bare == 0);
+        if (fmas != 1 || bare) fprintf(stderr, "FFMA: %u Fma, %u without NoContraction\n", fmas, bare);
+        free(spv);
+    }
+    free(code);
+}
 static void test_ftz_modes(const char* dir) {
     u8* code = calloc(1, 0x1000);
     if (!code) abort();
@@ -2196,6 +2320,80 @@ static void test_fragment_depth(const char* dir) {
                     cases[i].outputs, env.frag_depth, cases[i].depth_reg, want);
     }
     (void)dir;
+}
+
+/* the instruction that defines type id (a type's result is its word 1), 0 for none */
+static size_t spv_type_def(const u32* words, size_t count, u32 id) {
+    for (size_t i = 5; i < count && words[i] >> 16; i += words[i] >> 16)
+        if ((words[i] & 0xffff) >= 19 /* OpTypeVoid */ && (words[i] & 0xffff) <= 39 /* OpTypeForwardPointer */ &&
+            words[i + 1] == id)
+            return i;
+    return 0;
+}
+/* the component type of the output variable at location: 'u' unsigned, 'i' signed, 'f' float, 0 for none */
+static char spv_output_kind(const u32* words, size_t count, u32 location) {
+    u32 decorations[64], variables[64];
+    u32 nd = spv_find(words, count, SPV_OP_DECORATE, decorations, 64);
+    u32 nv = spv_find(words, count, 59 /* OpVariable */, variables, 64);
+    for (u32 d = 0; d < nd; d++) {
+        const u32* x = words + decorations[d];
+        if (x[2] != 30 /* Location */ || x[3] != location) continue;
+        for (u32 v = 0; v < nv; v++) {
+            const u32* var = words + variables[v];
+            if (var[2] != x[1] || var[3] != 3 /* Output */) continue;
+            size_t pointer = spv_type_def(words, count, var[1]);
+            size_t vector = pointer ? spv_type_def(words, count, words[pointer + 3]) : 0;
+            size_t component = vector ? spv_type_def(words, count, words[vector + 2]) : 0;
+            if (!component) return 0;
+            if ((words[component] & 0xffff) == 22 /* OpTypeFloat */) return 'f';
+            return (words[component] & 0xffff) == 21 /* OpTypeInt */ ? (words[component + 3] ? 'i' : 'u') : 0;
+        }
+    }
+    return 0;
+}
+/* A fragment program's colour for an integer target (the key's rt_int_mask, signed in rt_sint_mask) goes out in an
+   output of the target's numeric type with the registers' bits: a float output's values are undefined in an integer
+   attachment, which the validation layer reported for each mesh draw of one game into its R8_UINT target. Targets 0
+   unsigned, 1 signed and 2 float, from R0-R11 */
+static void test_integer_targets(const char* dir) {
+    const u32 bits[12] = {5, 0x12, 0x34, 0xff, 0xfffffffeu, 7, 0x80000000u, 1, f2u(0.5f), f2u(-1.0f), 0, f2u(1.0f)};
+    u8 code[16 * 16] = {0};
+    u32 n = 0;
+    for (u32 r = 0; r < 12; r++) put(code, n++, mov_imm(r, bits[r]));
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    n++;
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xfff;
+    ShaderInfo si = {.rt_int_mask = 3, .rt_sint_mask = 2};
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
+    CHECK(spv != NULL);
+    if (!spv) {
+        fprintf(stderr, "integer targets: %s\n", si.first_unsupported);
+        return;
+    }
+    static const char kinds[3] = {'u', 'i', 'f'};
+    for (u32 rt = 0; rt < 3; rt++) {
+        char kind = spv_output_kind(spv, count, rt);
+        CHECK(kind == kinds[rt]);
+        if (kind != kinds[rt])
+            fprintf(stderr, "integer targets: render target %u's output has components of kind '%c', not '%c'\n", rt,
+                    kind ? kind : '0', kinds[rt]);
+    }
+    SpvEvalEnv env = {0};
+    const char* why = spv_eval(spv, count, &env);
+    if (why) fprintf(stderr, "integer targets: the evaluator stops at %s\n", why);
+    CHECK(!why);
+    for (u32 i = 0; !why && i < 12; i++) {
+        CHECK(env.out[i / 4][i % 4] == bits[i]);
+        if (env.out[i / 4][i % 4] != bits[i])
+            fprintf(stderr, "integer targets: render target %u component %u is %08x, R%u's %08x expected\n", i / 4,
+                    i % 4, env.out[i / 4][i % 4], i, bits[i]);
+    }
+    if (dir) CHECK(keep_module(dir, "fs_integer_targets", spv, count));
+    free(spv);
 }
 
 /* ISETP.GE.U32.AND Pd, PT, RZ, imm, PT: Pd true for imm 0, false for 1 */
@@ -2455,7 +2653,49 @@ static void test_shading_rate(const char* dir) {
     u32* spv = sm86_to_spirv(code, 3 * 16, ST_VS, vsph, &si, &count);
     CHECK(!spv && strstr(si.first_unsupported, "0x84 outside a fragment program"));
     free(spv);
-    (void)dir;
+    /* where the device reads an Ounce's shading rate image (g_spirv_translate.shading_rate), the fragment's size
+       comes from its builtin: FragmentSizeNV of SPV_NV_shading_rate, or ShadingRateKHR, each Flat, with its
+       capability and extension. spirv-val checks each module (keep_module) */
+    static const struct {
+        int how;
+        u32 capability, builtin;
+        const char *extension, *name;
+    } modes[] = {{SH_RATE_NV, SPV_CAPABILITY_SHADING_RATE_NV, SPV_BUILT_IN_FRAGMENT_SIZE_NV, "SPV_NV_shading_rate",
+                  "shading_rate_nv"},
+                 {SH_RATE_KHR, SPV_CAPABILITY_FRAGMENT_SHADING_RATE_KHR, SPV_BUILT_IN_SHADING_RATE_KHR,
+                  "SPV_KHR_fragment_shading_rate", "shading_rate_khr"}};
+    int had = g_spirv_translate.shading_rate;
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    for (size_t m = 0; m < sizeof modes / sizeof *modes; m++) {
+        g_spirv_translate.shading_rate = modes[m].how;
+        si = (ShaderInfo){0};
+        spv = sm86_to_spirv(code, 3 * 16, ST_FS, fsph, &si, &count);
+        CHECK(spv != NULL);
+        if (!spv) continue;
+        u32 at[64];
+        int capability = 0, builtin = 0, flat = 0, extension = 0;
+        u32 n = spv_find(spv, count, SPV_OP_CAPABILITY, at, 64);
+        for (u32 k = 0; k < n; k++) capability |= spv[at[k] + 1] == modes[m].capability;
+        u32 variable = 0;
+        n = spv_find(spv, count, SPV_OP_DECORATE, at, 64);
+        for (u32 k = 0; k < n; k++)
+            if (spv[at[k] + 2] == SPV_DECORATION_BUILT_IN && spv[at[k] + 3] == modes[m].builtin) {
+                builtin = 1;
+                variable = spv[at[k] + 1];
+            }
+        for (u32 k = 0; k < n; k++) flat |= variable && spv[at[k] + 1] == variable && spv[at[k] + 2] == 14 /* Flat */;
+        n = spv_find(spv, count, 10 /* OpExtension */, at, 64);
+        for (u32 k = 0; k < n; k++) extension |= !strcmp((const char*)&spv[at[k] + 1], modes[m].extension);
+        CHECK(capability && builtin && flat && extension);
+        if (!(capability && builtin && flat && extension))
+            fprintf(stderr, "S2R 0x84 with %s: capability %d, builtin %d, Flat %d, extension %d\n", modes[m].name,
+                    capability, builtin, flat, extension);
+        if (dir) CHECK(keep_module(dir, modes[m].name, spv, count));
+        free(spv);
+    }
+    g_spirv_translate.shading_rate = had;
 }
 /* FMUL's scale (bits 84-86, 2^(field - 4): nvdisasm's .D4 at 2, .M4 at 6) is part of the product whatever the device
    rounds in: 3.0 * 2.0 is 1.5 with .D4 and 24.0 with .M4, with doubles and without them. And it is applied before the
@@ -2689,6 +2929,50 @@ static void test_wide_carries(const char* dir) {
     u32* spv = sm86_to_spirv(code, 13 * 16, ST_VS, vsph, &si, &count);
     CHECK(spv != NULL);
     if (spv) CHECK(keep_module(dir, "wide_carries", spv, count));
+    free(spv);
+}
+
+/* A signed IMAD.HI (bit 73) writes its carry out to the predicate at 81-83 as the unsigned one does: the carry of the
+   64-bit sum of the product's bits and c sign extended. R12 = IMAD.HI -2, 3, 5 (-1: no carry) over a P1 that was true,
+   R13 = IMAD.X RZ, RZ, R6, P1; R14 = IMAD.HI -2, 3, 7 (1: a carry) over a P2 that was false, R15 = IMAD.X RZ, RZ, R6,
+   P2. The predicate kept its old value, so R13 and R15 took the carry the other way */
+static void test_imad_hi_signed_carry(const char* dir) {
+    u8 code[16 * 14] = {0};
+    u32 n = 0;
+    put(code, n++, mov_imm(3, 0xfffffffeu));
+    put(code, n++, mov_imm(4, 3));
+    put(code, n++, mov_imm(5, 5));
+    put(code, n++, mov_imm(6, 0x10));
+    put(code, n++, mov_imm(7, 7));
+    put(code, n++, setp_const(1, 0)); /* P1 = true */
+    for (u32 k = 0; k < 2; k++) {
+        Word m = alu(0x027, 1, 12 + 2 * k, 3); /* IMAD.HI R12 + 2k, Pk+1, R3, R4, R5 or R7 */
+        set(&m, 32, 8, 4), set(&m, 64, 8, k ? 7 : 5), set(&m, 73, 1, 1), set(&m, 81, 3, 1 + k), set(&m, 84, 3, 7);
+        set(&m, 87, 4, 7);
+        put(code, n++, m);
+        m = alu(0x024, 1, 13 + 2 * k, 255); /* IMAD.X R13 + 2k, RZ, RZ, R6, Pk+1 */
+        set(&m, 32, 8, 255), set(&m, 64, 8, 6), set(&m, 74, 1, 1), set(&m, 81, 3, 7), set(&m, 84, 3, 7);
+        set(&m, 87, 4, 1 + k);
+        put(code, n++, m);
+    }
+    put(code, n++, ast(0x70, 12, 4));
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    n++;
+    u32 vsph[32] = {0};
+    vsph[0] = sph0(1, 1);
+    SpvEvalEnv env = {0};
+    int ran = run_stage(ST_VS, code, n, vsph, &env);
+    int ok = ran && env.position[0] == 0xffffffffu && env.position[1] == 0x10 && env.position[2] == 0 &&
+             env.position[3] == 0x11;
+    CHECK(ok);
+    if (!ok)
+        fprintf(stderr, "signed IMAD.HI's carry: ran %d, %x %x %x %x (want ffffffff 10 0 11)\n", ran, env.position[0],
+                env.position[1], env.position[2], env.position[3]);
+    ShaderInfo si = {0};
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, n * 16, ST_VS, vsph, &si, &count);
+    CHECK(spv && keep_module(dir, "imad_hi_signed_carry", spv, count));
     free(spv);
 }
 
@@ -3182,7 +3466,11 @@ static Word ushf_r(u32 ud, u32 uc, u32 shift) {
    and gives the texture's word and the sampler's index. The TEX.B takes its handle register R6 from an LDG.64 at
    [UR4 + 0x10]. A handle whose address depends on the invocation (S2R of the lane), or whose register has another
    writer on a path (a guarded MOV), is no texture (SH_PROBE_NONE), and the program translates. Variant 4 samples with
-   a TXD whose handle is in the uniform register pair (TXD_U, 0xf6c), which takes the same slot with no depth reference */
+   a TXD whose handle is in the uniform register pair (TXD_U, 0xf6c), which takes the same slot with no depth reference
+   though its bit 78, TEX's depth reference, is set. In variant 5 a TXD's fault predicate (bits 81-83) writes the P0 of
+   an ISETP before the SEL that reads it, so the handle is made with the TXD's predicate, which nothing evaluates */
+static Word isetp(u32 p, u32 q, u32 a, u32 b, u32 cmp, int is_signed, int ex, u32 low, u32 set_op, u32 acc);
+static Word sel(u32 dst, u32 a, u32 b, u32 pred);
 static void test_uniform_handle(const char* dir) {
     static const struct {
         u64 hi, lo;
@@ -3200,7 +3488,7 @@ static void test_uniform_handle(const char* dir) {
     u32 fsph[32] = {0};
     fsph[0] = sph0(2, 5);
     fsph[18] = 0xf;
-    for (u32 variant = 0; variant < 5; variant++) {
+    for (u32 variant = 0; variant < 6; variant++) {
         int txd = variant == 4, base = txd ? 0 : (int)variant; /* TXD_U's program is variant 0's */
         u8 code[16 * 20] = {0};
         u32 n = 0;
@@ -3217,6 +3505,17 @@ static void test_uniform_handle(const char* dir) {
             put(code, n++, iadd3(2, 2, 3));
         }
         if (variant == 3) put(code, n++, mov_if(2, 3, 0, 0)); /* @P0 MOV R2, R3: two writers reach the LDG */
+        if (variant == 5) { /* P0 = R2 < R3, a TXD of c[0][0x40] whose fault predicate is P0, SEL R2, R2, R3, P0 */
+            put(code, n++, isetp(0, 7, 2, 3, 1, 0, 0, 7, 0, 7));
+            Word g = {{forms[4].lo, forms[4].hi}};
+            set(&g, 10, 1, 0);
+            set(&g, 91, 1, 0);
+            set(&g, 40, 19, 0x10);
+            set(&g, 16, 8, 20); /* R20 to R23, apart from the handle's */
+            set(&g, 81, 3, 0);
+            put(code, n++, g);
+            put(code, n++, sel(2, 2, 3, 0));
+        }
         put(code, n++, shf_imm(2, 2, 5, 255, 3, 0, 0, 0)); /* SHF.L.U32 R2, R2, 5, RZ */
         put(code, n++, iadd3_imm(2, 2, 0x18));
         put(code, n++, ldg_reg_ur64(4, 2, 4, 0));
@@ -3225,6 +3524,7 @@ static void test_uniform_handle(const char* dir) {
         put(code, n++, ushf_r(9, 8, 20));
         Word t = {{forms[txd ? 4 : 0].lo, forms[txd ? 4 : 0].hi}};
         set(&t, 40, 6, 8);
+        if (txd) set(&t, 78, 1, 1);
         put(code, n++, t);
         if (variant == 1) { /* a TEX.B, its handle R6 from [UR4 + 0x10] */
             put(code, n++, ldg_uniform64(6, 4, 0x10));
@@ -3245,13 +3545,16 @@ static void test_uniform_handle(const char* dir) {
         size_t count = 0;
         u32* spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
         if (base >= 2) { /* no texture (SH_PROBE_NONE), the draw going on, and nothing kept to run */
-            const char* want = variant == 2 ? "made with S2R" : "has no one writer";
-            int ok = spv && si.ntex == 1 && (si.tex[0].flags & SNX_TEX_MEMORY) && si.tex[0].cbuf_off == SH_PROBE_NONE &&
-                     si.tex[0].bl2_off == SH_PROBE_NONE && si.memh_none == 1 && strstr(si.memh_why, want) &&
-                     si.nmemh == 0;
+            const char* want = variant == 2 ? "made with S2R" : variant == 5 ? "made with TXD" : "has no one writer";
+            int m = 0; /* the handle's slot: variant 5's TXD has one of its own */
+            while (m + 1 < si.ntex && !(si.tex[m].flags & SNX_TEX_MEMORY)) m++;
+            int ok = spv && si.ntex == (variant == 5 ? 2 : 1) && (si.tex[m].flags & SNX_TEX_MEMORY) &&
+                     si.tex[m].cbuf_off == SH_PROBE_NONE && si.tex[m].bl2_off == SH_PROBE_NONE && si.memh_none == 1 &&
+                     strstr(si.memh_why, want) && si.nmemh == 0;
             CHECK(ok);
             if (!ok)
-                fprintf(stderr, "memory handle, variant %u: %s, %s\n", variant, si.first_unsupported, si.memh_why);
+                fprintf(stderr, "memory handle, variant %u: %s, %s, %d textures\n", variant, si.first_unsupported,
+                        si.memh_why, si.ntex);
             if (spv) CHECK(keep_module(dir, "fs_memory_handle_none", spv, count));
             free(spv);
             continue;
@@ -4426,6 +4729,273 @@ static void test_fragment_unfed(const char* dir) {
     CHECK(inputs_of[0] == inputs_of[1] + 1); /* the generic's Input, beside FragCoord */
 }
 
+/* FMUL of a perspective input's IPA by MUFU.RCP of IPA's read of a[0x7c] (sm86_translate.c's fmul_over_w): the input
+   as Vulkan interpolates it, with neither the multiply by gl_FragCoord.w that ipa_input makes to rebuild the console's
+   attr / w nor the FMUL's. A program's OpFMul (133) are then its perspective IPAs' alone, one each; an FMUL kept adds
+   its own, in any rounding mode. A modifier or a scale on the way, another multiplier, a guard, a write of either register
+   that may reach the FMUL on some path, an a[0x7c] read at another frequency, and an input that isn't perspective at
+   frequency 0 keep it. Run on the CPU (support/spv_eval.c) with generic 0's x 0.7 and gl_FragCoord.w 7, where the two
+   multiplies give 0.70000005: the fold gives the input's bits whatever w is, and the FMUL's .SAT still clamps them */
+static Word fold_ipa(u32 dst, u32 addr) { /* IPA Rd, a[addr], at the default place and frequency */
+    Word x = fix(0x326);
+    set(&x, 16, 8, dst);
+    set(&x, 32, 8, 255);
+    set(&x, 64, 8, addr >> 2);
+    set(&x, 81, 3, 7);
+    return x;
+}
+static Word fold_mufu(u32 dst, u32 b, u32 fn) { /* MUFU.<fn> Rd, Rb: 4 RCP, 5 RSQ */
+    Word x = alu(0x108, 1, dst, 255);
+    set(&x, 32, 8, b);
+    set(&x, 64, 8, 255);
+    set(&x, 74, 6, fn);
+    return x;
+}
+static Word fold_fmul(u32 dst, u32 a, u32 b) { /* FMUL Rd, Ra, Rb, rounding to nearest with no scale */
+    Word x = alu(0x020, 1, dst, a);
+    set(&x, 32, 8, b);
+    set(&x, 64, 8, 255);
+    set(&x, 84, 3, 4);
+    return x;
+}
+static Word fold_with(Word x, unsigned lo, unsigned n, u64 v) {
+    set(&x, lo, n, v);
+    return x;
+}
+/* TXQ Rd on, the dimensions of c[2][0x40], with bit 79, which only a float result takes as .F16: its integers go one a
+   register */
+static Word fold_txq(u32 dst, u32 mask) {
+    Word x = fix(0xb6f);
+    set(&x, 16, 8, dst);
+    set(&x, 24, 8, 255);
+    set(&x, 40, 19, 2u << 14 | 0x40 >> 2);
+    set(&x, 64, 8, 255);
+    set(&x, 72, 4, mask);
+    set(&x, 79, 1, 1);
+    return x;
+}
+/* the fragment program of n instructions and its EXIT, render target 0 from R0-R3, generic 0's components
+   interpolated as imap says (the SPH's byte 0x18, 2 bits a component), translated */
+static u32* fold_fs(const Word* insns, u32 n, u32 imap, ShaderInfo* si, size_t* count) {
+    u8 code[16 * 24] = {0};
+    for (u32 i = 0; i < n; i++) put(code, i, insns[i]);
+    put(code, n, exit_insn());
+    put(code, n + 1, bra(n + 1, n + 1, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[6] = imap;
+    fsph[18] = 0xf;
+    *si = (ShaderInfo){0};
+    u32* spv = sm86_to_spirv(code, (n + 2) * 16, ST_FS, fsph, si, count);
+    if (!spv) fprintf(stderr, "perspective fold: %s\n", si->first_unsupported);
+    return spv;
+}
+/* folds: whether the FMULs fold, the program's OpFMul being then its perspective IPAs' and its other multiplies
+   (others) alone */
+static void fold_case(const Word* insns, u32 n, u32 imap, u32 others, int folds, const char* what) {
+    ShaderInfo si;
+    size_t count = 0;
+    u32* spv = fold_fs(insns, n, imap, &si, &count);
+    u32 at[64], found = spv ? spv_find(spv, count, 133 /* OpFMul */, at, 64) : 0;
+    int ok = spv && (folds ? found == others : found > others);
+    if (!ok) fprintf(stderr, "perspective fold: %s: %u multiplies, %s %u\n", what, found, folds ? "" : "over", others);
+    CHECK(ok);
+    free(spv);
+}
+/* R0 of the program run with generic 0's x and gl_FragCoord.w as given, 1 when it ran */
+static int fold_run(const Word* insns, u32 n, float x, float w, u32* r0) {
+    ShaderInfo si;
+    size_t count = 0;
+    u32* spv = fold_fs(insns, n, 0xaa, &si, &count);
+    if (!spv) return 0;
+    SpvEvalEnv env = {0};
+    env.in[0][0] = f2u(x);
+    for (u32 k = 0; k < 3; k++) env.builtin[15][k] = f2u(1.0f); /* FragCoord */
+    env.builtin[15][3] = f2u(w);
+    const char* why = spv_eval(spv, count, &env);
+    free(spv);
+    if (why) fprintf(stderr, "perspective fold: the evaluator stops at %s\n", why);
+    *r0 = env.out[0][0];
+    return !why;
+}
+static void test_perspective_fold(const char* dir) {
+    const Word w = fold_ipa(4, 0x7c), rcp = fold_mufu(4, 4, 4), x = fold_ipa(0, 0x80), mul = fold_fmul(0, 0, 4);
+    const Word one = mov_imm(5, f2u(1.0f)), r4 = mov_imm(4, f2u(1.0f));
+    const Word folds[] = {w, rcp, x, mul};
+    fold_case(folds, 4, 0xaa, 1, 1, "FMUL of a perspective IPA by 1 / a[0x7c] is the input with no multiply");
+    fold_case(folds, 4, 0x02, 1, 1, "a generic whose first used component is perspective folds the same");
+    const Word swapped[] = {w, rcp, x, fold_fmul(0, 4, 0)};
+    fold_case(swapped, 4, 0xaa, 1, 1, "FMUL by 1 / a[0x7c] times the IPA folds too");
+    const Word into_rcp[] = {w, rcp, x, fold_fmul(4, 0, 4)};
+    fold_case(into_rcp, 4, 0xaa, 1, 1, "an FMUL that writes the reciprocal's own register folds too");
+    const Word ftz[] = {w, rcp, x, fold_with(mul, 80, 1, 1)};
+    /* the flush of its result is the one multiply more: by 0, for the subnormal's signed zero */
+    fold_case(ftz, 4, 0xaa, 2, 1, "FMUL.FTZ folds and keeps its flush");
+    const Word saturated[] = {w, rcp, x, fold_with(mul, 77, 1, 1)};
+    fold_case(saturated, 4, 0xaa, 1, 1, "FMUL.SAT folds and keeps its clamp");
+    /* an IPA writes one register: one into R3 leaves the reciprocal in R4 */
+    fold_case((const Word[]){w, rcp, fold_ipa(3, 0x84), x, mul}, 5, 0xaa, 2, 1,
+              "an IPA into the register below the reciprocal's leaves it to the FMUL");
+    /* a texture instruction writes the registers of the components its mask selects, a load those of its size: one
+       between the reciprocal and the FMUL that doesn't reach R4 leaves it to the FMUL, one that does keeps both */
+    const Word tex = fold_with(tex_f16(2, 255, 3), 79, 1, 0), tex1 = fold_with(tex_f16(8, 4, 3), 79, 1, 0);
+    fold_case((const Word[]){w, rcp, x, tex, mul}, 5, 0xaa, 1, 1, "a TEX into R2 and R3 leaves the reciprocal");
+    fold_case((const Word[]){w, rcp, x, fold_with(tex, 72, 4, 7), mul}, 5, 0xaa, 1, 0,
+              "a TEX whose third component goes on into R4 keeps both");
+    fold_case((const Word[]){w, rcp, x, tex1, mul}, 5, 0xaa, 1, 1,
+              "a TEX of two components into R8 and R9 leaves R4, its second destination, as it was");
+    fold_case((const Word[]){w, rcp, x, fold_with(tex1, 72, 4, 0xd), mul}, 5, 0xaa, 1, 0,
+              "a TEX whose third component goes to its second destination, R4, keeps both");
+    fold_case((const Word[]){w, rcp, x, tex_f16(8, 4, 3), mul}, 5, 0xaa, 1, 1,
+              "TEX.F16 packs two components in R8 alone and leaves R4");
+    fold_case((const Word[]){w, rcp, x, tex_f16(8, 4, 7), mul}, 5, 0xaa, 1, 0,
+              "TEX.F16 packs a third component in its second destination, R4: keeps both");
+    fold_case((const Word[]){w, rcp, x, fold_with(tex_f16(0, 255, 1), 79, 1, 0), mul}, 5, 0xaa, 1, 0,
+              "a TEX into the input's register keeps both");
+    /* TMML and TLD (its level 0) write as TEX does; TMML's levels in fixed point are two multiplies more, and TLD's
+       texel over a fragment's scale eight */
+    const Word tmml = fold_with(tex, 0, 12, 0xb69), tld = fold_with(fold_with(tex, 0, 12, 0xb66), 87, 3, 1);
+    fold_case((const Word[]){w, rcp, x, tmml, mul}, 5, 0xaa, 3, 1, "a TMML into R2 and R3 leaves the reciprocal");
+    fold_case((const Word[]){w, rcp, x, fold_with(tmml, 72, 4, 7), mul}, 5, 0xaa, 3, 0,
+              "a TMML of three values writes R4: keeps both");
+    fold_case((const Word[]){w, rcp, x, tld, mul}, 5, 0xaa, 9, 1, "a TLD into R2 and R3 leaves the reciprocal");
+    fold_case((const Word[]){w, rcp, x, fold_with(tld, 72, 4, 7), mul}, 5, 0xaa, 9, 0,
+              "a TLD of three components writes R4: keeps both");
+    /* a 2D TXQ's size over a fragment's scale (scaled_size) is two multiplies more */
+    fold_case((const Word[]){w, rcp, x, fold_txq(2, 3), mul}, 5, 0xaa, 3, 1,
+              "a TXQ of two values into R2 and R3 leaves R4");
+    fold_case((const Word[]){w, rcp, x, fold_txq(2, 7), mul}, 5, 0xaa, 3, 0,
+              "a TXQ of three values, a register each with bit 79, writes R4: keeps both");
+    fold_case((const Word[]){w, rcp, x, local_op(0x983, 3, 255, 0, 4), mul}, 5, 0xaa, 1, 1,
+              "LDL of 32 bits into R3 leaves R4");
+    fold_case((const Word[]){w, rcp, x, local_op(0x983, 3, 255, 0, 5), mul}, 5, 0xaa, 1, 0,
+              "LDL of 64 bits into R3 writes R4: keeps both");
+    fold_case((const Word[]){w, rcp, x, local_op(0x983, 1, 255, 0, 6), mul}, 5, 0xaa, 1, 0,
+              "LDL of 128 bits into R1 writes R4: keeps both");
+    /* through the pointer c[0][0x110] in R6 and R7 */
+    const Word pointer = ldc(6, 255, 0, 0x110, 5);
+    fold_case((const Word[]){pointer, w, rcp, x, ldg_nou(3, 6, 0, 4), mul}, 6, 0xaa, 1, 1,
+              "LDG of 32 bits into R3 leaves R4");
+    fold_case((const Word[]){pointer, w, rcp, x, ldg_nou(3, 6, 0, 5), mul}, 6, 0xaa, 1, 0,
+              "LDG of 64 bits into R3 writes R4: keeps both");
+    const Word two[] = {w, rcp, x, fold_ipa(1, 0x84), mul, fold_fmul(1, 1, 4)};
+    fold_case(two, 6, 0xaa, 2, 1, "each component's FMUL by the one reciprocal folds");
+    /* the reciprocal before a forward branch over code that writes neither register, or before a loop that doesn't */
+    const Word across[] = {w, rcp, x, bra(3, 5, 0, 0), one, mul};
+    fold_case(across, 6, 0xaa, 1, 1, "the operands reach the FMUL across a branch over other writes");
+    const Word loop[] = {w, rcp, x, fold_fmul(1, 0, 4), one, bra(5, 3, 0, 0)};
+    fold_case(loop, 6, 0xaa, 1, 1, "the operands reach the FMUL in a loop that writes other registers");
+
+    /* a modifier or a scale on the FMUL */
+    fold_case((const Word[]){w, rcp, x, fold_with(mul, 72, 1, 1)}, 4, 0xaa, 1, 0, "FMUL of -IPA keeps both");
+    fold_case((const Word[]){w, rcp, x, fold_with(mul, 73, 1, 1)}, 4, 0xaa, 1, 0, "FMUL of |IPA| keeps both");
+    fold_case((const Word[]){w, rcp, x, fold_with(mul, 63, 1, 1)}, 4, 0xaa, 1, 0, "FMUL by -1 / w keeps both");
+    fold_case((const Word[]){w, rcp, x, fold_with(mul, 62, 1, 1)}, 4, 0xaa, 1, 0, "FMUL by |1 / w| keeps both");
+    /* one game's interpolation is FMUL.RZ.FTZ, its product rounded toward zero on doubles */
+    fold_case((const Word[]){w, rcp, x, fold_with(fold_with(mul, 78, 2, 3), 80, 1, 1)}, 4, 0xaa, 2, 1,
+              "FMUL.RZ.FTZ folds too");
+    fold_case((const Word[]){w, rcp, x, fold_with(mul, 84, 3, 3)}, 4, 0xaa, 1, 0, "FMUL.D2 keeps both");
+    /* another multiplier */
+    /* with a MUFU.RCP into the same register after the FMUL, the RSQ the one that reaches it */
+    fold_case((const Word[]){w, fold_mufu(4, 4, 5), x, mul, rcp}, 5, 0xaa, 1, 0, "MUFU.RSQ of a[0x7c] keeps both");
+    fold_case((const Word[]){w, fold_with(rcp, 62, 1, 1), x, mul}, 4, 0xaa, 1, 0, "MUFU.RCP of |a[0x7c]| keeps both");
+    fold_case((const Word[]){w, fold_with(rcp, 63, 1, 1), x, mul}, 4, 0xaa, 1, 0, "MUFU.RCP of -a[0x7c] keeps both");
+    fold_case((const Word[]){w, fold_with(rcp, 73, 1, 1), x, mul}, 4, 0xaa, 1, 0, "MUFU.RCP.F16 keeps both");
+    fold_case((const Word[]){w, x, mul}, 3, 0xaa, 1, 0, "FMUL by a[0x7c] itself keeps both");
+    fold_case((const Word[]){w, fold_mufu(5, 4, 4), fold_fmul(0, 4, 5)}, 3, 0xaa, 0, 0,
+              "FMUL of a[0x7c] by its reciprocal keeps its multiply");
+    /* an immediate's operand field reads as R0, where the input is */
+    fold_case((const Word[]){w, rcp, x, fold_with(fold_with(alu(0x020, 4, 1, 4), 32, 32, f2u(2.0f)), 84, 3, 4)}, 4,
+              0xaa, 1, 0, "FMUL of the reciprocal by an immediate keeps its multiply");
+    Word rcp_imm = fold_with(alu(0x108, 4, 4, 255), 32, 32, f2u(2.0f));
+    fold_case((const Word[]){fold_ipa(0, 0x7c), fold_with(rcp_imm, 74, 6, 4), fold_ipa(1, 0x80), fold_fmul(1, 1, 4)}, 4,
+              0xaa, 1, 0, "MUFU.RCP of an immediate keeps both");
+    /* an FMUL into the input's register whose fields read as IPA a[0x80]'s */
+    fold_case((const Word[]){w, rcp, x, fold_with(fold_fmul(0, 0, 255), 64, 8, 0x80 >> 2), mul}, 5, 0xaa, 2, 0,
+              "an FMUL that writes the input's register keeps both");
+    fold_case((const Word[]){w, fold_fmul(4, 4, 4), x, mul}, 4, 0xaa, 1, 0, "FMUL by an FMUL of a[0x7c] keeps both");
+    /* the same FMUL with MUFU's function field, 74-79, as RCP's; and one with IPA's address field, 64-71, as a[0x7c]'s,
+       that the reciprocal is of */
+    fold_case((const Word[]){w, fold_with(fold_fmul(4, 4, 4), 74, 6, 4), x, mul, rcp}, 5, 0xaa, 2, 0,
+              "FMUL by an FMUL whose bits read as MUFU.RCP's keeps both");
+    fold_case((const Word[]){w, fold_with(fold_fmul(4, 4, 4), 64, 8, 0x7c >> 2), rcp, x, mul}, 5, 0xaa, 2, 0,
+              "the reciprocal of an FMUL whose bits read as IPA a[0x7c]'s keeps both");
+    fold_case((const Word[]){fold_with(w, 78, 2, 1), rcp, x, mul}, 4, 0xaa, 1, 0,
+              "the reciprocal of a[0x7c] read at another frequency keeps both");
+    fold_case((const Word[]){fold_ipa(4, 0x8c), rcp, x, mul}, 4, 0xaa, 2, 0,
+              "the reciprocal of a generic's w keeps both");
+    fold_case((const Word[]){mov_imm(4, 0x40e00000u), rcp, x, mul}, 4, 0xaa, 1, 0,
+              "the reciprocal of a constant keeps both");
+    /* a guard, or a write that may reach the FMUL on some path */
+    fold_case((const Word[]){w, predicated(rcp, 0), x, mul}, 4, 0xaa, 1, 0, "a reciprocal under P0 keeps both");
+    fold_case((const Word[]){w, predicated(w, 0), rcp, x, mul}, 5, 0xaa, 1, 0, "a[0x7c] read under P0 keeps both");
+    fold_case((const Word[]){w, rcp, x, predicated(x, 0), mul}, 5, 0xaa, 2, 0, "an input read under P0 keeps both");
+    fold_case((const Word[]){w, rcp, r4, x, mul}, 5, 0xaa, 1, 0, "a write of the multiplier after it keeps both");
+    fold_case((const Word[]){w, r4, rcp, x, mul}, 5, 0xaa, 1, 0, "a write of a[0x7c]'s register keeps both");
+    fold_case((const Word[]){w, rcp, x, mov_imm(0, f2u(1.0f)), mul}, 5, 0xaa, 1, 0,
+              "a write of the input's register keeps both");
+    fold_case((const Word[]){w, rcp, x, bra(3, 5, 0, 0), r4, mul}, 6, 0xaa, 1, 0,
+              "a write of the multiplier on one side of a branch keeps both");
+    fold_case((const Word[]){r4, bra(1, 3, 0, 0), w, rcp, x, mul}, 6, 0xaa, 1, 0,
+              "a[0x7c] read on one side of a branch only keeps both");
+    fold_case((const Word[]){w, rcp, mov_imm(0, f2u(1.0f)), bra(3, 5, 0, 0), x, mul}, 6, 0xaa, 1, 0,
+              "the input read on one side of a branch only keeps both");
+    fold_case((const Word[]){w, rcp, x, fold_fmul(1, 0, 4), r4, bra(5, 3, 0, 0)}, 6, 0xaa, 1, 0,
+              "a write of the multiplier later in a loop around the FMUL keeps both");
+    /* the multiply by gl_FragCoord.w is a perspective input's at frequency 0 alone: none to take back elsewhere */
+    fold_case(folds, 4, 0xff, 0, 0, "FMUL of a screen-linear input keeps its multiply");
+    fold_case(folds, 4, 0x55, 0, 0, "FMUL of a flat input keeps its multiply");
+    fold_case((const Word[]){w, rcp, fold_with(x, 78, 2, 1), mul}, 4, 0xaa, 0, 0,
+              "FMUL of an input read at another frequency keeps its multiply");
+
+    /* on the CPU: the fold's R0 is the input's bits for any w; the same arithmetic with |1 / w| rounds twice */
+    volatile float vx = 0.7f, vw = 7.0f;
+    const float twice = vx * vw * (1.0f / vw);
+    CHECK(f2u(twice) != f2u(vx));
+    const float ws[] = {7.0f, 1e-30f, 1e30f, 0.0f, INFINITY, NAN};
+    u32 r0 = 0;
+    for (size_t k = 0; k < sizeof ws / sizeof *ws; k++) {
+        int ran = fold_run(folds, 4, vx, ws[k], &r0);
+        if (!ran || r0 != f2u(vx)) fprintf(stderr, "perspective fold: w %g: R0 %08x, not %08x\n", ws[k], r0, f2u(vx));
+        CHECK(ran && r0 == f2u(vx));
+    }
+    const Word kept[] = {w, rcp, x, fold_with(mul, 62, 1, 1)}; /* |1 / w|, which is 1 / w here */
+    CHECK(fold_run(kept, 4, vx, vw, &r0) && r0 == f2u(twice));
+    CHECK(fold_run(folds, 4, 3e38f, 4.0f, &r0) && r0 == f2u(3e38f));
+    CHECK(fold_run(kept, 4, 3e38f, 4.0f, &r0) && r0 == f2u(INFINITY));
+    CHECK(fold_run(ftz, 4, vx, vw, &r0) && r0 == f2u(vx));
+    const Word rz[] = {w, rcp, x, fold_with(fold_with(mul, 78, 2, 3), 80, 1, 1)};
+    CHECK(fold_run(rz, 4, vx, vw, &r0) && r0 == f2u(vx));
+    CHECK(fold_run(ftz, 4, -0x1p-140f, vw, &r0) && r0 == 0x80000000u); /* a subnormal input flushed, its sign kept */
+    const float clamps[][2] = {{1.5f, 1.0f}, {-0.25f, 0.0f}, {NAN, 0.0f}};
+    for (size_t k = 0; k < sizeof clamps / sizeof *clamps; k++)
+        CHECK(fold_run(saturated, 4, clamps[k][0], vw, &r0) && r0 == f2u(clamps[k][1]));
+    ShaderInfo si;
+    size_t count = 0;
+    u32* spv = fold_fs(folds, 4, 0xaa, &si, &count);
+    CHECK(spv && keep_module(dir, "fs_perspective_fold", spv, count));
+    free(spv);
+    /* TXQ's integers with bit 79 go one a register: a module spirv-val passes, where packing them as halves wouldn't */
+    spv = fold_fs((const Word[]){w, rcp, x, fold_txq(2, 7), mul}, 5, 0xaa, &si, &count);
+    CHECK(spv && keep_module(dir, "fs_perspective_fold_txq", spv, count));
+    free(spv);
+    /* a legacy texture coordinate (a[0x300], generic 22), perspective by the header's texture coordinate map (word
+       15): its FMUL by the reciprocal folds as a generic's does, to generic 22's input */
+    u8 code[16 * 8] = {0};
+    const Word legacy[] = {w, rcp, fold_ipa(0, 0x300), mul};
+    for (u32 i = 0; i < 4; i++) put(code, i, legacy[i]);
+    put(code, 4, exit_insn());
+    put(code, 5, bra(5, 5, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[15] = 0xaa;
+    fsph[18] = 0xf;
+    SpvEvalEnv env = {0};
+    env.in[22][0] = f2u(vx);
+    env.builtin[15][3] = f2u(vw);
+    CHECK(run_stage(ST_FS, code, 6, fsph, &env) && env.out[0][0] == f2u(vx));
+}
+
 /* the pass over the shipped programs leaves a task or mesh program to its draw: it finds their ISBE accesses */
 static void test_uses_isbe(void) {
     u8 code[16 * 40] = {0};
@@ -4653,17 +5223,18 @@ static void test_warp_matrix(const char* dir) {
     /* The matrix unit's shapes, one OpCooperativeMatrixMulAddKHR a product, on the same 4 HMMAs (two .16816, two
        .1688, all of them A at R8 and B at R12): a 16 wide K takes each in one product, so 4; 16x8x8 splits the
        .16816s' K in two, so 6; 8x8x8 splits their M too, so 12. A fragment is staged once a block, so the matrix
-       loads are those of the first HMMA of each kind alone. Each HMMA stores its D once: an f16 D at its own HMMA,
-       where its halves round, and an f32 one at the block's end, where its matrix stops. An A register written
+       loads are those of the first HMMA of each kind alone, and of the two f32 Ds' C, whose registers no matrix
+       stands for (one an M block). Each HMMA stores its D once: an f16 D at its own HMMA, where its halves round, and
+       an f32 one at the block's end, where its matrix stops, each between barriers of its own. An A register written
        between HMMAs stages its fragment again (restage below) */
     static const struct {
         u32 bit;
         const char* name;
         u32 products, loads, stores, restage, barriers;
-    } shapes[] = {{SH_COOP_16x16x16, "16x16x16", 4, 4, 4, 3, 7},
-                  {SH_COOP_16x8x16, "16x8x16", 4, 4, 4, 3, 7},
-                  {SH_COOP_16x8x8, "16x8x8", 6, 6, 4, 6, 7},
-                  {SH_COOP_8x8x8, "8x8x8", 12, 9, 8, 10, 7}};
+    } shapes[] = {{SH_COOP_16x16x16, "16x16x16", 4, 6, 4, 4, 14},
+                  {SH_COOP_16x8x16, "16x8x16", 4, 6, 4, 4, 14},
+                  {SH_COOP_16x8x8, "16x8x8", 6, 8, 4, 7, 14},
+                  {SH_COOP_8x8x8, "8x8x8", 12, 13, 8, 12, 14}};
     u32 stages_wide = 0;
     for (u32 s = 0; s < 4; s++) {
         for (int written = 0; written < 2; written++) {
@@ -4938,13 +5509,37 @@ static int hmma_match(u32 got, int f32, u32 j, double want, double tol, int kind
     if (bits) return v == want;
     return fabs(v - want) <= tol;
 }
+/* the outputs of hmma_program on one set of inputs that are not what hmma_expect says (with packed, of the half
+   sums), the first 8 told under the name what */
+static u32 hmma_bad(const HmmaMats* mats, const u32* out, int set, int packed, const char* what) {
+    u32 bad = 0;
+    for (u32 l = 0; l < 32; l++)
+        for (u32 w = 0; w < HMMA_OUT; w++) {
+            u32 got = out[l * HMMA_OUT + w], at = 0, k = 0;
+            for (; k < 8 && w >= at + (hmma_cases[k][2] & 0x10 ? 4u : 2u); k++) at += hmma_cases[k][2] & 0x10 ? 4u : 2u;
+            int f32 = hmma_cases[k][2] >> 4 & 1;
+            for (u32 j = 0; j < (f32 ? 1u : 2u); j++) {
+                double tol;
+                int kind, zero_sign, overflow;
+                double want = hmma_expect(mats, l, w, j, packed, &tol, &kind, &zero_sign, &overflow);
+                if (hmma_match(got, f32, j, want, tol, kind, zero_sign, set == HM_EXACT, overflow)) continue;
+                if (bad++ < 8)
+                    fprintf(stderr,
+                            "warp matrix values (set %d, %s): lane %u word %u half %u is 0x%08x, expected %.9g within "
+                            "%.3g (kind %d, zero sign %d)\n",
+                            set, what, l, w, j, got, want, tol, kind, zero_sign);
+            }
+        }
+    return bad;
+}
 /* HMMA (16816 and 1688, F16 and F32 D, C from RZ, an f16 input or an earlier D) on the evaluator's 32 lanes, as each
    lane gathers B, as pairs of lanes share it (g_spirv_translate.hmma_pairs) and through a warp's slot of shared memory
    (g_spirv_translate.hmma_stage), with and without the quads and the mixed dot product, and without it in half sums
-   (g_spirv_translate.hmma_f16): on the exact set every output is the sum's bits; on the rounded one within an f32 sum's
-   error, or the half sums' (hmma_expect); on the special and zeros ones infinities, NaNs and the sign of zero follow
-   IEEE's sum of the terms in any order, but where the half sums can overflow. And the forms agree with each other: bit
-   for bit on the exact set, the same kinds on the others */
+   (g_spirv_translate.hmma_f16), and on the device's cooperative matrices of each shape (g_spirv_translate.hmma_coop):
+   on the exact set every output is the sum's bits; on the rounded one within an f32 sum's error, or the half sums'
+   (hmma_expect); on the special and zeros ones infinities, NaNs and the sign of zero follow IEEE's sum of the terms in
+   any order, but where the half sums can overflow. And the forms agree with each other: bit for bit on the exact set,
+   the same kinds on the others */
 static void test_warp_matrix_values(const char* dir) {
     u8 code[16 * 48] = {0};
     u32 n = hmma_program(code);
@@ -4973,30 +5568,10 @@ static void test_warp_matrix_values(const char* dir) {
                         g_spirv_translate.hmma_f16 = half_was;
                         CHECK(ran);
                         if (!ran) return;
-                        u32 bad = 0;
-                        for (u32 l = 0; l < 32; l++)
-                            for (u32 w = 0; w < HMMA_OUT; w++) {
-                                u32 got = out[form][l * HMMA_OUT + w], at = 0, k = 0;
-                                for (; k < 8 && w >= at + (hmma_cases[k][2] & 0x10 ? 4u : 2u); k++)
-                                    at += hmma_cases[k][2] & 0x10 ? 4u : 2u;
-                                int f32 = hmma_cases[k][2] >> 4 & 1;
-                                for (u32 j = 0; j < (f32 ? 1u : 2u); j++) {
-                                    double tol;
-                                    int kind, zero_sign, overflow;
-                                    double want =
-                                        hmma_expect(&mats, l, w, j, packed, &tol, &kind, &zero_sign, &overflow);
-                                    if (hmma_match(got, f32, j, want, tol, kind, zero_sign, set == HM_EXACT, overflow))
-                                        continue;
-                                    if (bad++ < 8)
-                                        fprintf(stderr,
-                                                "warp matrix values (set %d, quad %d, mixed %d, form %d, half sums "
-                                                "%d): lane %u word %u half %u is 0x%08x, expected %.9g within %.3g "
-                                                "(kind %d, zero sign %d)\n",
-                                                set, quad, mixed, form, packed, l, w, j, got, want, tol, kind,
-                                                zero_sign);
-                                }
-                            }
-                        CHECK(bad == 0);
+                        char what[48];
+                        snprintf(what, sizeof what, "quad %d, mixed %d, form %d, half sums %d", quad, mixed, form,
+                                 packed);
+                        CHECK(hmma_bad(&mats, out[form], set, packed, what) == 0);
                     }
                     /* the three forms: the same bits where the sums are exact, else the same kinds and values within
                        their bounds (hmma_match above) */
@@ -5010,6 +5585,22 @@ static void test_warp_matrix_values(const char* dir) {
                                 "forms\n",
                                 quad, mixed, packed, differ);
                 }
+        /* the cooperative matrices, each shape (its products' order is the evaluator's, one rounding to f32) */
+        static const char* const shape_name[4] = {"16x16x16", "16x8x16", "16x8x8", "8x8x8"};
+        int coop_was = g_spirv_translate.hmma_coop;
+        u32 shapes_was = g_spirv_translate.hmma_coop_shapes;
+        for (u32 s = 0; s < 4; s++) {
+            g_spirv_translate.hmma_coop = 65536, g_spirv_translate.hmma_coop_shapes = 1u << s,
+            g_spirv_translate.float16 = 1;
+            char keep[32], what[32];
+            snprintf(keep, sizeof keep, "warp_values_coop_%s", shape_name[s]);
+            snprintf(what, sizeof what, "cooperative %s", shape_name[s]);
+            int ran = hmma_run(code, n, in, out[0], dir, set == HM_EXACT ? keep : NULL, 0);
+            g_spirv_translate.hmma_coop = coop_was, g_spirv_translate.hmma_coop_shapes = shapes_was,
+            g_spirv_translate.float16 = f16_was;
+            CHECK(ran);
+            if (ran) CHECK(hmma_bad(&mats, out[0], set, 0, what) == 0);
+        }
     }
 }
 
@@ -5057,6 +5648,393 @@ static void test_warp_matrix_flush(const char* dir) {
                     small);
         CHECK(exact ? bad == 0 : bad > 0);
     }
+}
+
+/* ---- HFMA2's one rounding ---- */
+
+/* the f16 nearest a double, ties to even, subnormals kept, past 65504 an infinity */
+static u32 f16_rne(double v) {
+    u32 sign = signbit(v) ? 0x8000u : 0;
+    double a = fabs(v);
+    if (a >= 65520.0) return sign | 0x7c00u;
+    if (a < 0x1p-14) return sign | (u32)nearbyint(ldexp(a, 24));
+    int ex;
+    double m = frexp(a, &ex);
+    return sign | (((u32)(ex + 14) << 10) + (u32)nearbyint(ldexp(m, 11)) - 0x400u);
+}
+/* a * b + c of three finite f16 rounded once to the nearest even f16, as a fused multiply-add of halves: the product is
+   exact in double, TwoSum gives the double sum's error, and a sum that is the midpoint of two f16 goes to its error's
+   side. Within the finite f16 */
+static u32 fma16_once(u32 a, u32 b, u32 c) {
+    double p = hmma_half(a) * hmma_half(b), q = hmma_half(c), s = p + q, qs = s - p;
+    double e = (p - (s - qs)) + (q - qs);
+    u32 h = f16_rne(s);
+    double v = hmma_half(h);
+    if (v == s || e == 0) return h;
+    u32 other = fabs(s) > fabs(v) ? h + 1 : h - 1; /* the f16 on s's other side, by magnitude */
+    double w = hmma_half(other);
+    if ((v + w) / 2 != s) return h;
+    return (e > 0) == (w > v) ? other : h;
+}
+/* HFMA2 R0 = R1 * R2 + R3 (R1-R3 from c[1][0], [4] and [8]) on the evaluator, both halves: each the f16 nearest the
+   exact a * b + c. The f32 sum went to PackHalf2x16 rounded already, and two roundings could land on an f16 tie that
+   the sum is not on: the cases below were found so (by exact rationals), where the one rounding goes the other way.
+   Then random triples of f16, the result's magnitude below 65504, against fma16_once */
+static Word mov_cbuf(u32 dst, u32 bank, u32 off);
+static void test_hfma2_once(const char* dir) {
+    /* a, b, c, and the f16 nearest the exact sum */
+    static const u16 twice[6][3] = {{0xd2d8, 0xe440, 0x8f1d}, {0x3e00, 0x7847, 0x176a}, {0x2872, 0x2333, 0xbf52},
+                                    {0xa362, 0x7951, 0xf364}, {0x0a44, 0xe078, 0x52d8}, {0x3baa, 0xc83d, 0x8fdf}};
+    static const double exact[6] = {59552.0, 52576.0, -1.8291015625, -15768.0, 54.65625, -8.1171875};
+    u8 code[16 * 6] = {0};
+    for (u32 k = 0; k < 3; k++) put(code, k, mov_cbuf(1 + k, 1, 4 * k));
+    Word x = alu(0x031, 1, 0, 1); /* HFMA2 R0, R1, R2, R3 */
+    set(&x, 32, 8, 2);
+    set(&x, 64, 8, 3);
+    put(code, 3, x);
+    put(code, 4, exit_insn());
+    put(code, 5, bra(5, 5, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, 6 * 16, ST_FS, fsph, &si, &count);
+    CHECK(spv != NULL);
+    if (!spv) {
+        fprintf(stderr, "hfma2 once: %s\n", si.first_unsupported);
+        return;
+    }
+    CHECK(keep_module(dir, "hfma2_once", spv, count));
+    u32 seed = 0x51ed27u, bad = 0, tried = 0;
+    for (u32 k = 0; k < 6 + 4096; k++) {
+        u32 in[3][2], want[2];
+        for (u32 j = 0; j < 2; j++) {
+            if (k < 6) { /* the found cases, in the low half and in the high one */
+                u32 i = (k + 3 * j) % 6;
+                for (u32 t = 0; t < 3; t++) in[t][j] = twice[i][t];
+                want[j] = f16_rne(exact[i]);
+                CHECK(fma16_once(in[0][j], in[1][j], in[2][j]) == want[j]);
+                continue;
+            }
+            do {
+                for (u32 t = 0; t < 3; t++) {
+                    seed = seed * 1664525u + 1013904223u;
+                    u32 h = seed >> 16 & 0x7fffu;
+                    in[t][j] = (h >= 0x7c00u ? h - 0x7c00u : h) | (seed & 0x8000u);
+                }
+            } while (fabs(hmma_half(in[0][j]) * hmma_half(in[1][j]) + hmma_half(in[2][j])) >= 65504.0);
+            want[j] = fma16_once(in[0][j], in[1][j], in[2][j]);
+        }
+        u32 bank1[4] = {in[0][0] | in[0][1] << 16, in[1][0] | in[1][1] << 16, in[2][0] | in[2][1] << 16, 0};
+        SpvEvalEnv env = {0};
+        env.ubo[SNX_VKB_CB + 1] = bank1;
+        env.ubo_words[SNX_VKB_CB + 1] = 4;
+        const char* why = spv_eval(spv, count, &env);
+        u32 got = env.out[0][0], wanted = want[0] | want[1] << 16;
+        tried++;
+        if ((why || got != wanted) && bad++ < 6)
+            fprintf(stderr, "hfma2 once: %04x*%04x+%04x, %04x*%04x+%04x is 0x%08x, not 0x%08x%s%s\n", in[0][0],
+                    in[1][0], in[2][0], in[0][1], in[1][1], in[2][1], got, wanted, why ? ": " : "", why ? why : "");
+    }
+    if (bad) fprintf(stderr, "hfma2 once: %u of %u pairs differ\n", bad, tried);
+    CHECK(bad == 0);
+    free(spv);
+}
+
+/* ---- HMMA on the cooperative matrices against the gathers, bit for bit, on the evaluator's 32 lanes ---- */
+
+/* a lane's input words in c[1] (A's 4, B's 2, an f16 C's 2 and an f32 C's 4: R8-R19) and its output words */
+#define COOP_IN  12u
+#define COOP_OUT 16u
+static Word hmma_insn(u32 d, u32 a, u32 b, u32 cr, u32 variant) {
+    Word x = fix(0x23c);
+    set(&x, 16, 8, d);
+    set(&x, 24, 8, a);
+    set(&x, 32, 8, b);
+    set(&x, 64, 8, cr);
+    set(&x, 72, 19, variant);
+    return x;
+}
+/* S2R R0, TID.X; R1 = 4 COOP_IN R0; R2 = 0x400 + 4 COOP_OUT R0, the lane's outputs past the tile; STS [R2], RZ (the
+   program's shared memory, the first Workgroup variable, which the evaluator keeps); R8-R19 from c[1][R1 + 4k]; R7 =
+   16 R0, the lane's A words stored at [R7 + 0x40], the tile an LDSM.4 of [R7 + 0x40] reads back; BAR.SYNC */
+static u32 coop_prologue(u8* code) {
+    u32 n = 0;
+    Word x = fix(0x919);
+    set(&x, 72, 8, 0x21);
+    put(code, n++, x);
+    static const u32 scale[3][3] = {{1, 4 * COOP_IN, 0}, {2, 4 * COOP_OUT, 0x400}, {7, 16, 0}};
+    for (u32 k = 0; k < 3; k++) { /* IMAD Rd, R0, scale, RZ, then IADD3 Rd, Rd, offset */
+        x = alu(0x024, 4, scale[k][0], 0);
+        set(&x, 32, 32, scale[k][1]);
+        set(&x, 64, 8, 255);
+        put(code, n++, x);
+        if (scale[k][2]) put(code, n++, iadd3_imm(scale[k][0], scale[k][0], scale[k][2]));
+    }
+    x = fix(0x388); /* STS [R2], RZ */
+    set(&x, 24, 8, 2);
+    set(&x, 32, 8, 255);
+    set(&x, 73, 3, 4);
+    put(code, n++, x);
+    for (u32 k = 0; k < COOP_IN; k++) put(code, n++, ldc(8 + k, 1, 1, 4 * k, 4));
+    x = fix(0x388); /* STS.128 [R7 + 0x40], R8 */
+    set(&x, 24, 8, 7);
+    set(&x, 32, 8, 8);
+    set(&x, 40, 24, 0x40);
+    set(&x, 73, 3, 6);
+    put(code, n++, x);
+    put(code, n++, fix(0xb1d)); /* BAR.SYNC 0 */
+    return n;
+}
+/* STS [R2 + 4k], regs[k] for each output, EXIT and the BRA to itself: the count of instructions */
+static u32 coop_epilogue(u8* code, u32 n, const u32* regs, u32 outs) {
+    for (u32 k = 0; k < outs; k++) {
+        Word x = fix(0x388);
+        set(&x, 24, 8, 2);
+        set(&x, 32, 8, regs[k]);
+        set(&x, 40, 24, 4 * k);
+        set(&x, 73, 3, 4);
+        put(code, n++, x);
+    }
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    return n + 1;
+}
+/* c[2], which a program of the tests below may read: its jump tables, and their read by the translation */
+static u32 hmma_bank2[16];
+static int hmma_bank2_read(u32 idx, u32 off, u32* out) {
+    if (idx != 2 || off % 4 || off / 4 >= sizeof hmma_bank2 / 4) return 0;
+    *out = hmma_bank2[off / 4];
+    return 1;
+}
+/* the program on the evaluator's 32 lanes, with the exact set's A, B and f16 C (hmma_inputs) and an f32 C of the same
+   values, translated with the cooperative matrices of one shape (shape_bit) or with the gathers (0): the outputs into
+   out, 0 when the translation or the evaluator fails */
+static int coop_run(const u8* code, u32 n, u32 shape_bit, u32* out, const char* dir, const char* keep) {
+    static HmmaMats mats;
+    static u32 in[32 * 8], bank1[32 * COOP_IN];
+    hmma_inputs(&mats, in, HM_EXACT);
+    u32 seed = 0x7f4a7c15u;
+    for (u32 l = 0; l < 32; l++) {
+        for (u32 k = 0; k < 8; k++) bank1[l * COOP_IN + k] = in[l * 8 + k];
+        for (u32 k = 0; k < 4; k++)
+            bank1[l * COOP_IN + 8 + k] = f2u((float)hmma_half(hmma_element(&seed, HM_EXACT, 0)));
+    }
+    int coop_was = g_spirv_translate.hmma_coop, f16_was = g_spirv_translate.float16;
+    u32 shapes_was = g_spirv_translate.hmma_coop_shapes;
+    g_spirv_translate.hmma_coop = shape_bit ? 65536 : 0, g_spirv_translate.hmma_coop_shapes = shape_bit;
+    g_spirv_translate.float16 = 1;
+    ShaderInfo si = {0};
+    si.cs_local[0] = 32, si.cs_local[1] = si.cs_local[2] = 1;
+    si.shared_size = (int)(0x400 + 32 * COOP_OUT * 4);
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, n * 16, ST_CS, NULL, &si, &count);
+    g_spirv_translate.hmma_coop = coop_was, g_spirv_translate.hmma_coop_shapes = shapes_was;
+    g_spirv_translate.float16 = f16_was;
+    if (!spv) {
+        fprintf(stderr, "%s: not translated: %s\n", keep, si.first_unsupported);
+        return 0;
+    }
+    if (shape_bit && !spv_count(spv, count, 4459)) {
+        fprintf(stderr, "%s: no cooperative matrix product\n", keep);
+        free(spv);
+        return 0;
+    }
+    CHECK(keep_module(dir, keep, spv, count));
+    static SpvEvalEnv env[32];
+    memset(env, 0, sizeof env);
+    for (u32 l = 0; l < 32; l++) {
+        env[l].ubo[SNX_VKB_CB + 1] = bank1;
+        env[l].ubo_words[SNX_VKB_CB + 1] = 32 * COOP_IN;
+        env[l].ubo[SNX_VKB_CB + 2] = hmma_bank2;
+        env[l].ubo_words[SNX_VKB_CB + 2] = sizeof hmma_bank2 / 4;
+        env[l].builtin[27][0] = env[l].builtin[29][0] = env[l].builtin[41][0] = l; /* LocalInvocationId.x, Index */
+        env[l].builtin[24][0] = env[l].builtin[24][1] = env[l].builtin[24][2] = 1; /* NumWorkgroups */
+    }
+    const char* why = spv_eval_subgroup(spv, count, env, 32);
+    free(spv);
+    if (why || env[0].shared_words < 0x100 + 32 * COOP_OUT) {
+        fprintf(stderr, "%s: the evaluator stops at %s (%u shared words)\n", keep, why ? why : "nothing",
+                env[0].shared_words);
+        return 0;
+    }
+    memcpy(out, env[0].shared + 0x100, 32 * COOP_OUT * 4);
+    return 1;
+}
+/* whether the program's outputs (outs a lane) on the cooperative matrices of each shape are the gathers', bit for
+   bit: every sum of the exact set is exact in f16 and f32, so any difference is a wrong value. The modules are kept
+   as name_<shape> */
+static int coop_agrees(const u8* code, u32 n, u32 outs, const char* dir, const char* name) {
+    static const char* const shape_name[4] = {"16x16x16", "16x8x16", "16x8x8", "8x8x8"};
+    static u32 want[32 * COOP_OUT], got[32 * COOP_OUT];
+    char keep[64];
+    snprintf(keep, sizeof keep, "%s_gathers", name);
+    if (!coop_run(code, n, 0, want, dir, keep)) return 0;
+    int ok = 1;
+    for (u32 s = 0; s < 4; s++) {
+        snprintf(keep, sizeof keep, "%s_%s", name, shape_name[s]);
+        if (!coop_run(code, n, 1u << s, got, dir, keep)) {
+            ok = 0;
+            continue;
+        }
+        u32 bad = 0;
+        for (u32 l = 0; l < 32; l++)
+            for (u32 w = 0; w < outs; w++)
+                if (got[l * COOP_OUT + w] != want[l * COOP_OUT + w] && bad++ < 4)
+                    fprintf(stderr, "%s: lane %u output %u is 0x%08x, the gathers' 0x%08x\n", keep, l, w,
+                            got[l * COOP_OUT + w], want[l * COOP_OUT + w]);
+        ok &= bad == 0;
+    }
+    return ok;
+}
+/* a program of the prologue, then HMMAs (d, a, b, c, variant; an a of COOP_LDSM | r has an LDSM.4 of [R7 + 0x40] into
+   r before it, the pair the fuse takes; a d of COOP_BRA is a BRA to the next instruction, which ends the block), then
+   the outputs' stores: whether the cooperative matrices of each shape give the gathers' outputs */
+#define COOP_LDSM 0x100u
+#define COOP_BRA  0x200u
+static int coop_case(const char* dir, const char* name, const u32 (*insns)[5], u32 ninsns, const u32* outs, u32 nouts) {
+    u8 code[16 * 64] = {0};
+    u32 n = coop_prologue(code);
+    for (u32 i = 0; i < ninsns; i++) {
+        const u32* h = insns[i];
+        if (h[0] == COOP_BRA) {
+            put(code, n, bra(n, n + 1, 7, 0));
+            n++;
+            continue;
+        }
+        if (h[1] & COOP_LDSM) {
+            Word x = fix(0x83b); /* LDSM.16.M88.4 r, [R7 + 0x40] */
+            set(&x, 16, 8, h[1] & 0xff);
+            set(&x, 24, 8, 7);
+            set(&x, 40, 24, 0x40);
+            set(&x, 72, 2, 2);
+            put(code, n++, x);
+        }
+        put(code, n++, hmma_insn(h[0], h[1] & 0xff, h[2], h[3], h[4]));
+    }
+    n = coop_epilogue(code, n, outs, nouts);
+    return coop_agrees(code, n, nouts, dir, name);
+}
+
+/* A GEMM chain across an LDSM fused with its HMMA (fuse.c): R20 = A B, then R20 = A' B + R20, A' the LDSM's tile. The
+   fused block wrote both halves and took their code back, but not the matrices they held: the fused HMMA missed R20's
+   matrix and added the words of its registers, never written, which lost A B */
+static void test_coop_fused_chain(const char* dir) {
+    static const u32 insns[2][5] = {{20, 8, 12, 255, 0x18}, {20, COOP_LDSM | 24, 12, 20, 0x18}};
+    static const u32 outs[4] = {20, 21, 22, 23};
+    CHECK(coop_case(dir, "coop_fused_chain", insns, 2, outs, 4));
+}
+/* HMMA with an RZ A or B, whose products are zeros: R24 = RZ B + R20 and R28 = A RZ + R20 are R20 = A B. The staging
+   stored what the fragment's array held for an RZ one, the words of the HMMA before */
+static void test_coop_rz(const char* dir) {
+    static const u32 insns[3][5] = {{20, 8, 12, 255, 0x18}, {24, 255, 12, 20, 0x18}, {28, 8, 255, 20, 0x18}};
+    static const u32 outs[12] = {20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
+    CHECK(coop_case(dir, "coop_rz", insns, 3, outs, 12));
+}
+/* An f32 D whose C is in registers that no held matrix stands for: R20 = A B + R16. Its D stayed in its matrix, and
+   the C its words were to take after the product never came */
+static void test_coop_c_regs(const char* dir) {
+    static const u32 insns[1][5] = {{20, 8, 12, 16, 0x18}};
+    static const u32 outs[4] = {20, 21, 22, 23};
+    CHECK(coop_case(dir, "coop_c_regs", insns, 1, outs, 4));
+}
+/* HMMAs whose D or C takes only some of a held D's registers. R22 = A B over R20 = A B's R22 and R23: R20 and R21 keep
+   the first D's words, which went nowhere when the second held its own. R24 = A B + R22, C R20's last two words and two
+   never written: it took R20's matrix whole as its C */
+static void test_coop_overlap(const char* dir) {
+    static const u32 d_over[2][5] = {{20, 8, 12, 255, 0x18}, {22, 8, 12, 255, 0x18}};
+    static const u32 c_over[2][5] = {{20, 8, 12, 255, 0x18}, {24, 8, 12, 22, 0x18}};
+    static const u32 outs[8] = {20, 21, 22, 23, 24, 25, 26, 27};
+    CHECK(coop_case(dir, "coop_overlap_d", d_over, 2, outs, 6));
+    CHECK(coop_case(dir, "coop_overlap_c", c_over, 2, outs, 8));
+}
+/* Two f32 Ds held at a block's end: R20 = A B, R24 = A B + R20, then a BRA. Their matrices were all stored to the
+   slot's one D, then read back: each register took the last one's words */
+static void test_coop_flow(const char* dir) {
+    static const u32 insns[3][5] = {{20, 8, 12, 255, 0x18}, {24, 8, 12, 20, 0x18}, {COOP_BRA}};
+    static const u32 outs[8] = {20, 21, 22, 23, 24, 25, 26, 27};
+    CHECK(coop_case(dir, "coop_flow", insns, 3, outs, 8));
+}
+/* A program whose one HMMA is fused with its LDSM: it takes the cooperative matrices as a lone HMMA does (coop_wanted
+   counted the HMMAs alone) */
+static void test_coop_fused_only(const char* dir) {
+    static const u32 insns[1][5] = {{20, COOP_LDSM | 24, 12, 255, 0x18}};
+    static const u32 outs[4] = {20, 21, 22, 23};
+    CHECK(coop_case(dir, "coop_fused_only", insns, 1, outs, 4));
+}
+
+/* Jumps around a fused LDSM and HMMA (fuse.c), on the evaluator's 32 lanes with the gathers, against the same program
+   with a MOV between the two halves, which no fuse takes: every output the same. After the prologue, a BRX of R40,
+   c[2][0x10 + c[2][0]], to the LDSM, the HMMA (R20 = R24 R12 + R16) or the MOV R30, 1.0 after it, and a loop whose
+   BRA goes back to the HMMA (R20 = R24 R12 + R20, twice). The fuse took the HMMA's place out of the array: a BRX's
+   case past the pair landed one instruction late, past the MOV; and a case or a BRA that went to the HMMA ran the
+   pair's next instruction instead. Such a pair now stays two, and a pair keeps every position */
+static Word brx_at(u32 ip, u32 reg, int uniform);
+static void test_fuse_jumps(const char* dir) {
+    int coop_was = g_spirv_translate.hmma_coop;
+    g_spirv_translate.hmma_coop = 0;
+    for (int form = 0; form < 3; form++) /* the BRX to the LDSM and the MOV, to all three, the loop */
+        for (u32 pick = 0; pick < (form == 0 ? 2u : form == 1 ? 3u : 1u); pick++) {
+            static u32 out[2][32 * COOP_OUT];
+            static const u32 outs[5] = {20, 21, 22, 23, 30};
+            u32 ncases = form == 0 ? 2 : form == 1 ? 3 : 1, nouts = 5;
+            int ran = 1;
+            for (int apart = 0; apart < 2; apart++) {
+                u8 code[16 * 64] = {0};
+                u32 n = coop_prologue(code), ldsm = 0;
+                if (form < 2) {
+                    put(code, n++, ldc(41, 255, 2, 0, 4));   /* LDC R41, c[2][0]: the case times 4 */
+                    put(code, n++, ldc(40, 41, 2, 0x10, 4)); /* LDC R40, c[2][R41 + 0x10] */
+                    put(code, n, brx_at(n, 40, 0));
+                    n++;
+                }
+                Word x = fix(0x83b); /* LDSM.16.M88.4 R24, [R7 + 0x40] */
+                set(&x, 16, 8, 24);
+                set(&x, 24, 8, 7);
+                set(&x, 40, 24, 0x40);
+                set(&x, 72, 2, 2);
+                ldsm = n;
+                put(code, n++, x);
+                if (apart) put(code, n++, mov_imm(60, 0)); /* MOV R60, 0 */
+                u32 hmma_at = n;
+                put(code, n++, hmma_insn(20, 24, 12, form < 2 ? 16 : 20, 0x18));
+                u32 mov_at = n;
+                put(code, n++, mov_imm(30, f2u(1.0f)));
+                if (form == 2) { /* R31 += 1; P0 = R31 < 2; @P0 BRA the HMMA */
+                    put(code, n++, iadd3_imm(31, 31, 1));
+                    x = alu(0x00c, 4, 255, 31);
+                    set(&x, 32, 32, 2);
+                    set(&x, 76, 3, 1);
+                    set(&x, 81, 3, 0);
+                    set(&x, 84, 3, 7);
+                    set(&x, 87, 3, 7);
+                    put(code, n++, x);
+                    put(code, n, bra(n, hmma_at, 0, 0));
+                    n++;
+                }
+                n = coop_epilogue(code, n, outs, nouts);
+                const u32 targets[3] = {ldsm, form == 1 ? hmma_at : mov_at, mov_at};
+                memset(hmma_bank2, 0, sizeof hmma_bank2);
+                hmma_bank2[0] = 4 * pick;
+                for (u32 k = 0; k < ncases; k++) hmma_bank2[4 + k] = targets[k] * 16;
+                hmma_bank2[4 + ncases] = 0xffffffffu;
+                char keep[48];
+                snprintf(keep, sizeof keep, "fuse_jumps%d%u%d", form, pick, apart);
+                g_shader_cb_read = hmma_bank2_read;
+                ran &= coop_run(code, n, 0, out[apart], dir, keep);
+                g_shader_cb_read = NULL;
+            }
+            CHECK(ran);
+            u32 bad = 0;
+            for (u32 l = 0; ran && l < 32; l++)
+                for (u32 w = 0; w < nouts; w++)
+                    if (out[0][l * COOP_OUT + w] != out[1][l * COOP_OUT + w] && bad++ < 4)
+                        fprintf(stderr, "fuse jumps, form %d, case %u: lane %u output %u is 0x%08x, apart 0x%08x\n",
+                                form, pick, l, w, out[0][l * COOP_OUT + w], out[1][l * COOP_OUT + w]);
+            CHECK(bad == 0);
+        }
+    g_spirv_translate.hmma_coop = coop_was;
 }
 
 /* the way the log says a device's compute HMMAs take (shader_hmma_way), from the flags device.c sets */
@@ -5184,10 +6162,11 @@ static u32 spv_decorations(const u32* words, size_t count, u32 decoration) {
 /* HMMA on the device's cooperative matrices (g_spirv_translate.hmma_coop), in a program that also reads and writes
    global memory (LDG, STG), stores to shared memory (STS, a byte's by two atomics), adds there (ATOMS), waits
    (MEMBAR.GPU, BAR.SYNC) and reads it (LDSM), whose barriers and atomics the Vulkan memory model takes too: each HMMA
-   one OpCooperativeMatrixMulAddKHR of two matrices loaded and one stored, with no dot products and no B gathers (LDSM's
-   4 shuffles and MOVM's 2 stay), in a module of the Vulkan memory model, whose global buffer is not Coherent but read
-   and written by atomics. With the flag off, or a block of 16 lanes, too little shared memory left for the slots, no
-   shaderFloat16, the program is hmma's as before; and a program without HMMA stays GLSL450's with the flag on */
+   one OpCooperativeMatrixMulAddKHR of two matrices loaded (an f32 D's C from the registers a third) and one stored,
+   with no dot products and no B gathers (LDSM's 4 shuffles and MOVM's 2 stay), in a module of the Vulkan memory
+   model, whose global buffer is not Coherent but read and written by atomics. With the flag off, or a block of 16
+   lanes, too little shared memory left for the slots, no shaderFloat16, the program is hmma's as before; and a
+   program without HMMA stays GLSL450's with the flag on */
 static void test_warp_matrix_coop(const char* dir) {
     u8 code[16 * 20] = {0};
     u32 n = 0;
@@ -5282,7 +6261,7 @@ static void test_warp_matrix_coop(const char* dir) {
                 u32 model = spv_memory_model(spv, count), coherent = spv_decorations(spv, count, 23);
                 u32 atomic_rw = spv_count(spv, count, 227) + spv_count(spv, count, 228);
                 if (coop) {
-                    CHECK(products == 4 && loads == 4 && stores == 4 && dots == 0 && shuffles == 6);
+                    CHECK(products == 4 && loads == 6 && stores == 4 && dots == 0 && shuffles == 6);
                     CHECK(model == 3 && coherent == 0 && atomic_rw == 2);
                     CHECK(spv_has_capability(spv, count, 6022) && spv_has_capability(spv, count, 5345) &&
                           spv_has_capability(spv, count, 5346));
@@ -5379,6 +6358,767 @@ static void test_complementary_pair(const char* dir) {
     (void)dir;
 }
 
+/* the fuse of an LDSM and the HMMA that reads its fragments (fuse.c): one instruction where the two were, with the
+   HMMA's fields kept and the LDSM's packed beside them. The HMMA has the scheduling bits a compiled one has (105-125:
+   its stalls, yield, barriers, waits and reuse), which the LDSM's fields once took: OR'ed into stall 15 and yield,
+   the LDSM read R199 for R7, took a count of 3 (eight matrices into a four word array) and transposed */
+static void test_fuse_pairs(void) {
+    Word x = fix(0x83b); /* an LDSM: R24, the address in R7, 0x40 on, four matrices, not transposed */
+    set(&x, 16, 8, 24);
+    set(&x, 24, 8, 7);
+    set(&x, 40, 24, 0x40);
+    set(&x, 72, 2, 2);
+    Word y = fix(0x23c); /* an HMMA: R40, A at R24, B at R12, C RZ, .16816.F32 */
+    set(&y, 16, 8, 40);
+    set(&y, 24, 8, 24);
+    set(&y, 32, 8, 12);
+    set(&y, 64, 8, 255);
+    set(&y, 72, 19, 0x18);
+    const u32 sched = 15u | 1u << 4 | 5u << 5 | 3u << 8 | 0x2bu << 11 | 6u << 17; /* stall, yield, barriers, reuse */
+    set(&y, 105, 21, sched);
+    Sm86Insn pair[2] = {dec(x), dec(y)};
+    u32 n = 2, count = 0;
+    FuseSpan* spans = sm86_fuse_find(pair, n, &count);
+    CHECK(spans && count == 1 && spans[0].pos == 0 && spans[0].len == 2 && spans[0].tag == SM86_FUSE_LDSM_HMMA);
+    sm86_fuse_make(pair, n, spans, count);
+    CHECK(pair[0].op == SM86_LDSM_HMMA && pair[1].op == SM86_NOP && pair[1].dst == SM86_RZ);
+    /* the LDSM's fields, packed into the bits the HMMA does not use */
+    CHECK(sm86_fuse_ldsm_dst(&pair[0]) == 24 && sm86_fuse_ldsm_a(&pair[0]) == 7 &&
+          sm86_fuse_ldsm_count(&pair[0]) == 2 && sm86_fuse_ldsm_trans(&pair[0]) == 0 &&
+          sm86_field(&pair[0], 40, 24) == 0x40);
+    if (sm86_fuse_ldsm_a(&pair[0]) != 7 || sm86_fuse_ldsm_count(&pair[0]) != 2 || sm86_fuse_ldsm_trans(&pair[0]))
+        fprintf(stderr, "fuse pairs: the LDSM's R%u, count %u, transpose %u, not R7, 2, 0\n",
+                sm86_fuse_ldsm_a(&pair[0]), sm86_fuse_ldsm_count(&pair[0]), sm86_fuse_ldsm_trans(&pair[0]));
+    /* the HMMA's fields, kept as they were, its scheduling too */
+    CHECK(pair[0].dst == 40 && sm86_field(&pair[0], 24, 8) == 24 && sm86_field(&pair[0], 32, 8) == 12 &&
+          sm86_field(&pair[0], 72, 19) == 0x18 && sm86_field(&pair[0], 105, 21) == sched);
+    /* a pair the HMMA's A is not the LDSM's destination, and a program of one instruction, are no pair */
+    Sm86Insn two[2] = {pair[0], dec(y)};
+    CHECK(!sm86_fuse_find(two, 2, &count) && count == 0);
+    CHECK(!sm86_fuse_find(pair, 1, &count) && count == 0);
+    /* nor is an HMMA with a bit set where the LDSM's fields would go, at 40-63 or 91-101 */
+    static const u32 taken[2] = {63, 101};
+    for (u32 k = 0; k < 2; k++) {
+        Word z = y;
+        set(&z, taken[k], 1, 1);
+        Sm86Insn other[2] = {dec(x), dec(z)};
+        CHECK(!sm86_fuse_find(other, 2, &count) && count == 0);
+    }
+}
+
+/* a fused pair leaves every instruction where it was, the HMMA's place a NOP: the branches over the pair, either way,
+   keep their encodings and targets */
+static void test_fuse_branch(void) {
+    Word words[5] = {0};
+    u32 n = 0;
+    words[n++] = bra(0, 4, 7, 0); /* over the pair */
+    Word x = fix(0x83b); /* LDSM.16.M88.4 R40, [R7 + 0x40] */
+    set(&x, 16, 8, 40);
+    set(&x, 24, 8, 7);
+    set(&x, 40, 24, 0x40);
+    set(&x, 72, 2, 2);
+    words[n++] = x;
+    x = fix(0x23c); /* HMMA.16816.F32 R16, R40, R12, RZ */
+    set(&x, 16, 8, 16);
+    set(&x, 24, 8, 40);
+    set(&x, 32, 8, 12);
+    set(&x, 64, 8, 255);
+    set(&x, 72, 19, 0x18);
+    words[n++] = x;
+    words[n++] = alu(0x002, 5, 60, 255); /* MOV R60, RZ */
+    words[n++] = bra(4, 0, 7, 0); /* back over the pair */
+    Sm86Insn in[5];
+    for (u32 i = 0; i < n; i++) CHECK(sm86_decode(words[i].w[0], words[i].w[1], &in[i]));
+    u32 count = 0;
+    FuseSpan* span = sm86_fuse_find(in, n, &count);
+    CHECK(span && count == 1);
+    if (span) {
+        sm86_fuse_make(in, n, span, count);
+        CHECK(in[1].op == SM86_LDSM_HMMA && in[2].op == SM86_NOP && in[3].op == SM86_MOV);
+        CHECK(in[0].op == SM86_BRA && in[0].lo == words[0].w[0] && sm86_branch_target(&in[0], 0) == 4);
+        CHECK(in[4].op == SM86_BRA && in[4].lo == words[4].w[0] && sm86_branch_target(&in[4], 4) == 0);
+    }
+}
+
+/* a program's LDSM and HMMAs on the same fragments, in two shapes: the LDSM beside the first HMMA (a pair), and the
+   same with an instruction between them (none). The pair's module takes four instructions less than the other's,
+   which are A's words read from the registers the LDSM wrote */
+static void test_fuse_ldsm_hmma(const char* dir) {
+    static const u32 hmma[4][3] = {{16, 14, 0x08}, {20, 24, 0x18}, {28, 255, 0x00}, {32, 36, 0x10}};
+    static u32 words_of[4];
+    for (int pair = 0; pair < 2; pair++) {
+        u8 code[16 * 20] = {0};
+        u32 n = 0;
+        Word x = fix(0x919); /* S2R R0, TID.X */
+        set(&x, 72, 8, 0x21);
+        put(code, n++, x);
+        put(code, n++, uldc64(0x20));
+        x = fix(0x981); /* LDG.E R8, [R0.U32 + UR4] */
+        set(&x, 16, 8, 8);
+        set(&x, 24, 8, 0);
+        set(&x, 32, 6, 4);
+        set(&x, 72, 1, 1);
+        set(&x, 73, 3, 4);
+        set(&x, 81, 3, 7);
+        set(&x, 91, 1, 1);
+        put(code, n++, x);
+        x = fix(0x388); /* STS [R0 + 0x40], R8: the tile the LDSM reads */
+        set(&x, 24, 8, 0);
+        set(&x, 32, 8, 8);
+        set(&x, 40, 24, 0x40);
+        set(&x, 73, 3, 4);
+        put(code, n++, x);
+        put(code, n++, fix(0xb1d)); /* BAR.SYNC 0 */
+        x = fix(0x83b);             /* LDSM.16.M88.4 R40, [R7 + 0x40] */
+        set(&x, 16, 8, 40);
+        set(&x, 24, 8, 7);
+        set(&x, 40, 24, 0x40);
+        set(&x, 72, 2, 2);
+        put(code, n++, x);
+        if (!pair) put(code, n++, alu(0x002, 5, 60, 255)); /* MOV R60, RZ: the two halves apart */
+        for (u32 k = 0; k < 4; k++) {                   /* HMMA dst, R40, R12, C */
+            x = fix(0x23c);
+            set(&x, 16, 8, hmma[k][0]);
+            set(&x, 24, 8, 40);
+            set(&x, 32, 8, 12);
+            set(&x, 64, 8, hmma[k][1]);
+            set(&x, 72, 19, hmma[k][2]);
+            put(code, n++, x);
+        }
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        ShaderInfo si = {0};
+        si.cs_local[0] = 32, si.cs_local[1] = 2, si.cs_local[2] = 1;
+        si.shared_size = 49152;
+        int coop_was = g_spirv_translate.hmma_coop;
+        u32 shapes_was = g_spirv_translate.hmma_coop_shapes;
+        for (int coop = 0; coop < 2; coop++) {
+            g_spirv_translate.hmma_coop = coop ? 65536 : 0;
+            g_spirv_translate.hmma_coop_shapes = coop ? SH_COOP_16x16x16 : 0;
+            size_t count = 0;
+            u32* spv = sm86_to_spirv(code, n * 16, ST_CS, NULL, &si, &count);
+            CHECK(spv != NULL);
+            if (!spv) {
+                fprintf(stderr, "ldsm + hmma, coop %d, pair %d: %s\n", coop, pair, si.first_unsupported);
+                continue;
+            }
+            words_of[pair * 2 + coop] = spv_count(spv, count, 61 /* OpLoad */);
+            char name[48];
+            snprintf(name, sizeof name, "fuse_ldsm_hmma_%d%d", pair, coop);
+            CHECK(spv && keep_module(dir, name, spv, count));
+            free(spv);
+        }
+        g_spirv_translate.hmma_coop = coop_was;
+        g_spirv_translate.hmma_coop_shapes = shapes_was;
+    }
+    /* the pair's module is five Loads fewer than the two halves', which are A's four words, read from the loader's
+       tile in the fused block instead of reads of the registers the LDSM wrote, and one more with them */
+    for (int coop = 0; coop < 2; coop++)
+        CHECK(words_of[coop] == words_of[2 + coop] + 5);
+}
+
+/* Reads of other lanes in two blocks, the first of which does not reach the second on every path: MOVM R10, R8 under
+   @P0 BRA past it, then MOVM R11, R8. The lanes' base (warp_base) was made once for the module, in the first block, and
+   the second's use of it was not dominated by its definition: the module failed spirv-val (shader_sm86_test.py). Each
+   block makes its own now. The values on the evaluator's 32 lanes: R11 is R10 where both ran */
+static Word setp_ge(u32 imm);
+static void test_warp_base_blocks(const char* dir) {
+    u8 code[16 * 12] = {0};
+    u32 n = 0;
+    Word x = fix(0x919); /* S2R R0, TID.X */
+    set(&x, 72, 8, 0x21);
+    put(code, n++, x);
+    put(code, n++, ldc(8, 255, 1, 0, 4)); /* LDC R8, c[1][0] */
+    put(code, n++, setp_ge(64));          /* P0 = R0 >= 64: false */
+    put(code, n, bra(n, n + 2, 0, 0));    /* @P0 BRA past the first MOVM */
+    n++;
+    for (u32 k = 0; k < 2; k++) {
+        x = fix(0x23a); /* MOVM.16.MT88 R10 + k, R8 */
+        set(&x, 16, 8, 10 + k);
+        set(&x, 24, 8, 8);
+        put(code, n++, x);
+    }
+    x = alu(0x024, 4, 2, 0); /* IMAD R2, R0, 8, RZ */
+    set(&x, 32, 32, 8);
+    set(&x, 64, 8, 255);
+    put(code, n++, x);
+    x = fix(0x388); /* STS.64 [R2], R10 */
+    set(&x, 24, 8, 2);
+    set(&x, 32, 8, 10);
+    set(&x, 73, 3, 5);
+    put(code, n++, x);
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    n++;
+    ShaderInfo si = {0};
+    si.cs_local[0] = 32, si.cs_local[1] = si.cs_local[2] = 1;
+    si.shared_size = 32 * 8;
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, n * 16, ST_CS, NULL, &si, &count);
+    CHECK(spv != NULL);
+    if (!spv) {
+        fprintf(stderr, "warp base blocks: %s\n", si.first_unsupported);
+        return;
+    }
+    CHECK(keep_module(dir, "warp_base_blocks", spv, count));
+    static u32 bank1[4] = {0x12345678u};
+    static SpvEvalEnv env[32];
+    memset(env, 0, sizeof env);
+    for (u32 l = 0; l < 32; l++) {
+        env[l].ubo[SNX_VKB_CB + 1] = bank1;
+        env[l].ubo_words[SNX_VKB_CB + 1] = 4;
+        env[l].builtin[27][0] = env[l].builtin[29][0] = env[l].builtin[41][0] = l;
+    }
+    const char* why = spv_eval_subgroup(spv, count, env, 32);
+    free(spv);
+    CHECK(!why && env[0].shared_words >= 64);
+    u32 bad = 0;
+    for (u32 l = 0; !why && l < 32; l++) bad += env[0].shared[2 * l] != env[0].shared[2 * l + 1];
+    CHECK(bad == 0);
+    if (why || bad) fprintf(stderr, "warp base blocks: %s, %u lanes differ\n", why ? why : "ran", bad);
+}
+
+/* ---- a jump table whose load is far from its BRX, or across a branch ---- */
+
+/* the table that the tests below read from c[1][0x10]: two targets, then a word that is no target */
+static const u32* brx_far_table;
+static u32 brx_far_words;
+static int brx_far_read(u32 idx, u32 off, u32* out) {
+    if (idx != 1 || off < 0x10 || (off - 0x10) % 4) return 0;
+    u32 k = (off - 0x10) / 4;
+    if (k >= brx_far_words) return 0;
+    *out = brx_far_table[k];
+    return 1;
+}
+/* BRX, or BRXU, of register reg at instruction ip whose offset cancels the next instruction's address: the table's
+   words are the targets' own byte addresses (brx_bias) */
+static Word brx_at(u32 ip, u32 reg, int uniform) {
+    Word x = fix(uniform ? 0x958 : 0x949);
+    set(&x, 24, uniform ? 6 : 8, reg);
+    set(&x, 34, 48, (u64)0 - (u64)(ip + 1) * 4);
+    set(&x, 87, 3, 7);
+    return x;
+}
+/* The switch's case values, in the order OpSwitch lists them */
+static u32 switch_cases(const u32* spv, size_t count, u32* values, u32 max) {
+    u32 at[4];
+    if (spv_find(spv, count, 251 /* OpSwitch */, at, 4) == 0) return 0; /* the first, for a program with two */
+    const u32* sw = spv + at[0];
+    /* the word count in the high half: the opcode's id, the selector and the default's label, then a literal and a
+       label for each case */
+    u32 words = sw[0] >> 16, pairs = words >= 3 ? (words - 3) / 2 : 0;
+    for (u32 k = 0; k < pairs && k < max; k++) values[k] = sw[3 + 2 * k];
+    return pairs < max ? pairs : max;
+}
+/* The table that a BRX loads 40 instructions before it: the scan of the 32 instructions before the BRX misses it, and
+   the load's writer reaches the branch on every path. Color 0 is R0, 1.0 from the table's first word */
+static void test_brx_far(const char* dir) {
+    enum { BRX = 41, CASE0 = 43, CASE1 = 45, END = 47 };
+    static const u32 table[3] = {CASE0 * 16, CASE1 * 16, 0xffffffffu};
+    u8 code[16 * 48] = {0};
+    Word x = fix(0xb82); /* LDC R2, c[1][R1 + 0x10] */
+    set(&x, 16, 8, 2);
+    set(&x, 24, 8, 1);
+    cbuf(&x, 1, 0x10);
+    set(&x, 73, 3, 4);
+    put(code, 0, x);
+    for (u32 k = 1; k < BRX; k++) put(code, k, mov_imm(20, 0));
+    put(code, BRX, brx_at(BRX, 2, 0));
+    put(code, BRX + 1, exit_insn());
+    for (u32 k = 0; k < 2; k++) {
+        put(code, CASE0 + 2 * k, mov_imm(0, f2u(k ? 2.0f : 1.0f)));
+        put(code, CASE0 + 2 * k + 1, exit_insn());
+    }
+    put(code, END, bra(END, END, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    brx_far_table = table, brx_far_words = 3;
+    g_shader_cb_read = brx_far_read;
+    u32* spv = sm86_to_spirv(code, (END + 1) * 16, ST_FS, fsph, &si, &count);
+    g_shader_cb_read = NULL;
+    CHECK(spv != NULL);
+    if (!spv) fprintf(stderr, "far brx: %s\n", si.first_unsupported);
+    if (spv) {
+        u32 cases[4], n = switch_cases(spv, count, cases, 4);
+        CHECK(n == 2 && ((cases[0] == CASE0 && cases[1] == CASE1) || (cases[0] == CASE1 && cases[1] == CASE0)));
+        CHECK(keep_module(dir, "fs_brx_far", spv, count));
+    }
+    free(spv);
+    /* the same on the CPU: R1 is 0, so the load reads the table's first word, the first case */
+    static const u32 cb1[0x14 / 4 + 3] = {0, 0, 0, 0, CASE0 * 16, CASE1 * 16, 0xffffffffu};
+    g_shader_cb_read = brx_far_read;
+    u32 out[4];
+    int ran = run_fs_at(code, END + 1, 0, cb1, sizeof cb1 / 4, out);
+    g_shader_cb_read = NULL;
+    CHECK(ran && out[0] == f2u(1.0f));
+}
+
+/* The same table loaded before a branch, and the BRX after it: the load dominates the branch, and the scan of the
+   BRX's block stops at the branch (an EXIT in the other arm) before it reaches the load */
+static void test_brx_far_branch(const char* dir) {
+    enum { BRX = 5, CASE0 = 7, CASE1 = 9, END = 11 };
+    static const u32 table[3] = {CASE0 * 16, CASE1 * 16, 0xffffffffu};
+    u8 code[16 * 12] = {0};
+    Word x = fix(0xb82); /* LDC R2, c[1][R1 + 0x10] */
+    set(&x, 16, 8, 2);
+    set(&x, 24, 8, 1);
+    cbuf(&x, 1, 0x10);
+    set(&x, 73, 3, 4);
+    put(code, 0, x);
+    put(code, 1, setp_const(0, 1)); /* P0 true */
+    put(code, 2, bra(2, BRX, 0, 0));
+    put(code, 3, exit_insn());
+    put(code, 4, exit_insn());
+    put(code, BRX, brx_at(BRX, 2, 0));
+    put(code, BRX + 1, exit_insn());
+    for (u32 k = 0; k < 2; k++) {
+        put(code, CASE0 + 2 * k, mov_imm(0, f2u(k ? 2.0f : 1.0f)));
+        put(code, CASE0 + 2 * k + 1, exit_insn());
+    }
+    put(code, END, bra(END, END, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    brx_far_table = table, brx_far_words = 3;
+    g_shader_cb_read = brx_far_read;
+    u32* spv = sm86_to_spirv(code, (END + 1) * 16, ST_FS, fsph, &si, &count);
+    g_shader_cb_read = NULL;
+    CHECK(spv != NULL);
+    if (!spv) fprintf(stderr, "far brx across a branch: %s\n", si.first_unsupported);
+    if (spv) {
+        u32 cases[4], n = switch_cases(spv, count, cases, 4);
+        CHECK(n == 2 && ((cases[0] == CASE0 && cases[1] == CASE1) || (cases[0] == CASE1 && cases[1] == CASE0)));
+        CHECK(keep_module(dir, "fs_brx_far_branch", spv, count));
+    }
+    free(spv);
+}
+
+/* A move of the loaded value between the table and the branch: the BRX reads R3, which the MOV at 31 copies from R2,
+   the LDC at 0's register. The scan of the BRX's block finds the MOV and stops there */
+static void test_brx_far_move(const char* dir) {
+    enum { MOV_AT = 31, BRX = 41, CASE0 = 43, CASE1 = 45, END = 47 };
+    static const u32 table[3] = {CASE0 * 16, CASE1 * 16, 0xffffffffu};
+    u8 code[16 * 48] = {0};
+    Word x = fix(0xb82); /* LDC R2, c[1][R1 + 0x10] */
+    set(&x, 16, 8, 2);
+    set(&x, 24, 8, 1);
+    cbuf(&x, 1, 0x10);
+    set(&x, 73, 3, 4);
+    put(code, 0, x);
+    for (u32 k = 1; k < BRX; k++) put(code, k, mov_imm(20, 0));
+    put(code, MOV_AT, mov_if(3, 2, 7, 0)); /* MOV R3, R2 */
+    put(code, BRX, brx_at(BRX, 3, 0));
+    put(code, BRX + 1, exit_insn());
+    for (u32 k = 0; k < 2; k++) {
+        put(code, CASE0 + 2 * k, mov_imm(0, f2u(k ? 2.0f : 1.0f)));
+        put(code, CASE0 + 2 * k + 1, exit_insn());
+    }
+    put(code, END, bra(END, END, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    brx_far_table = table, brx_far_words = 3;
+    g_shader_cb_read = brx_far_read;
+    u32* spv = sm86_to_spirv(code, (END + 1) * 16, ST_FS, fsph, &si, &count);
+    g_shader_cb_read = NULL;
+    CHECK(spv != NULL);
+    if (!spv) fprintf(stderr, "far brx behind a move: %s\n", si.first_unsupported);
+    if (spv) {
+        u32 cases[4], n = switch_cases(spv, count, cases, 4);
+        CHECK(n == 2 && ((cases[0] == CASE0 && cases[1] == CASE1) || (cases[0] == CASE1 && cases[1] == CASE0)));
+        CHECK(keep_module(dir, "fs_brx_far_move", spv, count));
+    }
+    free(spv);
+}
+
+/* Two far tables: the second BRX is only reached through the first's second case, so its flow has the first's edges */
+static int brx_chain_read(u32 idx, u32 off, u32* out) {
+    static const u32 first[3] = {43 * 16, 45 * 16, 0xffffffffu};
+    static const u32 second[3] = {82 * 16, 84 * 16, 0xffffffffu};
+    const u32* table;
+    if (idx != 1) return 0;
+    if (off >= 0x10 && off < 0x10 + sizeof first)
+        table = first, off -= 0x10;
+    else if (off >= 0x20 && off < 0x20 + sizeof second)
+        table = second, off -= 0x20;
+    else
+        return 0;
+    if (off % 4) return 0;
+    *out = table[off / 4];
+    return 1;
+}
+/* Two far BRXs one after the other: the first at 41, loaded at 0, and the second at 80, loaded at 45, which only the
+   first's second case reaches. brx_resolve finds the first's table, then walks the second over the flow that table
+   makes, so both become switches */
+static void test_brx_far_chain(const char* dir) {
+    enum { BRX1 = 41, CASE1 = 43, LOAD2 = 45, BRX2 = 80, CASE2 = 82, CASE3 = 84, END = 86 };
+    u8 code[16 * 87] = {0};
+    Word x = fix(0xb82); /* LDC R2, c[1][R1 + 0x10] */
+    set(&x, 16, 8, 2);
+    set(&x, 24, 8, 1);
+    cbuf(&x, 1, 0x10);
+    set(&x, 73, 3, 4);
+    put(code, 0, x);
+    for (u32 k = 1; k < BRX1; k++) put(code, k, mov_imm(20, 0));
+    put(code, BRX1, brx_at(BRX1, 2, 0));
+    put(code, BRX1 + 1, exit_insn());
+    put(code, CASE1, mov_imm(0, f2u(1.0f)));
+    put(code, CASE1 + 1, exit_insn());
+    x = fix(0xb82); /* LDC R4, c[1][R1 + 0x20] */
+    set(&x, 16, 8, 4);
+    set(&x, 24, 8, 1);
+    cbuf(&x, 1, 0x20);
+    set(&x, 73, 3, 4);
+    put(code, LOAD2, x);
+    for (u32 k = LOAD2 + 1; k < BRX2; k++) put(code, k, mov_imm(20, 0));
+    put(code, BRX2, brx_at(BRX2, 4, 0));
+    put(code, BRX2 + 1, exit_insn());
+    for (u32 k = 0; k < 2; k++) {
+        put(code, CASE2 + 2 * k, mov_imm(0, f2u(k ? 3.0f : 2.0f)));
+        put(code, CASE2 + 2 * k + 1, exit_insn());
+    }
+    put(code, END, bra(END, END, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    g_shader_cb_read = brx_chain_read;
+    u32* spv = sm86_to_spirv(code, (END + 1) * 16, ST_FS, fsph, &si, &count);
+    g_shader_cb_read = NULL;
+    CHECK(spv != NULL);
+    if (!spv) fprintf(stderr, "far brx chain: %s\n", si.first_unsupported);
+    if (spv) {
+        u32 at[4];
+        CHECK(spv_find(spv, count, 251 /* OpSwitch */, at, 4) == 2);
+        CHECK(keep_module(dir, "fs_brx_far_chain", spv, count));
+    }
+    free(spv);
+}
+
+/* c[1][0x10]: the far bounded test's two entries, then a word that names instruction 0, which the bound leaves out */
+static int brx_bound_read(u32 idx, u32 off, u32* out) {
+    static const u32 table[3] = {82 * 16, 84 * 16, 0};
+    if (idx != 1 || off < 0x10 || off >= 0x10 + sizeof table || (off - 0x10) % 4) return 0;
+    *out = table[(off - 0x10) / 4];
+    return 1;
+}
+/* The far load of test_brx_far, with ptxas's bound beside it: IMNMX.U32 R1, R0, 1; IMAD R2, R1, 4, RZ; LDC R2,
+   c[1][R2 + 0x10], then 40 instructions later the BRX. The bound is two entries, so the word after them, which names
+   instruction 0, is not a third case (as in test_brx_bounded) */
+static void test_brx_far_bounded(const char* dir) {
+    enum { LOAD = 39, BRX = 80, CASE0 = 82, CASE1 = 84, END = 86 };
+    u8 code[16 * 87] = {0};
+    for (u32 k = 0; k < LOAD; k++) put(code, k, mov_imm(20, 0));
+    Word x = alu(0x017, 4, 1, 0); /* IMNMX.U32 R1, R0, 1 */
+    set(&x, 32, 32, 1);
+    set(&x, 87, 3, 7);
+    put(code, LOAD - 2, x);
+    x = alu(0x024, 4, 2, 1); /* IMAD R2, R1, 4, RZ */
+    set(&x, 32, 32, 4);
+    set(&x, 64, 8, 255);
+    put(code, LOAD - 1, x);
+    x = fix(0xb82); /* LDC R2, c[1][R2 + 0x10] */
+    set(&x, 16, 8, 2);
+    set(&x, 24, 8, 2);
+    cbuf(&x, 1, 0x10);
+    set(&x, 73, 3, 4);
+    put(code, LOAD, x);
+    for (u32 k = LOAD + 1; k < BRX; k++) put(code, k, mov_imm(20, 0));
+    put(code, BRX, brx_at(BRX, 2, 0));
+    put(code, BRX + 1, exit_insn());
+    for (u32 k = 0; k < 2; k++) {
+        put(code, CASE0 + 2 * k, mov_imm(0, f2u(k ? 2.0f : 1.0f)));
+        put(code, CASE0 + 2 * k + 1, exit_insn());
+    }
+    put(code, END, bra(END, END, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    g_shader_cb_read = brx_bound_read;
+    u32* spv = sm86_to_spirv(code, (END + 1) * 16, ST_FS, fsph, &si, &count);
+    g_shader_cb_read = NULL;
+    CHECK(spv != NULL);
+    if (!spv) fprintf(stderr, "far bounded brx: %s\n", si.first_unsupported);
+    if (spv) {
+        u32 cases[4], n = switch_cases(spv, count, cases, 4);
+        CHECK(n == 2 && ((cases[0] == CASE0 && cases[1] == CASE1) || (cases[0] == CASE1 && cases[1] == CASE0)));
+        u32 at[4];
+        CHECK(spv_find(spv, count, 246 /* OpLoopMerge */, at, 4) == 0);
+        CHECK(keep_module(dir, "fs_brx_far_bounded", spv, count));
+    }
+    free(spv);
+}
+
+/* c[1][0x10]: three entries, then a word that names instruction 0, which the bound leaves out */
+static int brx_flow_bound_read(u32 idx, u32 off, u32* out) {
+    static const u32 table[5] = {102 * 16, 104 * 16, 106 * 16, 0, 0xffffffffu};
+    if (idx != 1 || off < 0x10 || off >= 0x10 + sizeof table || (off - 0x10) % 4) return 0;
+    *out = table[(off - 0x10) / 4];
+    return 1;
+}
+/* The ptxas bound is 20 instructions before the times-4, which is 20 before the load: all three are outside the 16
+   instructions that a scan of the load's block reads, so only the flow finds the bound of three entries. The table
+   has a fourth word that names instruction 0, which the bound leaves out */
+static void test_brx_far_bound_flow(const char* dir) {
+    enum { BOUND = 20, TIMES4 = 40, LOAD = 60, BRX = 100, CASE0 = 102, CASE1 = 104, CASE2 = 106, END = 108 };
+    u8 code[16 * 109] = {0};
+    for (u32 k = 0; k < END; k++) put(code, k, mov_imm(20, 0));
+    Word x = alu(0x017, 4, 1, 0); /* IMNMX.U32 R1, R0, 2 */
+    set(&x, 32, 32, 2);
+    set(&x, 87, 3, 7);
+    put(code, BOUND, x);
+    x = alu(0x019, 4, 2, 1); /* SHF.L.U32 R2, R1, 2, RZ */
+    set(&x, 32, 32, 2);
+    set(&x, 64, 8, 255);
+    set(&x, 73, 2, 3);
+    put(code, TIMES4, x);
+    x = fix(0xb82); /* LDC R2, c[1][R2 + 0x10] */
+    set(&x, 16, 8, 2);
+    set(&x, 24, 8, 2);
+    cbuf(&x, 1, 0x10);
+    set(&x, 73, 3, 4);
+    put(code, LOAD, x);
+    put(code, BRX, brx_at(BRX, 2, 0));
+    put(code, BRX + 1, exit_insn());
+    for (u32 k = 0; k < 3; k++) {
+        put(code, CASE0 + 2 * k, mov_imm(0, f2u((float)k + 1.0f)));
+        put(code, CASE0 + 2 * k + 1, exit_insn());
+    }
+    put(code, END, bra(END, END, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    g_shader_cb_read = brx_flow_bound_read;
+    u32* spv = sm86_to_spirv(code, (END + 1) * 16, ST_FS, fsph, &si, &count);
+    g_shader_cb_read = NULL;
+    CHECK(spv != NULL);
+    if (!spv) fprintf(stderr, "far flow bound brx: %s\n", si.first_unsupported);
+    if (spv) {
+        u32 cases[4], n = switch_cases(spv, count, cases, 4), mask = 0;
+        for (u32 k = 0; k < n; k++)
+            mask |= cases[k] == CASE0 ? 1 : cases[k] == CASE1 ? 2 : cases[k] == CASE2 ? 4 : 0;
+        CHECK(n == 3 && mask == 7);
+        CHECK(keep_module(dir, "fs_brx_far_bound_flow", spv, count));
+    }
+    free(spv);
+}
+
+/* Two tables one after the other in c[1], neither with a bound: the first starts at 0x10 and the second at 0x18. The
+   first BRX must read its two entries and stop where the second table starts, not take the second's two as its own */
+static int brx_adjacent_read(u32 idx, u32 off, u32* out) {
+    static const u32 first[4] = {3 * 16, 5 * 16, 8 * 16, 10 * 16};
+    static const u32 second[2] = {8 * 16, 10 * 16};
+    if (idx != 1 || (off & 3)) return 0;
+    if (off >= 0x10 && off < 0x10 + sizeof first)
+        *out = first[(off - 0x10) / 4];
+    else if (off >= 0x18 && off < 0x18 + sizeof second)
+        *out = second[(off - 0x18) / 4];
+    else
+        return 0;
+    return 1;
+}
+static void test_brx_adjacent_tables(const char* dir) {
+    /* the first switch's second case falls into the second table's load and BRX, so both switches are reachable */
+    u8 code[16 * 13] = {0};
+    Word x = fix(0xb82); /* LDC R2, c[1][R1 + 0x10] */
+    set(&x, 16, 8, 2);
+    set(&x, 24, 8, 1);
+    cbuf(&x, 1, 0x10);
+    set(&x, 73, 3, 4);
+    put(code, 0, x);
+    put(code, 1, brx_at(1, 2, 0));
+    put(code, 2, exit_insn());
+    put(code, 3, mov_imm(0, f2u(1.0f)));
+    put(code, 4, exit_insn());
+    x = fix(0xb82); /* LDC R4, c[1][R1 + 0x18], the first switch's second case */
+    set(&x, 16, 8, 4);
+    set(&x, 24, 8, 1);
+    cbuf(&x, 1, 0x18);
+    set(&x, 73, 3, 4);
+    put(code, 5, x);
+    put(code, 6, brx_at(6, 4, 0));
+    put(code, 7, exit_insn());
+    put(code, 8, mov_imm(0, f2u(3.0f)));
+    put(code, 9, exit_insn());
+    put(code, 10, mov_imm(0, f2u(4.0f)));
+    put(code, 11, exit_insn());
+    put(code, 12, bra(12, 12, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    g_shader_cb_read = brx_adjacent_read;
+    u32* spv = sm86_to_spirv(code, 13 * 16, ST_FS, fsph, &si, &count);
+    g_shader_cb_read = NULL;
+    CHECK(spv != NULL);
+    if (!spv) fprintf(stderr, "adjacent brx tables: %s\n", si.first_unsupported);
+    if (spv) {
+        u32 cases[4], n = switch_cases(spv, count, cases, 4);
+        CHECK(n == 2 && ((cases[0] == 3 && cases[1] == 5) || (cases[0] == 5 && cases[1] == 3)));
+        CHECK(cases[0] != 8 && cases[0] != 10 && cases[1] != 8 && cases[1] != 10);
+        u32 at[4];
+        CHECK(spv_find(spv, count, 251 /* OpSwitch */, at, 4) == 2);
+        CHECK(keep_module(dir, "fs_brx_adjacent", spv, count));
+    }
+    free(spv);
+}
+
+/* BRXU, whose ULDC.IDX is 40 instructions before it: the ptxas bound of its index is beside the load, and the table
+   that the uniform register reads is the same two entries */
+static void test_brxu_far(const char* dir) {
+    enum { LOAD = 4, BRX = 45, CASE0 = 47, CASE1 = 49, END = 51 };
+    static const u32 table[3] = {CASE0 * 16, CASE1 * 16, 0xffffffffu};
+    u8 code[16 * 53] = {0};
+    put(code, 0, ualu(0x082, 1, 0, 1)); /* UMOV UR1, 1 */
+    Word x = ualu(0x08c, 0, 1, 1);      /* UISETP.LT.U32.AND UP0, PT, UR1, 1, PT */
+    set(&x, 76, 3, 1);
+    set(&x, 81, 3, 0);
+    set(&x, 84, 3, 7);
+    set(&x, 87, 3, 7);
+    put(code, 1, x);
+    x = ualu(0x087, 2, 1, 1); /* USEL UR2, UR1, 1, UP0 */
+    set(&x, 87, 3, 0);
+    put(code, 2, x);
+    x = ualu(0x099, 3, 2, 2); /* USHF.L.U32 UR3, UR2, 2, URZ */
+    set(&x, 73, 2, 3);
+    put(code, 3, x);
+    x = fix(0xabb); /* ULDC.IDX UR3, c[1][UR3 + 0x10] */
+    set(&x, 16, 6, 3);
+    set(&x, 24, 6, 3);
+    cbuf(&x, 1, 0x10);
+    set(&x, 73, 3, 4);
+    put(code, LOAD, x);
+    for (u32 k = LOAD + 1; k < BRX; k++) put(code, k, mov_imm(20, 0));
+    put(code, BRX, brx_at(BRX, 3, 1));
+    put(code, BRX + 1, exit_insn());
+    for (u32 k = 0; k < 2; k++) {
+        put(code, CASE0 + 2 * k, mov_imm(0, f2u(k ? 2.0f : 1.0f)));
+        put(code, CASE0 + 2 * k + 1, exit_insn());
+    }
+    put(code, END, bra(END, END, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    brx_far_table = table, brx_far_words = 3;
+    g_shader_cb_read = brx_far_read;
+    u32* spv = sm86_to_spirv(code, (END + 1) * 16, ST_FS, fsph, &si, &count);
+    g_shader_cb_read = NULL;
+    CHECK(spv != NULL);
+    if (!spv) fprintf(stderr, "far brxu: %s\n", si.first_unsupported);
+    if (spv) {
+        u32 cases[4], n = switch_cases(spv, count, cases, 4);
+        CHECK(n == 2 && ((cases[0] == CASE0 && cases[1] == CASE1) || (cases[0] == CASE1 && cases[1] == CASE0)));
+        CHECK(keep_module(dir, "fs_brxu_far", spv, count));
+    }
+    free(spv);
+    /* UR1 is 1: the bound leaves one entry, the second case, R0 = 2.0 */
+    static const u32 cb1[0x14 / 4 + 3] = {0, 0, 0, 0, CASE0 * 16, CASE1 * 16, 0xffffffffu};
+    g_shader_cb_read = brx_far_read;
+    u32 out[4];
+    int ran = run_fs_at(code, END + 1, 0, cb1, sizeof cb1 / 4, out);
+    g_shader_cb_read = NULL;
+    CHECK(ran && out[0] == f2u(2.0f));
+}
+
+/* c[1][0x10] and c[1][0x20]: the two tables of the arms of the merge test, the second the first's entries reversed */
+static int brx_two_read(u32 idx, u32 off, u32* out) {
+    static const u32 first[3] = {4 * 16, 7 * 16, 0xffffffffu};
+    static const u32 second[3] = {7 * 16, 4 * 16, 0xffffffffu};
+    const u32* table;
+    if (idx != 1) return 0;
+    if (off >= 0x10 && off < 0x10 + sizeof first)
+        table = first, off -= 0x10;
+    else if (off >= 0x20 && off < 0x20 + sizeof second)
+        table = second, off -= 0x20;
+    else
+        return 0;
+    if (off % 4) return 0;
+    *out = table[off / 4];
+    return 1;
+}
+/* A table load in one arm only, and the BRX after the merge: the other path reaches the branch with the register's
+   initial value, so no single load is the table. The program is refused, never given the arm's table */
+static void test_brx_not_dominating(const char* dir) {
+    u8 code[16 * 8] = {0};
+    put(code, 0, setp_const(0, 1)); /* P0 true */
+    put(code, 1, bra(1, 5, 0, 0));
+    Word x = fix(0xb82); /* LDC R2, c[1][R1 + 0x10], in the arm that the branch skips */
+    set(&x, 16, 8, 2);
+    set(&x, 24, 8, 1);
+    cbuf(&x, 1, 0x10);
+    set(&x, 73, 3, 4);
+    put(code, 2, x);
+    put(code, 3, bra(3, 6, 7, 0));
+    put(code, 4, exit_insn());
+    put(code, 5, mov_imm(20, 0));
+    put(code, 6, brx_at(6, 2, 0));
+    put(code, 7, bra(7, 7, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    static const u32 table[3] = {7 * 16, 7 * 16, 0xffffffffu};
+    ShaderInfo si = {0};
+    size_t count = 0;
+    brx_far_table = table, brx_far_words = 3;
+    g_shader_cb_read = brx_far_read;
+    u32* spv = sm86_to_spirv(code, 8 * 16, ST_FS, fsph, &si, &count);
+    g_shader_cb_read = NULL;
+    CHECK(spv == NULL && si.unsupported);
+    free(spv);
+    (void)dir;
+}
+
+/* Two arm loads of different tables, and the BRX after their merge: each path has its own table, so neither is the
+   branch's. Refused, with no table of one arm taken for the other */
+static void test_brx_two_tables(const char* dir) {
+    u8 code[16 * 8] = {0};
+    put(code, 0, setp_const(0, 1));
+    put(code, 1, bra(1, 5, 0, 0));
+    Word x = fix(0xb82); /* LDC R2, c[1][R1 + 0x10] */
+    set(&x, 16, 8, 2);
+    set(&x, 24, 8, 1);
+    cbuf(&x, 1, 0x10);
+    set(&x, 73, 3, 4);
+    put(code, 2, x);
+    put(code, 3, bra(3, 6, 7, 0));
+    put(code, 4, exit_insn());
+    x = fix(0xb82); /* LDC R2, c[1][R1 + 0x20] */
+    set(&x, 16, 8, 2);
+    set(&x, 24, 8, 1);
+    cbuf(&x, 1, 0x20);
+    set(&x, 73, 3, 4);
+    put(code, 5, x);
+    put(code, 6, brx_at(6, 2, 0));
+    put(code, 7, bra(7, 7, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 0xf;
+    ShaderInfo si = {0};
+    size_t count = 0;
+    g_shader_cb_read = brx_two_read;
+    u32* spv = sm86_to_spirv(code, 8 * 16, ST_FS, fsph, &si, &count);
+    g_shader_cb_read = NULL;
+    CHECK(spv == NULL && si.unsupported && strstr(si.first_unsupported, "doesn't reach it on every path"));
+    free(spv);
+    (void)dir;
+}
+
 int main(int argc, char** argv) {
     const char* dir = argc > 1 ? argv[1] : ".";
     test_alu_forms();
@@ -5390,6 +7130,7 @@ int main(int argc, char** argv) {
     test_programs(dir);
     test_game_forms(dir);
     test_brx(dir);
+    test_warp_base_blocks(dir);
     test_brx_bounded(dir);
     test_alu_group(dir);
     test_compute_forms(dir);
@@ -5402,6 +7143,7 @@ int main(int argc, char** argv) {
     test_fswzadd(dir);
     test_lane_masks(dir);
     test_shfl_operands(dir);
+    test_vote_warps(dir);
     test_ldc_small(dir);
     test_break(dir);
     test_local_memory(dir);
@@ -5411,17 +7153,29 @@ int main(int argc, char** argv) {
     test_debug_prologue(dir);
     test_legacy_varyings(dir);
     test_brxu(dir);
+    test_brx_far(dir);
+    test_brx_far_branch(dir);
+    test_brx_far_move(dir);
+    test_brx_far_bounded(dir);
+    test_brx_far_bound_flow(dir);
+    test_brx_adjacent_tables(dir);
+    test_brx_far_chain(dir);
+    test_brxu_far(dir);
+    test_brx_not_dominating(dir);
+    test_brx_two_tables(dir);
     test_ipa_uniform(dir);
     test_tld_multisample(dir);
     test_resolution_scale(dir);
     test_tex_f16(dir);
     test_output_defaults(dir);
     test_fragment_depth(dir);
+    test_integer_targets(dir);
     test_clip_distances(dir);
     test_float64_fallback_scale(dir);
     test_flow_operand(dir);
     test_global_pointer(dir);
     test_wide_carries(dir);
+    test_imad_hi_signed_carry(dir);
     test_instance_id(dir);
     test_base_instance_word(dir);
     test_u64_conversions();
@@ -5450,16 +7204,29 @@ int main(int argc, char** argv) {
     test_geometry_adjacency();
     test_fragment_per_primitive(dir);
     test_fragment_unfed(dir);
+    test_perspective_fold(dir);
     test_uses_isbe();
     test_warp_matrix(dir);
+    test_hfma2_once(dir);
     test_warp_matrix_values(dir);
+    test_coop_fused_chain(dir);
+    test_coop_rz(dir);
+    test_coop_c_regs(dir);
+    test_coop_overlap(dir);
+    test_coop_flow(dir);
+    test_coop_fused_only(dir);
     test_warp_matrix_flush(dir);
     test_hmma_way();
     test_hmma_choose();
     test_hmma_f16_unused();
     test_warp_matrix_coop(dir);
     test_ftz_modes(dir);
+    test_ffma_fused();
     test_complementary_pair(dir);
+    test_fuse_pairs();
+    test_fuse_branch();
+    test_fuse_ldsm_hmma(dir);
+    test_fuse_jumps(dir);
     if (failures) {
         fprintf(stderr, "%d checks failed\n", failures);
         return 1;

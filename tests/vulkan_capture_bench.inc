@@ -128,7 +128,7 @@ static int capture_bench_validity(VkCapture* capture, u32 workload) {
     const float zero[4] = {0}, one[4] = {1, 0, 0, 0};
     capture_bench_clear(&capture->valid, workload == 1 ? one : zero);
     if (workload != 0) return 0;
-    vk_surf_use(vk_cmd(), &capture->valid, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    vk_surf_use(vk_cmd(), &capture->valid, VK_LAYOUT(COLOR_ATTACHMENT_OPTIMAL),
                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
     VkRenderingAttachmentInfo attachment = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = capture->valid.att, .imageLayout = capture->valid.layout,
@@ -258,7 +258,7 @@ static int bench_capture_tiles(void) {
                                                    method == 2 ? SH_CAPTURE_ADAPTIVE_DISPATCH : 0);
                 else rec_CmdDispatch(vk_cmd(), 64, 64, 1);
                 rec_CmdWriteTimestamp2(vk_cmd(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, queries, method * 2 + 1);
-                vk_surf_use(vk_cmd(), &target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                vk_surf_use(vk_cmd(), &target, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), VK_PIPELINE_STAGE_2_COPY_BIT,
                              VK_ACCESS_2_TRANSFER_READ_BIT);
                 VkBufferImageCopy copy = {.bufferOffset = method * bytes,
                     .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {512, 512, 1}};
@@ -284,7 +284,7 @@ static int bench_capture_tiles(void) {
             qsort(times[method], 8, sizeof(double), capture_bench_double_compare);
             double median = (times[method][3] + times[method][4]) * 0.5;
             printf("GPU_TIMESTAMP_BENCH workload=capture_tiles_%s method=%s operations=%u gpu_ns=%.0f min_gpu_ns=%.0f max_gpu_ns=%.0f samples=8 exact=1\n",
-                   names[workload], method == 2 ? "adaptive_full" : method ? "tiled" : "full_grid", workload == 1 ? 4096 : workload == 3 ? 0 : 1,
+                   names[workload], method == 2 ? "adaptive_full" : method ? "tiled" : "full_grid", workload == 1 ? 4096u : workload == 3 ? 0u : 1u,
                    median, times[method][0], times[method][7]);
         }
     }

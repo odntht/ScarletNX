@@ -9,6 +9,7 @@
 * [Shaders](#shaders)
 * [Surfaces](#surfaces)
 * [Driver offsets](#driver-offsets)
+* [Shading rate images](#shading-rate-images)
 * [Compute QMDs](#compute-qmds)
 * [Mesh shaders](#mesh-shaders)
   * [Stages](#stages)
@@ -151,7 +152,7 @@ bits set, with their masks, and clears the masks (`mirror_harvest.comp`). Once t
 traps guest memory, each listed page is queued, still pending (`own_entries`), and stays GPU-owned in the mirror from
 the next point where nothing is being recorded (`vk_mirror_publish`): before the releases its submits gate let the game
 see them, at the end of a GPU job, and before a CPU read of them. There the CPU's changes to it since it was brought up
-to date, the bytes its programs didn't log, are copied into the mirror (a byte both wrote keeps the program's), and
+to date are copied into the mirror (a byte both wrote keeps the CPU's, which came after the submit), and
 once that copy is submitted the page is published over guest memory with the mirror as its owner
 (`docs/layers/gpu/ownership.md`). Nothing of this is recorded where the results land: that runs inside a frame's
 recycling, a submission and a draw's setup, and recording there went into a command buffer being reset or submitted,
@@ -161,11 +162,14 @@ buffer inside the landing after a present's submission. It stayed open, and when
 recorded into it past the recording thread, with sets only that thread can resolve. The CPU's first touch of a page
 lands it whole, which is exact as none of its bytes can change in between, and the mirror lets go of its shadow then
 (`vk_mirror_landed`). Pages the CPU never reads never come back. Without traps the pass copies the pages' bytes too, and
-they land in guest memory and in the shadow once the submit is done, the bytes logged and no others. Landing every
-written page at each submit took most of the GPU thread in one game's menus. A read of guest memory under pending writes
-lands them first, and a draw reading them takes the mirror instead (`buffer.c`'s `buf_get`), as does a draw reading a
-range part of which the mirror owns (`vk_mirror_holds`): read elsewhere, the CPU's bytes between the owned pages were
-staged again for each draw.
+they land in guest memory and in the shadow once the submit is done, the bytes logged and no others, as do the pages
+the CPU touched in the last presents with traps. A logged byte that guest memory no longer holds as the shadow has it
+keeps the CPU's: the shadow holds every CPU write from before the submit, so the CPU wrote it later. Landed over it,
+the write was lost to guest memory and the mirror both (one game's characters showed squares of wrong lighting).
+Landing every written page at each submit took most of the GPU thread in one game's menus. A read of guest memory
+under pending writes lands them first, and a draw reading them takes the mirror instead (`buffer.c`'s `buf_get`), as
+does a draw reading a range part of which the mirror owns (`vk_mirror_holds`): read elsewhere, the CPU's bytes between
+the owned pages were staged again for each draw.
 Before, every writing dispatch copied the 16 MiB of each range twice (its original bytes, and its input), compared
 all of it after the dispatch and copied it back from the GPU, and the per-dispatch buffers took gigabytes of rings.
 
@@ -173,11 +177,13 @@ Without the mirror (no sparse residency of buffers, memory shared with the CPU, 
 result is made for the dispatch as before and lands from the dispatch's write log (`vk/writelog.c`), which the host
 reads once the submit is done. A writer that logs nothing (a draw, a buffer image) is compared.
 
-A byte the CPU writes while the programs' writes are pending, which a program writes too, takes the program's value:
-on the console both reach memory in an order the program left open. Once the submit is done and the page is the
-mirror's, the CPU's write traps and lands the page first, so the CPU's value comes last. A byte the CPU writes and the
-program doesn't is kept. The comparison took the CPU's value instead; over 80 seconds of one game, 14,000 results
-landed with no byte written by both.
+Without the mirror, a byte the CPU writes while a program's logged writes are pending, which the program writes too,
+takes the program's value (`vk_write_runs`): nothing keeps the bytes from before the dispatch to tell the two apart,
+and on the console both reach memory in an order the program left open. In the mirror the shadow tells them apart: a
+byte that differs from it was written after the submit, and keeps the CPU's value (above). Once the submit is done and
+the page is the mirror's, the CPU's write traps and lands the page first, so the CPU's value comes last there too. A
+byte the CPU writes and the program doesn't is kept. The comparison took the CPU's value instead; over 80 seconds of
+one game, 14,000 results landed with no byte written by both.
 
 The translator declares the global buffers `Aliased` and `Coherent`: one game binds a range and a part of it to the
 same program, writes through one and waits for the value through the other.
@@ -279,8 +285,29 @@ address, then the control section's CPU address. `nvnProgramInitializeFromBuilde
 Push constants write `table | offset << 8` to method 0x141 of the 3D or compute engine (`SET_ROOT_TABLE_SELECTOR`),
 and the words to 0x142 (`LOAD_ROOT_TABLE`). The driver passes the API's offset, in bytes, and it cuts a push at 256
 bytes, a table's size. Programs read the eight tables as banks 24 to 31, which the renderer binds as one uniform
-buffer (`SNX_VKB_ROOT`). Variable rate shading writes the shading rate image and palette, which the runtime leaves at the full rate.
+buffer (`SNX_VKB_ROOT`). Variable rate shading writes the shading rate image and palette (next section).
 `SetGeometryProcessingMode` writes method 0xe26.
+
+## Shading rate images
+
+The driver of game-d1ed1846 (its `sdk` module) writes these methods for variable rate shading:
+
+| Function | Methods |
+| --- | --- |
+| `nvnCommandBufferBindShadingRateImage(cb, texture, view)` | 8 words from 0x4aa: the address, the size and the block layout. Then 0 to 0x9f. A null texture writes 6 zero words from 0x4aa. |
+| `nvnCommandBufferShadingRateImagePalette(cb, viewport, count, rates)` | 3 words from 0xed0: the viewport in bits 4 to 7, then 16 entries of 4 bits. |
+| `nvnCommandBufferSetShadingRatePaletteMode(cb, mode)` | 0xb3: 0 for mode 1, 1 for the others. The meaning is not known. The game sets mode 1 only. |
+
+The driver sends the game's rates to the hardware with no table. The numbers are those of
+`VkShadingRatePaletteEntryNV` (5 is one invocation for each pixel). The driver fills the entries that the game leaves
+out with 5. A texel of the image covers 16x16 pixels, and holds an index into the palette of the primitive's
+viewport. The game's image is R8_UINT (format 0xF6), 160x90 texels for 2560x1440. In a race, the game sets
+palettes for viewports 0 to 4. Viewport 0 maps indices 13 to 15 to 2x2, 4x2 and 4x4, and the others to 1x1.
+
+The renderer converts the image on the GPU at each bind (`vk/shading_rate.c`). With `VK_NV_shading_rate_image`, the
+draws read the game's indices and palettes, as the console does. With the attachment of
+`VK_KHR_fragment_shading_rate`, the image holds the rates of viewport 0's palette, with no supersampled rates. The
+fragment programs read their fragment's size (S2R 0x84) from `FragmentSizeNV` or `ShadingRateKHR`.
 
 ## Compute QMDs
 
@@ -293,8 +320,8 @@ channel 22 and a ring of 16 on channel 23. Their increments and decrements don't
 
 The game draws part of its frames with mesh shaders: about 14 `nvnCommandBufferDrawMeshTasks` calls a frame in the
 screens after the title, all from the programs of `Shader/Drive.Nin_Ounce_NVN2.release.sarc.zs`
-(`DrivePassShaderDefault.sharcb`, the 3D scene's passes). The renderer can draw them with `VK_EXT_mesh_shader`
-behind the experimental `mesh_draws` setting, off by default (see [Draws](#draws)). No font or UI program
+(`DrivePassShaderDefault.sharcb`, the 3D scene's passes). The renderer draws them with `VK_EXT_mesh_shader` where
+the driver has it and no ban holds, which keeps them off on NVIDIA's driver (see [Draws](#draws)). No font or UI program
 (`Lib/sead/nvn2_font`, the programs in `main`) is a mesh program, so the missing menu text has another cause. Of the
 programs that the shipped pass translates, about 500 fragment and vertex programs are refused (most with "BRX with no
 jump table"), which is a better lead for the text.
@@ -420,7 +447,7 @@ the push constant's z has `SH_PUSH_GPU_MESH_FIRST`, the task program, or the mes
 workgroup from there. The copy ends the rendering pass. In the first 3D scene of one game about 30 mesh draws a frame
 are indirect; the 3D form's and the multi-draws, which no run calls, are still skipped.
 
-With `mesh_draws` on, an RTX 2080 faulted in most menu runs: Xid 31 (`GPCCLIENT_GCC`, reads of addresses that no
+With the mesh draws on, an RTX 2080 faulted in most menu runs: Xid 31 (`GPCCLIENT_GCC`, reads of addresses that no
 memory backs), then Xid 109 and a lost device. NV diagnostic checkpoints put each hang in a draw with a task program,
 and the device fault data put the faulting instruction in the task program, at the same address in each run. A task
 program that does nothing launched no fault. A task program that reads no constant buffer still faulted. Every
@@ -496,16 +523,18 @@ the menus and the first 3D scene. With `RADV_DEBUG=hang`, which waits for each d
 draws of the menus hung the GPU twice, once with every task draw of 0 workgroups (the gfx ring, then a compute ring
 timed out; the dump's compute IB held an `ACQUIRE_MEM` and `NOP`s, with the shader engines idle): a task program's
 draw is a gang submission, its task stage on an ACE queue, which that option's waits stall. Don't take it to a run
-with mesh draws.
+with mesh draws. On an RX 6700 XT (RADV, Mesa 26.2.6) a run from boot into a race drew 213,192 mesh draws, and one
+under the validation layer 78,495, with no fault.
 
-With `mesh_draws=1` the draws translate and draw, with no `not translated` line and no validation message of their
+With the mesh draws on, the draws translate and draw, with no `not translated` line and no validation message of their
 own, but 6 of 7 runs through the menus on an RTX 2080 (driver 615.78.08) ended in a GPU fault: Xid 109 (context switch
 timeout) and Xid 31 (MMU faults of `GPCCLIENT_GCC`, reads at addresses such as `0xfffff079_ad3f2000`), then
 `VK_ERROR_DEVICE_LOST`. Runs without mesh draws had none. GPU-assisted validation reported nothing about them. What
 did not remove the faults: the per-primitive SPH at the right offset, the fragment inputs no mesh output writes read
 as 0, 0, 0, 1, and storage buffers of the two stages bound to all the memory mapped from their addresses. A run that
 drew only the mesh programs alone without per-primitive outputs had no fault in 319 frames, which is too few to be
-sure. So the setting stays off.
+sure. So `VK_EXT_mesh_shader` is off on NVIDIA's driver, by its line in `src/common/gpu/vk/extension_bans.txt`, which
+`vk_ext_mesh_shader=on` goes over to test it again (the `vulkan_headless_mesh` test does).
 
 ### Open questions
 
@@ -514,7 +543,7 @@ sure. So the setting stays off.
   does when no lane writes the count. The design starts it at 0.
 - Whether `first` reaches the index as the first vertex of the point draw does (the game passes 0, so the runs
   cannot show it).
-- The cause of the GPU faults with `mesh_draws=1`. Next checks: the per-primitive outputs and the fragment
+- The cause of the GPU faults on NVIDIA's driver. Next checks: the per-primitive outputs and the fragment
   program's `PerPrimitiveEXT` inputs (with their interpolation decorations), the primitive indices against the vertex
   count, and a RenderDoc capture of the first faulting draw.
 - The 3D form's indirect record (x, y, z), and whether `DrawMeshTasksIndirect`'s is `{count, first}`, as the

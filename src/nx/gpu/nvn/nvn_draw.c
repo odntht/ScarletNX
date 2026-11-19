@@ -30,6 +30,7 @@
 #include "nx/runtime/platform/log.h"
 #include <math.h>
 #include <string.h>
+#include <stdatomic.h>
 
 /* the inline banks' layout (above) */
 enum {
@@ -58,8 +59,8 @@ enum {
 };
 
 void nvn_draw_device(u32 origin, u32 depth_mode) {
-    __atomic_store_n(&g_nvn.draw.origin, origin, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_nvn.draw.depth_mode, depth_mode, __ATOMIC_RELAXED);
+    atomic_store_explicit(&g_nvn.draw.origin, origin, memory_order_relaxed);
+    atomic_store_explicit(&g_nvn.draw.depth_mode, depth_mode, memory_order_relaxed);
 }
 
 /* DsState.gen: a new generation of group *gen, from the sequence every front end shares */
@@ -115,7 +116,7 @@ void nvn_draw_init(NvnDraw* d, u32 owner) {
     d->ds.owner = owner;
     /* the game's driver writes the window origin register once, as it initializes the queue: the flip when the
        device's origin is lower left then. A game that sets an upper left origin after it keeps the flip */
-    d->flip = __atomic_load_n(&g_nvn.draw.origin, __ATOMIC_RELAXED) == NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT;
+    d->flip = atomic_load_explicit(&g_nvn.draw.origin, memory_order_relaxed) == NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT;
     /* NVN's state before anything is bound: the state objects' defaults (nvn_object.c's SetDefaults) */
     for (i = 0; i < DS_TARGETS_MAX; i++) {
         u64 w = 0;
@@ -152,6 +153,8 @@ void nvn_draw_init(NvnDraw* d, u32 owner) {
         d->scissor[j][2] = d->scissor[j][3] = 0x10000;
     }
     d->bind.tex_bank = 2;
+    for (u32 j = 0; j < 16; j++) d->rate_in.palette[j] = NVN_RATE_PALETTE_FULL;
+    d->rate_in.texel = NVN_RATE_TEXEL;
     for (s = 0; s < DS_GFX_STAGES; s++) {
         /* Maxwell's largest point size (11.4 fixed point), which GLSLC clamps a written size to: the game's driver
            writes 2047.9375 (NVN 53.13 and 55.12) */
@@ -171,7 +174,7 @@ void nvn_draw_init(NvnDraw* d, u32 owner) {
     d->dirty = ~0u;
     d->vp_dirty = (1u << DS_VIEWPORTS_MAX) - 1;
     d->viewport_upper_left =
-        __atomic_load_n(&g_nvn.draw.origin, __ATOMIC_RELAXED) == NVN_WINDOW_ORIGIN_MODE_UPPER_LEFT;
+        atomic_load_explicit(&g_nvn.draw.origin, memory_order_relaxed) == NVN_WINDOW_ORIGIN_MODE_UPPER_LEFT;
     for (s = 0; s < DS_GFX_STAGES; s++) {
         d->inl_lo[0][s] = d->inl_lo[1][s] = 0;
         d->inl_hi[0][s] = DS_INLINE_BANK0;
@@ -551,7 +554,7 @@ static void make_dynamic(NvnDraw* d, u32 base_instance) {
     y.alpha_ref = d->alpha_ref;
     /* the window origin register as the game's driver writes it: the flip the queue took when it was initialized
        (nvn_draw_init), and never the lower left bit, so y counts from the top of the targets as on the driver's */
-    u32 depth_mode = __atomic_load_n(&g_nvn.draw.depth_mode, __ATOMIC_RELAXED);
+    u32 depth_mode = atomic_load_explicit(&g_nvn.draw.depth_mode, memory_order_relaxed);
     y.window_origin = d->flip ? DS_ORIGIN_FLIP_Y : 0;
     y.depth_mode = depth_mode == NVN_DEPTH_MODE_NEAR_IS_ZERO;
     y.sprite_origin = 1; /* the game's driver's sprite origin bit, set whatever the window origin */
@@ -602,9 +605,10 @@ static u32 scissor_clip(i32 origin, i32 extent) {
     return end > start ? start | end << 16 : 0;
 }
 static void make_viewports(NvnDraw* d) {
-    int near_zero = __atomic_load_n(&g_nvn.draw.depth_mode, __ATOMIC_RELAXED) == NVN_DEPTH_MODE_NEAR_IS_ZERO;
+    int near_zero = atomic_load_explicit(&g_nvn.draw.depth_mode, memory_order_relaxed) == NVN_DEPTH_MODE_NEAR_IS_ZERO;
     /* clip space's y points up in both origins: an upper-left window's rows count down, so its scale is negative */
-    int upper_left = __atomic_load_n(&g_nvn.draw.origin, __ATOMIC_RELAXED) == NVN_WINDOW_ORIGIN_MODE_UPPER_LEFT;
+    int upper_left =
+        atomic_load_explicit(&g_nvn.draw.origin, memory_order_relaxed) == NVN_WINDOW_ORIGIN_MODE_UPPER_LEFT;
     DsViewports v;
     memcpy(&v, &d->ds.vp, sizeof v); /* retain unchanged viewports and their padding for keep */
     /* NVN has no call that turns the viewport transform off */
@@ -661,12 +665,13 @@ static void sync(NvnDraw* d, i32 base_vertex, u32 base_instance) {
     if (d->ds.dyn.depth_word != base_instance) d->dirty |= D_DYNAMIC;
     /* Device state can change without changing a packed depth/stencil object. Equal binds no longer rebuild
        dynamic state incidentally, so refresh the depth convention at the draw that observes it. */
-    u32 near_zero = __atomic_load_n(&g_nvn.draw.depth_mode, __ATOMIC_RELAXED) == NVN_DEPTH_MODE_NEAR_IS_ZERO;
+    u32 near_zero = atomic_load_explicit(&g_nvn.draw.depth_mode, memory_order_relaxed) == NVN_DEPTH_MODE_NEAR_IS_ZERO;
     if (d->ds.dyn.depth_mode != near_zero) {
         d->dirty |= D_DYNAMIC;
         viewports_dirty(d, 0, DS_VIEWPORTS_MAX);
     }
-    u32 upper_left = __atomic_load_n(&g_nvn.draw.origin, __ATOMIC_RELAXED) == NVN_WINDOW_ORIGIN_MODE_UPPER_LEFT;
+    u32 upper_left =
+        atomic_load_explicit(&g_nvn.draw.origin, memory_order_relaxed) == NVN_WINDOW_ORIGIN_MODE_UPPER_LEFT;
     if (d->viewport_upper_left != upper_left) viewports_dirty(d, 0, DS_VIEWPORTS_MAX);
     if (!d->dirty) return;
     if (d->dirty & D_PROGRAMS) make_programs(d);
@@ -729,6 +734,7 @@ static void indirect(DrawCall* dc, u64 ind, u64 count, i32 max, i32 stride, u32 
 }
 static void draw_fixed_state(const NvnDraw* d, DrawCall* call) {
     call->state_flags = d->fixed_flags;
+    call->shading_rate = d->rate;
     for (u32 i = 0; i < DS_TARGETS_MAX; i++)
         call->advanced_blend[i] = ((d->color >> i) & 1) && nvn_field(d->blend[i], NVN_BLEND_ADV) ? d->blend[i] : 0;
     if (d->fixed_flags & DS_DRAW_POINT_SIZE) call->point_size = d->point_size;
@@ -1227,8 +1233,38 @@ static void draw_texture(NvnDraw* d, u64 payload) {
     sync(d, 0, 0);
     g_renderer->draw_texture(&d->ds, &t);
 }
+/* The bound shading rate image given to the renderer again, with the palettes: an id for the draws after it */
+static void rate_update(NvnDraw* d, int new_image) {
+    d->rate_in.new_image = new_image;
+    d->rate = d->rate_in.addr && g_renderer->shading_rate ? g_renderer->shading_rate(&d->rate_in) : 0;
+}
+/* OP_RATE_IMAGE: the texture's header (TIC), as a texture pool would hold it, which the renderer looks up as a draw's
+   texture: the texels the GPU wrote last, wherever the renderer keeps them. 0 with none bound */
+static void rate_image(NvnDraw* d, u64 payload) {
+    NvnPRateImage r;
+    memcpy(&r, GP(payload), sizeof r);
+    d->rate_in.addr = 0;
+    NvnTexture t = {0}; /* past the snapshot's bytes */
+    if (r.tex) memcpy(&t, GP(r.tex), NVN_TEX_SNAP);
+    if (r.tex && nvn_tic_encode(&t, r.has_view ? &r.view : NULL, 0, g_nvn.loader.api, d->rate_in.tic)) {
+        d->rate_in.addr = t.gpu;
+        LOG_LIMIT(2, "nvn: a shading rate image of %ux%u texels, format %#x, at %llx\n", t.d.width, t.d.height,
+                  t.d.format, (unsigned long long)t.gpu);
+    } else if (r.tex)
+        LOG_LIMIT(1, "nvn: a shading rate image whose texture has no texture header: each pixel is shaded\n");
+    rate_update(d, 1);
+}
 int nvn_draw_record(NvnDraw* d, u32 op, u64 payload, u32 size) {
     switch (op) {
+        case OP_RATE_IMAGE: rate_image(d, payload); return 1;
+        case OP_RATE_PALETTE: {
+            const NvnPRatePalette* r = NVN_OBJ(const NvnPRatePalette, payload);
+            if (d->rate_in.palette[r->viewport & 15] == r->rates) return 1;
+            d->rate_in.palette[r->viewport & 15] = r->rates;
+            if (d->rate_in.addr) rate_update(d, 0);
+            return 1;
+        }
+        case OP_RATE_MODE: return 1;
         case OP_SET_RT: set_targets(d, payload); return 1;
         case OP_DISCARD:
             if (size >= sizeof(NvnPDiscard)) discard_targets(d, NVN_OBJ(const NvnPDiscard, payload)->targets);

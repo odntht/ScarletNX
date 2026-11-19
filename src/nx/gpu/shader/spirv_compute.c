@@ -267,8 +267,11 @@ static u32* compute_to_spirv(const u8* code, const u64* words, u32 max_bytes, Sh
         u32 arr = spv_emit_type_runtime_array(&c->e, c->u, 4);
         u32 structure = spv_emit_type_struct_one(&c->e, arr);
         c->gbptr = spv_emit_type_storage_pointer(&c->e, c->u);
+        /* two or more global buffers may be the same memory (a dispatch binds overlapping ranges where they are in
+           guest memory): none is assumed apart from the others (SPIR-V's Aliased) */
         for (int i = 0; i < meta.ngbuf; i++) {
             c->gb[i] = spv_emit_storage_buffer(&c->e, structure, 0, 18 + (u32)i);
+            if (meta.ngbuf >= 2) spv_emit_decorate(&c->e, c->gb[i], SPV_DECORATION_ALIASED, NULL, 0);
             interfaces[ninterface++] = c->gb[i];
         }
     }
@@ -405,6 +408,7 @@ static u32* compute_to_spirv(const u8* code, const u64* words, u32 max_bytes, Sh
                 add = spv_emit_unary(&c->e, SPV_OP_BITCAST, c->f, add);
                 if (B(w, 49, 1)) add = spv_emit_unary(&c->e, SPV_OP_F_NEGATE, c->f, add);
                 result = spv_emit_glsl_ternary(&c->e, c->f, c->glsl, SPV_GLSL_FMA, lhs, rhs, add);
+                spv_emit_no_contraction(&c->e, result);
             } else {
                 result = spv_emit_binary(&c->e, SPV_OP_F_MUL, c->f, lhs, rhs);
                 spv_emit_no_contraction(&c->e, result);

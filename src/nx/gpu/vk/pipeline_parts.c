@@ -27,6 +27,17 @@ void vk_gpl_bans(VkGplDevice* d, VkBanSay say) {
 #undef EDS3
 }
 
+float vk_conservative_dilation(u32 conservative, float most, char* line, size_t n) {
+    float asked = conservative > 1 ? (float)(conservative - 1) * 0.25f : 0.0f;
+    float drawn = asked < most ? asked : most;
+    if (n) line[0] = 0;
+    if (drawn < asked)
+        snprintf(line, n,
+                 "vulkan: a conservative raster dilation of %.2f pixels is drawn as %.2f, the most this device "
+                 "overestimates by (maxExtraPrimitiveOverestimationSize): the pixels between the two are left out",
+                 (double)asked, (double)drawn);
+    return drawn;
+}
 void vk_depth_range_line(const VkGplDevice* d, u32 dyn_pr, char* line, size_t n) {
     if (dyn_pr & VK_DYN_PR_DEPTH_RANGE) {
         snprintf(line, n,
@@ -95,6 +106,8 @@ void vk_pipe_part_src(u32 part, const void* key, PipeKey* out) {
         const PipeViKey* vi = key;
         out->topo_class = vi->topo_class;
         out->vi = vi->vi;
+        out->fetch = vi->fetch;
+        out->heaps = vi->heaps;
     } else if (part == VK_PART_PR) {
         const PipePrKey* pr = key;
         out->vs = pr->vs;
@@ -108,6 +121,8 @@ void vk_pipe_part_src(u32 part, const void* key, PipeKey* out) {
         out->depth_clip = pr->depth_clip;
         out->provoking_last = pr->provoking_last;
         out->conservative = pr->conservative;
+        for (u32 s = 0; s < 5; s++) out->cb_addr[s] = pr->cb_addr[s];
+        out->heaps = pr->heaps;
     } else if (part == VK_PART_FS) {
         const PipeFsKey* f = key;
         out->fs = f->fs;
@@ -120,6 +135,8 @@ void vk_pipe_part_src(u32 part, const void* key, PipeKey* out) {
         out->alpha_to_coverage = f->alpha_to_coverage;
         out->alpha_to_one = f->alpha_to_one;
         out->coverage = f->coverage;
+        for (u32 s = 0; s < 5; s++) out->cb_addr[s] = f->cb_addr[s];
+        out->heaps = f->heaps;
     } else {
         const PipeFoKey* fo = key;
         out->ncolor = fo->ncolor;
@@ -145,6 +162,7 @@ void vk_pipe_part_src(u32 part, const void* key, PipeKey* out) {
         out->feedback = fo->feedback;
         out->coverage = fo->coverage;
         out->advanced = fo->advanced;
+        out->heaps = fo->heaps;
         /* the masks hold already whether there is a fragment program: any one passes them through */
         out->fs = (VkShaderModule)(uintptr_t)1;
     }
@@ -153,7 +171,7 @@ void vk_pipe_part_src(u32 part, const void* key, PipeKey* out) {
 /* every dynamic state a draw pipeline can have, in the order pipe_create always listed them (a pipeline cache entry
    depends on it), with the part that holds it (the specification's "Graphics Pipeline Library" says which state each
    part holds) and when it is there */
-enum { DYN_ALWAYS, DYN_FEEDBACK, DYN_STRIDE, DYN_VERTEX_INPUT, DYN_PR, DYN_PR_TESS, DYN_CLAMP_RANGE };
+enum { DYN_ALWAYS, DYN_FEEDBACK, DYN_STRIDE, DYN_VERTEX_INPUT, DYN_PR, DYN_PR_TESS, DYN_CLAMP_RANGE, DYN_RATE_PALETTE };
 static const struct {
     VkDynamicState state;
     u32 part; /* VK_PART_* */
@@ -192,6 +210,7 @@ static const struct {
     {VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT, VK_PART_PR, DYN_PR_TESS | VK_DYN_PR_PATCH << 8},
     {VK_DYNAMIC_STATE_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT, VK_PART_PR, DYN_PR | VK_DYN_PR_DEPTH_RANGE << 8},
     {VK_DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT, VK_PART_PR, DYN_CLAMP_RANGE},
+    {VK_DYNAMIC_STATE_VIEWPORT_SHADING_RATE_PALETTE_NV, VK_PART_PR, DYN_RATE_PALETTE},
 };
 typedef char dyn_states_fit[sizeof g_dyn_states / sizeof *g_dyn_states <= VK_PIPE_DYN_MAX ? 1 : -1];
 
@@ -204,6 +223,7 @@ u32 vk_pipe_dynamic(u32 parts, const PipeDynIn* in, VkDynamicState* out) {
                  : when == DYN_STRIDE       ? in->stride
                  : when == DYN_VERTEX_INPUT ? in->vertex_input
                  : when == DYN_CLAMP_RANGE  ? in->clamp_range
+                 : when == DYN_RATE_PALETTE ? in->rate_palette
                  : when == DYN_PR           ? (in->dyn_pr & bit) != 0
                                             : (in->dyn_pr & bit) && in->tess;
         if (in->mesh && g_dyn_states[i].part == VK_PART_VI) on = 0; /* a mesh pipeline has no vertex input state */
@@ -230,6 +250,8 @@ void vk_pipe_split(const PipeKey* k, VkShaderModule fs, const PipeSplitDevice* d
     *vi = (PipeViKey){0};
     vi->topo_class = k->topo_class;
     vi->vi = k->vi;
+    vi->fetch = k->fetch;
+    vi->heaps = k->heaps;
 
     *pr = (PipePrKey){0};
     pr->vs = k->vs;
@@ -237,6 +259,9 @@ void vk_pipe_split(const PipeKey* k, VkShaderModule fs, const PipeSplitDevice* d
     pr->tes = k->tes;
     pr->gs = k->gs;
     pr->arrays = k->arrays & VK_ARRAYS_PR;
+    pr->heaps = k->heaps;
+    const u32 fs_set = SHADER_VK_SET_FS; /* the set of pipe_info's fifth module, the fragment program */
+    for (u32 s = 0; s < 5; s++) pr->cb_addr[s] = s == fs_set ? 0 : k->cb_addr[s];
     if (!(d->dyn_pr & VK_DYN_PR_PATCH)) pr->patch = k->patch;
     if (!(d->dyn_pr & VK_DYN_PR_POLYGON)) pr->polygon = k->polygon;
     if (!(d->dyn_pr & VK_DYN_PR_DEPTH_CLAMP)) pr->depth_clamp = k->depth_clamp;
@@ -248,6 +273,8 @@ void vk_pipe_split(const PipeKey* k, VkShaderModule fs, const PipeSplitDevice* d
     f->fs = fs;
     f->arrays = k->arrays & VK_ARRAYS_FS;
     f->spec = k->fs_spec;
+    f->heaps = k->heaps;
+    f->cb_addr[fs_set] = k->cb_addr[fs_set];
     if (!d->feedback_dynamic) f->feedback = k->feedback;
     if (k->sample_shading) {
         f->sample_shading = k->sample_shading;
@@ -282,10 +309,11 @@ void vk_pipe_split(const PipeKey* k, VkShaderModule fs, const PipeSplitDevice* d
     if (!d->feedback_dynamic) fo->feedback = k->feedback;
     fo->coverage = k->coverage;
     fo->advanced = k->advanced;
+    fo->heaps = k->heaps;
 }
 
 /* out's text from at, which may be past its end (the text is then cut): where the next one goes */
-static size_t key_say(char* out, size_t n, size_t at, const char* fmt, ...) __attribute__((format(printf, 4, 5)));
+[[gnu::format(printf, 4, 5)]] static size_t key_say(char* out, size_t n, size_t at, const char* fmt, ...);
 static size_t key_say(char* out, size_t n, size_t at, const char* fmt, ...) {
     va_list ap;
     int wrote;

@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #define CB(a)                   NVN_OBJ(NvnCmdBuf, a)
 /* room a piece of the runtime's memory keeps after every record: one JUMP to the next piece */
@@ -95,7 +96,7 @@ static void put_hdr(u64 at, u32 op, u32 size, u32 cost) {
 /* the target before the header: a walk of another submission that reads the JUMP reads where it goes (nvn_replay.c) */
 static void put_jump(u64 at, u64 to) {
     memcpy(GP(at + 8), &to, 8);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    atomic_thread_fence(memory_order_release);
     put_hdr(at, OP_JUMP, 16, 0);
 }
 
@@ -165,7 +166,8 @@ static void spill_census(const NvnCmdState* st) {
             }
     LOG("nvn: census of the runtime's record memory: %u of %u pieces in use, in %u of %u segments, %llu KiB with the "
         "small store's, %u cut in all\n",
-        st->np, NVN_SPILL_PIECES, live_segs, st->ns, (unsigned long long)(st->total >> 10), st->serial);
+        atomic_load_explicit(&st->np, memory_order_relaxed), NVN_SPILL_PIECES, live_segs, st->ns,
+        (unsigned long long)(st->total >> 10), st->serial);
     for (int j = 0; j < SHOWN && top[j]; j++) {
         u32 k = top[j] - 1; /* NvnCmdBuf.ctl: the control slot plus 1 */
         const Tally* a = &t[k];
@@ -199,7 +201,7 @@ static u32 spill_cut(u64 cb, u64 anchor, u32 need, u64* at, u32* piece) {
     u64 want = (u64)need + OP_RESERVE, canchor = ctl_anchor(cb);
     NvnCtl* own = ctl_of(cb);
     u32 who = CB(cb)->ctl, k, i, slot, b, any;
-    if (__atomic_load_n(&st->np, __ATOMIC_RELAXED) >= st->sweep) spill_sweep(st);
+    if (atomic_load_explicit(&st->np, memory_order_relaxed) >= st->sweep) spill_sweep(st);
     pm_lock(&st->lock);
     /* From the segment its last piece came from, and only one that holds no other command buffer's pieces: a segment
        comes back when all of its pieces do, and they do when the ring they are anchored in passes them. One game has a ring
@@ -235,6 +237,8 @@ static u32 spill_cut(u64 cb, u64 anchor, u32 need, u64* at, u32* piece) {
         st->s[k].at = kmem_alloc(size, MS_KERNEL, PERM_RW);
         st->s[k].size = size;
         st->s[k].top = 0;
+        if (!st->ns || st->s[k].at < st->lo) st->lo = st->s[k].at;
+        if (st->s[k].at + size > st->hi) st->hi = st->s[k].at + size;
         st->ns++;
         st->total += size;
         if ((st->total ^ was) > was) { /* a new power of two of the total */
@@ -268,9 +272,10 @@ static u32 spill_cut(u64 cb, u64 anchor, u32 need, u64* at, u32* piece) {
     st->p[slot].serial = ++st->serial;
     st->p[slot].next = st->bucket[b];
     st->bucket[b] = slot;
-    st->np++;
-    if (st->np / (NVN_SPILL_PIECES / 4) > st->census) { /* a quarter, a half and three quarters of the slots */
-        st->census = st->np / (NVN_SPILL_PIECES / 4);
+    atomic_store_explicit(&st->np, atomic_load_explicit(&st->np, memory_order_relaxed) + 1, memory_order_relaxed);
+    if (atomic_load_explicit(&st->np, memory_order_relaxed) / (NVN_SPILL_PIECES / 4) >
+        st->census) { /* a quarter, a half and three quarters of the slots */
+        st->census = atomic_load_explicit(&st->np, memory_order_relaxed) / (NVN_SPILL_PIECES / 4);
         spill_census(st);
     }
     st->hint = k;
@@ -345,7 +350,7 @@ static void piece_free(NvnCmdState* st, u32 slot, int control) {
     q->next = st->free;
     st->free = slot;
     q->anchor = q->canchor = 0; /* free: nvn_cmd_describe lists the others */
-    st->np--;
+    atomic_store_explicit(&st->np, atomic_load_explicit(&st->np, memory_order_relaxed) - 1, memory_order_relaxed);
     if (q->seg >= NVN_SPILL_SMALL) {
         if (q->at) small_give(st, q->seg - NVN_SPILL_SMALL, q->at); /* 0: a newer recording took its block */
         return;
@@ -410,11 +415,17 @@ int nvn_cmd_unfinished(u64 p) {
     u32 k;
     int r = 0;
     pm_lock(&st->lock);
-    for (k = 0; k < st->ns; k++)
+    /* An address outside every segment (the game's own command memory) is answered at once, and inside them the
+       segment found last is looked at first: each jump of a submission's walk looked through every segment, more of
+       the submitting thread's time than the walk itself in one game */
+    for (u32 i = 0; p >= st->lo && p < st->hi && i < st->ns; i++) {
+        k = (st->found + i) % st->ns;
         if (p >= st->s[k].at && p < st->s[k].at + st->s[k].size) {
             r = st->s[k].owner && p >= st->s[k].at + st->s[k].top;
+            st->found = k;
             break;
         }
+    }
     pm_unlock(&st->lock);
     return r;
 }
@@ -680,8 +691,11 @@ static void spill_sweep(NvnCmdState* st) {
     u32 n = 0, gone = 0;
     pm_lock(&st->lock);
     st->sweep = ~0u; /* one at a time */
-    Seen* seen = malloc((st->np ? st->np : 1) * sizeof *seen);
-    for (u32 i = 1; seen && i <= st->slots && n < st->np; i++)
+    Seen* seen = malloc((atomic_load_explicit(&st->np, memory_order_relaxed)
+                             ? atomic_load_explicit(&st->np, memory_order_relaxed)
+                             : 1) *
+                        sizeof *seen);
+    for (u32 i = 1; seen && i <= st->slots && n < atomic_load_explicit(&st->np, memory_order_relaxed); i++)
         if (st->p[i].anchor && st->p[i].mark)
             seen[n++] = (Seen){(st->p[i].anchor + 7) & ~7ull, st->p[i].mark, i, st->p[i].serial};
     pm_unlock(&st->lock);
@@ -698,7 +712,10 @@ static void spill_sweep(NvnCmdState* st) {
             gone++;
         }
     }
-    st->sweep = st->np + (st->np > 4096 ? st->np : 4096); /* the next once as many more are in use as stay */
+    st->sweep = atomic_load_explicit(&st->np, memory_order_relaxed) +
+                (atomic_load_explicit(&st->np, memory_order_relaxed) > 4096
+                     ? atomic_load_explicit(&st->np, memory_order_relaxed)
+                     : 4096); /* the next once as many more are in use as stay */
     pm_unlock(&st->lock);
     free(seen);
     if (gone)
@@ -896,27 +913,6 @@ void nvn_CommandBufferSetRecordingMode(CPU* c, u64 cb, i32 mode) {
 }
 /* the Ounce's compute/copy overlap mode: same as SetRecordingMode, the runtime's records carry their own kind */
 void nvn_CommandBufferSetComputeOverlapMode(CPU* c, u64 cb, i32 mode) {
-    (void)c;
-    (void)cb;
-    (void)mode;
-}
-/* the Ounce's shading rate image, which lowers the fragment rate where it says. The runtime shades each pixel,
-   which gives the image of the full rate. A null texture unbinds it (the game's driver skips its methods) */
-void nvn_CommandBufferBindShadingRateImage(CPU* c, u64 cb, u64 t, u64 v) {
-    (void)c;
-    (void)cb;
-    (void)v;
-    if (t) LOG_LIMIT(1, "nvn: a shading rate image is shaded at the full rate\n");
-}
-/* the shading rates of a viewport's palette, and how the palette is read: the runtime shades at the full rate */
-void nvn_CommandBufferShadingRateImagePalette(CPU* c, u64 cb, i32 viewport, i32 n, u64 rates) {
-    (void)c;
-    (void)cb;
-    (void)viewport;
-    (void)n;
-    (void)rates;
-}
-void nvn_CommandBufferSetShadingRatePaletteMode(CPU* c, u64 cb, i32 mode) {
     (void)c;
     (void)cb;
     (void)mode;
@@ -1167,6 +1163,32 @@ static u64 tex_snap(u64 payload, size_t off, int k, u64 t) {
 static void copy_view(NvnView* dst, u8* has, u64 v) {
     *has = v != 0;
     if (v) memcpy(dst, GP(v), sizeof *dst);
+}
+/* The Ounce's shading rate image, which lowers the fragment rate where it says (OP_RATE_IMAGE, the renderer's
+   shading_rate.c). The game's driver writes 8 words from method 0x4aa (the address, size and layout) and 0 to method
+   0x9f, or 6 zero words from 0x4aa for a null texture, which unbinds it. It reads the view only for the layout */
+void nvn_CommandBufferBindShadingRateImage(CPU* c, u64 cb, u64 t, u64 v) {
+    u64 payload = rec(c, cb, OP_RATE_IMAGE, SNAP_OFF(NvnPRateImage) + (t ? NVN_TEX_SNAP : 0), t ? 40 : 28);
+    NvnPRateImage* r = (NvnPRateImage*)(void*)GP(payload);
+    r->tex = tex_snap(payload, SNAP_OFF(NvnPRateImage), 0, t);
+    copy_view(&r->view, &r->has_view, t ? v : 0);
+}
+/* a viewport's palette: its first n entries from rates, the others 5 (one invocation for each pixel), and every one 5
+   with no rates. The driver writes the viewport and the 16 entries to methods 0xed0 to 0xed2, with no table between
+   the game's numbers and the hardware's. It has no check of n against 16 */
+void nvn_CommandBufferShadingRateImagePalette(CPU* c, u64 cb, i32 viewport, i32 n, u64 rates) {
+    NvnPRatePalette* r = REC(c, cb, OP_RATE_PALETTE, NvnPRatePalette, 16);
+    u32 game[16] = {0};
+    if (n > 16) LOG_LIMIT(1, "nvn: a shading rate palette of %d entries: the first 16 are taken\n", n);
+    for (i32 i = 0; rates && i < n && i < 16; i++) game[i] = gr32(rates + 4 * (u64)i);
+    r->viewport = viewport & 15;
+    r->rates = nvn_rate_palette(rates ? game : NULL, n);
+}
+/* the driver writes method 0xb3, 0 for mode 1 and 1 for the others. The game sets mode 1 only, and what the bit
+   changes is not known: the renderer reads each viewport's own palette */
+void nvn_CommandBufferSetShadingRatePaletteMode(CPU* c, u64 cb, i32 mode) {
+    *REC(c, cb, OP_RATE_MODE, i32, 4) = mode;
+    if (mode != 1) LOG_LIMIT(1, "nvn: shading rate palette mode %d, read as mode 1\n", mode);
 }
 void nvn_CommandBufferSetRenderTargets(CPU* c, u64 cb, i32 n, u64 colors, u64 views, u64 depth, u64 depth_view) {
     u64 payload;

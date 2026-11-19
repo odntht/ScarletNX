@@ -58,7 +58,7 @@ static struct {
 VkResult vk_buffer_create(const VkBufferCreateInfo* info, const DevMemWant* allocation, VkBuffer* buffer,
                           DevMem* memory, DevMemInfo* details) {
     VkBufferCreateInfo create = *info;
-    if ((g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support) &&
+    if ((g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support || g_vk.has_gbuf_address) &&
         (create.usage & (VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                          VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)))
         create.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -200,8 +200,9 @@ static void buffer_descriptor(const VkDescriptorGetInfoEXT* info, const VkDescri
     }
     memcpy(destination, encoding, size);
 }
-VkDescriptorSet vk_descriptors_write(VkDescriptorSetLayout layout, u32 count, const VkWriteDescriptorSet* writes) {
-    if (g_vk.has_descriptor_heaps) return vk_descriptor_heaps_write(layout, count, writes);
+VkDescriptorSet vk_descriptors_write(VkDescriptorSetLayout layout, u32 count, const VkWriteDescriptorSet* writes,
+                                     u32 cb_addr) {
+    if (g_vk.has_descriptor_heaps) return vk_descriptor_heaps_write(layout, count, writes, cb_addr);
     u32 index = 0;
     while (index < g_descriptors.nlayouts && g_descriptors.layouts[index].layout != layout) index++;
     if (index == g_descriptors.nlayouts) fatal("vulkan: unknown graphics descriptor layout");

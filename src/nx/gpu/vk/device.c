@@ -4,12 +4,15 @@
    and dynamic rendering (1.3): it runs on Vulkan 1.3, or on 1.2 with the extensions 1.3 took in (vk12_extensions). */
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include "nx/runtime/options.h"
 #include "nx/runtime/platform/backend.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/gpu/gpu.h"
 #include "nx/gpu/vk/vk.h"
+#include "nx/gpu/vk/shading_rate.h"
+#include "nx/runtime/main.h"
 #include "nx/gpu/vk/ledger.h"
 #include "nx/memory/own.h"
 #include "nx/gpu/vk/vertex_input.h"
@@ -19,6 +22,7 @@
 #include "nx/gpu/texture/astc_bc.h"
 #include "common/gpu/vk/extension_bans.h"
 #include "common/gpu/vk/device_settings.h"
+#include "common/gpu/vk/gpu_pstate.h"
 #include "nx/gpu/vk/hdr_swapchain.h"
 #include "common/gpu/vk/swapchain.h"
 #include "common/gpu/vk/vk_common.h"
@@ -34,22 +38,49 @@ VkState g_vk;
 /* reentrant on the thread that holds it: landing compute results writes guest memory, which can come back here */
 static PMutex g_vklock;
 static _Thread_local int t_vkdepth;
-static u32 g_vk_owner; /* the thread holding it (plat_tid), 0 when none: a trap's fault on it can't be answered */
+/* from vk_lock_pause to vk_lock_resume: the hold goes on after it, and a hold of the lock in between does not end
+   this one's (vk_own_release_held) */
+static _Thread_local int t_vkpaused;
+static _Atomic u32
+    g_vk_owner; /* the thread holding it (plat_tid), 0 when none: a trap's fault on it can't be answered */
+/* The lock hands off fairly. A Windows SRW lock (and a pthread mutex) lets the thread that let go take it straight back
+   before the waiter it woke runs: a thread whose draws ran back to back kept it, and the threads landing GPU results and
+   signalling fences waited milliseconds for each hold of a few microseconds. A thread letting go with
+   others waiting in pm_lock sets the baton; until one of them (or any thread) takes the lock, a thread coming to it
+   waits for the baton, not the lock, and only those already waiting compete */
+static _Atomic u32 g_vk_waiting; /* threads blocked in pm_lock on g_vklock */
+static _Atomic u32 g_vk_baton;   /* 1: let go to a waiter, which hasn't taken it yet */
+static void vk_took(void) {
+    atomic_store_explicit(&g_vk_owner, plat_tid(), memory_order_relaxed);
+    if (atomic_load_explicit(&g_vk_baton, memory_order_relaxed)) {
+        atomic_store_explicit(&g_vk_baton, 0, memory_order_release);
+        plat_wake_word(&g_vk_baton);
+    }
+}
 void vk_lock(void) {
     if (!t_vkdepth++) {
-        if (!pm_trylock(&g_vklock)) { /* held: the GPU thread says so for the stall report */
+        int got = !atomic_load_explicit(&g_vk_baton, memory_order_acquire) && pm_trylock(&g_vklock);
+        if (!got) { /* held: the GPU thread says so for the stall report */
             /* Only a contended acquisition gets a zone. */
             SNX_ZONE(z_wait, "vk lock wait");
             gpu_wait_note("vk_lock, which another thread holds", 0);
-            pm_lock(&g_vklock);
+            /* the timeout only guards against a wake lost to the store's race: the baton is cleared at each take */
+            while (atomic_load_explicit(&g_vk_baton, memory_order_acquire)) plat_wait_word(&g_vk_baton, 1, 1000000);
+            if (!pm_trylock(&g_vklock)) {
+                atomic_fetch_add_explicit(&g_vk_waiting, 1, memory_order_seq_cst);
+                pm_lock(&g_vklock);
+                atomic_fetch_sub_explicit(&g_vk_waiting, 1, memory_order_seq_cst);
+            }
             gpu_wait_note(NULL, 0);
         }
-        __atomic_store_n(&g_vk_owner, plat_tid(), __ATOMIC_RELAXED);
+        vk_took();
     }
 }
 /* lets go of this thread's last hold, then signals the event slots its releases under it reached */
 static void vk_let_go(void) {
-    __atomic_store_n(&g_vk_owner, 0, __ATOMIC_RELAXED);
+    atomic_store_explicit(&g_vk_owner, 0, memory_order_relaxed);
+    if (atomic_load_explicit(&g_vk_waiting, memory_order_seq_cst))
+        atomic_store_explicit(&g_vk_baton, 1, memory_order_release);
     pm_unlock(&g_vklock);
     vk_release_events();
 }
@@ -57,30 +88,45 @@ void vk_unlock(void) {
     /* watched bytes that this hold read with no publish (own.c owes them): the targets over them are watched again
        before the lock goes, and the next CPU access publishes them */
     if (t_vkdepth == 1 && own_owed_any()) vk_rt_watch_owed();
+    if (t_vkdepth == 1 && vk_own_later_any()) vk_own_release_later();
+    /* the results that commands recorded under this hold read by their address: they are recorded now. Not at a
+       pause, part-way through the work that records them */
+    if (t_vkdepth == 1 && !t_vkpaused && vk_own_held_any()) vk_own_release_held();
     if (!--t_vkdepth) vk_let_go();
 }
 int vk_trylock(void) {
     if (!t_vkdepth && !pm_trylock(&g_vklock)) return 0;
-    if (!t_vkdepth++) __atomic_store_n(&g_vk_owner, plat_tid(), __ATOMIC_RELAXED);
+    if (!t_vkdepth++) vk_took();
     return 1;
 }
-u32 vk_lock_owner(void) { return __atomic_load_n(&g_vk_owner, __ATOMIC_RELAXED); }
+u32 vk_lock_owner(void) { return atomic_load_explicit(&g_vk_owner, memory_order_relaxed); }
 int vk_lock_held(void) { return t_vkdepth > 0; }
+int vk_lock_pause(void) {
+    if (t_vkdepth != 1) return 0;
+    t_vkpaused = 1;
+    vk_unlock();
+    return 1;
+}
+void vk_lock_resume(int paused) {
+    if (!paused) return;
+    vk_lock();
+    t_vkpaused = 0;
+}
 
 /* What held the memory at an out-of-memory, at the first ones: each heap as devmem.c counts it, and the descriptor
    pools, which MoltenVK backs with Metal memory that its blocks do not hold (cmd.c). The heap's use less its blocks
    is what the driver and the other allocations of the process took. Any thread can fail, and the counts take
    devmem.c's own lock */
 /* set once devmem.c knows the device's memory: vk_memory_text's threads ask it only after they see this, atomic */
-static int g_devmem_ready;
+static _Atomic int g_devmem_ready;
 #define OOM_REPORTS 3
 static void oom_report(VkResult r) {
-    static u32 reports;
+    static _Atomic u32 reports;
     DevMemBudget b[VK_MAX_MEMORY_HEAPS];
     const VkPhysicalDeviceMemoryProperties* mp;
     if (r != VK_ERROR_OUT_OF_DEVICE_MEMORY && r != VK_ERROR_OUT_OF_HOST_MEMORY) return;
-    if (!__atomic_load_n(&g_devmem_ready, __ATOMIC_ACQUIRE) ||
-        __atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) >= OOM_REPORTS)
+    if (!atomic_load_explicit(&g_devmem_ready, memory_order_acquire) ||
+        atomic_fetch_add_explicit(&reports, 1, memory_order_relaxed) >= OOM_REPORTS)
         return;
     vk_devmem_budgets(b);
     mp = vk_devmem_props();
@@ -104,7 +150,7 @@ u64 vk_memory_blocks(void) {
     DevMemBudget b[VK_MAX_MEMORY_HEAPS];
     const VkPhysicalDeviceMemoryProperties* mp;
     u64 sum = 0;
-    if (!__atomic_load_n(&g_devmem_ready, __ATOMIC_ACQUIRE)) return 0;
+    if (!atomic_load_explicit(&g_devmem_ready, memory_order_acquire)) return 0;
     vk_devmem_budgets(b);
     mp = vk_devmem_props();
     for (u32 h = 0; h < mp->memoryHeapCount; h++) sum += b[h].block_bytes;
@@ -116,7 +162,7 @@ void vk_memory_text(char* out, size_t size) {
     size_t n = 0;
     if (!size) return;
     out[0] = 0;
-    if (!__atomic_load_n(&g_devmem_ready, __ATOMIC_ACQUIRE)) {
+    if (!atomic_load_explicit(&g_devmem_ready, memory_order_acquire)) {
         snprintf(out, size, "no GPU heaps yet, %u descriptor pools", vk_desc_pools());
         return;
     }
@@ -441,21 +487,21 @@ static VkPhysicalDeviceSubgroupSizeControlProperties subgroup_sizes(int has, voi
 /* An Ounce's mesh draws (render.c): VK_EXT_mesh_shader's mesh stage, and its task stage when the device has one. The
    programs' lanes are a warp's (sm86.h), so both stages need a required subgroup size of 32 in full subgroups
    (subgroupSizeControl, computeFullSubgroups, requiredSubgroupSizeStages: sizes says whether the device has them,
-   Vulkan 1.3's or VK_EXT_subgroup_size_control's). Without them, or with the experimental mesh_draws setting off, the
-   draws are skipped, and the log says why once */
+   Vulkan 1.3's or VK_EXT_subgroup_size_control's). Without them, or with the extension off (a ban on the device's
+   driver, or vk_ext_mesh_shader=off: its own line says which), the draws are skipped, and the log says why once */
 static void mesh_choose(int has_ext, const VkPhysicalDeviceMeshShaderFeaturesEXT* f,
                         const VkPhysicalDeviceVulkan13Features* f13, int sizes) {
     VkPhysicalDeviceMeshShaderPropertiesEXT mp = {.sType =
                                                       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     VkPhysicalDeviceSubgroupSizeControlProperties sp = subgroup_sizes(sizes, has_ext ? &mp : NULL);
     const VkShaderStageFlags both = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT;
-    const char* why = !g_settings.mesh_draws                                    ? "mesh_draws off (experimental)"
-                      : !has_ext                                                ? "no VK_EXT_mesh_shader"
-                      : !f->meshShader                                          ? "no meshShader"
-                      : !f13->subgroupSizeControl || !f13->computeFullSubgroups ? "no subgroup size control"
-                      : sp.minSubgroupSize > 32 || sp.maxSubgroupSize < 32      ? "no subgroups of 32"
+    const char* why = !has_ext         ? "VK_EXT_mesh_shader is off (the line on VK_EXT_mesh_shader says why)"
+                      : !f->meshShader ? "this GPU has no meshShader"
+                      : !f13->subgroupSizeControl || !f13->computeFullSubgroups
+                          ? "this GPU has no subgroup size control"
+                      : sp.minSubgroupSize > 32 || sp.maxSubgroupSize < 32 ? "this GPU has no subgroups of 32"
                       : (sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_MESH_BIT_EXT) == 0
-                          ? "no required subgroup size in the mesh stage"
+                          ? "this GPU has no required subgroup size in the mesh stage"
                           : NULL;
     g_vk.has_mesh = why == NULL;
     g_vk.has_task = g_vk.has_mesh && f->taskShader && (sp.requiredSubgroupSizeStages & both) == both;
@@ -470,7 +516,7 @@ static void mesh_choose(int has_ext, const VkPhysicalDeviceMeshShaderFeaturesEXT
     g_vk.mesh_vertex_granule = mp.meshOutputPerVertexGranularity;
     g_vk.mesh_primitive_granule = mp.meshOutputPerPrimitiveGranularity;
     if (why)
-        LOG("vulkan: mesh draws are skipped: %s%s\n", g_settings.mesh_draws ? "this GPU has " : "", why);
+        LOG("vulkan: mesh draws are skipped: %s\n", why);
     else
         LOG("vulkan: mesh draws use VK_EXT_mesh_shader%s\n",
             g_vk.has_task ? " with task shaders" : ", without task shaders");
@@ -667,6 +713,9 @@ typedef struct {
     ShCaps translate;
     int core13, second, sparse_queue;
     const char* store_none_ext;
+    int has_drm; /* VK_EXT_physical_device_drm in the device's list, after its setting and the bans */
+    int pstate;  /* gpu_pstate's value (SNX_GPU_PSTATE_*) */
+    const char* boost_lacks; /* why an NVIDIA GPU that gpu_pstate holds has no VK_NV_low_latency2, NULL for none */
 } DeviceChoice;
 
 /* extension_needs, of a device as common/gpu/vk/device.c asks for them */
@@ -786,6 +835,8 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     WANT(shaderStorageImageReadWithoutFormat);
     WANT(shaderStorageImageMultisample);
     WANT(shaderResourceMinLod);
+    /* the texture table's (table.c) images and samplers, indexed by a word that is the same for the whole draw */
+    WANT(shaderSampledImageArrayDynamicIndexing);
     g_spirv_translate.resource_min_lod = want->shaderResourceMinLod != 0;
     WANT(shaderClipDistance);
     WANT(shaderCullDistance);
@@ -803,6 +854,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         VkQueueFamilyProperties* q = snx_vk_queue_families(g_vk.phys, &nq);
         sparse_queue = g_vk.gfx_family < nq && (q[g_vk.gfx_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT);
         g_vk.gfx_timestamp_bits = g_vk.gfx_family < nq ? q[g_vk.gfx_family].timestampValidBits : 0;
+        g_vk.compute_timestamp_bits = g_vk.compute_family < nq ? q[g_vk.compute_family].timestampValidBits : 0;
         free(q);
     }
     if (sparse_queue) {
@@ -831,7 +883,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     int has_google_timing = 0;
     int has_host_import = 0, has_ahb = 0, has_placed = 0, has_map2 = 0, has_dmabuf = 0;
     int has_descriptor_buffer = 0, has_descriptor_heap = 0, has_extended_flags = 0, has_maintenance5 = 0;
-    int has_maintenance8 = 0;
+    int has_maintenance8 = 0, has_copy_indirect = 0;
     int has_vertex_input = 0;
     int has_hdr_metadata = 0;
     int has_gpl = 0, has_eds2 = 0, has_eds3 = 0; /* the extensions of pipeline libraries and their dynamic state */
@@ -845,6 +897,13 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     /* VK_EXT_shader_atomic_float: RED.ADD.F32 in one instruction (g_spirv_translate.float_atomic_add) */
     int has_atomic_float = 0;
     int has_fault = 0; /* VK_EXT_device_fault: what the GPU reports of a fault, at a lost device */
+    int has_pageable = 0;          /* VK_EXT_pageable_device_local_memory, and VK_EXT_memory_priority that it needs */
+    /* VK_KHR_pipeline_executable_properties: the drivers' statistics of each pipeline, for pipeline_stats only */
+    int has_exec = 0;
+    /* VK_EXT_shader_object: draws bind compiled shaders and set the rest as dynamic state (shader_objects.c) */
+    int has_so = 0;
+    /* VK_NV_shading_rate_image and VK_KHR_fragment_shading_rate: an Ounce's shading rate image (shading_rate.c) */
+    int has_nv_rate = 0, has_khr_rate = 0;
     const char* index8_ext = NULL; /* VK_KHR_index_type_uint8, or the EXT it was promoted from */
     const char* store_none_ext = NULL; /* a 1.2 device's store op NONE (vk12_store_none) */
     if (!g_opt_headless && !snx_vk_choice_enable(c, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
@@ -887,6 +946,11 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         g_vk.has_nv_checkpoints =
             g_settings.gpu_checkpoints && snx_vk_choice_has(c, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
         has_fault = snx_vk_choice_has(c, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        has_so = snx_vk_choice_has(c, VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
+        has_exec = g_settings.pipeline_stats[0] &&
+                   snx_vk_choice_has(c, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+        if (g_settings.pipeline_stats[0] && !has_exec)
+            WARN("vulkan: pipeline_stats: the driver has no VK_KHR_pipeline_executable_properties: no statistics\n");
         g_vk.has_coverage_to_color = snx_vk_choice_has(c, VK_NV_FRAGMENT_COVERAGE_TO_COLOR_EXTENSION_NAME);
         g_vk.has_post_depth_coverage = snx_vk_choice_has(c, VK_EXT_POST_DEPTH_COVERAGE_EXTENSION_NAME);
         g_vk.sample_locations.available = snx_vk_choice_has(c, VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
@@ -900,10 +964,12 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         has_extended_flags = snx_vk_choice_has(c, VK_KHR_EXTENDED_FLAGS_EXTENSION_NAME);
         has_maintenance5 = snx_vk_choice_has(c, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
         has_maintenance8 = snx_vk_choice_has(c, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+        has_copy_indirect = snx_vk_choice_has(c, VK_KHR_COPY_MEMORY_INDIRECT_EXTENSION_NAME);
         has_reconvergence = snx_vk_choice_has(c, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
         g_vk.has_feedback = snx_vk_choice_has(c, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
         has_feedback_dynamic = snx_vk_choice_has(c, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
         g_vk.has_local_read = snx_vk_choice_has(c, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+        g_vk.has_unified_layouts = snx_vk_choice_has(c, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
         has_cond = snx_vk_choice_has(c, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
         has_provoking = snx_vk_choice_has(c, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
         has_mesh = snx_vk_choice_has(c, VK_EXT_MESH_SHADER_EXTENSION_NAME);
@@ -914,12 +980,19 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         has_atomic_float = snx_vk_choice_has(c, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
         has_barycentric = snx_vk_choice_has(c, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         g_vk.has_conservative = snx_vk_choice_has(c, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
+        has_nv_rate = snx_vk_choice_has(c, VK_NV_SHADING_RATE_IMAGE_EXTENSION_NAME);
+        has_khr_rate = snx_vk_choice_has(c, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
         g_vk.has_depth_range_unrestricted = snx_vk_choice_has(c, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
         has_pipeline_robustness = snx_vk_choice_has(c, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
         has_robustness2 = snx_vk_choice_has(c, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
         /* the driver's budget for each heap, the other processes' use taken out (devmem.c): without it the budget
            is 80% of a heap's size, blind to what the desktop and other programs hold */
         g_vk.has_budget = snx_vk_choice_has(c, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+        /* memory the driver may move to system memory when the GPU's own is short, by the priorities devmem.c gives
+           (vk_devmem_priority). Priorities alone are not used: devmem.c knows an allocation's owner only after the
+           driver made its memory, and only pageable memory takes a new priority after that */
+        has_pageable = snx_vk_choice_has(c, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME) &&
+                       snx_vk_choice_has(c, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
         /* the GPU's clock next to the client's, for the profiler's GPU track (gpuprof.c's calibration) */
         has_calibrated = snx_vk_choice_has(c, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
         /* a portability driver's subset must be enabled when it has one (MoltenVK) */
@@ -943,6 +1016,8 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         has_calibrated_khr = snx_vk_choice_has(c, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
         has_google_timing = !g_opt_headless && snx_vk_choice_has(c, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
         has_host_import = snx_vk_choice_has(c, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        /* the render node gpu_pstate holds an AMD GPU's clocks on: its properties read, the device not made with it */
+        d->has_drm = snx_vk_choice_has(c, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME);
         has_placed = snx_vk_choice_has(c, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME);
         has_map2 = snx_vk_choice_has(c, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
         has_dmabuf = snx_vk_choice_has(c, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
@@ -954,9 +1029,15 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         has_hdr_metadata = !g_opt_headless && snx_vk_choice_has(c, VK_EXT_HDR_METADATA_EXTENSION_NAME);
     }
     /* guest memory the GPU reads in place (uma.c) */
-    int uma_with = vk_uma_choose(has_host_import, has_ahb, has_placed && has_map2);
+    int uma_with = vk_uma_choose(has_host_import, has_ahb, has_placed && has_map2, has_dmabuf);
     if (uma_with == VK_UMA_WITH_HOST) snx_vk_choice_enable(c, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (uma_with == VK_UMA_WITH_AHB) snx_vk_choice_enable(c, "VK_ANDROID_external_memory_android_hardware_buffer");
+    /* the dma-bufs of memfds that guest memory moves into (uma.c, udmabuf), which placed maps' views also take */
+    int fd_exts = uma_with == VK_UMA_WITH_DMABUF;
+    if (fd_exts) {
+        snx_vk_choice_enable(c, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+        snx_vk_choice_enable(c, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+    }
     if (g_vk.has_budget) snx_vk_choice_enable(c, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     if (has_hdr_metadata) {
         snx_vk_choice_enable(c, VK_EXT_HDR_METADATA_EXTENSION_NAME);
@@ -1078,6 +1159,13 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT};
     VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     VkPhysicalDeviceFaultFeaturesEXT qfault = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT qpriority = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT};
+    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT qpageable = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT};
+    VkPhysicalDeviceShaderObjectFeaturesEXT qso = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT};
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR qexec = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
     VkPhysicalDeviceDescriptorBufferFeaturesEXT qdesc = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
     VkPhysicalDeviceDescriptorHeapFeaturesEXT qheap = {
@@ -1088,12 +1176,16 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
     VkPhysicalDeviceMaintenance8FeaturesKHR qmaintenance8 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+    VkPhysicalDeviceCopyMemoryIndirectFeaturesKHR qcopy = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_KHR};
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT qloop = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
     VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT qloop_dyn = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT};
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR qlocal = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR qunified = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR};
     VkPhysicalDeviceConditionalRenderingFeaturesEXT qcond = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
     VkPhysicalDeviceProvokingVertexFeaturesEXT qprov = {
@@ -1117,6 +1209,10 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
     VkPhysicalDeviceDepthClampControlFeaturesEXT qclamp_control = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT};
+    VkPhysicalDeviceShadingRateImageFeaturesNV qnv_rate = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADING_RATE_IMAGE_FEATURES_NV};
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR qkhr_rate = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
     /* with the subset enabled, each of its features is off until the device asks for it: a view's swizzle, for one */
     PortabilityFeatures qport = {.sType = PORTABILITY_FEATURES_STYPE};
     VkPhysicalDevicePresentIdFeaturesKHR qpid = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
@@ -1137,6 +1233,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
                            has_extended_flags ? &qflags : NULL,
                            has_maintenance5 ? &qmaintenance5 : NULL,
                            has_maintenance8 ? &qmaintenance8 : NULL,
+                           has_copy_indirect ? &qcopy : NULL,
                            &q11,
                            &q12,
                            core13 ? &q13 : NULL,
@@ -1158,6 +1255,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
                            g_vk.has_feedback ? &qloop : NULL,
                            has_feedback_dynamic ? &qloop_dyn : NULL,
                            g_vk.has_local_read ? &qlocal : NULL,
+                           g_vk.has_unified_layouts ? &qunified : NULL,
                            has_cond ? &qcond : NULL,
                            has_provoking ? &qprov : NULL,
                            has_list_restart ? &qlist_restart : NULL,
@@ -1182,7 +1280,13 @@ static bool choose_device(SnxVkChoice* c, void* user) {
                            has_mixed_dot ? &qmixdot : NULL,
                            has_coop ? &qcoop : NULL,
                            has_atomic_float ? &qatomic_float : NULL,
-                           has_fault ? &qfault : NULL};
+                           has_fault ? &qfault : NULL,
+                           has_pageable ? &qpriority : NULL,
+                           has_pageable ? &qpageable : NULL,
+                           has_exec ? &qexec : NULL,
+                           has_so ? &qso : NULL,
+                           has_nv_rate ? &qnv_rate : NULL,
+                           has_khr_rate ? &qkhr_rate : NULL};
     snx_vk_chain(query, sizeof query / sizeof *query);
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &f2);
     /* Each order between submissions, queues and the CPU is a timeline value: the graphics and compute timelines
@@ -1267,6 +1371,8 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     g_vk.has_vertex_robustness2 = qpipeline.pipelineRobustness && qrobust.robustBufferAccess2 && !g_vk.robust_buffer2;
     g_vk.has_cond_render = has_cond && qcond.conditionalRendering;
     g_vk.has_fault = has_fault && qfault.deviceFault;
+    g_vk.has_pageable = has_pageable && qpriority.memoryPriority && qpageable.pageableDeviceLocalMemory;
+    g_vk.has_exec_stats = has_exec && qexec.pipelineExecutableInfo;
     g_vk.has_provoking_last = has_provoking && qprov.provokingVertexLast;
     g_vk.has_list_restart = has_list_restart && qlist_restart.primitiveTopologyListRestart;
     g_vk.has_patch_list_restart = g_vk.has_list_restart && qlist_restart.primitiveTopologyPatchListRestart;
@@ -1341,10 +1447,40 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     g_vk.has_feedback_dynamic =
         g_vk.has_feedback && has_feedback_dynamic && qloop_dyn.attachmentFeedbackLoopDynamicState;
     g_vk.has_local_read = g_vk.has_feedback && g_vk.has_local_read && qlocal.dynamicRenderingLocalRead;
+    /* the extension alone allows GENERAL where the specification asks for it. The feature says that GENERAL costs
+       nothing against each use's own layout, which is why the renderer then keeps its images there */
+    g_vk.has_unified_layouts = g_vk.has_unified_layouts && qunified.unifiedImageLayouts;
     g_spirv_translate.maximal_reconvergence = has_reconvergence && qreconv.shaderMaximalReconvergence;
     g_spirv_translate.clock_scopes =
         has_shader_clock ? (qclock.shaderSubgroupClock ? 1 : 0) | (qclock.shaderDeviceClock ? 2 : 0) : 0;
     g_vk.has_divisor = g_vk.has_divisor && fdiv.vertexAttributeInstanceRateDivisor;
+    {
+        /* an Ounce's shading rate image: NVIDIA's extension where it is, as it has the console's palettes, else the
+           attachment of the KHR one. Each palette entry of the device's image is a rate (shading_rate.c), 13 of them */
+        VkPhysicalDeviceShadingRateImagePropertiesNV pnv = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADING_RATE_IMAGE_PROPERTIES_NV};
+        VkPhysicalDeviceFragmentShadingRatePropertiesKHR pkhr = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        if (has_nv_rate) p2.pNext = &pnv;
+        else if (has_khr_rate) p2.pNext = &pkhr;
+        if (p2.pNext) vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        VkVrsDevice vd = {.ounce = g_ounce,
+                          .nv = has_nv_rate && qnv_rate.shadingRateImage,
+                          .nv_texel = pnv.shadingRateTexelSize,
+                          .nv_palette = pnv.shadingRatePaletteSize,
+                          .khr = has_khr_rate && qkhr_rate.attachmentFragmentShadingRate &&
+                                 qkhr_rate.pipelineFragmentShadingRate,
+                          .khr_min = pkhr.minFragmentShadingRateAttachmentTexelSize,
+                          .khr_max = pkhr.maxFragmentShadingRateAttachmentTexelSize,
+                          .khr_aspect = pkhr.maxFragmentShadingRateAttachmentTexelSizeAspectRatio};
+        char line[300];
+        g_vk.vrs = vk_vrs_choose(&vd, &g_vk.vrs_texel, line, sizeof line);
+        g_spirv_translate.shading_rate = g_vk.vrs == VK_VRS_NV    ? SH_RATE_NV
+                                         : g_vk.vrs == VK_VRS_KHR ? SH_RATE_KHR
+                                                                  : SH_RATE_NONE;
+        LOG("%s\n", line);
+    }
     {
         /* pipelines from libraries (pipeline_parts.h), and the pre-rasterization state they take as dynamic state */
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {
@@ -1383,6 +1519,38 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         }
         vk_depth_range_line(&gd, g_vk.dyn_pr, line, sizeof line);
         LOG("%s\n", line);
+        /* Shader objects where the device has them: a draw binds its compiled shaders and sets what a pipeline held as
+           dynamic state, and no pipeline is made for each combination of shaders and state (issue #1454). They take
+           the pre-rasterization state that pipeline libraries take as dynamic (render.c's pr_dynamic) and the vertex
+           layout as the draws set it, so they need both. A draw they can't take is made as a pipeline
+           (shader_objects.c's vk_so_takes) */
+        const char* so_why = !has_so ? "the device has no VK_EXT_shader_object, or a setting or a ban took it out"
+                             : !qso.shaderObject ? "the device has VK_EXT_shader_object without shaderObject"
+                             : !g_vk.has_gpl ? "pipeline libraries are off, and with them the dynamic pre-rasterization "
+                                               "state"
+                             : !g_vk.vertex_input_dynamic ? "the vertex layout is no dynamic state"
+                             : g_vk.has_vertex_robustness2
+                                 ? "vertex inputs take their strict bounds from each pipeline, without the device's "
+                                   "robustBufferAccess2"
+                                 : NULL;
+        g_vk.has_shader_objects = !so_why;
+        /* a shader object has no executables to ask statistics of: a draw that binds them makes no pipeline, and no
+           row */
+        if (g_vk.has_shader_objects && g_vk.has_exec_stats)
+            WARN("vulkan: pipeline_stats: draws bind shader objects (VK_EXT_shader_object), which the driver gives no "
+                 "statistics of: only compute pipelines, and the pipelines of draws shader objects can't take, get "
+                 "rows; with vk_ext_shader_object=off every draw's program gets them\n");
+        if (g_vk.has_shader_objects) {
+            VkPhysicalDeviceShaderObjectPropertiesEXT sop = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sop};
+            vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+            memcpy(g_vk.so_binary_uuid, sop.shaderBinaryUUID, VK_UUID_SIZE);
+            g_vk.so_binary_version = sop.shaderBinaryVersion;
+            LOG("vulkan: draws bind shader objects (VK_EXT_shader_object), and go through pipelines only where they "
+                "can't\n");
+        } else
+            LOG("vulkan: draws go through pipelines: %s\n", so_why);
         /* depth clipping and clamping apart, as the console's viewport clip control has them, where the device can;
            with pipeline libraries' dynamic clamp only if the clip is dynamic too (pipeline_parts.h) */
         int clamp_alone = (g_vk.dyn_pr & VK_DYN_PR_DEPTH_CLAMP) && !(g_vk.dyn_pr & VK_DYN_PR_DEPTH_CLIP);
@@ -1481,6 +1649,27 @@ static bool choose_device(SnxVkChoice* c, void* user) {
             "descriptors use %s\n",
             g_settings.descriptor_buffers, heaps_missing, g_vk.has_descriptor_buffers ? "buffers" : "sets");
     g_vk.has_descriptor_heaps = g_vk.has_descriptor_heap_support;
+    g_vk.cb_address = g_settings.constant_buffers_by_address;
+    /* the copies name device addresses: the device's memory gets them for these too (bufferDeviceAddress) */
+    g_vk.has_copy_indirect =
+        g_settings.indirect_copies && has_copy_indirect && qcopy.indirectMemoryCopy && q12.bufferDeviceAddress;
+    if (g_vk.has_copy_indirect) { /* recorded in the graphics queue's command buffers: its family has to take them */
+        VkPhysicalDeviceCopyMemoryIndirectPropertiesKHR pcopy = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pcopy};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &props);
+        g_vk.has_copy_indirect = (pcopy.supportedQueues & VK_QUEUE_GRAPHICS_BIT) != 0;
+    }
+    g_vk.has_inplace_loads = g_settings.texture_loads_in_place && q12.bufferDeviceAddress;
+    LOG("vulkan: kept results are copied %s, and texture loads read them %s\n",
+        g_vk.has_copy_indirect                                      ? "by indirect copies"
+        : !g_settings.indirect_copies                               ? "one command each (vk_copy_indirect=0)"
+        : !has_copy_indirect || !qcopy.indirectMemoryCopy          ? "one command each (no VK_KHR_copy_memory_indirect)"
+        : !q12.bufferDeviceAddress                                  ? "one command each (no bufferDeviceAddress)"
+                                                                    : "one command each (not on the graphics queue)",
+        g_vk.has_inplace_loads              ? "in place"
+        : !g_settings.texture_loads_in_place ? "from copies (vk_inplace_loads=0)"
+                                             : "from copies (no bufferDeviceAddress)");
     if (g_vk.has_descriptor_heap_support) {
         g_vk.descriptor_heap_props = (VkPhysicalDeviceDescriptorHeapPropertiesEXT){
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT};
@@ -1502,18 +1691,30 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     g_vk.has_draw_indirect_count = q12.drawIndirectCount != 0;
     /* Enable mirror clamp and vertex shader Layer output when the device supports them. */
     g_vk.has_mirror_clamp = q12.samplerMirrorClampToEdge;
-    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-                                            .pNext = &f11,
-                                            .samplerMirrorClampToEdge = q12.samplerMirrorClampToEdge,
-                                            .samplerFilterMinmax = q12.samplerFilterMinmax,
-                                            .timelineSemaphore = VK_TRUE,
-                                            .bufferDeviceAddress = g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support,
-                                            .shaderFloat16 = q12.shaderFloat16,
-                                            .shaderOutputViewportIndex = q12.shaderOutputViewportIndex,
-                                            .shaderOutputLayer = q12.shaderOutputLayer,
-                                            .drawIndirectCount = q12.drawIndirectCount,
-                                            .shaderSampledImageArrayNonUniformIndexing =
-                                                q12.shaderSampledImageArrayNonUniformIndexing};
+    /* the texture table of SM86 programs (table.c): one set that the renderer writes while draws that bind it are
+       pending, with slots that hold nothing yet. vk_pipeline_init decides with the limits and the other caps */
+    /* SM86 programs' global memory by device address (ShCaps.gbuf_address, with the texture table): the buffers its
+       bindings come from and their memory get device addresses. vk_pipeline_init decides with the other caps */
+    g_vk.has_gbuf_address = g_shader_sm86 && q12.bufferDeviceAddress && g_vk.feat.shaderInt64;
+    g_vk.has_table_features =
+        g_shader_sm86 && q12.descriptorBindingPartiallyBound && q12.descriptorBindingSampledImageUpdateAfterBind &&
+        q12.descriptorBindingUpdateUnusedWhilePending && g_vk.feat.shaderSampledImageArrayDynamicIndexing;
+    VkPhysicalDeviceVulkan12Features f12 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = &f11,
+        .samplerMirrorClampToEdge = q12.samplerMirrorClampToEdge,
+        .samplerFilterMinmax = q12.samplerFilterMinmax,
+        .timelineSemaphore = VK_TRUE,
+        .bufferDeviceAddress = g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support ||
+                               g_vk.has_copy_indirect || g_vk.has_inplace_loads || g_vk.has_gbuf_address,
+        .shaderFloat16 = q12.shaderFloat16,
+        .shaderOutputViewportIndex = q12.shaderOutputViewportIndex,
+        .shaderOutputLayer = q12.shaderOutputLayer,
+        .drawIndirectCount = q12.drawIndirectCount,
+        .shaderSampledImageArrayNonUniformIndexing = q12.shaderSampledImageArrayNonUniformIndexing,
+        .descriptorBindingPartiallyBound = g_vk.has_table_features,
+        .descriptorBindingSampledImageUpdateAfterBind = g_vk.has_table_features,
+        .descriptorBindingUpdateUnusedWhilePending = g_vk.has_table_features};
     /* shaders pick an indexed texture per invocation from an array (SNX_VKB_TEXARRAY) */
     g_spirv_translate.texture_arrays = q12.shaderSampledImageArrayNonUniformIndexing != 0;
     g_spirv_translate.float16 = q12.shaderFloat16 != 0;
@@ -1593,6 +1794,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
                                             .maintenance4 = q13.maintenance4,
                                             /* KIL demotes the lane; S2R queries its helper status */
                                             .shaderDemoteToHelperInvocation = VK_TRUE,
+                                            .pipelineCreationCacheControl = q13.pipelineCreationCacheControl,
                                             /* the task and mesh stages' subgroups of 32, whole (mesh_choose), and
                                                those of the compute programs that use other lanes' values */
                                             .subgroupSizeControl = g_vk.has_mesh || g_vk.has_cs_warp32,
@@ -1607,6 +1809,8 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         g_vk.bc7_dot = dp13.integerDotProduct4x8BitPackedUnsignedAccelerated != 0;
     }
     f13.shaderIntegerDotProduct = g_vk.bc7_dot ? VK_TRUE : VK_FALSE;
+    /* a 1.2 device's chain leaves f13 out, and q13 was not queried: no cache-only pipelines there */
+    g_vk.has_cache_control = core13 && q13.pipelineCreationCacheControl;
     void* chain = &f13;
     /* a 1.2 device: those features as its extensions' (vk12_extensions), the 1.3 struct left out */
     VkPhysicalDeviceSynchronization2Features fsync2 = {.sType =
@@ -1654,6 +1858,13 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         fmaintenance8.pNext = chain;
         chain = &fmaintenance8;
         snx_vk_choice_enable(c, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    }
+    VkPhysicalDeviceCopyMemoryIndirectFeaturesKHR fcopy = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_KHR, .indirectMemoryCopy = VK_TRUE};
+    if (g_vk.has_copy_indirect) {
+        fcopy.pNext = chain;
+        chain = &fcopy;
+        snx_vk_choice_enable(c, VK_KHR_COPY_MEMORY_INDIRECT_EXTENSION_NAME);
     }
     VkPhysicalDeviceDescriptorBufferFeaturesEXT fdesc = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
@@ -1726,7 +1937,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         snx_vk_choice_enable(c, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
         snx_vk_choice_enable(c, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME);
         vk_uma_dmabuf(has_dmabuf); /* a view of it maps the same memory again, through a dma-buf */
-        if (vk_uma_can_view()) {
+        if (vk_uma_can_view() && !fd_exts) {
             snx_vk_choice_enable(c, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
             snx_vk_choice_enable(c, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
         }
@@ -1779,6 +1990,37 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         chain = &ffault;
         snx_vk_choice_enable(c, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     }
+    /* the GPU's own memory that the driver may move to system memory when it is short, the lowest priority first */
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT fpriority = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,
+        .pNext = chain,
+        .memoryPriority = VK_TRUE};
+    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT fpageable = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT,
+        .pNext = &fpriority,
+        .pageableDeviceLocalMemory = VK_TRUE};
+    if (g_vk.has_pageable) {
+        chain = &fpageable;
+        snx_vk_choice_enable(c, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+        snx_vk_choice_enable(c, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+        LOG("vulkan: the driver may move the GPU's memory to system memory where it is short, the lowest priority "
+            "first: render targets and rings high, textures with drawn pixels medium, textures loaded from memory low "
+            "(VK_EXT_pageable_device_local_memory)\n");
+    }
+    VkPhysicalDeviceShaderObjectFeaturesEXT fso = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT, .pNext = chain, .shaderObject = VK_TRUE};
+    if (g_vk.has_shader_objects) {
+        chain = &fso;
+        snx_vk_choice_enable(c, VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
+    }
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR fexec = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR,
+        .pNext = chain,
+        .pipelineExecutableInfo = VK_TRUE};
+    if (g_vk.has_exec_stats) {
+        chain = &fexec;
+        snx_vk_choice_enable(c, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    }
     PortabilityFeatures fport = qport;
     fport.pNext = chain;
     if (has_portability) chain = &fport;
@@ -1806,6 +2048,14 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     if (g_vk.has_local_read) {
         chain = &flocal;
         snx_vk_choice_enable(c, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+    }
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR funified = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
+        .pNext = chain,
+        .unifiedImageLayouts = VK_TRUE};
+    if (g_vk.has_unified_layouts) {
+        chain = &funified;
+        snx_vk_choice_enable(c, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
     }
     VkPhysicalDeviceBlendOperationAdvancedFeaturesEXT fadvanced = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BLEND_OPERATION_ADVANCED_FEATURES_EXT,
@@ -1867,6 +2117,22 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
         g_vk.conservative_extra = cons.maxExtraPrimitiveOverestimationSize;
         snx_vk_choice_enable(c, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
+    }
+    /* an Ounce's shading rate image (shading_rate.c): the one extension that g_vk.vrs chose. The two cannot be on
+       together (VUID-VkDeviceCreateInfo-shadingRateImage-04478) */
+    VkPhysicalDeviceShadingRateImageFeaturesNV fnv_rate = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADING_RATE_IMAGE_FEATURES_NV,
+        .pNext = chain,
+        .shadingRateImage = VK_TRUE};
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR fkhr_rate = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR,
+        .pNext = chain,
+        .pipelineFragmentShadingRate = VK_TRUE,
+        .attachmentFragmentShadingRate = VK_TRUE};
+    if (g_vk.vrs != VK_VRS_NONE) {
+        chain = g_vk.vrs == VK_VRS_NV ? (void*)&fnv_rate : (void*)&fkhr_rate;
+        snx_vk_choice_enable(c, g_vk.vrs == VK_VRS_NV ? VK_NV_SHADING_RATE_IMAGE_EXTENSION_NAME
+                                                      : VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
     }
     /* the 3D engine's 8-bit indices, read as they are (render.c); without it they are widened on the GPU */
     VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT fvertex_input = {
@@ -1972,6 +2238,18 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     }
     if (g_vk.has_display_timing)
         snx_vk_choice_enable(c, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME); /* when presents are shown */
+    /* an NVIDIA GPU's clocks held through VK_NV_low_latency2's boost (gpu_pstate.h), which needs present ids */
+    SnxGpuPstateDevice pstate = {.vendor = g_vk.props.vendorID, .type = (int)g_vk.props.deviceType};
+    d->boost_lacks = NULL;
+    if (pstate.vendor == SNX_GPU_VENDOR_NVIDIA && snx_gpu_pstate_wanted(d->pstate, &pstate)) {
+        if (!snx_vk_choice_has(c, VK_NV_LOW_LATENCY_2_EXTENSION_NAME))
+            d->boost_lacks = "its device has no VK_NV_low_latency2 (the extension's line says why)";
+        else if (!g_vk.has_present_wait && !g_vk.has_present_timing)
+            d->boost_lacks = "its presents carry no ids (VK_KHR_present_id with present_wait, or their 2s), which "
+                             "VK_NV_low_latency2 needs: a run without a window, or vk_ext_khr_present_id off";
+        else
+            g_vk.has_low_latency2 = snx_vk_choice_enable(c, VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+    }
     VkPhysicalDevicePipelineRobustnessFeaturesEXT fpipeline = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT,
         .pNext = chain,
@@ -2028,11 +2306,42 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     return true;
 }
 
+static void pstate_say(const char* line, int warn) {
+    if (warn)
+        WARN("vulkan: %s\n", line);
+    else
+        LOG("vulkan: %s\n", line);
+}
+
+/* The GPU's clocks held while the game runs, as gpu_pstate asks (common/gpu/vk/gpu_pstate.h), on the render node the
+   driver names where the device lists VK_EXT_physical_device_drm (has_drm). A value the setting doesn't take stops the
+   game here, as a player who wrote gpu_pstate=of would otherwise play with what they meant to turn off */
+static void gpu_pstate_hold(int mode, int has_drm, const char* boost_lacks) {
+    VkPhysicalDeviceDrmPropertiesEXT drm = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT};
+    if (has_drm) {
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drm};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+    }
+    SnxGpuPstateDevice d = {g_vk.props.deviceName,
+                            g_vk.props.vendorID,
+                            (int)g_vk.props.deviceType,
+                            drm.hasRender,
+                            drm.renderMajor,
+                            drm.renderMinor,
+                            "/sys",
+                            "/dev",
+                            boost_lacks};
+    snx_gpu_pstate_hold(mode, &d, pstate_say);
+}
+
 /* The device, on the device device_rating rates highest (choose_device), made again once without an extension the
    first one's driver lacked a command of (common/gpu/vk/device.h), and what the renderer sets up on it. 0 with the
    reason in g_vk.start_failure */
 static int create_device(void) {
-    DeviceChoice d = {.vk = g_vk, .translate = g_spirv_translate};
+    /* the GPU's clocks held (gpu_pstate_hold): read here, as an NVIDIA device is made with what holds them */
+    int pstate = snx_gpu_pstate_mode(g_settings.gpu_pstate);
+    if (pstate < 0) fatal("settings: gpu_pstate=%s is not auto, on or off", g_settings.gpu_pstate);
+    DeviceChoice d = {.vk = g_vk, .translate = g_spirv_translate, .pstate = pstate};
     VkExtensionSetting settings[VK_EXTENSION_SETTINGS];
     char none[160], err[1024];
     snprintf(none, sizeof none,
@@ -2085,8 +2394,10 @@ static int create_device(void) {
     vkGetDeviceQueue(g_vk.dev, g_vk.compute_family, second ? 1 : 0, &g_vk.compute);
     vk_mem_init(sparse_queue);
     /* the renderer's own allocator (devmem.c): its blocks are 64 MiB at most, and no more than the cap */
-    if (!vk_devmem_init(g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support)) return 0;
-    __atomic_store_n(&g_devmem_ready, 1, __ATOMIC_RELEASE);
+    if (!vk_devmem_init(g_vk.has_descriptor_buffers || g_vk.has_descriptor_heap_support || g_vk.has_copy_indirect ||
+                        g_vk.has_inplace_loads || g_vk.has_gbuf_address))
+        return 0;
+    atomic_store_explicit(&g_devmem_ready, 1, memory_order_release);
     { /* a GPU of 4 GiB or less: memory held back for render targets (devmem.c vk_devmem_reserve) */
         VkPhysicalDeviceMemoryProperties mp;
         vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
@@ -2133,6 +2444,7 @@ static int create_device(void) {
         snprintf(g_vk.driver_name, sizeof g_vk.driver_name, "%s", dp.driverName);
         LOG("vulkan: the driver that runs: %s, %s (driver ID %d)\n", dp.driverName, dp.driverInfo, (int)dp.driverID);
     }
+    gpu_pstate_hold(pstate, d.has_drm, d.boost_lacks);
     if (g_vk.api_cap && g_vk.props.apiVersion >= VK_API_VERSION_1_3)
         LOG("vulkan: vk_api=1.2 runs the Vulkan 1.2 way on this %u.%u device\n",
             VK_API_VERSION_MAJOR(g_vk.props.apiVersion), VK_API_VERSION_MINOR(g_vk.props.apiVersion));
@@ -2325,7 +2637,7 @@ static int hdr_surface(u32 space, VkSurfaceFormatKHR* fmt) {
             LOG("vulkan: hdr_game=1, and a game is told the display is SDR: %s\n", why);
         said = on;
     }
-    __atomic_store_n(&g_vk.hdr_display, on, __ATOMIC_RELAXED);
+    atomic_store_explicit(&g_vk.hdr_display, on, memory_order_relaxed);
     found = on && vk_hdr_surface_format(space, formats, n, fmt);
     if (space != SNX_HDR_SPACE_SRGB && !on) /* on: the surface lists both spaces' formats */
         LOG_LIMIT(4, "vulkan: %s frames are shown on an SDR swapchain, their values as they are: %s\n",
@@ -2372,7 +2684,7 @@ int vk_swapchain_create(int kind) {
 
     /* vsync=1: FIFO, which every device has. Otherwise mailbox, else immediate, else FIFO all the same. Read once: the
        main thread's .ini reload writes it */
-    int vsync = __atomic_load_n(&g_settings.vsync, __ATOMIC_RELAXED);
+    int vsync = atomic_load_explicit((_Atomic int*)&g_settings.vsync, memory_order_relaxed);
     u32 nm = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nm, NULL);
     VkPresentModeKHR* ms = calloc(nm ? nm : 1, sizeof *ms);
@@ -2386,7 +2698,8 @@ int vk_swapchain_create(int kind) {
        once the one before is displayed, so frames don't queue for the display: one image more than the driver keeps
        is enough, and more would only let frames that came early (a menu's, fps_limit's) queue */
     int clock = g_vk.has_present_wait || g_vk.has_display_timing;
-    u32 extra = clock && mode == VK_PRESENT_MODE_FIFO_KHR && __atomic_load_n(&g_settings.frame_pacing, __ATOMIC_RELAXED)
+    u32 extra = clock && mode == VK_PRESENT_MODE_FIFO_KHR &&
+                        atomic_load_explicit((_Atomic int*)&g_settings.frame_pacing, memory_order_relaxed)
                     ? 1
                     : VK_FRAMES;
     u32 count = snx_vk_swap_image_count(&caps, extra, VK_SC_MAX);
@@ -2439,6 +2752,10 @@ int vk_swapchain_create(int kind) {
                                    .presentMode = mode,
                                    .clipped = VK_TRUE,
                                    .oldSwapchain = old};
+    /* a swapchain that takes a sleep mode, for the boost below (gpu_pstate_hold) */
+    VkSwapchainLatencyCreateInfoNV latency = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV,
+                                              .latencyModeEnable = VK_TRUE};
+    if (g_vk.has_low_latency2) ci.pNext = &latency;
     /* old is retired by the create, made or not: on any failure it goes too, and the next present starts anew */
     VkSwapchainKHR sc;
     VkSemaphore done[VK_SC_MAX];
@@ -2465,6 +2782,19 @@ int vk_swapchain_create(int kind) {
     }
     if (old) swapchain_retire();
     g_vk.swapchain = sc;
+    if (g_vk.has_low_latency2) {
+        /* the boost alone: no sleep is asked, so its low latency mode stays off and the game keeps its own pace */
+        VkLatencySleepModeInfoNV boost = {.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV,
+                                          .lowLatencyMode = VK_FALSE,
+                                          .lowLatencyBoost = VK_TRUE};
+        VkResult br = vkSetLatencySleepModeNV(g_vk.dev, sc, &boost);
+        if (br != VK_SUCCESS)
+            WARN("vulkan: gpu_pstate: vkSetLatencySleepModeNV refused the swapchain's boost: %s (%d): the driver "
+                 "chooses the clocks\n",
+                 snx_vk_result_str(br), (int)br);
+        else if (!g_vk.sc_made)
+            LOG("vulkan: gpu_pstate: the swapchain asks the GPU's boost (vkSetLatencySleepModeNV, lowLatencyBoost)\n");
+    }
     /* the times presents are held until: the system's CLOCK_MONOTONIC (plat_monotonic_ns) if the swapchain has it,
        else a present stage's own clock, calibrated against CLOCK_MONOTONIC at each present (display.c), the stage
        the first pixel goes out at if it can be. VK_GOOGLE_display_timing's are CLOCK_MONOTONIC's, under FIFO */

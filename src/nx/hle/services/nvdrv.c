@@ -37,8 +37,10 @@
 #include "nx/gpu/video/host1x.h"
 #include "nx/runtime/clock.h"
 #include "nx/runtime/platform/tracy.h"
+#include "snx_settings.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 static void nv_events_check(void);
 
 /* host1x (nvmap_get) and vi (nvmap_addr_by_id) read handles on the game's other threads while they create, alloc
@@ -87,15 +89,91 @@ static u32 gmmu_l2_index(u64 page) { return (u32)(page & (GMMU_L2_ENTRIES - 1));
 #define GHINT_MAX           ((1u << (GMMU_PAGE_BITS - GMMU_PTE_HINT_SHIFT)) - 1)
 #define GHINT_MASK          ((u64)GHINT_MAX << GMMU_PTE_HINT_SHIFT)
 static u64 gmmu_pte_hint(u64 e) { return (e & GHINT_MASK) >> GMMU_PTE_HINT_SHIFT; }
+/* ---- changes of the page table that the GPU thread makes later (gmmu_later), in the ring g_host.nvdrv.later */
+/* a queued map's pages, as gmmu_space_map rounds them */
+static u64 later_size(u64 size) { return (size + GMMU_PAGE_MASK) & ~(u64)GMMU_PAGE_MASK; }
+/* whether sequence number a comes after b, across the wrap */
+static int later_after(u32 a, u32 b) { return a != b && (u32)(a - b) < 0x80000000u; }
+/* the bytes from gva on, at most max, that the newest map queued for the GPU thread over gva shows, and in *cpu the
+   guest address of gva: 0 when none is, and always on the GPU thread. Asked only where the table has no entry, so the
+   common translation doesn't take the lock. Queued unmaps aren't answered for: their pages show what they showed until
+   the GPU thread unmaps them, and the results pending over them land first, as with any unmap */
+static u64 later_run(u64 gva, u64 max, u64* cpu) {
+    const HostNvdrv* h = &g_host.nvdrv;
+    u64 n = 0;
+    if (!atomic_load_explicit(&h->nlater, memory_order_acquire) || gpu_on_thread()) return 0;
+    pm_lock(&g_host.nvdrv.later_lock);
+    for (u32 i = atomic_load_explicit(&h->nlater, memory_order_relaxed); i-- > 0;) {
+        const GLater* l = &h->later[(h->later_head + i) & (h->caplater - 1)];
+        if (l->kind != GMMU_LATER_MAP || gva - l->gva >= later_size(l->size)) continue;
+        *cpu = l->cpu + (gva - l->gva);
+        n = later_size(l->size) - (gva - l->gva);
+        break;
+    }
+    pm_unlock(&g_host.nvdrv.later_lock);
+    return n ? mem_mapped_run(*cpu, n < max ? n : max) : 0;
+}
+u32 gmmu_later(GmmuLaterKind kind, u64 gva, u64 cpu, u64 size, u32 nvmap) {
+    HostNvdrv* h = &g_host.nvdrv;
+    pm_lock(&h->later_lock);
+    if (atomic_load_explicit(&h->nlater, memory_order_relaxed) ==
+        h->caplater) { /* a ring twice as big, the oldest first again */
+        u32 cap = h->caplater ? h->caplater * 2 : 64;
+        GLater* l = malloc((size_t)cap * sizeof *l);
+        if (!l) fatal("nvdrv: out of memory for %u queued changes of the GPU page table\n", cap);
+        for (u32 i = 0; i < atomic_load_explicit(&h->nlater, memory_order_relaxed); i++)
+            l[i] = h->later[(h->later_head + i) & (h->caplater - 1)];
+        free(h->later);
+        h->later = l;
+        h->later_head = 0;
+        h->caplater = cap;
+    }
+    u32 seq = ++h->later_seq ? h->later_seq : ++h->later_seq; /* 0 is none to the caller */
+    h->later[(h->later_head + atomic_load_explicit(&h->nlater, memory_order_relaxed)) & (h->caplater - 1)] =
+        (GLater){gva, cpu, size, seq, nvmap, kind};
+    atomic_store_explicit(&h->nlater, atomic_load_explicit(&h->nlater, memory_order_relaxed) + 1, memory_order_release);
+    pm_unlock(&h->later_lock);
+    return seq;
+}
+/* On the GPU thread: the queued changes up to the sequence number in arg, the oldest first, each left in the ring until
+   it is made, so that other threads see a map until the table shows it. Another thread's change older than that goes
+   too, and its own call then finds it gone: it was queued before this call, and so was the work queued before it. Only
+   this thread takes changes out, so the ring's head is still the change it made */
+static void later_apply(void* arg) {
+    HostNvdrv* h = &g_host.nvdrv;
+    u32 upto = (u32)(uintptr_t)arg;
+    for (;;) {
+        pm_lock(&h->later_lock);
+        if (!atomic_load_explicit(&h->nlater, memory_order_relaxed) || later_after(h->later[h->later_head].seq, upto)) {
+            pm_unlock(&h->later_lock);
+            return;
+        }
+        GLater c = h->later[h->later_head];
+        pm_unlock(&h->later_lock);
+        if (c.kind == GMMU_LATER_MAP)
+            gmmu_space_map(c.gva, c.cpu, c.size);
+        else if (c.kind == GMMU_LATER_UNMAP)
+            gmmu_space_unmap(c.gva, c.size);
+        else { /* the handle goes once its pages show nothing */
+            gmmu_space_free(c.gva, c.size);
+            nvmap_handle_drop(c.nvmap);
+        }
+        pm_lock(&h->later_lock);
+        h->later_head = (h->later_head + 1) & (h->caplater - 1);
+        atomic_store_explicit(&h->nlater, atomic_load_explicit(&h->nlater, memory_order_relaxed) - 1,
+                              memory_order_release);
+        pm_unlock(&h->later_lock);
+    }
+}
+void gmmu_later_post(u32 seq) { gpu_call(later_apply, (void*)(uintptr_t)seq, NULL, 0); }
 /* the guest address of a GPU address, 0 when its page isn't mapped. On the GPU thread, while ioctl_as maps and unmaps
    on others */
 u64 gmmu_translate(u64 gva) {
     u64 page = gva >> GMMU_PAGE_BITS;
-    u64* t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(page)], __ATOMIC_ACQUIRE);
+    _Atomic u64* t = atomic_load_explicit(&g_hle.nvdrv.gmmu[gmmu_l1_index(page)], memory_order_acquire);
     u64 e;
-    if (!t) return 0;
-    e = __atomic_load_n(&t[gmmu_l2_index(page)], __ATOMIC_RELAXED);
-    if (!(e & GMMU_PTE_VALID)) return 0;
+    if (!t || !((e = atomic_load_explicit(&t[gmmu_l2_index(page)], memory_order_relaxed)) & GMMU_PTE_VALID))
+        return later_run(gva, 1, &e) ? e : 0;
     e = (e & GMMU_PTE_ADDR_MASK) | (gva & GMMU_PAGE_MASK);
     return mem_mapped_run(e, 1) ? e : 0; /* a page the guest freed after mapping it here: as unmapped */
 }
@@ -103,10 +181,11 @@ u64 gmmu_translate(u64 gva) {
    0 when gva's page isn't mapped. One walk of the table for a range, where gmmu_translate per page walks it again */
 u64 gmmu_run(u64 gva, u64 max, u64* cpu) {
     u64 page = gva >> GMMU_PAGE_BITS, n, e, want;
-    u64* t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(page)], __ATOMIC_ACQUIRE);
-    if (!max || !t) return 0;
-    e = __atomic_load_n(&t[gmmu_l2_index(page)], __ATOMIC_RELAXED);
-    if (!(e & GMMU_PTE_VALID)) return 0;
+    _Atomic u64* t = atomic_load_explicit(&g_hle.nvdrv.gmmu[gmmu_l1_index(page)], memory_order_acquire);
+    if (!max) return 0;
+    /* a page with no entry: a queued map's run, which keeps its guest memory contiguous */
+    if (!t || !((e = atomic_load_explicit(&t[gmmu_l2_index(page)], memory_order_relaxed)) & GMMU_PTE_VALID))
+        return later_run(gva, max, cpu);
     *cpu = (e & GMMU_PTE_ADDR_MASK) | (gva & GMMU_PAGE_MASK);
     n = GMMU_PAGE_SIZE - (gva & GMMU_PAGE_MASK);
     want = (e & GMMU_PTE_ADDR_MASK) + GMMU_PAGE_SIZE;
@@ -117,14 +196,14 @@ u64 gmmu_run(u64 gva, u64 max, u64* cpu) {
             n += h << GMMU_PAGE_BITS;
             want += h << GMMU_PAGE_BITS;
             if (n >= max) break;
-            e = __atomic_load_n(&t[gmmu_l2_index(page)], __ATOMIC_RELAXED);
+            e = atomic_load_explicit(&t[gmmu_l2_index(page)], memory_order_relaxed);
             continue;
         }
         page++;
         if (!gmmu_l2_index(page)) /* into the next second-level table */
-            t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(page)], __ATOMIC_ACQUIRE);
+            t = atomic_load_explicit(&g_hle.nvdrv.gmmu[gmmu_l1_index(page)], memory_order_acquire);
         if (!t) break;
-        e = __atomic_load_n(&t[gmmu_l2_index(page)], __ATOMIC_RELAXED);
+        e = atomic_load_explicit(&t[gmmu_l2_index(page)], memory_order_relaxed);
         if (!(e & GMMU_PTE_VALID) || (e & GMMU_PTE_ADDR_MASK) != want) break;
         n += GMMU_PAGE_SIZE;
         want += GMMU_PAGE_SIZE;
@@ -133,12 +212,14 @@ u64 gmmu_run(u64 gva, u64 max, u64* cpu) {
        there, as at a page with no entry */
     return mem_mapped_run(*cpu, n < max ? n : max);
 }
-static u64* gmmu_l2(u32 i) {
-    u64* t = __atomic_load_n(&g_hle.nvdrv.gmmu[i], __ATOMIC_ACQUIRE);
+static _Atomic u64* gmmu_l2(u32 i) {
+    _Atomic u64* t = atomic_load_explicit(&g_hle.nvdrv.gmmu[i], memory_order_acquire);
     if (t) return t;
-    u64* n = calloc(GMMU_L2_ENTRIES, sizeof *n);
+    _Atomic u64* n = calloc(GMMU_L2_ENTRIES, sizeof *n);
     if (!n) fatal("nvdrv: out of memory for the GPU page table\n");
-    if (__atomic_compare_exchange_n(&g_hle.nvdrv.gmmu[i], &t, n, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return n;
+    if (atomic_compare_exchange_strong_explicit(&g_hle.nvdrv.gmmu[i], &t, n, memory_order_acq_rel,
+                                                memory_order_acquire))
+        return n;
     free(n);
     return t;
 }
@@ -154,14 +235,14 @@ static void gmmu_change_end(u64 gva, u64 size) {
 static void gmmu_clip(u64 first) {
     for (u64 k = 1; k <= GHINT_MAX && k <= first; k++) {
         u64 q = first - k, e;
-        u64* t;
+        _Atomic u64* t;
         if ((q ^ first) >> GMMU_L2_BITS) break; /* counts stay in their table */
-        t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(q)], __ATOMIC_ACQUIRE);
+        t = atomic_load_explicit(&g_hle.nvdrv.gmmu[gmmu_l1_index(q)], memory_order_acquire);
         if (!t) break;
-        e = __atomic_load_n(&t[gmmu_l2_index(q)], __ATOMIC_RELAXED);
+        e = atomic_load_explicit(&t[gmmu_l2_index(q)], memory_order_relaxed);
         if (gmmu_pte_hint(e) >= k)
-            __atomic_store_n(&t[gmmu_l2_index(q)], (e & ~GHINT_MASK) | ((k - 1) << GMMU_PTE_HINT_SHIFT),
-                             __ATOMIC_RELAXED);
+            atomic_store_explicit(&t[gmmu_l2_index(q)], (e & ~GHINT_MASK) | ((k - 1) << GMMU_PTE_HINT_SHIFT),
+                                  memory_order_relaxed);
     }
 }
 /* ---- the page table again as runs, and their index by guest page, for gmmu_aliases. Mappings change a few times a
@@ -193,6 +274,71 @@ static u32 grun_find(u64 g) {
     }
     return lo;
 }
+/* The runs' edges in guest order (GAlias.edge), kept at each change of the runs: the index's build
+   was a qsort of 2 * ngruns edges after each mapping change, most of its time (gmmu_aliases' callers ask after each
+   change, and one game changes its mappings many times a frame). Each edge names its run by its place in gruns, so a
+   run put in or taken out moves the places after it (edge_shift). Not kept while edges_ok is 0: the next build sorts
+   them again */
+static int edges_kept(void) { return g_hle.nvdrv.alias.edges_ok; }
+/* the first edge of key `key` or after */
+static u32 edge_find(u64 key) {
+    const GEdge* e = g_hle.nvdrv.alias.edge;
+    u32 lo = 0, hi = g_hle.nvdrv.alias.nedge;
+    while (lo < hi) {
+        u32 m = lo + (hi - lo) / 2;
+        if (e[m].key < key)
+            lo = m + 1;
+        else
+            hi = m;
+    }
+    return lo;
+}
+static void edge_insert(u64 key, u32 run) {
+    GAlias* x = &g_hle.nvdrv.alias;
+    if (x->nedge == x->capedge) {
+        u32 nc = x->capedge ? x->capedge * 2 : 2048;
+        GEdge* e = realloc(x->edge, (size_t)nc * sizeof *e);
+        if (!e) fatal("nvdrv: out of memory for the GPU mappings' edges\n");
+        x->edge = e;
+        x->capedge = nc;
+    }
+    u32 k = edge_find(key);
+    memmove(&x->edge[k + 1], &x->edge[k], (x->nedge - k) * sizeof *x->edge);
+    x->edge[k] = (GEdge){key, run};
+    x->nedge++;
+}
+static void edge_remove(u64 key, u32 run) {
+    GAlias* x = &g_hle.nvdrv.alias;
+    u32 k = edge_find(key);
+    while (k < x->nedge && x->edge[k].key == key && x->edge[k].run != run) k++;
+    if (k == x->nedge || x->edge[k].key != key) { /* not there: the edges no longer match the runs */
+        WARN_LIMIT(4, "nvdrv: no edge of GPU mapping run %u at guest page %llx: the edges are sorted again\n", run,
+                   (unsigned long long)(key >> 1));
+        x->edges_ok = 0;
+        return;
+    }
+    memmove(&x->edge[k], &x->edge[k + 1], (x->nedge - k - 1) * sizeof *x->edge);
+    x->nedge--;
+}
+/* run k's two edges in, or out */
+static void run_edges(u32 k, int in) {
+    const GRun* r = &g_hle.nvdrv.gruns[k];
+    if (!edges_kept()) return;
+    if (in) {
+        edge_insert(r->cpage << 1 | 1, k);
+        edge_insert((r->cpage + r->pages) << 1, k);
+    } else {
+        edge_remove(r->cpage << 1 | 1, k);
+        edge_remove((r->cpage + r->pages) << 1, k);
+    }
+}
+/* the runs at from on moved by delta places (a run put in before them, or runs taken out) */
+static void edge_shift(u32 from, u32 delta, int up) {
+    GAlias* x = &g_hle.nvdrv.alias;
+    if (!edges_kept()) return;
+    for (u32 i = 0; i < x->nedge; i++)
+        if (x->edge[i].run >= from) x->edge[i].run = up ? x->edge[i].run + delta : x->edge[i].run - delta;
+}
 /* takes pages [g0, g1) out of the runs. With own, only from the runs still showing guest page c0 + (p - g0) at each
    page p, which are the pages gmmu_unmap's own clears: a run shows them at all its pages or at none */
 static void grun_cut(u64 g0, u64 g1, int own, u64 c0) {
@@ -204,14 +350,22 @@ static void grun_cut(u64 g0, u64 g1, int own, u64 c0) {
         tail.gpage = g1;
         tail.pages = r[k].gpage + r[k].pages - g1;
         tail.cpage = r[k].cpage + (g1 - r[k].gpage);
+        run_edges(k, 0);
         r[k].pages = g0 - r[k].gpage;
+        run_edges(k, 1);
         grun_room(1);
         r = g_hle.nvdrv.gruns;
         memmove(&r[k + 2], &r[k + 1], (n - k - 1) * sizeof *r);
         r[k + 1] = tail;
         g_hle.nvdrv.ngruns++;
+        edge_shift(k + 1, 1, 1);
+        run_edges(k + 1, 1);
         return;
     }
+    const u32 k0 = k;
+    u32 kend = k;
+    while (kend < n && r[kend].gpage < g1) kend++;
+    for (u32 j = k0; j < kend; j++) run_edges(j, 0); /* in again below, as they are after the cut */
     for (w = k; k < n && r[k].gpage < g1; k++) {
         GRun e = r[k];
         u64 end = e.gpage + e.pages;
@@ -227,9 +381,12 @@ static void grun_cut(u64 g0, u64 g1, int own, u64 c0) {
         }
         r[w++] = e;
     }
-    if (w == k) return;
-    memmove(&r[w], &r[k], (n - k) * sizeof *r);
-    g_hle.nvdrv.ngruns = n - (k - w);
+    if (w != k) {
+        memmove(&r[w], &r[k], (n - k) * sizeof *r);
+        g_hle.nvdrv.ngruns = n - (k - w);
+        edge_shift(kend, kend - w, 0);
+    }
+    for (u32 j = k0; j < w; j++) run_edges(j, 1);
 }
 /* the table's pages first to last (gmmu_map's and gmmu_unmap's numbers) changed: mapped to guest memory from cpu on,
    or cleared (with own, only those still mapped where a mapping of cpu put them) */
@@ -249,6 +406,8 @@ static void grun_change(u64 first, u64 last, int map, int own, u64 cpu) {
             g_hle.nvdrv.gruns[k].pages = n;
             g_hle.nvdrv.gruns[k].cpage = cpu >> GMMU_PAGE_BITS;
             g_hle.nvdrv.ngruns++;
+            edge_shift(k, 1, 1);
+            run_edges(k, 1);
         } else if (!own || !(cpu & GHINT_MASK)) /* an own unmap compares its address's hint bits too: set, none match */
             grun_cut(g, g + n, own, cpu >> GMMU_PAGE_BITS);
         if (n >= last - first + 1) break;
@@ -258,40 +417,54 @@ static void grun_change(u64 first, u64 last, int map, int own, u64 cpu) {
     g_hle.nvdrv.alias.stale = 1;
     pm_unlock(&g_host.nvdrv.alias_lock);
 }
-/* where a run starts (bit 0 set) or ends in guest memory, by page, ends first at a page */
-typedef struct {
-    u64 key;
-    u32 run;
-} GEdge;
 static int gedge_cmp(const void* a, const void* b) {
     u64 x = ((const GEdge*)a)->key, y = ((const GEdge*)b)->key;
     return (x > y) - (x < y);
 }
-/* the index from the runs: a sweep over their edges in guest order, keeping the runs over the current interval in
-   act (pos[r] is run r's place there). The first pass counts what the second writes */
-static void alias_build(void) {
-    GAlias* x = &g_hle.nvdrv.alias;
+/* the runs' edges into e (2 * ngruns of them), sorted */
+static void edges_sort(GEdge* e) {
     const GRun* r = g_hle.nvdrv.gruns;
-    u32 n = g_hle.nvdrv.ngruns, ne = 2 * n, i, nb = 0, nact, pass;
-    u64 ncover = 0;
-    GEdge* e;
-    u32 *act, *pos;
-    x->stale = 0;
-    x->nbound = 0;
-    x->query = 0;
-    if (!n) return;
-    if (n > 0x40000000u) fatal("nvdrv: too many GPU mappings for their index\n");
-    e = malloc((size_t)ne * sizeof *e + 2 * (size_t)n * sizeof *act);
-    if (!e) fatal("nvdrv: out of memory for the GPU mappings' index\n");
-    act = (u32*)(e + ne);
-    pos = act + n;
-    for (i = 0; i < n; i++) {
+    u32 n = g_hle.nvdrv.ngruns;
+    for (u32 i = 0; i < n; i++) {
         e[2 * i].key = r[i].cpage << 1 | 1;
         e[2 * i].run = i;
         e[2 * i + 1].key = (r[i].cpage + r[i].pages) << 1;
         e[2 * i + 1].run = i;
     }
-    qsort(e, ne, sizeof *e, gedge_cmp);
+    qsort(e, 2 * (size_t)n, sizeof *e, gedge_cmp);
+}
+/* the index from the runs: a sweep over their edges in guest order, keeping the runs over the current interval in
+   act (pos[r] is run r's place there). The first pass counts what the second writes. The edges are the ones kept in
+   order at each change (sorted again once where they don't match the runs) */
+static void alias_build(void) {
+    GAlias* x = &g_hle.nvdrv.alias;
+    u32 n = g_hle.nvdrv.ngruns, ne = 2 * n, i, nb = 0, nact, pass;
+    u64 ncover = 0, t0 = plat_ns();
+    GEdge* e;
+    u32 *act, *pos;
+    x->stale = 0;
+    x->nbound = 0;
+    x->query = 0;
+    x->builds++;
+    if (x->edges_ok && x->nedge != ne)
+        WARN_LIMIT(4, "nvdrv: %u edges kept for %u GPU mapping runs: sorted again\n", x->nedge, n);
+    if (!x->edges_ok || x->nedge != ne) { /* after a state's load, or edges that went wrong: once */
+        if (ne > x->capedge) {
+            GEdge* grown = realloc(x->edge, (size_t)(ne ? ne : 1) * sizeof *grown);
+            if (!grown) fatal("nvdrv: out of memory for the GPU mappings' edges\n");
+            x->edge = grown;
+            x->capedge = ne ? ne : 1;
+        }
+        edges_sort(x->edge);
+        x->nedge = ne;
+        x->edges_ok = 1;
+    }
+    if (!n) return;
+    if (n > 0x40000000u) fatal("nvdrv: too many GPU mappings for their index\n");
+    act = malloc(2 * (size_t)n * sizeof *act);
+    if (!act) fatal("nvdrv: out of memory for the GPU mappings' index\n");
+    pos = act + n;
+    e = x->edge;
     for (pass = 0; pass < 2; pass++) {
         nb = 0;
         ncover = 0;
@@ -335,7 +508,18 @@ static void alias_build(void) {
     }
     x->first[nb] = (u32)ncover;
     x->nbound = nb;
-    free(e);
+    free(act);
+    x->build_ns += plat_ns() - t0;
+}
+void gmmu_alias_log(void) {
+    GAlias* x = &g_hle.nvdrv.alias;
+    pm_lock(&g_host.nvdrv.alias_lock);
+    const u32 builds = x->builds, runs = g_hle.nvdrv.ngruns;
+    const u64 ns = x->build_ns;
+    x->builds = 0;
+    x->build_ns = 0;
+    pm_unlock(&g_host.nvdrv.alias_lock);
+    LOG("gmmu: %u alias index builds over 600 presents, %u runs, %.2f ms\n", builds, runs, (double)ns / 1e6);
 }
 void gmmu_aliases(u64 cpu, u64 size, void (*fn)(void* ctx, u64 gva, u64 n), void* ctx) {
     GAlias* x = &g_hle.nvdrv.alias;
@@ -388,13 +572,13 @@ void gmmu_map(u64 gva, u64 cpu, u64 size) {
     last = (gva + size - 1) >> GMMU_PAGE_BITS;
     gmmu_clip(first);
     for (p = last;; p--) { /* from the last, so a page's count covers only pages already written */
-        u64* t = gmmu_l2(gmmu_l1_index(p));
+        _Atomic u64* t = gmmu_l2(gmmu_l1_index(p));
         u64 h = last - p, room = (GMMU_L2_ENTRIES - 1) - gmmu_l2_index(p); /* counts stay in their table */
         u64 e;
         if (h > room) h = room;
         if (h > GHINT_MAX) h = GHINT_MAX;
         e = (cpu + ((p - first) << GMMU_PAGE_BITS)) | (h << GMMU_PTE_HINT_SHIFT) | GMMU_PTE_VALID;
-        __atomic_store_n(&t[gmmu_l2_index(p)], e, __ATOMIC_RELAXED);
+        atomic_store_explicit(&t[gmmu_l2_index(p)], e, memory_order_relaxed);
         if (p == first) break;
     }
     grun_change(first, last, 1, 0, cpu);
@@ -412,27 +596,27 @@ static void gmmu_unmap(u64 gva, u64 size, int own, u64 cpu) {
        that an own unmap keeps lose theirs */
     gmmu_clip(first);
     for (p = first; p <= last; p++) {
-        u64* t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(p)], __ATOMIC_ACQUIRE);
+        _Atomic u64* t = atomic_load_explicit(&g_hle.nvdrv.gmmu[gmmu_l1_index(p)], memory_order_acquire);
         u64 e;
         if (!t) {
             p |= GMMU_L2_ENTRIES - 1;
             continue;
         }
-        e = __atomic_load_n(&t[gmmu_l2_index(p)], __ATOMIC_RELAXED);
-        if (e & GHINT_MASK) __atomic_store_n(&t[gmmu_l2_index(p)], e & ~GHINT_MASK, __ATOMIC_RELAXED);
+        e = atomic_load_explicit(&t[gmmu_l2_index(p)], memory_order_relaxed);
+        if (e & GHINT_MASK) atomic_store_explicit(&t[gmmu_l2_index(p)], e & ~GHINT_MASK, memory_order_relaxed);
     }
     for (p = first; p <= last; p++) {
-        u64* t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(p)], __ATOMIC_ACQUIRE);
-        u64* e;
+        _Atomic u64* t = atomic_load_explicit(&g_hle.nvdrv.gmmu[gmmu_l1_index(p)], memory_order_acquire);
+        _Atomic u64* e;
         if (!t) { /* nothing was ever mapped in this table's range: skip to the next table */
             p |= GMMU_L2_ENTRIES - 1;
             continue;
         }
         e = &t[gmmu_l2_index(p)];
-        if (own && (__atomic_load_n(e, __ATOMIC_RELAXED) & ~GHINT_MASK) !=
+        if (own && (atomic_load_explicit(e, memory_order_relaxed) & ~GHINT_MASK) !=
                        ((cpu + ((p - first) << GMMU_PAGE_BITS)) | GMMU_PTE_VALID))
             continue;
-        __atomic_store_n(e, 0, __ATOMIC_RELAXED);
+        atomic_store_explicit(e, 0, memory_order_relaxed);
     }
     grun_change(first, last, 0, own, cpu);
     gmmu_change_end(gva, size);
@@ -603,13 +787,15 @@ static u64 va_alloc(u64 size, u64 align) {
    syncpt_free are Eden's AllocateSyncpoint and FreeSyncpoint, syncpt_promise its IncrementSyncpointMaxExt, syncpt_add
    host1x's IncrementGuest, syncpt_wait its WaitGuest */
 /* the syncpoint's value (ReadSyncpointMinValue); 0 for an id past the table */
-u32 syncpt_read(u32 id) { return id < SYNCPT_IDS ? __atomic_load_n(&g_hle.nvdrv.syncpt[id], __ATOMIC_SEQ_CST) : 0; }
+u32 syncpt_read(u32 id) {
+    return id < SYNCPT_IDS ? atomic_load_explicit(&g_hle.nvdrv.syncpt[id], memory_order_seq_cst) : 0;
+}
 u64 g_sync_shim_cpu; /* the syncpoint shim's guest CPU page (GET_SYNC_RO_MAP), 0 until bound */
 /* the value moved and its waiters woken: 0 for no increment */
 static int syncpt_bump(u32 id, u32 n) {
     if (id >= SYNCPT_IDS || !n) return 0;
     pm_lock(&g_host.nvdrv.sync_lk);
-    u32 v = __atomic_add_fetch(&g_hle.nvdrv.syncpt[id], n, __ATOMIC_SEQ_CST);
+    u32 v = (atomic_fetch_add_explicit(&g_hle.nvdrv.syncpt[id], n, memory_order_seq_cst) + n);
     if ((i32)(v - g_hle.nvdrv.syncpt_max[id]) > 0) g_hle.nvdrv.syncpt_max[id] = v; /* the CPU promises nothing first */
     pc_broadcast(&g_host.nvdrv.sync_cv);
     pm_unlock(&g_host.nvdrv.sync_lk);
@@ -618,7 +804,7 @@ static int syncpt_bump(u32 id, u32 n) {
 void syncpt_add(u32 id, u32 n) {
     if (!syncpt_bump(id, n)) return;
     /* seq_cst, as the arm's fetch_or: an arm meanwhile is seen here or sees this increment in its own check */
-    if (__atomic_load_n(&g_hle.nvdrv.armed_tables, __ATOMIC_SEQ_CST)) nv_events_check();
+    if (atomic_load_explicit(&g_hle.nvdrv.armed_tables, memory_order_seq_cst)) nv_events_check();
     gsv_syncpt_changed(); /* the Ounce syncpoint supervisor's armed waits */
     gpu_kick(); /* a GPU channel's stream may wait for it */
 }
@@ -630,7 +816,7 @@ void syncpt_add_quiet(u32 id, u32 n) {
 void syncpt_events(void) {
     if (!t_hle.nvdrv.events_due) return;
     t_hle.nvdrv.events_due = 0;
-    if (__atomic_load_n(&g_hle.nvdrv.armed_tables, __ATOMIC_SEQ_CST)) nv_events_check();
+    if (atomic_load_explicit(&g_hle.nvdrv.armed_tables, memory_order_seq_cst)) nv_events_check();
     gsv_syncpt_changed(); /* the Ounce syncpoint supervisor's armed waits */
 }
 void syncpt_incr(u32 id) { syncpt_add(id, 1); }
@@ -673,10 +859,10 @@ int syncpt_wait(u32 id, u32 thresh, i64 timeout_ns) {
     }
     pm_unlock(&g_host.nvdrv.sync_lk);
     u64 waited_ns = plat_ns() - started;
-    __atomic_add_fetch(&g_host.nvdrv.syncpt_waits, 1, __ATOMIC_RELAXED);
+    atomic_fetch_add_explicit(&g_host.nvdrv.syncpt_waits, 1, memory_order_relaxed);
     [[maybe_unused]] double ms = (double)waited_ns / 1e6;
     SNX_PLOT("syncpt wait ms", ms);
-    if (!reached) __atomic_add_fetch(&g_host.nvdrv.syncpt_timeouts, 1, __ATOMIC_RELAXED);
+    if (!reached) atomic_fetch_add_explicit(&g_host.nvdrv.syncpt_timeouts, 1, memory_order_relaxed);
     if (ms > 1.0 && snx_tracy_attached()) {
         char msg[64];
         int n = snprintf(msg, sizeof msg, "syncpoint %u waited for %u", id, thresh);
@@ -685,8 +871,8 @@ int syncpt_wait(u32 id, u32 thresh, i64 timeout_ns) {
     return reached;
 }
 void syncpt_wait_stats(u64* waits, u64* timeouts) {
-    *waits = __atomic_load_n(&g_host.nvdrv.syncpt_waits, __ATOMIC_RELAXED);
-    *timeouts = __atomic_load_n(&g_host.nvdrv.syncpt_timeouts, __ATOMIC_RELAXED);
+    *waits = atomic_load_explicit(&g_host.nvdrv.syncpt_waits, memory_order_relaxed);
+    *timeouts = atomic_load_explicit(&g_host.nvdrv.syncpt_timeouts, memory_order_relaxed);
 }
 /* every syncpoint user (GPU channels here, host1x channels in host1x.c) allocates here, lowest free id first, so ids
    stay unique and below SYNCPT_N (nvdrv.h: NVIDIA's stream library sizes its per-syncpoint tables at 128, and an id
@@ -698,7 +884,7 @@ u32 syncpt_alloc(void) {
         if (!g_hle.nvdrv.syncpt_used[id]) {
             g_hle.nvdrv.syncpt_used[id] = 1;
             /* an id used before starts with nothing promised past its value */
-            g_hle.nvdrv.syncpt_max[id] = g_hle.nvdrv.syncpt[id];
+            g_hle.nvdrv.syncpt_max[id] = atomic_load_explicit(&g_hle.nvdrv.syncpt[id], memory_order_relaxed);
             pm_unlock(&g_host.nvdrv.sync_lk);
             LOG("nvdrv: syncpt_alloc -> %u\n", id);
             return id;
@@ -791,7 +977,9 @@ static NvEvent* nvev_slot(u32 fd, u32 slot, int make) {
 /* ctrl fd fd's event slot is armed: its bit in its table's armed_mask, the only record of it. Called with the lock
    held, for an fd with a table */
 static int nvev_armed(u32 fd, u32 slot) {
-    return (int)(__atomic_load_n(&g_hle.nvdrv.armed_mask[g_hle.nvdrv.ctrl_ev[fd] - 1], __ATOMIC_RELAXED) >> slot & 1);
+    return (int)(atomic_load_explicit(&g_hle.nvdrv.armed_mask[g_hle.nvdrv.ctrl_ev[fd] - 1], memory_order_relaxed) >>
+                     slot &
+                 1);
 }
 /* the KEvent of an event slot, made on first use (NULL without memory). nvdrv keeps a reference of its own, so the
    game closing its handle doesn't free an event a later syncpoint increment signals. Called with the lock held */
@@ -815,8 +1003,8 @@ static NvEvent* nvev_detach(u32 fd, NvEvent* out) {
     if (t) {
         u32 ti = (u32)(t - g_hle.nvdrv.ctrl_evt);
         memcpy(out, t->slot, sizeof t->slot);
-        __atomic_store_n(&g_hle.nvdrv.armed_mask[ti], 0, __ATOMIC_RELEASE);
-        __atomic_fetch_and(&g_hle.nvdrv.armed_tables, ~(1ull << ti), __ATOMIC_RELEASE);
+        atomic_store_explicit(&g_hle.nvdrv.armed_mask[ti], 0, memory_order_release);
+        atomic_fetch_and_explicit(&g_hle.nvdrv.armed_tables, ~(1ull << ti), memory_order_release);
         POOL_PUT(t);
     }
     g_hle.nvdrv.ctrl_ev[fd] = 0;
@@ -827,21 +1015,22 @@ static NvEvent* nvev_detach(u32 fd, NvEvent* out) {
 static void nv_events_check(void) {
     u64 tables;
     nvev_lock();
-    tables = __atomic_load_n(&g_hle.nvdrv.armed_tables, __ATOMIC_RELAXED);
+    tables = atomic_load_explicit(&g_hle.nvdrv.armed_tables, memory_order_relaxed);
     while (tables) {
         u32 t = snx_ctz64(tables);
-        u64 mask = g_hle.nvdrv.ctrl_evt[t].fd ? __atomic_load_n(&g_hle.nvdrv.armed_mask[t], __ATOMIC_RELAXED) : 0;
+        u64 mask =
+            g_hle.nvdrv.ctrl_evt[t].fd ? atomic_load_explicit(&g_hle.nvdrv.armed_mask[t], memory_order_relaxed) : 0;
         tables &= tables - 1;
         while (mask) {
             u32 bit = snx_ctz64(mask);
             NvEvent* e = &g_hle.nvdrv.ctrl_evt[t].slot[bit];
             mask &= mask - 1;
             if (!syncpt_reached(e->id, e->thresh)) continue;
-            __atomic_fetch_and(&g_hle.nvdrv.armed_mask[t], ~(1ull << bit), __ATOMIC_RELEASE);
+            atomic_fetch_and_explicit(&g_hle.nvdrv.armed_mask[t], ~(1ull << bit), memory_order_release);
             if (e->ev) kevent_signal(kev(e->ev));
         }
-        if (!g_hle.nvdrv.ctrl_evt[t].fd || !__atomic_load_n(&g_hle.nvdrv.armed_mask[t], __ATOMIC_RELAXED))
-            __atomic_fetch_and(&g_hle.nvdrv.armed_tables, ~(1ull << t), __ATOMIC_RELEASE);
+        if (!g_hle.nvdrv.ctrl_evt[t].fd || !atomic_load_explicit(&g_hle.nvdrv.armed_mask[t], memory_order_relaxed))
+            atomic_fetch_and_explicit(&g_hle.nvdrv.armed_tables, ~(1ull << t), memory_order_release);
     }
     nvev_unlock();
 }
@@ -1297,8 +1486,9 @@ static void nvev_disarm(u32 fd, u32 slot) { /* under nvev_lk; the event stays un
     if (nvev_armed(fd, slot)) {
         u32 t = g_hle.nvdrv.ctrl_ev[fd] - 1;
         u64 remain;
-        remain = __atomic_fetch_and(&g_hle.nvdrv.armed_mask[t], ~(1ull << slot), __ATOMIC_RELEASE) & ~(1ull << slot);
-        if (!remain) __atomic_fetch_and(&g_hle.nvdrv.armed_tables, ~(1ull << t), __ATOMIC_RELEASE);
+        remain = atomic_fetch_and_explicit(&g_hle.nvdrv.armed_mask[t], ~(1ull << slot), memory_order_release) &
+                 ~(1ull << slot);
+        if (!remain) atomic_fetch_and_explicit(&g_hle.nvdrv.armed_tables, ~(1ull << t), memory_order_release);
     }
     kevent_clear(kev(e->ev));
 }
@@ -1333,8 +1523,8 @@ static u32 ctrl_event_wait(u32 fd, u8* d, int async) {
         e->thresh = thresh;
         if (!nvev_armed(fd, slot)) {
             u32 t = g_hle.nvdrv.ctrl_ev[fd] - 1;
-            __atomic_fetch_or(&g_hle.nvdrv.armed_mask[t], 1ull << slot, __ATOMIC_RELEASE);
-            __atomic_fetch_or(&g_hle.nvdrv.armed_tables, 1ull << t, __ATOMIC_SEQ_CST);
+            atomic_fetch_or_explicit(&g_hle.nvdrv.armed_mask[t], 1ull << slot, memory_order_release);
+            atomic_fetch_or_explicit(&g_hle.nvdrv.armed_tables, 1ull << t, memory_order_seq_cst);
         }
     }
     nvev_unlock();
@@ -1968,6 +2158,7 @@ void nv_init(void) {
     pm_init(&g_host.nvdrv.lock);
     pm_init(&g_host.nvdrv.aslock);
     pm_init(&g_host.nvdrv.alias_lock);
+    pm_init(&g_host.nvdrv.later_lock);
     pm_init(&g_host.nvdrv.nvev_lk);
     pm_init(&g_host.nvdrv.sync_lk);
     pm_init(&g_host.nvdrv.submit_lk);
